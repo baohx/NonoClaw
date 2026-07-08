@@ -1,0 +1,51 @@
+# NonoClaw — Rust rewrite of Claude Code (agent CLI).
+# `src/` at the repo root is the immutable TypeScript reference implementation.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/api",
+    "crates/tools",
+    "crates/engine",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/anthropics/claude-code"
+
+# Shared dependency versions — reference from each crate as `dep.workspace = true`.
+[workspace.dependencies]
+nonoclaw-core = { path = "crates/core" }
+nonoclaw-api = { path = "crates/api" }
+nonoclaw-tools = { path = "crates/tools" }
+nonoclaw-engine = { path = "crates/engine" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+regex = "1"
+glob = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

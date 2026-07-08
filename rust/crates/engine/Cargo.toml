@@ -1,0 +1,22 @@
+[package]
+name = "nonoclaw-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agentic query loop, system prompt assembly, and context for NonoClaw"
+
+[dependencies]
+nonoclaw-core = { workspace = true }
+nonoclaw-api = { workspace = true }
+nonoclaw-tools = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

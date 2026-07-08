@@ -1,0 +1,23 @@
+[package]
+name = "nonoclaw-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tool trait, registry, permission engine, and core tool implementations for NonoClaw"
+
+[dependencies]
+nonoclaw-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+glob = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
