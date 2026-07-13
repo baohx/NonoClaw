@@ -126,6 +126,18 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     serve_http: Option<String>,
 
+    /// Public URL used in the QR code for mobile access (e.g.
+    /// http://192.168.1.42:8765). If not set, the QR defaults to
+    /// `window.location.origin`.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+
+    /// Auto-spawn cloudflared tunnel for public internet access. Requires
+    /// cloudflared in PATH. The generated *.trycloudflare.com URL replaces
+    /// --public-url automatically.
+    #[arg(long)]
+    tunnel: bool,
+
     /// Connect to a remote session server at ADDR and run the prompt.
     #[arg(long, value_name = "ADDR")]
     remote: Option<String>,
@@ -211,6 +223,22 @@ async fn main() -> Result<()> {
     let settings = nonoclaw_engine::load_settings(&cwd, cli.settings.as_deref());
     nonoclaw_engine::settings::apply_env(&settings);
 
+    // Multi-model: if models[] is present, apply the default profile's creds so
+    // the initial Client uses the default endpoint. Profiles are passed through
+    // to serve_http for per-run Client rebuild on model switch.
+    let model_profiles: Vec<nonoclaw_engine::ModelProfile> =
+        settings.models.clone().unwrap_or_default();
+    for p in &model_profiles {
+        if p.default {
+            if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
+                std::env::set_var("ANTHROPIC_BASE_URL", &p.base_url);
+            }
+            if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+                std::env::set_var("ANTHROPIC_API_KEY", &p.api_key);
+            }
+        }
+    }
+
     let client = Client::from_env().context("failed to build API client")?;
 
     let permission_mode = if cli.dangerously_skip_permissions {
@@ -221,7 +249,7 @@ async fn main() -> Result<()> {
     };
 
     const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
-    const DEFAULT_MAX_TURNS: u32 = 10;
+    const DEFAULT_MAX_TURNS: u32 = 200;
     const DEFAULT_MAX_TOKENS: u32 = 8192;
     const DEFAULT_COMPACT_THRESHOLD: usize = 150_000;
     // Build options: CLI flags > settings > built-in defaults.
@@ -323,23 +351,9 @@ async fn main() -> Result<()> {
         .or_else(|| settings.model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".into());
 
-    // Web UI server: HTTP + WebSocket, opens browser.
+    // Web UI server: HTTP + WebSocket.
     if let Some(addr) = &cli.serve_http {
-        let url = format!("http://{addr}");
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .spawn();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(&url).spawn();
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("start").arg(&url).spawn();
-        }
+        tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
             addr,
             Arc::new(client),
@@ -351,6 +365,9 @@ async fn main() -> Result<()> {
             mcp_sources,
             context_window,
             compact_threshold_tokens,
+            cli.public_url.clone(),
+            cli.tunnel,
+            model_profiles,
         )
         .await?;
         return Ok(());
@@ -450,10 +467,9 @@ fn resolve_session(
 }
 
 fn add_plugin(src: &str) -> Result<()> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .context("HOME")?;
-    let plugins = home.join(".nonoclaw/plugins");
+    let home = nonoclaw_core::nonoclaw_data_dir()
+        .context("cannot resolve nonoclaw data dir (set HOME or USERPROFILE)")?;
+    let plugins = home.join("plugins");
     std::fs::create_dir_all(&plugins)?;
     if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("git@") {
         let name = src

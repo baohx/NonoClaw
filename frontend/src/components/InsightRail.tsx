@@ -8,7 +8,7 @@ interface Props {
   onRefresh: () => void;
 }
 
-const DEFAULT_OPEN = new Set(["tools", "hooks", "docs", "project"]);
+const DEFAULT_OPEN = new Set<string>();
 
 export default function InsightRail({ info, onOpen, onRefresh }: Props) {
   const [open, setOpen] = useState<Set<string>>(DEFAULT_OPEN);
@@ -94,6 +94,8 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
           )}
         </Section>
 
+        <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} />
+
         <Section
           id="skills"
           label="Skills"
@@ -169,6 +171,10 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         >
           <PathRows label="docs" layers={info?.docs ?? []} onOpen={onOpen} />
           <PathRows label="config" layers={info?.settings ?? []} onOpen={onOpen} />
+        </Section>
+
+        <Section id="slash" label="Slash commands" count={3} open={open.has("slash")} onToggle={toggle}>
+          <SlashRef />
         </Section>
 
         <Section id="cli" label="CLI reference" count={null} open={open.has("cli")} onToggle={toggle}>
@@ -406,6 +412,62 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
   );
 }
 
+// ── Models section ──────────────────────────────────────────────────────────
+
+function ModelsSection({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const models = useStore((s) => s.availableModels);
+  const active = useStore((s) => s.model);
+  if (models.length === 0) return null;
+  return (
+    <Section id="models" label="Models" count={models.length} open={open} onToggle={onToggle}>
+      <div className="acc-body">
+        {models.map((m) => (
+          <div key={m.name} className="insight-row">
+            <div className="insight-row__top">
+              <span className={`dot ${m.name === active ? "on" : "off"}`} />
+              <span className="insight-row__name">{m.label || m.name}</span>
+              {m.name === active && <span className="tag mcp">active</span>}
+            </div>
+            <div className="insight-row__meta">{m.name}</div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+// ── Slash commands reference ────────────────────────────────────────────────
+
+function SlashRef() {
+  return (
+    <div className="acc-body">
+      <div className="insight-row">
+        <div className="insight-row__top">
+          <span className="tag mcp">/clear</span>
+          <span className="insight-row__name">Reset conversation</span>
+        </div>
+        <div className="insight-row__meta">Clear all messages and start fresh</div>
+      </div>
+      <div className="insight-row">
+        <div className="insight-row__top">
+          <span className="tag mcp">/compact</span>
+          <span className="insight-row__name">Summarise long context</span>
+        </div>
+        <div className="insight-row__meta">Compress older messages into a summary to free context window</div>
+      </div>
+      <div className="insight-row">
+        <div className="insight-row__top">
+          <span className="tag mcp">/multi</span>
+          <span className="insight-row__name">Multi-model compare</span>
+        </div>
+        <div className="insight-row__meta">
+          Syntax: /multi deepseek-chat,glm-4-plus {"<prompt>"} — answers from multiple models side by side (Phase 2)
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Static CLI reference ────────────────────────────────────────────────────
 
 const CLI_FLAGS: { name: string; desc: string }[] = [
@@ -490,9 +552,11 @@ function ProjectKv({ info }: { info: ProjectInfo | null }) {
       </div>
       <div className="kv__row">
         <span className="kv__k">tools</span>
-        <span className="kv__v">
-          {info?.tools.length ?? 0} · mcp {info?.mcp_servers.length ?? 0}
-        </span>
+        <span className="kv__v">{info?.tools.length ?? 0}</span>
+      </div>
+      <div className="kv__row">
+        <span className="kv__k">mcp</span>
+        <span className="kv__v">{info?.mcp_servers.length ?? 0}</span>
       </div>
       <div className="kv__row">
         <span className="kv__k">skills</span>

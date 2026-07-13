@@ -28,6 +28,8 @@ pub struct ProjectInfo {
     pub context_window: Option<usize>,
     /// Effective auto-compact threshold (tokens).
     pub compact_threshold: usize,
+    /// Public URL for QR-code mobile access, if set via --public-url.
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -56,6 +58,7 @@ pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub source: String, // on-disk SKILL.md path
+    pub body: String,   // full markdown body (injected as append_system_prompt)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -103,10 +106,7 @@ pub struct CommitInfo {
 
 /// The nonoclaw home dir: `$NONOCLAW_HOME` or `~/.nonoclaw`.
 pub fn nonoclaw_home() -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("NONOCLAW_HOME") {
-        return Some(PathBuf::from(v));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nonoclaw"))
+    nonoclaw_core::nonoclaw_data_dir()
 }
 
 /// Gather the full project context. All local FS probes + a handful of git
@@ -119,6 +119,7 @@ pub async fn gather(
     mcp_sources: &HashMap<String, String>,
     context_window: Option<usize>,
     compact_threshold: usize,
+    public_url: Option<String>,
 ) -> ProjectInfo {
     let tools: Vec<ToolInfo> = registry
         .all()
@@ -168,6 +169,7 @@ pub async fn gather(
             name: s.name,
             description: s.description,
             source: s.source,
+            body: s.body,
         })
         .collect();
 
@@ -198,6 +200,7 @@ pub async fn gather(
         git,
         context_window,
         compact_threshold,
+        public_url,
     }
 }
 
@@ -348,8 +351,22 @@ fn collect_settings_layers(cwd: &Path) -> Vec<PathLayer> {
 /// dep) — mirrors `engine::context::git_out`.
 async fn git_info(cwd: &Path) -> Option<GitInfo> {
     let branch_raw = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+    // Empty repo (git init, no commits): rev-parse fails but .git/ exists.
+    // Return is_empty=true instead of None so the UI shows "no commits yet".
     if branch_raw.is_empty() {
-        return None; // not a git repo
+        if !cwd.join(".git").exists() {
+            return None; // genuinely not a git repo
+        }
+        let user_raw = git_out(cwd, &["config", "user.name"]).await;
+        let user = (!user_raw.is_empty()).then_some(user_raw);
+        return Some(GitInfo {
+            branch: None,
+            ahead: 0, behind: 0,
+            staged: 0, modified: 0, untracked: 0, conflicts: 0,
+            is_empty: true,
+            recent_commits: vec![],
+            user,
+        });
     }
     let branch = (branch_raw == "HEAD").then(|| "HEAD (detached)".to_string()).or(Some(branch_raw));
 

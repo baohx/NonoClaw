@@ -15,3 +15,29 @@ pub use message::{
 };
 pub use permissions::{PermissionDecision, PermissionMode, PermissionResult, ValidationResult};
 pub use usage::{Usage, UsagePart};
+
+/// The user's home directory (platform-aware).
+/// `$HOME` on Unix / Git Bash; `%USERPROFILE%` on Windows cmd.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(h) = std::env::var_os("HOME") {
+            return Some(std::path::PathBuf::from(h));
+        }
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+}
+
+/// Resolve the nonoclaw data directory for config / sessions / plugins.
+/// `$NONOCLAW_HOME` → `$HOME/.nonoclaw` (Unix / Git Bash) →
+/// `%USERPROFILE%\.nonoclaw` (Windows cmd).
+pub fn nonoclaw_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("NONOCLAW_HOME") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    home_dir().map(|h| h.join(".nonoclaw"))
+}

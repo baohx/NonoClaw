@@ -92,7 +92,7 @@ pub fn get_user_context(cwd: &Path, add_dirs: &[PathBuf]) -> UserContext {
     }
 
     // 5-6. User-global
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
         // 5. User NONOCLAW.md
         if let Some(content) = read_optional(&PathBuf::from(&home).join(".nonoclaw/NONOCLAW.md")) {
             append_md(&mut nonoclaw_md, "~/.nonoclaw/NONOCLAW.md", content);

@@ -16,12 +16,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
     textareaRef.current?.focus();
   }, []);
 
-  const resize = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 240) + "px";
-  }, []);
+  // resize is handled by CSS `field-sizing: content` — no JS reflow per keystroke.
 
   // Shared by both ⌘/Ctrl+Enter and the Send button.
   const submit = useCallback(() => {
@@ -34,9 +29,8 @@ export default function InputBox({ onSubmit, disabled }: Props) {
     draftRef.current = "";
     el.value = "";
     setHasText(false);
-    resize();
     onSubmit(text);
-  }, [disabled, onSubmit, resize]);
+  }, [disabled, onSubmit]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -56,7 +50,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           historyIdx.current--;
           el.value = historyRef.current[historyIdx.current] || "";
           setHasText(el.value.trim().length > 0);
-          resize();
         }
         return;
       }
@@ -70,7 +63,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           el.value = draftRef.current;
         }
         setHasText(el.value.trim().length > 0);
-        resize();
         return;
       }
     },
@@ -80,8 +72,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
   const handleInput = useCallback(() => {
     const el = textareaRef.current;
     setHasText(!!el && el.value.trim().length > 0);
-    resize();
-  }, [resize]);
+  }, []);
 
   return (
     <div className="composer">

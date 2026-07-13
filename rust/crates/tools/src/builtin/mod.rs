@@ -59,7 +59,7 @@ pub(crate) fn expand_tilde(p: &str) -> PathBuf {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    nonoclaw_core::home_dir()
 }
 
 /// Register all Phase 0 built-in tools. Returns the registry and the shared

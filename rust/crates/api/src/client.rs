@@ -189,6 +189,11 @@ impl Client {
         Self::new(api_key, auth_token, base_url)
     }
 
+    /// The configured base URL (for per-run Client comparison).
+    pub fn base_url(&self) -> &str { &self.base_url }
+    /// The configured API key, if any.
+    pub fn api_key(&self) -> Option<&str> { self.api_key.as_deref() }
+
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self

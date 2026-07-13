@@ -15,6 +15,7 @@ pub use loop_::{
     EngineEvent, EngineOptions, FinalResult, PermissionRequest, PermissionResolver, QueryEngine,
 };
 pub use session::{
-    list_sessions, load_session, most_recent_session, new_session_id, session_path, SessionInfo,
+    clear_session, list_sessions, load_session, most_recent_session, new_session_id,
+    session_path, SessionInfo,
 };
-pub use settings::{apply_env, apply_settings, load_settings, SettingsFile};
+pub use settings::{apply_env, apply_settings, load_settings, ModelProfile, SettingsFile};

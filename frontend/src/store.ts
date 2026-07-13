@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type {
   ChatMessage,
   FileEntry,
+  ModelInfo,
+  PermissionMode,
   PermissionRequired,
   ProjectInfo,
   QuestionRequired,
@@ -49,7 +51,7 @@ interface AppState {
   pendingCommit: { sha: string; output: string } | null;
   /** True while a manual /compact summarization round-trip is in flight. */
   compacting: boolean;
-  /** Session-picker visibility. */
+  agentRunning: boolean;
   showSessionPicker: boolean;
 
   // ── File tree ──
@@ -60,6 +62,15 @@ interface AppState {
   projectInfo: ProjectInfo | null;
   leftRailCollapsed: boolean;
   insightCollapsed: boolean;
+
+  // ── Theme ──
+  theme: "biolume" | "amber" | "frost";
+  /** QR auth token from the server Info message. */
+  authToken: string;
+  /** Current permission mode (switchable at runtime). */
+  permissionMode: PermissionMode;
+  /** Available models from settings.json (multi-model support). */
+  availableModels: ModelInfo[];
 
   // ── Usage ── (accumulated across the conversation)
   inputTokens: number;
@@ -75,7 +86,9 @@ interface AppState {
   addToolCard: (id: string, name: string, input: unknown) => string;
   updateToolResult: (toolId: string, ok: boolean, preview: string) => void;
   setConnectionStatus: (s: "connecting" | "connected" | "disconnected") => void;
-  setInfo: (model: string, sessionId: string) => void;
+  setInfo: (model: string, sessionId: string, authToken?: string, availableModels?: ModelInfo[]) => void;
+  setAuthToken: (authToken: string) => void;
+  setPermissionMode: (mode: PermissionMode) => void;
   /** Update just the displayed model (from the API's real model_info event). */
   setModel: (model: string) => void;
   setSessions: (s: SessionInfoWire[]) => void;
@@ -86,7 +99,10 @@ interface AppState {
   setInsightCollapsed: (v: boolean) => void;
   toggleLeftRail: () => void;
   toggleInsight: () => void;
+  setTheme: (theme: "biolume" | "amber" | "frost") => void;
+  cycleTheme: () => void;
   setCompacting: (v: boolean) => void;
+  setAgentRunning: (v: boolean) => void;
   setPendingPermission: (p: PermissionRequired | null) => void;
   setPendingQuestion: (q: QuestionRequired | null) => void;
   setPendingCommit: (c: { sha: string; output: string } | null) => void;
@@ -118,6 +134,7 @@ export const useStore = create<AppState>((set, get) => ({
   pendingQuestion: null,
   pendingCommit: null,
   compacting: false,
+  agentRunning: false,
   showSessionPicker: false,
   fileTreeRoot: "",
   fileTree: [],
@@ -128,6 +145,16 @@ export const useStore = create<AppState>((set, get) => ({
   outputTokens: 0,
   cacheReadTokens: 0,
   cacheWriteTokens: 0,
+  theme: (() => {
+    if (typeof localStorage !== "undefined") {
+      const t = localStorage.getItem("nonoclaw:theme");
+      if (t === "amber" || t === "frost" || t === "biolume") return t;
+    }
+    return "biolume";
+  })(),
+  authToken: "",
+  permissionMode: "default" as PermissionMode,
+  availableModels: [] as ModelInfo[],
 
   addMessage: (msg) =>
     set((s) => ({ messages: [...s.messages, msg] })),
@@ -184,17 +211,20 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updateToolResult: (msgId, ok, preview) => {
+    const content = (!preview && ok) ? "[ok — no output]" : preview;
     set((s) => ({
       messages: s.messages.map((m) =>
         m.id === msgId
-          ? { ...m, content: preview, toolOk: ok, streaming: false }
+          ? { ...m, content, toolOk: ok, streaming: false }
           : m
       ),
     }));
   },
 
   setConnectionStatus: (status) => set({ connectionStatus: status }),
-  setInfo: (model, sessionId) => set({ model, sessionId }),
+  setInfo: (model, sessionId, authToken, availableModels) => set({ model, sessionId, authToken, availableModels }),
+  setAuthToken: (authToken) => set({ authToken }),
+  setPermissionMode: (permissionMode) => set({ permissionMode }),
   setModel: (model) => set({ model }),
   setSessions: (sessions) => set({ sessions }),
   setShowSessionPicker: (showSessionPicker) => set({ showSessionPicker }),
@@ -204,7 +234,18 @@ export const useStore = create<AppState>((set, get) => ({
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((s) => ({ leftRailCollapsed: !s.leftRailCollapsed })),
   toggleInsight: () => set((s) => ({ insightCollapsed: !s.insightCollapsed })),
+  setTheme: (theme) => {
+    try { localStorage.setItem("nonoclaw:theme", theme); } catch {}
+    set({ theme });
+  },
+  cycleTheme: () =>
+    set((s) => {
+      const next = s.theme === "biolume" ? "amber" : s.theme === "amber" ? "frost" : "biolume";
+      try { localStorage.setItem("nonoclaw:theme", next); } catch {}
+      return { theme: next };
+    }),
   setCompacting: (compacting) => set({ compacting }),
+  setAgentRunning: (agentRunning) => set({ agentRunning }),
   setPendingPermission: (p) => set({ pendingPermission: p }),
   setPendingQuestion: (q) => set({ pendingQuestion: q }),
   setPendingCommit: (pendingCommit) => set({ pendingCommit }),
@@ -233,20 +274,42 @@ export const useStore = create<AppState>((set, get) => ({
   },
 }));
 
-// Persist messages to localStorage on every change (debounced via microtask).
-let saveScheduled = false;
+// Persist messages to localStorage — throttled + skipped during streaming + capped.
+// The full in-memory messages array stays intact; storage keeps a truncated window
+// so refresh recovery doesn't blow localStorage quotas or serialize for ages.
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const SAVE_THROTTLE_MS = 1500;
+const MAX_STORED_MSGS = 60;
+const MAX_STORED_CONTENT = 3000;
+
+function messagesForStorage(): ChatMessage[] {
+  return useStore
+    .getState()
+    .messages.slice(-MAX_STORED_MSGS)
+    .map((m) => ({
+      ...m,
+      content:
+        typeof m.content === "string" && m.content.length > MAX_STORED_CONTENT
+          ? m.content.slice(0, MAX_STORED_CONTENT) + "…"
+          : m.content,
+      toolInput: undefined, // drop large JSON blobs
+    }));
+}
+
 useStore.subscribe(() => {
-  if (saveScheduled) return;
-  saveScheduled = true;
-  queueMicrotask(() => {
-    saveScheduled = false;
+  const s = useStore.getState();
+  // Streaming hammers the store; don't persist until it settles.
+  if (s.streamingIdx !== null) return;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
     if (typeof localStorage === "undefined") return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(useStore.getState().messages));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messagesForStorage()));
     } catch {
-      // storage full or unavailable — ignore.
+      try { localStorage.removeItem(STORAGE_KEY); } catch {}
     }
-  });
+  }, SAVE_THROTTLE_MS);
 });
 
 // ── Engine Message → ChatMessage mapping (for session replay) ──────────────
@@ -261,6 +324,8 @@ function engineMessagesToChat(msgs: unknown[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   let counter = 0;
   const uid = () => `msg-${counter++}`;
+  // Map tool_use_id → tool name, so tool_result cards get a title too.
+  const toolNameById = new Map<string, string>();
 
   for (const raw of msgs) {
     const m = raw as { role?: string; content?: unknown };
@@ -284,10 +349,12 @@ function engineMessagesToChat(msgs: unknown[]): ChatMessage[] {
             content?: unknown;
             is_error?: boolean;
           };
+          const name = b.tool_use_id ? toolNameById.get(b.tool_use_id) : undefined;
           out.push({
             id: `tool-${b.tool_use_id ?? counter++}`,
             role: "tool",
             content: extractText(b.content) || "(tool result)",
+            toolName: name,
             toolOk: !b.is_error,
             streaming: false,
           });
@@ -303,6 +370,7 @@ function engineMessagesToChat(msgs: unknown[]): ChatMessage[] {
         out.push({ id: uid(), role: "assistant", content: text });
       }
       for (const tu of toolUses) {
+        if (tu.id && tu.name) toolNameById.set(tu.id, tu.name);
         out.push({
           id: `tool-${tu.id ?? counter++}`,
           role: "tool",

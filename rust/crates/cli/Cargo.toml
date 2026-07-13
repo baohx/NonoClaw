@@ -27,3 +27,4 @@ uuid = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
+qrcode = "0.14"

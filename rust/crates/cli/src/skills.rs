@@ -29,8 +29,8 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
 
     // Direct skill dirs.
     let mut bases: Vec<PathBuf> = vec![cwd.join(".nonoclaw/skills")];
-    if let Some(home) = std::env::var_os("HOME") {
-        bases.push(PathBuf::from(home).join(".nonoclaw/skills"));
+    if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
+        bases.push(home.join("skills"));
     }
     for base in &bases {
         scan_skill_dir(base, &mut skills);
@@ -79,12 +79,49 @@ pub fn parse_skill(path: &Path) -> Option<Skill> {
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+
+    // Load reference .md files from the skill directory so the model gets the
+    // full instructions (routing tables, platform commands, etc.), not just
+    // the SKILL.md frontmatter body.
+    let mut full_body = body.trim().to_string();
+    if let Some(skill_dir) = path.parent() {
+        // Walk the skill directory; collect all .md files except SKILL.md.
+        let mut refs: Vec<PathBuf> = Vec::new();
+        walk_ref_dir(skill_dir, &mut refs);
+        refs.sort();
+        for ref_path in &refs {
+            if ref_path == path {
+                continue; // skip the main SKILL.md — already included
+            }
+            if let Ok(content) = std::fs::read_to_string(ref_path) {
+                let rel = ref_path
+                    .strip_prefix(skill_dir)
+                    .unwrap_or(ref_path)
+                    .display();
+                full_body.push_str(&format!("\n\n## {rel}\n{content}"));
+            }
+        }
+    }
+
     Some(Skill {
         name,
         description,
-        body: body.trim().to_string(),
+        body: full_body,
         source,
     })
+}
+
+/// Recursively collect .md files under a directory.
+fn walk_ref_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_ref_dir(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(p);
+        }
+    }
 }
 
 /// Split `---\n<yaml>\n---\n<body>` into (key map, body). Tolerant: if no

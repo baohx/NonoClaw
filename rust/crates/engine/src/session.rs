@@ -40,10 +40,7 @@ pub struct SessionInfo {
 
 /// Resolve the root directory for session storage (`$NONOCLAW_HOME` or `~/.nonoclaw`).
 pub fn home_root() -> Option<PathBuf> {
-    if let Some(custom) = std::env::var_os("NONOCLAW_HOME") {
-        return Some(PathBuf::from(custom));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nonoclaw"))
+    nonoclaw_core::nonoclaw_data_dir()
 }
 
 /// The per-project directory holding that cwd's sessions.
@@ -103,6 +100,28 @@ pub fn append_message(path: &Path, msg: &Message) -> std::io::Result<()> {
     let entry = SessionEntry::Message(msg.clone());
     let line = serde_json::to_string(&entry)?;
     append_line(path, &line)
+}
+
+/// Truncate a session file back to just the header line (for `/clear`).
+pub fn clear_session(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let (_started, _summary, _messages) = load_session(path)?;
+    // Reconstruct the header from what we loaded, then overwrite.
+    // If load failed, just truncate the file.
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Some(header_line) = text.lines().next() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(header_line) {
+                if v.get("kind").and_then(|k| k.as_str()) == Some("session") {
+                    let line = serde_json::to_string(&v).unwrap_or_default();
+                    std::fs::write(path, format!("{line}\n"))?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {

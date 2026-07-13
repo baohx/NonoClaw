@@ -1,10 +1,14 @@
 import { useStore } from "../store";
+import type { PermissionMode } from "../types";
 
 interface Props {
   model: string;
   sessionId: string;
   connectionStatus: "connecting" | "connected" | "disconnected";
   onOpenSessions: () => void;
+  onShowQr: () => void;
+  onSetPermissionMode: (mode: PermissionMode) => void;
+  onSetModel: (name: string) => void;
   compacting: boolean;
   leftRailCollapsed: boolean;
   insightCollapsed: boolean;
@@ -17,14 +21,29 @@ export default function StatusBar({
   sessionId,
   connectionStatus,
   onOpenSessions,
+  onSetPermissionMode,
+  onSetModel,
   compacting,
   leftRailCollapsed,
   insightCollapsed,
   onToggleLeftRail,
   onToggleInsight,
+  onShowQr,
 }: Props) {
   const inputTokens = useStore((s) => s.inputTokens);
   const outputTokens = useStore((s) => s.outputTokens);
+  const theme = useStore((s) => s.theme);
+  const authToken = useStore((s) => s.authToken);
+  const permissionMode = useStore((s) => s.permissionMode);
+  const availableModels = useStore((s) => s.availableModels);
+
+  const modeColor =
+    permissionMode === "bypassPermissions" ? "var(--rose)" :
+    permissionMode === "plan" ? "var(--sky)" :
+    permissionMode === "acceptEdits" ? "var(--violet)" :
+    "var(--mint)";
+  const cycleTheme = useStore((s) => s.cycleTheme);
+  const dotColor = theme === "amber" ? "#fbbf24" : theme === "frost" ? "#93c5fd" : "#5eead4";
 
   const dotClass =
     connectionStatus === "connected"
@@ -47,13 +66,43 @@ export default function StatusBar({
         <span className="statusbar__brand">
           Nono<i>Claw</i>
         </span>
-        {model && (
+        {model && availableModels.length > 1 ? (
+          <>
+            <span className="statusbar__divider" />
+            <select
+              className="mode-select"
+              value={model}
+              onChange={(e) => onSetModel(e.target.value)}
+              title="Switch model"
+              style={{ color: "var(--mint)", borderColor: "var(--mint)", minWidth: 100 }}
+            >
+              {availableModels.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.label || m.name}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : model ? (
           <>
             <span className="statusbar__divider" />
             <span className="statusbar__model">{model}</span>
           </>
-        )}
+        ) : null}
         {compacting && <span className="tag-compact">◌ compacting</span>}
+        <select
+          className="mode-select"
+          value={permissionMode}
+          style={{ color: modeColor, borderColor: modeColor }}
+          onChange={(e) => onSetPermissionMode(e.target.value as PermissionMode)}
+          title="Permission mode"
+        >
+          <option value="default">default</option>
+          <option value="acceptEdits">acceptEdits</option>
+          <option value="auto">auto</option>
+          <option value="bypassPermissions">bypass</option>
+          <option value="plan">plan</option>
+        </select>
       </div>
 
       <div className="statusbar__side">
@@ -69,6 +118,13 @@ export default function StatusBar({
           </button>
         )}
         <button
+          className="theme-dot"
+          style={{ background: dotColor }}
+          onClick={cycleTheme}
+          title={`Theme: ${theme} (click to cycle)`}
+          aria-label="Cycle theme"
+        />
+        <button
           className="iconbtn"
           onClick={onToggleInsight}
           title={insightCollapsed ? "Show insight panel" : "Hide insight panel"}
@@ -76,6 +132,16 @@ export default function StatusBar({
         >
           {insightCollapsed ? "«" : "»"}
         </button>
+        {authToken && (
+          <button
+            className="iconbtn"
+            onClick={onShowQr}
+            title="Show QR code for mobile access"
+            aria-label="Show QR code"
+          >
+            &#x25f0;
+          </button>
+        )}
         <span className={dotClass} title={connectionStatus} />
       </div>
     </div>

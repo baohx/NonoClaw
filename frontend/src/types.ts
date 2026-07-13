@@ -48,10 +48,15 @@ export interface ErrorMsg {
   message: string;
 }
 
+export interface ModelInfo { name: string; label: string; }
+
 export interface InfoMsg {
   type: "info";
   model: string;
   session_id: string;
+  /** Auth token for QR-code remote access. */
+  auth_token?: string;
+  available_models: ModelInfo[];
 }
 
 export interface EventMsg {
@@ -118,6 +123,8 @@ export interface SkillInfo {
   name: string;
   description: string;
   source: string;
+  /** Full markdown body (injected as append_system_prompt when /skill-name is used). */
+  body: string;
 }
 export interface PluginInfo {
   name: string;
@@ -166,6 +173,8 @@ export interface ProjectInfo {
   context_window: number | null;
   /** Effective auto-compact threshold (tokens). */
   compact_threshold: number;
+  /** Public URL for QR-code mobile access, if set via --public-url. */
+  public_url: string | null;
   git: GitInfo | null;
 }
 export interface ProjectInfoMsg {
@@ -176,6 +185,18 @@ export interface ProjectInfoMsg {
 export interface GitShowRequest {
   type: "git_show";
   sha: string;
+}
+
+export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions" | "plan";
+
+export interface SetPermissionModeRequest {
+  type: "set_permission_mode";
+  mode: PermissionMode;
+}
+
+export interface SetModelRequest {
+  type: "set_model";
+  name: string;
 }
 
 export interface GitShowMsg {
@@ -204,6 +225,8 @@ export interface RunRequest {
   prompt: string;
   model?: string;
   max_turns?: number;
+  /** Skill body injected into system prompt (from /skill-name). */
+  append_system_prompt?: string;
 }
 
 export interface CancelRequest {
@@ -265,7 +288,9 @@ export type ClientMsg =
   | FileTreeRequest
   | OpenFileRequest
   | ProjectInfoRefreshRequest
-  | GitShowRequest;
+  | GitShowRequest
+  | SetPermissionModeRequest
+  | SetModelRequest;
 
 // ── Application types ─────────────────────────────────────────────────────
 

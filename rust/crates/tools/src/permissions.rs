@@ -65,22 +65,22 @@ impl PermissionGate {
             };
         }
 
-        // 5. AcceptEdits auto-approves edits + reads.
+        // 5. AcceptEdits auto-approves reads + file edits (Write, Edit).
+        //    Other tools (Bash, Agent, WebFetch, etc.) still prompt.
         if self.mode == PermissionMode::AcceptEdits {
-            return if is_read_only || tool_decision.is_allow() {
+            let is_edit = tool_name == "Write" || tool_name == "Edit";
+            return if is_read_only || is_edit {
                 PermissionDecision::allow()
             } else {
                 PermissionDecision::ask(format!("{tool_name} needs permission"))
             };
         }
 
-        // 6. Auto mode auto-approves what the tool/rule engine allows.
+        // 6. Auto mode: trust the user — auto-approve everything (reads,
+        // writes, edits, shell commands) without prompting. Safety is still
+        // enforced by the tool's own `check_permissions` which can hard-deny.
         if self.mode == PermissionMode::Auto {
-            return if tool_decision.is_allow() {
-                PermissionDecision::allow()
-            } else {
-                PermissionDecision::ask(format!("{tool_name} needs permission"))
-            };
+            return PermissionDecision::allow();
         }
 
         // 7. Default: read-only auto-approved; writes/other -> tool decision

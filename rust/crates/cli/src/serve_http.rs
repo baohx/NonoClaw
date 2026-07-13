@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-    extract::State,
+    extract::{Query, State},
     response::IntoResponse,
     routing::get,
     Router,
@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use nonoclaw_api::Client;
 use nonoclaw_core::{Message, PermissionDecision};
-use nonoclaw_engine::{EngineEvent, EngineOptions, PermissionRequest, QueryEngine};
+use nonoclaw_engine::{EngineEvent, EngineOptions, ModelProfile, PermissionRequest, QueryEngine};
 use nonoclaw_tools::tool::{QuestionRequest, QuestionResolver};
 use nonoclaw_tools::{McpServerConfig, TodoStore, ToolRegistry};
 
@@ -54,6 +54,10 @@ enum ClientMsg {
         model: Option<String>,
         #[serde(default)]
         max_turns: Option<u32>,
+        /// Skill body injected as additional system-prompt instructions (from
+        /// `/skill-name` slash command).
+        #[serde(default)]
+        append_system_prompt: Option<String>,
     },
     Cancel,
     Clear,
@@ -85,6 +89,16 @@ enum ClientMsg {
     ProjectInfoRefresh,
     /// Request the patch for a commit (Git pane → GitShow reply).
     GitShow { sha: String },
+    /// Switch the permission mode at runtime (default/auto/bypass/plan).
+    SetPermissionMode { mode: String },
+    /// Switch the active model at runtime (from the multi-model dropdown).
+    SetModel { name: String },
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ModelInfo {
+    name: String,
+    label: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -121,8 +135,13 @@ enum ServerMsg {
     },
     Error { message: String },
     /// Emitted when the active session changes (after New/Resume). Carries the
-    /// real on-disk session id.
-    Info { model: String, session_id: String },
+    /// real on-disk session id + the server auth token for QR-code remote access.
+    Info {
+        model: String,
+        session_id: String,
+        auth_token: String,
+        available_models: Vec<ModelInfo>,
+    },
     /// Sent once right after the WS handshake. Lists resumable sessions for cwd.
     SessionList { sessions: Vec<SessionInfoWire> },
     /// Replays the full transcript after Resume (or [] for a fresh session) so
@@ -151,6 +170,17 @@ struct FileEntry {
     depth: u32,
 }
 
+// ── Shared session state ────────────────────────────────────────────────────
+
+type SharedHandle = Arc<Mutex<Option<SessionHandle>>>;
+
+/// A shared session: the handle + the set of connected Tx channels (used to
+/// broadcast MessagesLoaded after a run so desktop ↔ mobile stay in sync).
+struct SharedEntry {
+    handle: SharedHandle,
+    txs: Vec<Tx>,
+}
+
 // ── Shared application state ────────────────────────────────────────────────
 
 struct AppState {
@@ -167,14 +197,27 @@ struct AppState {
     context_window: Option<usize>,
     /// Effective auto-compact threshold (tokens) — surfaced in Insight.
     compact_threshold: usize,
+    /// Auth token for remote (QR-code) mobile access. Empty string = no auth.
+    auth_token: String,
+    /// The public URL shown in the QR code, or None.
+    public_url: Option<String>,
+    /// Available model profiles from settings.json (may be empty → single-model).
+    model_profiles: Vec<ModelProfile>,
+    /// Currently active model name (switchable via SetModel client message + UI).
+    active_model: Arc<Mutex<String>>,
+    /// Session registry → session_id → (shared handle, connected Txs).
+    session_registry: Arc<Mutex<HashMap<String, SharedEntry>>>,
     pending_permissions: Arc<PermissionMap>,
     pending_questions: Arc<QuestionMap>,
+    /// Runtime-mutable permission mode (switchable via UI).
+    permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
 }
 
 // ── Per-connection session ──────────────────────────────────────────────────
 
 /// A resolved session bound to one WebSocket connection: its id, on-disk file,
 /// and the in-memory working message set (the source of truth for the next run).
+#[derive(Clone)]
 struct SessionHandle {
     id: String,
     file: PathBuf,
@@ -274,6 +317,20 @@ async fn send_msg(tx: &Tx, msg: ServerMsg) {
     }
 }
 
+/// Like `send_msg` but returns `true` on success so the caller can detect
+/// dead connections (e.g. during broadcasts) without logging a warning.
+async fn send_msg_ok(tx: &Tx, msg: &ServerMsg) -> bool {
+    if let Ok(text) = serde_json::to_string(msg) {
+        tx.lock()
+            .await
+            .send(WsMessage::Text(text))
+            .await
+            .is_ok()
+    } else {
+        false
+    }
+}
+
 fn make_permission_resolver(
     tx: Tx,
     pending: Arc<PermissionMap>,
@@ -305,20 +362,26 @@ fn make_permission_resolver(
 fn build_options(
     model: Option<String>,
     max_turns: Option<u32>,
+    append: Option<String>,
     tx: Tx,
     pending_permissions: Arc<PermissionMap>,
+    permission_mode: nonoclaw_core::PermissionMode,
 ) -> EngineOptions {
+    const DEFAULT_MAX_TURNS: u32 = 200;
+    const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
+    const DEFAULT_MAX_TOKENS: u32 = 8192;
+    const DEFAULT_COMPACT_THRESHOLD: usize = 80_000;
     let permission_resolver = make_permission_resolver(tx, pending_permissions);
 
     EngineOptions {
-        model: model.unwrap_or_else(|| "claude-sonnet-4-5-20250929".into()),
-        max_tokens: 8192,
-        permission_mode: nonoclaw_core::PermissionMode::Default,
+        model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+        max_tokens: DEFAULT_MAX_TOKENS,
+        permission_mode,
         allowed_tools: vec![],
         disallowed_tools: vec![],
         add_dirs: vec![],
-        max_turns: max_turns.unwrap_or(10),
-        append_system_prompt: None,
+        max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+        append_system_prompt: append.clone(),
         thinking: None,
         is_non_interactive: false,
         permission_resolver: Some(permission_resolver),
@@ -363,7 +426,7 @@ fn frontend_dir(cwd: &Path) -> Option<PathBuf> {
     if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(data).join("nonoclaw/frontend/dist"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = nonoclaw_core::home_dir() {
         candidates.push(PathBuf::from(&home).join(".local/share/nonoclaw/frontend/dist"));
         candidates.push(PathBuf::from(&home).join(".nonoclaw/frontend/dist"));
     }
@@ -384,7 +447,6 @@ fn frontend_dir(cwd: &Path) -> Option<PathBuf> {
 
 /// Directories never shown in the tree (heavy, generated, or VCS-internal).
 const FILE_TREE_SKIP_DIRS: &[&str] = &[
-    ".git",
     "target",
     "node_modules",
     "dist",
@@ -400,8 +462,8 @@ const FILE_TREE_SKIP_DIRS: &[&str] = &[
     ".gradle",
     ".dart_tool",
 ];
-const FILE_TREE_MAX_DEPTH: u32 = 6;
-const FILE_TREE_MAX_ENTRIES: usize = 5000;
+const FILE_TREE_MAX_DEPTH: u32 = 10;
+const FILE_TREE_MAX_ENTRIES: usize = 10000;
 
 /// Build a flat, pre-order file tree rooted at `root`.
 fn build_file_tree(root: &Path) -> Vec<FileEntry> {
@@ -440,10 +502,9 @@ fn walk_dir(root: &Path, dir: &Path, depth: u32, out: &mut Vec<FileEntry>, count
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // Drop generated/VCS-heavy dirs everywhere; show dotfiles otherwise.
-        if is_dir && FILE_TREE_SKIP_DIRS.iter().any(|s| *s == name) {
-            continue;
-        }
+        // Skip hidden entries and generated/heavy dirs.
+        if name.starts_with('.') { continue; }
+        if is_dir && FILE_TREE_SKIP_DIRS.iter().any(|s| *s == name) { continue; }
         let rel = match entry.path().strip_prefix(root) {
             Ok(p) => p.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
@@ -556,6 +617,76 @@ fn open_with_default(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Spawn `cloudflared tunnel --url <local_addr>` and read its stderr for the
+/// public `*.trycloudflare.com` URL. Leaves the process running in background;
+/// it is killed automatically when the server exits (kill_on_drop).
+async fn spawn_tunnel(local_addr: &str) -> Option<String> {
+    let port = local_addr.rsplit(':').next()?;
+    let target = format!("http://127.0.0.1:{port}");
+    tracing::info!(%target, %local_addr, "spawning cloudflared tunnel");
+
+    let mut child = match tokio::process::Command::new("cloudflared")
+        .args(["tunnel", "--no-autoupdate", "--url", &target])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("cloudflared not found in PATH ({e}) — install it: curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ~/bin/cloudflared && chmod +x ~/bin/cloudflared");
+            return None;
+        }
+    };
+
+    let stderr = child.stderr.take()?;
+    let mut reader = tokio::io::BufReader::new(stderr);
+    use tokio::io::AsyncBufReadExt;
+    let mut buf = String::new();
+
+    let found: Option<String> = loop {
+        buf.clear();
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(12));
+        tokio::pin!(timeout);
+        tokio::select! {
+            r = reader.read_line(&mut buf) => match r {
+                Ok(0) => break None,
+                Ok(_) => {
+                    if buf.contains("trycloudflare.com") {
+                        if let Some(pos) = buf.find("https://") {
+                            let rest = &buf[pos..];
+                            let url = rest.split_whitespace()
+                                .next()
+                                .unwrap_or(rest)
+                                .trim_end_matches(|c: char| c == '.' || c == '|' || c == ' ');
+                            break Some(url.to_string());
+                        }
+                    }
+                }
+                Err(_) => break None,
+            },
+            _ = &mut timeout => {
+                tracing::warn!("timed out waiting for cloudflared URL");
+                break None;
+            }
+        }
+    };
+
+    // Move reader + child into background so the stderr pipe stays open
+    // (no EPIPE → no SIGPIPE → cloudflared keeps running).
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let _ = tokio::io::copy(&mut reader.into_inner(), &mut tokio::io::sink()).await;
+        let _ = child.wait().await;
+    });
+    if found.is_some() {
+        tracing::info!("tunnel URL captured — waiting for edge activation...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
+    found
+}
+
 pub async fn serve(
     addr: &str,
     client: Arc<Client>,
@@ -567,8 +698,38 @@ pub async fn serve(
     mcp_sources: HashMap<String, String>,
     context_window: Option<usize>,
     compact_threshold: usize,
+    public_url: Option<String>,
+    tunnel: bool,
+    model_profiles: Vec<ModelProfile>,
 ) -> anyhow::Result<()> {
+    // Bind the listener FIRST so the port is open before cloudflared tries
+    // to connect (otherwise tunnel spawn races the bind and gets "connection
+    // refused" from the OS).
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("NonoClaw web UI listening on http://{addr}");
+
+    // Spawn the tunnel after the port is confirmed open.
+    let public_url = if tunnel {
+        let tunnel_url = spawn_tunnel(addr).await;
+        if tunnel_url.is_some() {
+            tracing::info!(url = ?tunnel_url, "cloudflared tunnel ready");
+            tunnel_url
+        } else {
+            public_url
+        }
+    } else {
+        public_url
+    };
+
+    let auth_token = Uuid::new_v4().to_string().replace('-', "");
+    let active_model = model_profiles.iter()
+        .find(|p| p.default)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+    tracing::info!(auth_token, %active_model, "mobile auth token generated");
     let state = Arc::new(AppState {
+        model_profiles,
+        active_model: Arc::new(Mutex::new(active_model)),
         client,
         registry,
         todos,
@@ -578,13 +739,38 @@ pub async fn serve(
         mcp_sources,
         context_window,
         compact_threshold,
+        auth_token,
+        public_url,
+        session_registry: Arc::new(Mutex::new(HashMap::new())),
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
     });
 
-    // Always register the WebSocket route.
+    // Print QR code if a public URL is available (from --tunnel or --public-url).
+    if let Some(ref url) = state.public_url {
+        let full = format!("{url}/?token={}", state.auth_token);
+        use qrcode::QrCode;
+        match QrCode::new(&full) {
+            Ok(qr) => {
+                let s = qr.render::<char>().quiet_zone(true).module_dimensions(4, 2).build();
+                let bar = "═".repeat(56);
+                eprintln!("\n\x1b[1;36m{bar}");
+                eprintln!("{s}"); eprintln!("{bar}\x1b[0m");
+            }
+            Err(_) => {
+                let bar = "═".repeat(full.len() + 4);
+                eprintln!("\n\x1b[1;36m ╔{bar}╗\n ║  {full}  ║\n ╚{bar}╝\x1b[0m");
+            }
+        }
+        eprintln!("  \x1b[1;33m{full}\x1b[0m\n  \x1b[1;33mScan with your phone\x1b[0m\n");
+    }
+
+    // Always register the WebSocket route + PWA manifest + service worker.
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/manifest.json", get(serve_manifest))
+        .route("/sw.js", get(serve_sw))
         .with_state(state);
 
     // Optionally serve the built frontend from frontend/dist/.
@@ -612,8 +798,6 @@ pub async fn serve(
         app
     };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("NonoClaw web UI listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -622,22 +806,109 @@ pub async fn serve(
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+    // Validate auth token if present in query. No token = backward-compat.
+    if let Some(token) = params.get("token") {
+        if token != &state.auth_token {
+            return axum::response::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("invalid or missing auth token"))
+                .unwrap();
+        }
+    }
+    let session_id = params.get("session").cloned();
+    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id))
 }
 
-async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
+/// ── PWA manifest.json ────────────────────────────────────────────────────
+async fn serve_manifest() -> impl IntoResponse {
+    let icon = "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='38' fill='%23070a0f'/%3E%3Ctext x='96' y='124' font-family='serif' font-size='88' font-style='italic' fill='%235eead4' text-anchor='middle'%3ENC%3C/text%3E%3C/svg%3E";
+    let body = serde_json::json!({
+        "name": "NonoClaw",
+        "short_name": "NonoClaw",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#070a0f",
+        "theme_color": "#5eead4",
+        "icons": [
+            { "src": icon, "sizes": "192x192", "type": "image/svg+xml" },
+            { "src": icon, "sizes": "512x512", "type": "image/svg+xml" }
+        ]
+    })
+    .to_string();
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/manifest+json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// ── PWA service worker ───────────────────────────────────────────────────
+async fn serve_sw() -> impl IntoResponse {
+    let body = r#"const C="nc-v3";self.addEventListener("install",e=>{e.waitUntil(self.skipWaiting())});self.addEventListener("activate",e=>{e.waitUntil((async()=>{await self.clients.claim();const keys=await caches.keys();for(const k of keys){if(k!==C)await caches.delete(k)}})())});self.addEventListener("fetch",e=>{const u=new URL(e.request.url);if(u.pathname.startsWith("/assets/")){e.respondWith(caches.open(C).then(c=>c.match(e.request).then(r=>r||fetch(e.request).then(res=>{c.put(e.request,res.clone());return res}))))}else if(u.pathname==="/ws"){return}else{e.respondWith(fetch(e.request))}});"#;
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/javascript")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<String>) {
     let (tx, mut rx) = ws.split();
     let tx: Tx = Arc::new(Mutex::new(tx));
     let mut cancel: Option<CancellationToken> = None;
+    /// JoinHandle of the current run — aborted on Cancel to stop the engine hard.
+    let mut run_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Per-connection session. None until chosen; the default-on-connect flow
-    // below creates a fresh session immediately.
-    let session: Arc<Mutex<Option<SessionHandle>>> = Arc::new(Mutex::new(None));
+    // Capture before any inner shadow (the Run arm destructures session_id).
+    // Desktop (no URL param): auto-resume the most recent session.
+    // Mobile (QR code): use the session id encoded in the QR.
+    let shared_sid = session_id
+        .clone()
+        .or_else(|| nonoclaw_engine::most_recent_session(&state.cwd).ok().flatten());
 
-    // Connect handshake: send the resumable session list, then default to a
-    // fresh session so the user can start typing immediately.
+    // Register this Tx in the shared session if we have a session id
+    // (desktop auto-continue or mobile QR); otherwise use per-connection.
+    if let Some(ref sid) = shared_sid {
+        let mut reg = state.session_registry.lock().await;
+        if let Some(entry) = reg.get_mut(sid) {
+            entry.txs.push(tx.clone());
+        } else {
+            // First registration: try to load the session from disk. Only
+            // create a fresh one if the file is genuinely missing. If resume
+            // fails for other reasons, log it but still create a fresh one
+            // so the user can work (the old data is gone anyway).
+            let h = match resume_session(&state, sid) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!("session `{sid}` resume failed: {e} — creating fresh");
+                    create_new_session(&state)
+                }
+            };
+            reg.insert(
+                sid.clone(),
+                SharedEntry {
+                    handle: Arc::new(Mutex::new(h)),
+                    txs: vec![tx.clone()],
+                },
+            );
+        }
+    }
+
+    // Per-connection session: either the shared handle (if session_id is set)
+    // or a fresh per-connection one.
+    let session: SharedHandle = if let Some(ref sid) = shared_sid {
+        let reg = state.session_registry.lock().await;
+        reg.get(sid)
+            .map(|e| Arc::clone(&e.handle))
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)))
+    } else {
+        Arc::new(Mutex::new(None))
+    };
+
+    // Connect handshake.
     {
         send_msg(
             &tx,
@@ -646,27 +917,37 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
             },
         )
         .await;
-        let new = create_new_session(&state);
-        if let Some(h) = &new {
-            send_msg(&tx, ServerMsg::MessagesLoaded { messages: vec![] }).await;
-            send_msg(
-                &tx,
-                ServerMsg::Info {
-                    model: state.model.clone(),
-                    session_id: h.id.clone(),
-                },
-            )
-            .await;
-        } else {
-            send_msg(
-                &tx,
-                ServerMsg::Error {
-                    message: "no session storage (set HOME or NONOCLAW_HOME)".into(),
-                },
-            )
-            .await;
-        }
-        *session.lock().await = new;
+
+        // If sharing an existing session, replay its messages so the connecting
+        // peer (e.g. mobile) sees the same conversation. Otherwise, fresh.
+        let existing = session.lock().await.clone();
+        let h = existing.unwrap_or_else(|| {
+            create_new_session(&state).unwrap_or_else(|| SessionHandle {
+                id: "no-store".into(),
+                file: PathBuf::new(),
+                messages: Vec::new(),
+            })
+        });
+
+        let vals: Vec<serde_json::Value> =
+            h.messages.iter().filter_map(|m| serde_json::to_value(m).ok()).collect();
+        let sid = h.id.clone();
+        *session.lock().await = Some(h);
+
+        send_msg(&tx, ServerMsg::MessagesLoaded { messages: vals }).await;
+        send_msg(
+            &tx,
+            ServerMsg::Info {
+                model: state.model.clone(),
+                auth_token: state.auth_token.clone(),
+                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                    name: p.name.clone(),
+                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                }).collect(),
+                session_id: sid,
+            },
+        )
+        .await;
 
         // Send the project file tree so the frontend can render the left rail.
         send_msg(
@@ -687,10 +968,32 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
             &state.mcp_sources,
             state.context_window,
             state.compact_threshold,
+            state.public_url.clone(),
         )
         .await;
         send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
     }
+
+    // Server-side keepalive: send a lightweight data frame every 8s. Browser
+    // WS Ping/Pong frames do NOT fire onmessage, so the client can't track
+    // liveness from them — a data heartbeat lets the client detect a frozen
+    // (half-dead) socket via its lastMsgAt timer and reconnect on send.
+    let tx_ping = Arc::clone(&tx);
+    let ping_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(8));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            let mut guard = tx_ping.lock().await;
+            if guard
+                .send(WsMessage::Text(r#"{"type":"ping"}"#.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
     while let Some(Ok(msg)) = rx.next().await {
         let text = match &msg {
@@ -725,7 +1028,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                         send_msg(
                             &tx,
                             ServerMsg::Info {
-                                model: state.model.clone(),
+                                model: state.active_model.lock().await.clone(),
+                                auth_token: state.auth_token.clone(),
+                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                    name: p.name.clone(),
+                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                }).collect(),
                                 session_id: sid,
                             },
                         )
@@ -761,7 +1069,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                     send_msg(
                         &tx,
                         ServerMsg::Info {
-                            model: state.model.clone(),
+                            model: state.active_model.lock().await.clone(),
+                            auth_token: state.auth_token.clone(),
+                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                    name: p.name.clone(),
+                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                }).collect(),
                             session_id: sid,
                         },
                     )
@@ -792,6 +1105,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                     &state.mcp_sources,
                     state.context_window,
                     state.compact_threshold,
+                    state.public_url.clone(),
                 )
                 .await;
                 send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
@@ -861,6 +1175,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                 prompt,
                 model,
                 max_turns,
+                append_system_prompt,
             } => {
                 tracing::info!(prompt = %prompt, model = ?model, "ws run request");
                 // Require an active session.
@@ -912,15 +1227,22 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                 let tx2 = tx.clone();
                 let s = state.clone();
                 let session2 = Arc::clone(&session);
+                let sync_sid = shared_sid.clone();
+                let model_used = if let Some(m) = model.clone() {
+                    m
+                } else {
+                    s.active_model.lock().await.clone()
+                };
 
-                tokio::spawn(async move {
+                run_handle = Some(tokio::spawn(async move {
                     let request_id = Uuid::new_v4().to_string();
-                    let model_used = model.unwrap_or_else(|| s.model.clone());
                     let mut options = build_options(
-                        Some(model_used),
+                        Some(model_used.clone()),
                         max_turns,
+                        append_system_prompt.clone(),
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
+                        *s.permission_mode.lock().await,
                     );
 
                     // Question resolver (per-run to avoid oneshot key clashes).
@@ -931,8 +1253,35 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                     });
                     options.question_resolver = Some(qr);
 
+                    // Multi-model: if the requested model has its own
+                    // base_url/api_key in the profiles, build a dedicated
+                    // Client for this run. Otherwise reuse the default.
+                    let run_client: Arc<nonoclaw_api::Client> = {
+                        let profile = s.model_profiles.iter()
+                            .find(|p| p.name == model_used);
+                        match profile {
+                            Some(p) if p.base_url != s.client.base_url() || p.api_key != s.client.api_key().unwrap_or_default() => {
+                                match nonoclaw_api::Client::new(
+                                    Some(p.api_key.clone()),
+                                    None,
+                                    p.base_url.clone(),
+                                ) {
+                                    Ok(c) => {
+                                        tracing::info!(model=%model_used, url=%p.base_url, "per-run client rebuilt");
+                                        Arc::new(c)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("per-run client build failed ({e}) — falling back to default");
+                                        s.client.clone()
+                                    }
+                                }
+                            }
+                            _ => s.client.clone(),
+                        }
+                    };
+
                     let mut engine = QueryEngine::with_session(
-                        s.client.clone(),
+                        run_client,
                         s.registry.clone(),
                         s.todos.clone(),
                         options,
@@ -1008,9 +1357,41 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                                 &s.mcp_sources,
                                 s.context_window,
                                 s.compact_threshold,
+                                s.public_url.clone(),
                             )
                             .await;
-                            send_msg(&tx2, ServerMsg::ProjectInfo { info }).await;
+                            send_msg(&tx2, ServerMsg::ProjectInfo { info: info.clone() }).await;
+
+                            // Broadcast updated messages to all other peers
+                            // sharing this session (desktop ↔ mobile sync).
+                            if let Some(ref cid) = sync_sid {
+                                let mut reg = s.session_registry.lock().await;
+                                if let Some(entry) = reg.get_mut(cid) {
+                                    let updated: Vec<serde_json::Value> =
+                                        entry.handle.lock().await.as_ref()
+                                            .map(|h| h.messages.iter()
+                                                .filter_map(|m| serde_json::to_value(m).ok())
+                                                .collect())
+                                            .unwrap_or_default();
+                                    let n = updated.len();
+                                    let ml = ServerMsg::MessagesLoaded { messages: updated };
+                                    let pi = ServerMsg::ProjectInfo { info };
+                                    tracing::debug!(session=%cid, peers=entry.txs.len()-1, msgs=n, "broadcasting MessagesLoaded");
+                                    let mut dead = Vec::new();
+                                    for (i, peer) in entry.txs.iter().enumerate() {
+                                        if Arc::ptr_eq(peer, &tx2) {
+                                            continue;
+                                        }
+                                        if !send_msg_ok(peer, &ml).await || !send_msg_ok(peer, &pi).await {
+                                            dead.push(i);
+                                            tracing::debug!("removing dead peer from session broadcast");
+                                        }
+                                    }
+                                    for i in dead.into_iter().rev() {
+                                        entry.txs.remove(i);
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "engine run failed");
@@ -1019,7 +1400,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                             }
                         }
                     }
-                });
+                }));
             }
 
             // ── Cancel ──────────────────────────────────────────────────────
@@ -1027,12 +1408,68 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                 if let Some(ref c) = cancel {
                     c.cancel();
                 }
+                // Abort the spawned task to stop the engine immediately —
+                // CancellationToken only gates between turns, not during
+                // an in-flight API streaming call.
+                if let Some(h) = run_handle.take() {
+                    h.abort();
+                    // Notify the UI that the run was cancelled so agentRunning
+                    // flips back to false.
+                    send_msg(&tx, ServerMsg::Done {
+                        text: "Run cancelled.".into(),
+                        usage: serde_json::json!({}),
+                        turns: 0,
+                        stop_reason: Some("cancelled".into()),
+                    }).await;
+                }
+            }
+
+            // ── Switch permission mode at runtime ──────────────────────────
+            ClientMsg::SetPermissionMode { mode } => {
+                let new_mode = match mode.as_str() {
+                    "auto" => nonoclaw_core::PermissionMode::Auto,
+                    "bypass" | "bypassPermissions" => nonoclaw_core::PermissionMode::BypassPermissions,
+                    "plan" => nonoclaw_core::PermissionMode::Plan,
+                    "acceptEdits" => nonoclaw_core::PermissionMode::AcceptEdits,
+                    _ => nonoclaw_core::PermissionMode::Default,
+                };
+                *state.permission_mode.lock().await = new_mode;
+                tracing::info!(?new_mode, "permission mode switched");
+            }
+
+            // ── Switch active model ────────────────────────────────────
+            ClientMsg::SetModel { name } => {
+                // Verify the model exists in the profiles.
+                if state.model_profiles.iter().any(|p| p.name == name) {
+                    // Also apply env vars for the new model (needed for
+                    // non-multi-model runs that still use from_env).
+                    for p in &state.model_profiles {
+                        if p.name == name {
+                            if std::env::var_os("ANTHROPIC_BASE_URL").is_none() ||
+                               std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default() != p.base_url {
+                                std::env::set_var("ANTHROPIC_BASE_URL", &p.base_url);
+                            }
+                            if std::env::var_os("ANTHROPIC_API_KEY").is_none() ||
+                               std::env::var("ANTHROPIC_API_KEY").unwrap_or_default() != p.api_key {
+                                std::env::set_var("ANTHROPIC_API_KEY", &p.api_key);
+                            }
+                        }
+                    }
+                    *state.active_model.lock().await = name.clone();
+                    tracing::info!(%name, "active model switched");
+                } else {
+                    tracing::warn!("unknown model `{name}` — ignored");
+                }
             }
 
             // ── Clear (in-memory only; on-disk transcript is the archive) ───
             ClientMsg::Clear => {
                 if let Some(h) = session.lock().await.as_mut() {
                     h.messages.clear();
+                    // Truncate the on-disk JSONL back to header-only.
+                    if let Err(e) = nonoclaw_engine::clear_session(&h.file) {
+                        tracing::warn!("failed to clear session file: {e}");
+                    }
                 }
                 send_msg(&tx, ServerMsg::MessagesLoaded { messages: vec![] }).await;
             }
@@ -1065,8 +1502,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                 let opts = build_options(
                     None,
                     None,
+                    None,
                     tx.clone(),
                     Arc::clone(&state.pending_permissions),
+                    *state.permission_mode.lock().await,
                 );
                 let mut eng = QueryEngine::with_session(
                     state.client.clone(),
@@ -1096,7 +1535,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                         send_msg(
                             &tx,
                             ServerMsg::Info {
-                                model: state.model.clone(),
+                                model: state.active_model.lock().await.clone(),
+                                auth_token: state.auth_token.clone(),
+                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                    name: p.name.clone(),
+                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                }).collect(),
                                 session_id: String::new(),
                             },
                         )
@@ -1133,6 +1577,22 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>) {
                     let _ = sender.send(answer);
                 }
             }
+        }
+    }
+    // Loop exited — stop the keepalive pinger for this connection.
+    ping_handle.abort();
+    // Connection closed — remove this Tx from the shared session's broadcast
+    // list so we don't keep trying to send to a dead peer.
+    if let Some(ref sid) = shared_sid {
+        let mut reg = state.session_registry.lock().await;
+        let remove = if let Some(entry) = reg.get_mut(sid) {
+            entry.txs.retain(|t| !Arc::ptr_eq(t, &tx));
+            entry.txs.is_empty()
+        } else {
+            false
+        };
+        if remove {
+            reg.remove(sid);
         }
     }
 }

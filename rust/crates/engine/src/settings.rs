@@ -47,9 +47,27 @@ pub struct SettingsFile {
     pub env: Option<HashMap<String, String>>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
+    /// Pre-defined model profiles for multi-model switching. Each profile
+    /// carries its own base_url + api_key so different providers can be used.
+    #[serde(default)]
+    pub models: Option<Vec<ModelProfile>>,
     // Passthrough: preserve unknown fields.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+/// A model profile: name + endpoint + credentials, for multi-model switching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub name: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    #[serde(default)]
+    pub default: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,10 +82,7 @@ pub struct PermissionsSection {
 
 /// Resolve `$NONOCLAW_HOME` or `~/.nonoclaw`.
 pub fn nonoclaw_config_dir() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("NONOCLAW_HOME") {
-        return Some(PathBuf::from(d));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nonoclaw"))
+    nonoclaw_core::nonoclaw_data_dir()
 }
 
 /// Load user-level `settings.json` if it exists.
@@ -158,6 +173,10 @@ pub fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
         for (k, v) in mcp {
             b.insert(k.clone(), v.clone());
         }
+    }
+    // models: later overlay replaces the entire array.
+    if overlay.models.is_some() {
+        base.models = overlay.models.clone();
     }
     // passthrough extras: overwrite matching keys.
     for (k, v) in &overlay.extra {

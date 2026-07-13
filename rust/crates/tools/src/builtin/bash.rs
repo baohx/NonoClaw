@@ -19,7 +19,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 30_000;
 
-const PROMPT: &str = "Executes a given bash command and returns its output.\n\nThe working directory persists between commands, but shell state does not. The shell environment is initialized from the user's profile (bash or zsh).\n\nIMPORTANT: Avoid using this tool to run search (Grep/Glob), file read (Read), file edit (Edit), or file write (Write) commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool.\n\n# Instructions\n- You may specify an optional timeout in milliseconds (up to 600000 / 10 minutes). By default, your command will timeout after 120000 (2 minutes).\n- If the output exceeds ~30000 characters it will be truncated.\n- NEVER run interactive commands that require user input (e.g. without -y flags).\n- NEVER update git config.\n- NEVER run destructive git commands (push --force, reset --hard, branch -D, etc.) unless the user explicitly requests it.\n- Run multiple independent read commands in parallel for speed; run dependent commands sequentially.";
+const PROMPT: &str = "Executes a command inside a persistent shell and returns its combined stdout+stderr.\n\nThe working directory persists between calls. Shell environment (env vars, aliases) does not — each invocation starts from a fresh profile. On Linux/macOS the shell is bash; on Windows it is cmd /C.\n\nIMPORTANT: Always prefer dedicated tools (Read, Write, Edit, Grep, Glob, WebFetch, WebSearch) over raw shell commands. Only use Bash when no dedicated tool exists for the task.\n\n## Available commands\n- Package managers: cargo, npm, pip, apt, brew, etc.\n- Git: `git status`, `git diff`, `git log`, `git add -p`, `git commit -m`, `git stash`, `git branch`. NEVER run `git push --force`, `git reset --hard`, `git branch -D`, or destructive git commands unless the user explicitly requests them. NEVER update git config.\n- Build/test: `cargo build`, `cargo test`, `cargo check`, `npm test`, `make`, etc.\n- File listing: `ls -la`, `find`, `tree`. Prefer the Glob tool for pattern-based file discovery.\n- System info: `uname -a`, `which`, `env`, `cat /proc/cpuinfo` (Linux).\n- NEVER run interactive commands (e.g. commands without `-y` / `--yes`).\n- NEVER run destructive system commands (`sudo rm -rf /`, `shutdown`, `reboot`, etc.) unless the user explicitly requests them.\n\n## Parameters\n- `command` (required): the shell command to execute.\n- `timeout_ms` (optional, default 120000 = 2 minutes, max 600000 = 10 minutes). Increase for long builds.\n- `run_in_background` (not supported — rejected).\n\n## Output\n- Combined stdout+stderr, truncated at ~30000 characters with a `[truncated ...]` marker.\n- The exit code is appended to the output for non-zero exits.\n- If the command succeeds but produces no output, `[ok — no output]` is returned.";
 
 pub struct BashTool;
 
@@ -85,14 +85,22 @@ impl Tool for BashTool {
             return Err(Error::Cancelled);
         }
 
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .arg("--login") // load profile like the TS tool
+        #[cfg(windows)]
+        let (shell, arg) = ("cmd", "/C");
+        #[cfg(not(windows))]
+        let (shell, arg) = ("bash", "-c");
+
+        let mut cmd = Command::new(shell);
+        cmd.arg(arg).arg(command);
+        // `bash --login` loads the user's profile; cmd /C doesn't need one.
+        #[cfg(not(windows))]
+        { cmd.arg("--login"); }
+
+        let mut child = cmd
             .current_dir(ctx.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true) // ensure timeouts don't orphan the process
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::Tool {
                 tool: "Bash".into(),
@@ -128,7 +136,7 @@ impl Tool for BashTool {
                 let combined = truncate(combined, MAX_OUTPUT_CHARS);
                 let code = status.code().unwrap_or(-1);
                 let data = if code == 0 {
-                    combined
+                    if combined.is_empty() { "[ok — no output]".into() } else { combined }
                 } else {
                     format!("{combined}\n[exit code: {code}]")
                 };

@@ -45,24 +45,21 @@ function fileGlyph(name: string): string {
 }
 
 export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
-  // Expand top-level dirs by default; deeper dirs start collapsed.
-  const [expanded, setExpanded] = useState<Set<string>>(() => {
-    const s = new Set<string>();
-    for (const e of entries) if (e.is_dir && e.depth === 0) s.add(e.path);
-    return s;
-  });
+  // ALL directories collapsed by default — user expands what they need.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>());
 
-  // Re-seed defaults when a fresh tree arrives that no longer matches.
+  // When a fresh tree arrives, don't auto-expand anything.
   const seedKey = entries.map((e) => e.path).join("\n");
   const [lastSeed, setLastSeed] = useState(seedKey);
   if (seedKey !== lastSeed) {
     setLastSeed(seedKey);
-    const s = new Set<string>(expanded);
-    for (const e of entries) if (e.is_dir && e.depth === 0) s.add(e.path);
     // Drop stale expanded paths that no longer exist.
     const known = new Set(entries.filter((e) => e.is_dir).map((e) => e.path));
-    for (const p of [...s]) if (!known.has(p)) s.delete(p);
-    setExpanded(s);
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      for (const p of [...next]) if (!known.has(p)) next.delete(p);
+      return next;
+    });
   }
 
   const dirPaths = useMemo(

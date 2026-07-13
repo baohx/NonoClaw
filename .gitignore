@@ -1,0 +1,40 @@
+# Rust
+rust/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.bash_history
+
+# IDE / Editors
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+*.log
+
+# Temp / Cache
+.cache
+__pycache__/
+*.pyc
+*.pyo
+
+# NonoClaw runtime data (don't commit sessions / settings)
+.nonoclaw/
+
+# Android
+*.apk
+*.aab
+local.properties
