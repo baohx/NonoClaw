@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use nonoclaw_engine::skills::Skill;
 use nonoclaw_tools::{McpServerConfig, ToolRegistry};
 use serde::Serialize;
 
@@ -120,6 +121,7 @@ pub async fn gather(
     context_window: Option<usize>,
     compact_threshold: usize,
     public_url: Option<String>,
+    skills: &[Skill],
 ) -> ProjectInfo {
     let tools: Vec<ToolInfo> = registry
         .all()
@@ -163,13 +165,13 @@ pub async fn gather(
         })
         .collect();
 
-    let skills = crate::skills::discover(cwd)
-        .into_iter()
+    let skills: Vec<SkillInfo> = skills
+        .iter()
         .map(|s| SkillInfo {
-            name: s.name,
-            description: s.description,
-            source: s.source,
-            body: s.body,
+            name: s.name.clone(),
+            description: s.description.clone(),
+            source: s.source.clone(),
+            body: s.body.clone(),
         })
         .collect();
 

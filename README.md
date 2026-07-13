@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.1.0 | **Goal**: a native CLI coding agent with a complete tool ecosystem, multi-model switching, remote access via Cloudflare Tunnel, and a bioluminescent web interface.
+> **Version**: v0.2.0 | **Goal**: a native CLI coding agent with a complete tool ecosystem, multi-model switching, remote access via Cloudflare Tunnel, and a bioluminescent web interface.
 
 ---
 
@@ -60,16 +60,18 @@ nonoclaw -p "explain Rust ownership"
 
 | Category | Details |
 |---|---|
-| **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing |
-| **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes (Kitchen Sink, Runaway Refactor, etc.), Karpathy's anti-overengineering patterns |
-| **12 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator |
-| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`) |
+| **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **batched parallel tool execution** (concurrency cap=10) |
+| **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes (Kitchen Sink, Runaway Refactor, etc.), Karpathy's anti-overengineering patterns, ToolSearch guidance for deferred tools |
+| **17 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, **ToolSearch**, **TaskCreate/Get/List/Update** |
+| **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
+| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge** (`prompts/list` + `prompts/get`) |
 | **Multi-Model** | Pre-define model profiles in `settings.json` → switch at runtime via UI dropdown or `/multi` slash command |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
-| **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions` |
-| **Context** | Auto-compaction ~80k tokens, configurable `contextWindow` |
-| **Skills** | `/skill-name` injects full skill directory (SKILL.md + reference .md files) into system prompt |
-| **Plugins** | `--plugin-add`, PreToolUse/PostToolUse hooks via `.nonoclaw/hooks.json` |
+| **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming** (custom/ai/auto titles), **progressive metadata** (title, tag, mode) |
+| **Context** | Auto-compaction `compactThreshold` tokens, configurable `contextWindow`, **Prompt Caching** (ephemeral cache breakpoints on system prompt + tools) |
+| **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via `paths` globs / `triggers` regex / file-path discovery, **argument substitution** (`$1`, `$ARGUMENTS`, `${NONOCLAW_SKILL_DIR}`), **fork context** (`context: fork` → sub-agent), **usage tracking** (7-day half-life decay), **hot reload** (notify file watcher) |
+| **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP** hook kinds, 12 event types) |
+| **Task System** | File-persisted task store (`~/.nonoclaw/tasks/`), dependency graph (blocks/blockedBy), owner assignment, status lifecycle (pending→in_progress→completed) |
 | **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX rendering |
 | **PWA** | Add to Home Screen, offline SW cache, installable on Android/iOS |
 | **Mobile Sync** | QR code → shared session → real-time MessagesLoaded broadcast between desktop ↔ phone |
@@ -173,8 +175,9 @@ Start with `--serve-http 127.0.0.1:8765` and open the browser.
 |---|---|
 | `/clear` | Reset conversation (memory + disk) |
 | `/compact` | Summarise long context |
-| `/skill-name` | Inject a skill's instructions into system prompt |
+| `/skill-name` | Inject a skill's instructions into system prompt (with args: `/deploy prod main`) |
 | `/multi model1,model2 <prompt>` | Compare answers from multiple models |
+| `/rename <title>` | Set a custom session title |
 
 ---
 
@@ -223,20 +226,72 @@ Desktop sends Run → events stream to desktop only
 
 ### Skills (`/skill-name`)
 
-Create `.nonoclaw/skills/<name>/SKILL.md`:
+Create `.nonoclaw/skills/<name>/SKILL.md` with YAML frontmatter:
 
 ```markdown
 ---
-name: my-skill
-description: Refactor legacy patterns to modern Rust idioms
+name: deploy
+description: Deploy the project to production
+argument-hint: "<env> <branch>"
+arguments: [env, branch]
+paths: [deploy/**]
+triggers: ["deploy|ship|release"]
+when_to_use: when the user asks to deploy or ship code
+allowed-tools: [Bash, Read, Write]
+context: fork
 ---
-When refactoring:
-- Replace unwrap() with ? or proper error handling
-- Use iterators instead of for loops
-- Add unit tests for every modified function
+# Deploy
+Run `./deploy.sh --env=$1 --branch=$2`
 ```
 
-Add reference files in `references/*.md` — they're auto-loaded and appended to the skill body. Use in conversation: `/my-skill help me refactor this file`.
+#### Supported Frontmatter Fields (v0.2.0)
+
+| Field | Description |
+|---|---|
+| `name` | Skill name (used as `/name`) |
+| `description` | One-line purpose |
+| `paths` | Glob patterns — skill auto-activates when matching files are read/written/edited |
+| `triggers` | Regex patterns — skill auto-activates when user input matches |
+| `when_to_use` | NL guidance injected into system prompt |
+| `allowed-tools` | Restrict which tools the skill can use |
+| `argument-hint` | CLI usage hint shown in autocomplete |
+| `arguments` | Positional argument names for `$1`, `$2` substitution |
+| `version` | Skill version string |
+| `model` | Override model when skill is active |
+| `disable-model-invocation` | If true, model cannot auto-invoke — slash-command only |
+| `user-invocable` | Whether `/name` is available (default: true) |
+| `context` | `"fork"` spawns isolated sub-agent; otherwise inline |
+| `agent` | Agent type when context is `"fork"` |
+| `effort` | Thinking effort level (`low`/`medium`/`high`) |
+| `shell` | Shell override (`bash`/`powershell`) |
+
+#### Dynamic Activation (CC-compatible)
+
+Skills aren't just static `/name` commands — they activate dynamically:
+
+| Mechanism | How it works |
+|---|---|
+| **`paths`** | After Read/Write/Edit touches a matching file, the skill auto-activates (gitignore-style glob matching) |
+| **`triggers`** | User input regex match → skill auto-loads before the first turn |
+| **File discovery** | Walking up from operation file paths discovers nested `.nonoclaw/skills/` directories mid-session |
+| **Conditional** | Skills with `paths` are deferred until matching files are touched (reduces system prompt bloat) |
+
+#### Argument Substitution
+Skill bodies support CC-compatible variable expansion:
+- `$1`, `$2` — positional arguments from `/name arg1 arg2`
+- `$ARGUMENTS` — raw argument string
+- `$ARGUMENTS[0]`, `$ARGUMENTS[1]` — indexed access
+- `${NONOCLAW_SKILL_DIR}` — skill's own directory path
+- `${NONOCLAW_SESSION_ID}` — current session UUID
+
+#### Bundled Skills (12 built-in)
+Always available without disk scanning: `verify`, `simplify`, `debug`, `remember`, `loop`, `update-config`, `keybindings-help`, `claude-api`, `code-review`, `init`, `review`, `security-review`
+
+#### Usage Tracking
+Skill invocations are persisted to `~/.nonoclaw/skill-usage.json` with 7-day half-life decay — frequently used skills rank higher in listings.
+
+#### Hot Reload
+Edit `SKILL.md` on disk → changes reflected within 500ms via `notify` file watcher (no restart needed).
 
 ### Plugins
 
@@ -248,16 +303,30 @@ Installed to `~/.nonoclaw/plugins/`. Skills contributed by plugins are auto-disc
 
 ### Hooks (`.nonoclaw/hooks.json`)
 
+Three hook kinds supported — **shell command**, **LLM prompt evaluation**, and **HTTP POST**:
+
 ```json
 {
   "hooks": {
-    "PreToolUse":  [{ "matcher": "Bash*", "command": "scripts/guard.sh" }],
-    "PostToolUse": [{ "matcher": "*", "command": "notify-send", "args": ["done"] }]
+    "PreToolUse": [
+      { "matcher": "Bash*", "command": "scripts/guard.sh" }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "command": "notify-send", "args": ["done"] },
+      { "matcher": "Write", "prompt": { "model": "claude-haiku-4-5", "timeout_secs": 30 } },
+      { "matcher": "*", "http": { "url": "https://hooks.example.com/cc", "headers": { "X-Token": "${HOOK_TOKEN}" } } }
+    ]
   }
 }
 ```
-- `PreToolUse`: non-zero exit → **denies** the tool call
-- Other hooks (`PostToolUse`, `SessionStart`, `PreCompact`, etc.): fire-and-forget
+
+| Hook Type | Behavior |
+|---|---|
+| **Shell** (`command` + `args`) | Executes a subprocess; `PreToolUse` non-zero exit → blocks the tool call |
+| **Prompt** (`prompt`) | Calls a small model (Haiku) with the hook context, enforces JSON schema `{ ok, reason? }` |
+| **HTTP** (`http`) | POSTs JSON payload to URL, supports env-var interpolation in URL/headers |
+
+**12 event types**: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Notification`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact`
 
 ---
 
@@ -356,6 +425,7 @@ nonoclaw --plugin-add ~/my-hooks
 | `--disallowed-tools` | — | Comma-separated tool denylist |
 | `--dangerously-skip-permissions` | — | Bypass all permission checks |
 | `--append-system-prompt` | — | Extra system prompt text |
+| `--name` | — | Set custom session title at startup |
 | `--tunnel` | false | Auto-spawn cloudflared |
 | `--public-url` | — | Override QR code URL |
 | `--settings` | — | Explicit settings file path |
@@ -371,9 +441,9 @@ NonoClaw/
 │   ├── crates/
 │   │   ├── core/      nonoclaw-core     — messages, usage, permissions
 │   │   ├── api/       nonoclaw-api      — Anthropic streaming client
-│   │   ├── tools/     nonoclaw-tools    — Tool trait + registry + builtins + MCP
-│   │   ├── engine/    nonoclaw-engine   — query loop + prompt + compact + session
-│   │   └── cli/       nonoclaw (bin)    — CLI + TUI + Web UI + remote + skills
+│   │   ├── tools/     nonoclaw-tools    — Tool trait + registry + 17 builtins + MCP + background tasks
+│   │   ├── engine/    nonoclaw-engine   — query loop + prompt + compact + session + skills + hooks
+│   │   └── cli/       nonoclaw (bin)    — CLI + Web UI + remote + skill watcher + project info
 │   ├── install.sh / install.ps1
 │   └── Cargo.toml
 ├── frontend/          React + Vite (TypeScript)
@@ -395,21 +465,33 @@ NonoClaw/
 | `ANTHROPIC_AUTH_TOKEN` | Bearer auth (alternative) |
 | `NONOCLAW_HOME` | Override data root (`~/.nonoclaw`) |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch backends |
+| `NONOCLAW_MAX_TOOL_CONCURRENCY` | Max parallel tool executions (default: 10) |
+| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Disable `run_in_background` (default: enabled) |
 | `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
 
 ---
 
 ## 中文摘要
 
-NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的 **Rust 重写版本**。完整实现智能体循环、12 个内置工具、5 级权限门禁、会话持久化（JSONL）、MCP 双向、TUI 交互界面和 Web UI（含 PWA 移动端支持）。
+NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的 **Rust 重写版本**。完整实现智能体循环、17 个内置工具、分批并发工具执行、后台 Bash 任务、5 级权限门禁、会话持久化（JSONL，支持命名）、MCP 双向（含 prompts→skill 桥接）、Web UI（含 PWA 移动端支持）。
+
+### v0.2.0 新增亮点
+- **分批工具并发**：按 CC 标准 `partitionToolCalls` 实现，连续并发安全工具自动分组并行执行（上限 10，可通过 `NONOCLAW_MAX_TOOL_CONCURRENCY` 配置）
+- **Bash 后台任务**：`run_in_background: true` 将长时间命令放入后台，输出持久化到磁盘，完成后自动注入 `<task_notification>`
+- **Task 工具集**：TaskCreate/Get/List/Update 四个工具，文件持久化到 `~/.nonoclaw/tasks/`，支持依赖图（blocks/blockedBy）和 owner 分配
+- **ToolSearch 按需加载**：WebSearch/WebFetch/Coordinator 等低频工具不在 system prompt 中出现，模型通过 ToolSearch 工具按关键词查找
+- **Skills 动态激活**：12 个内置技能 + 条件激活（paths glob 匹配）+ 正则触发器（triggers）+ 文件路径向上发现 + fork 上下文子代理 + 参数替换 + 使用跟踪 + 热重载
+- **Hooks 扩展**：支持 3 种执行方式（Shell 命令 / LLM Prompt 评估 / HTTP POST），12 种事件类型
+- **Session 丰富**：支持自定义标题、AI 生成标题、自动首句提取、标签、模式元数据
+- **MCP 技能桥**：`prompts/list` → 自动注册为 `/mcp__server__prompt` 可调用技能
 
 ### 核心特色
 - **多模型切换**：在 `settings.json` 的 `models[]` 数组中预配不同供应商（DeepSeek、GLM、Claude）的 endpoint 和 key，通过 UI 下拉框随时切换；`/multi` 斜杠命令支持一轮对话中用多个模型回答并对比
 - **Web UI**：三栏布局（文件树+Git面板 / 对话 / Insight 手风琴），生物发光暗色主题，呼吸式 aurora 背景（随 token 输出节奏脉动），支持 Markdown + KaTeX 数学公式渲染
 - **Cloudflare Tunnel**：`--tunnel` 自动启动 cloudflared 隧道，终端打印 ASCII 二维码，手机在任何网络扫码即可远程访问并共享同一 session
 - **权限模式**：UI 下拉框随时切换 `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan`
-- **增强 System Prompt**：包含手术级改动规则、6 种命名失败模式（厨房水槽、失控重构等）、Karpathy 反过度工程规则
-- **Skills 机制**：`/skill-name` 自动加载技能目录下所有 .md 文件（含 references 子文件）注入 system prompt
+- **增强 System Prompt**：包含手术级改动规则、6 种命名失败模式（厨房水槽、失控重构等）、Karpathy 反过度工程规则、ToolSearch 使用指南
+- **Skills 机制**：12 个内置技能 + 15 种 frontmatter 字段 + 5 种动态激活方式 + 参数替换 + 使用排名 + 热重载
 - **配置灵活**：`settings.json` 集中管理模型、权限、上下文窗口、MCP server、Brave 搜索 key 等
 
 ### 安装运行

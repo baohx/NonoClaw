@@ -4,7 +4,7 @@
 //! Consumed by the web frontend Phase 1 (HTTP/WS server).
 #![allow(dead_code)]
 
-use crate::skills::Skill;
+use nonoclaw_engine::skills::Skill;
 
 /// Built-in slash commands: (name, one-line description).
 pub const BUILTINS: &[(&str, &str)] = &[
@@ -52,8 +52,7 @@ mod tests {
         let s = vec![Skill {
             name: "deploy".into(),
             description: "deploys the app".into(),
-            body: String::new(),
-            source: String::new(),
+            ..Default::default()
         }];
         let h = help_text(&s);
         assert!(h.contains("/deploy"));

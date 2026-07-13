@@ -37,11 +37,6 @@ export default function StatusBar({
   const permissionMode = useStore((s) => s.permissionMode);
   const availableModels = useStore((s) => s.availableModels);
 
-  const modeColor =
-    permissionMode === "bypassPermissions" ? "var(--rose)" :
-    permissionMode === "plan" ? "var(--sky)" :
-    permissionMode === "acceptEdits" ? "var(--violet)" :
-    "var(--mint)";
   const cycleTheme = useStore((s) => s.cycleTheme);
   const dotColor = theme === "amber" ? "#fbbf24" : theme === "frost" ? "#93c5fd" : "#5eead4";
 
@@ -74,7 +69,6 @@ export default function StatusBar({
               value={model}
               onChange={(e) => onSetModel(e.target.value)}
               title="Switch model"
-              style={{ color: "var(--mint)", borderColor: "var(--mint)", minWidth: 100 }}
             >
               {availableModels.map((m) => (
                 <option key={m.name} value={m.name}>
@@ -93,7 +87,6 @@ export default function StatusBar({
         <select
           className="mode-select"
           value={permissionMode}
-          style={{ color: modeColor, borderColor: modeColor }}
           onChange={(e) => onSetPermissionMode(e.target.value as PermissionMode)}
           title="Permission mode"
         >

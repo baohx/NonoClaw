@@ -77,6 +77,38 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Like `definitions()` but excludes deferred tools (where `should_defer()`
+    /// returns true). These tools are discoverable via ToolSearch.
+    pub fn active_definitions(&self, allowlist: Option<&[String]>) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|t| !t.should_defer())
+            .filter(|t| match allowlist {
+                None => true,
+                Some(names) => names.iter().any(|n| {
+                    matches_name(t.name(), t.aliases(), n)
+                        || n.split('(')
+                            .next()
+                            .map(|p| t.name() == p.trim())
+                            .unwrap_or(false)
+                }),
+            })
+            .map(|t| t.definition())
+            .collect()
+    }
+
+    /// Build ToolSearch entries for all registered tools (including deferred).
+    pub fn search_entries(&self) -> Vec<crate::builtin::tool_search::ToolSearchEntry> {
+        self.tools
+            .iter()
+            .map(|t| crate::builtin::tool_search::ToolSearchEntry {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                search_hint: t.search_hint().unwrap_or("").to_string(),
+            })
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }

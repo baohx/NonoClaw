@@ -10,7 +10,9 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod task_tools;
 pub mod todo;
+pub mod tool_search;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;
@@ -24,6 +26,7 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use todo::{TodoItem, TodoStatus, TodoStore, TodoWriteTool};
+pub use tool_search::ToolSearchTool;
 pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
 pub use write::WriteTool;
@@ -62,6 +65,10 @@ fn dirs_home() -> Option<PathBuf> {
     nonoclaw_core::home_dir()
 }
 
+pub(crate) fn nonoclaw_data_dir() -> Option<PathBuf> {
+    dirs_home().map(|h| h.join(".nonoclaw"))
+}
+
 /// Register all Phase 0 built-in tools. Returns the registry and the shared
 /// todo store (so the engine/UI can render the task list).
 pub fn register_all() -> (ToolRegistry, Arc<TodoStore>) {
@@ -79,5 +86,10 @@ pub fn register_all() -> (ToolRegistry, Arc<TodoStore>) {
     reg.register(std::sync::Arc::new(AgentTool));
     reg.register(std::sync::Arc::new(AskUserQuestionTool));
     reg.register(std::sync::Arc::new(CoordinatorTool));
+    let store = task_tools::TaskStore::new();
+    reg.register(std::sync::Arc::new(task_tools::TaskCreateTool { store: store.clone() }));
+    reg.register(std::sync::Arc::new(task_tools::TaskGetTool { store: store.clone() }));
+    reg.register(std::sync::Arc::new(task_tools::TaskListTool { store: store.clone() }));
+    reg.register(std::sync::Arc::new(task_tools::TaskUpdateTool { store }));
     (reg, todos)
 }

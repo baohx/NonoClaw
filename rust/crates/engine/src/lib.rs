@@ -8,6 +8,7 @@ pub mod loop_;
 pub mod prompt;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod tokens;
 
 pub use hooks::{lifecycle_context, run_hooks, HookType};
@@ -19,3 +20,4 @@ pub use session::{
     session_path, SessionInfo,
 };
 pub use settings::{apply_env, apply_settings, load_settings, ModelProfile, SettingsFile};
+pub use skills::{substitute_arguments, Skill, SkillsManager};

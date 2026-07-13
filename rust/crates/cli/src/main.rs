@@ -6,17 +6,18 @@ mod commands;
 mod project_info;
 mod remote;
 mod serve_http;
+mod skill_watcher;
 mod skills;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use nonoclaw_api::{Client, ThinkingConfig};
 use nonoclaw_core::{Message, PermissionMode, Usage};
-use nonoclaw_engine::{EngineEvent, EngineOptions, QueryEngine};
+use nonoclaw_engine::{EngineEvent, EngineOptions, QueryEngine, SkillsManager};
 use nonoclaw_tools::register_all;
 use serde_json::json;
 
@@ -276,6 +277,14 @@ async fn main() -> Result<()> {
         max_tokens,
         "resolved context budget"
     );
+    let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
+    let background_registry = Arc::new(std::sync::Mutex::new(
+        nonoclaw_tools::BackgroundTaskRegistry::new(),
+    ));
+
+    // Spawn file watcher for hot-reloading skills in headless mode.
+    skill_watcher::spawn_skill_watcher(Arc::clone(&skills_manager), cwd.clone());
+
     let options = EngineOptions {
         model: cli
             .model
@@ -311,6 +320,9 @@ async fn main() -> Result<()> {
             settings.auto_compact.unwrap_or(true)
         },
         compact_threshold_tokens,
+        skills_manager: Some(skills_manager),
+        arguments: None,
+        background_registry: Some(background_registry),
     };
 
     // Resolve the session: resume by id, --continue the most recent, or fresh.
@@ -342,13 +354,25 @@ async fn main() -> Result<()> {
         }
     }
     nonoclaw_tools::register_mcp(&mut registry, &mcp_configs).await;
+    // Register ToolSearch with a snapshot of all tools (including MCP).
+    let tool_search = nonoclaw_tools::builtin::ToolSearchTool::new(registry.search_entries());
+    registry.register(Arc::new(tool_search));
     let registry = Arc::new(registry);
 
-    // Resolve model: CLI flag > settings > built-in default.
+    // Resolve model: CLI flag > settings.model > model_profiles default > first
+    // profile > built-in fallback.
     let model = cli
         .model
         .clone()
         .or_else(|| settings.model.clone())
+        .or_else(|| {
+            settings.models.as_ref().and_then(|ps| {
+                ps.iter()
+                    .find(|p| p.default)
+                    .or_else(|| ps.first())
+                    .map(|p| p.name.clone())
+            })
+        })
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".into());
 
     // Web UI server: HTTP + WebSocket.

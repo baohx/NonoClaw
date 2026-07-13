@@ -26,6 +26,21 @@ enum SessionEntry {
     Summary {
         text: String,
     },
+    CustomTitle {
+        title: String,
+    },
+    AiTitle {
+        title: String,
+    },
+    LastPrompt {
+        prompt: String,
+    },
+    Tag {
+        tag: String,
+    },
+    Mode {
+        mode: String,
+    },
 }
 
 /// Metadata for a discovered session (for `--list-sessions`).
@@ -35,7 +50,58 @@ pub struct SessionInfo {
     pub started: Option<String>,
     pub message_count: usize,
     pub summary: String,
+    pub title: Option<String>,
+    pub tag: Option<String>,
     pub mtime: std::time::SystemTime,
+}
+
+/// Write a custom title entry for the session.
+pub fn write_custom_title(path: &Path, title: &str) -> std::io::Result<()> {
+    append_entry(path, &SessionEntry::CustomTitle { title: title.to_string() })
+}
+
+/// Write an AI-generated title.
+pub fn write_ai_title(path: &Path, title: &str) -> std::io::Result<()> {
+    append_entry(path, &SessionEntry::AiTitle { title: title.to_string() })
+}
+
+/// Write the first user prompt as a last-prompt entry.
+pub fn write_last_prompt(path: &Path, prompt: &str) -> std::io::Result<()> {
+    append_entry(path, &SessionEntry::LastPrompt { prompt: prompt.to_string() })
+}
+
+/// Get the best available session title.
+pub fn get_session_title(path: &Path) -> Option<String> {
+    let entries = read_entries(path)?;
+    let mut custom = None;
+    let mut ai = None;
+    let mut last = None;
+    for e in &entries {
+        match e {
+            SessionEntry::CustomTitle { title } => custom = Some(title.clone()),
+            SessionEntry::AiTitle { title } => ai = Some(title.clone()),
+            SessionEntry::LastPrompt { prompt } => last = Some(prompt.chars().take(200).collect()),
+            _ => {}
+        }
+    }
+    custom.or(ai).or(last)
+}
+
+/// Scan session entries for metadata (titles, tags). Only reads head+tail.
+fn read_entries(path: &Path) -> Option<Vec<SessionEntry>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<SessionEntry> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<SessionEntry>(line).ok())
+        .collect();
+    Some(entries)
+}
+
+fn append_entry(path: &Path, entry: &SessionEntry) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+    let line = serde_json::to_string(entry)?;
+    writeln!(f, "{line}")
 }
 
 /// Resolve the root directory for session storage (`$NONOCLAW_HOME` or `~/.nonoclaw`).
@@ -220,6 +286,8 @@ pub fn list_sessions(cwd: &Path) -> std::io::Result<Vec<SessionInfo>> {
             started,
             message_count: messages.len(),
             summary,
+            title: None,
+            tag: None,
             mtime,
         });
     }

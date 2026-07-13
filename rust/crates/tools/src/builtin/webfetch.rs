@@ -33,6 +33,9 @@ impl Tool for WebFetchTool {
     fn search_hint(&self) -> Option<&'static str> {
         Some("fetch a url read a web page http")
     }
+    fn should_defer(&self) -> bool {
+        true
+    }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -300,6 +303,7 @@ mod tests {
             cancel: &cancel,
             subagent: None,
             question: None,
+            background_registry: None,
         };
         let res = tool
             .call(

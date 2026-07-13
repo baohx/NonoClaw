@@ -141,6 +141,7 @@ mod tests {
             cancel: &cancel,
             subagent: None,
             question: None,
+            background_registry: None,
         };
         let res = tool
             .call(

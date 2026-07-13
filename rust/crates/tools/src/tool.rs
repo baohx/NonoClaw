@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use nonoclaw_core::{
@@ -17,6 +18,8 @@ use nonoclaw_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+pub use crate::background::BackgroundTaskRegistry;
 
 /// Spawns a subagent (a recursive engine run with its own message history and a
 /// restricted toolset) and returns its final text answer. Provided by the
@@ -83,6 +86,8 @@ pub struct ToolCtx<'a> {
     pub subagent: Option<&'a dyn SubagentRunner>,
     /// Interactive question resolver (AskUserQuestion). `None` when headless.
     pub question: Option<&'a dyn QuestionResolver>,
+    /// Background task registry for `run_in_background` bash commands.
+    pub background_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
 }
 
 impl<'a> ToolCtx<'a> {

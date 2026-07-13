@@ -3,10 +3,13 @@
 //! module assembles a faithful *functional* equivalent: identity + environment +
 //! tool guidance + NONOCLAW.md + memory.
 
+use std::sync::{Arc, RwLock};
+
 use nonoclaw_api::SystemBlock;
 use nonoclaw_core::CacheControl;
 
 use crate::context::{SystemContext, UserContext};
+use crate::skills::SkillsManager;
 
 const PLATFORM_HINT: &str = {
     #[cfg(target_os = "windows")]
@@ -28,6 +31,7 @@ pub fn build_system_blocks(
     memory: &Option<String>,
     tool_prompts: &[(String, String)],
     append: &Option<String>,
+    skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
 ) -> Vec<SystemBlock> {
     let mut main = String::new();
     main.push_str(BASE);
@@ -46,6 +50,14 @@ pub fn build_system_blocks(
     for (name, prompt) in tool_prompts {
         main.push_str(&format!("\n## Tool: {name}\n{prompt}\n"));
     }
+    // Inject active skills (static + dynamically activated/discovered).
+    if let Some(mgr) = skills_manager {
+        let skill_prompt = mgr.read().unwrap().render_prompt();
+        if !skill_prompt.is_empty() {
+            main.push_str(&format!("\n{skill_prompt}\n"));
+        }
+    }
+
     if let Some(extra) = append {
         main.push_str(&format!("\n# Additional instructions\n{extra}\n"));
     }
@@ -216,4 +228,10 @@ content searches — it's faster and respects .gitignore.
 - Pipe, redirect, and chain commands as needed. The working directory \
 persists across commands but shell state (env vars, aliases) does not.
 - Timeout defaults to 120s. Long-running commands (builds, tests) may need \
-a longer timeout specified via `timeout_ms`.";
+a longer timeout specified via `timeout_ms`.\n\
+\n\
+## ToolSearch\n\
+Some less-commonly-used tools are not listed above. Use the **ToolSearch** \
+tool to find them by keyword when you need a capability not covered by the \
+listed tools. For example: ToolSearch(query=\"web search\") or \
+ToolSearch(query=\"select:WebSearch\") to get a specific tool.";

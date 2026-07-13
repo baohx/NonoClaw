@@ -112,6 +112,9 @@ fn build_engine(
         question_resolver: None,
         auto_compact: false,
         compact_threshold_tokens: 150_000,
+        skills_manager: None,
+        arguments: None,
+        background_registry: None,
     };
     QueryEngine::new(client, registry, todos, options)
 }

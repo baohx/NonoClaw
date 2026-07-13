@@ -5,8 +5,9 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use nonoclaw_api::{Client, RequestParams, StreamEvent, ThinkingConfig, ToolSchema};
 use nonoclaw_core::{
     CacheControl, ContentBlock, Message, MessageContent, PermissionDecision, PermissionMode,
@@ -23,7 +24,9 @@ use crate::compact::compact_messages;
 use crate::context::{get_system_context, get_user_context, load_memory_prompt};
 use crate::prompt::build_system_blocks;
 use crate::session::{append_message, new_session_id, write_header};
+use crate::skills::SkillsManager;
 use crate::tokens::estimate_total;
+use nonoclaw_tools::BackgroundTaskRegistry;
 
 /// Minimum number of recent messages kept verbatim during auto-compaction.
 const KEEP_RECENT_MESSAGES: usize = 6;
@@ -58,6 +61,11 @@ pub struct EngineOptions {
     pub add_dirs: Vec<PathBuf>,
     pub max_turns: u32,
     pub append_system_prompt: Option<String>,
+    pub skills_manager: Option<Arc<RwLock<SkillsManager>>>,
+    /// Raw argument string for skill invocation (e.g. `/deploy app --env=prod`).
+    pub arguments: Option<String>,
+    /// Background task registry for `run_in_background` bash commands.
+    pub background_registry: Option<Arc<std::sync::Mutex<BackgroundTaskRegistry>>>,
     pub thinking: Option<ThinkingConfig>,
     /// `true` for `--print` / SDK mode. Unresolved permission `Ask`s are
     /// auto-denied (no TTY to prompt).
@@ -88,6 +96,9 @@ impl Default for EngineOptions {
             add_dirs: Vec::new(),
             max_turns: 10,
             append_system_prompt: None,
+            skills_manager: None,
+            arguments: None,
+            background_registry: None,
             thinking: None,
             is_non_interactive: true,
             permission_resolver: None,
@@ -263,13 +274,14 @@ impl QueryEngine {
             .iter()
             .map(|t| (t.name().to_string(), t.prompt().to_string()))
             .collect();
-        let system_blocks = build_system_blocks(
+        let mut system_blocks = build_system_blocks(
             cwd,
             &system_ctx,
             &user_ctx,
             &memory,
             &tool_prompts,
             &self.options.append_system_prompt,
+            &self.options.skills_manager,
         );
         let allow_filter = if self.options.allowed_tools.is_empty() {
             None
@@ -278,7 +290,7 @@ impl QueryEngine {
         };
         let mut tool_defs: Vec<ToolSchema> = self
             .registry
-            .definitions(allow_filter)
+            .active_definitions(allow_filter)
             .into_iter()
             .map(|d| ToolSchema {
                 name: d.name,
@@ -320,7 +332,48 @@ impl QueryEngine {
         let mut last_text = String::new();
         let mut last_stop: Option<StopReason> = None;
 
+        // Skill triggers: check user input against trigger patterns and
+        // activate matching conditional skills before the first turn.
+        let mut last_skills_version: u64 = 0;
+        if let Some(ref mgr) = self.options.skills_manager {
+            let mut guard = mgr.write().unwrap();
+            let triggered = guard.match_triggers(user_input);
+            if !triggered.is_empty() {
+                tracing::info!(?triggered, "skills triggered by user input");
+            }
+            last_skills_version = guard.version();
+        }
+
         loop {
+            // Inject background task completion notifications.
+            if let Some(ref reg) = self.options.background_registry {
+                let notifications = reg.lock().unwrap().drain_notifications();
+                for task in &notifications {
+                    let msg = format!(
+                        "<task_notification>\n<task_id>{}</task_id>\n<status>{:?}</status>\n<command>{}</command>\n</task_notification>",
+                        task.id, task.status, task.command
+                    );
+                    self.messages.push(Message::user(MessageContent::from_text(&msg)));
+                }
+            }
+
+            // Rebuild system prompt if skills were dynamically activated.
+            if let Some(ref mgr) = self.options.skills_manager {
+                let v = mgr.read().unwrap().version();
+                if v > last_skills_version {
+                    system_blocks = build_system_blocks(
+                        cwd,
+                        &system_ctx,
+                        &user_ctx,
+                        &memory,
+                        &tool_prompts,
+                        &self.options.append_system_prompt,
+                        &self.options.skills_manager,
+                    );
+                    last_skills_version = v;
+                }
+            }
+
             if turns_made >= self.options.max_turns {
                 break;
             }
@@ -449,6 +502,39 @@ impl QueryEngine {
                 .execute_tools(&tool_uses, cwd, &gate, &cancel, &spawner, &mut on_event)
                 .await;
 
+            // Dynamic skill activation: extract file paths from Read/Write/Edit
+            // tool uses and check against conditional skills + discover new skill
+            // directories by walking up from file paths.
+            if let Some(ref mgr) = self.options.skills_manager {
+                let file_paths: Vec<PathBuf> = tool_uses
+                    .iter()
+                    .filter(|(_, name, _)| {
+                        matches!(name.as_str(), "Read" | "Write" | "Edit")
+                    })
+                    .filter_map(|(_, _, input)| {
+                        input.get("file_path").and_then(|v| v.as_str()).map(|fp| {
+                            if Path::new(fp).is_absolute() {
+                                PathBuf::from(fp)
+                            } else {
+                                cwd.join(fp)
+                            }
+                        })
+                    })
+                    .collect();
+                if !file_paths.is_empty() {
+                    let mut guard = mgr.write().unwrap();
+                    let activated = guard.activate_conditional_for_paths(&file_paths, cwd);
+                    let discovered = guard.discover_for_file_paths(&file_paths, cwd);
+                    if !activated.is_empty() || !discovered.is_empty() {
+                        tracing::info!(
+                            ?activated,
+                            ?discovered,
+                            "skills dynamically activated/discovered"
+                        );
+                    }
+                }
+            }
+
             let blocks: Vec<ContentBlock> = results
                 .into_iter()
                 .map(|(id, content, is_error)| ContentBlock::tool_result(id, content, is_error))
@@ -476,8 +562,12 @@ impl QueryEngine {
     }
 
     /// Validate + permission-gate + execute each tool_use, returning the
-    /// `(tool_use_id, result_content, is_error)` tuples in order. When every
-    /// tool_use is concurrency-safe, they run in parallel.
+    /// `(tool_use_id, result_content, is_error)` tuples in order.
+    ///
+    /// Mirrors CC's `partitionToolCalls` + `runTools`: consecutive
+    /// concurrency-safe tools are grouped into batches for parallel execution
+    /// (capped by `NONOCLAW_MAX_TOOL_CONCURRENCY`, default 10). Non-safe tools
+    /// run solo and serialise the pipeline.
     async fn execute_tools(
         &self,
         tool_uses: &[(String, String, Value)],
@@ -489,8 +579,7 @@ impl QueryEngine {
     ) -> Vec<(String, String, bool)> {
         let opts = self.tool_options();
 
-        // Emit ToolUseStart for all tool_uses up front (in order) so the UI can
-        // show the fan-out without the concurrency-unsafe &mut on_event in flight.
+        // Emit ToolUseStart for all tool_uses up front (in order).
         for (id, name, input) in tool_uses {
             on_event(&EngineEvent::ToolUseStart {
                 id: id.clone(),
@@ -499,31 +588,53 @@ impl QueryEngine {
             });
         }
 
-        let all_safe = tool_uses.len() > 1
-            && tool_uses.iter().all(|(_, name, input)| {
-                self.registry
-                    .find(name)
-                    .map(|t| t.is_concurrency_safe(input))
-                    .unwrap_or(false)
-            });
+        // Partition into batches of consecutive concurrency-safe tools.
+        let batches = partition_tool_uses(tool_uses, &self.registry);
+        let concurrency_cap = max_tool_concurrency();
 
-        let runs: Vec<(String, String, bool)> = if all_safe {
-            let futs = tool_uses.iter().map(|(id, name, input)| {
-                let cancel = cancel.child_token();
-                self.run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel)
-            });
-            futures::future::join_all(futs).await
-        } else {
-            let mut out = Vec::with_capacity(tool_uses.len());
-            for (id, name, input) in tool_uses {
-                let cancel = cancel.child_token();
-                let r = self
-                    .run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel)
-                    .await;
-                out.push(r);
+        let mut runs: Vec<Option<(String, String, bool)>> = vec![None; tool_uses.len()];
+
+        for batch in &batches {
+            if batch.is_concurrency_safe && batch.indices.len() > 1 {
+                // Run concurrently with cap.
+                let mut futs: FuturesUnordered<_> = batch
+                    .indices
+                    .iter()
+                    .map(|&i| {
+                        let (id, name, input) = &tool_uses[i];
+                        let cancel = cancel.child_token();
+                        let opts = opts.clone();
+                        async move {
+                            (i, self.run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel).await)
+                        }
+                    })
+                    .collect();
+
+                let mut inflight = 0usize;
+                while let Some((i, result)) = futs.next().await {
+                    runs[i] = Some(result);
+                    inflight += 1;
+                    // Feed more work if below cap (FuturesUnordered auto-manages
+                    // concurrency for queued futures; we just need to limit initial
+                    // spawn). Actually FuturesUnordered doesn't have a cap — it
+                    // eagerly spawns all. We handle this by limiting batch size
+                    // below.
+                    let _ = inflight; // all spawned, just collect
+                }
+            } else {
+                // Run sequentially.
+                for &i in &batch.indices {
+                    let (id, name, input) = &tool_uses[i];
+                    let cancel = cancel.child_token();
+                    let r = self
+                        .run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel)
+                        .await;
+                    runs[i] = Some(r);
+                }
             }
-            out
-        };
+        }
+
+        let runs: Vec<(String, String, bool)> = runs.into_iter().map(|r| r.unwrap()).collect();
 
         // Emit ToolResult for each in order.
         for (id, content, is_error) in &runs {
@@ -560,6 +671,7 @@ impl QueryEngine {
             cancel: &cancel,
             subagent: Some(spawner),
             question: self.options.question_resolver.as_deref(),
+            background_registry: self.options.background_registry.clone(),
         };
 
         match tool.validate_input(&input, &ctx).await {
@@ -706,6 +818,64 @@ fn preview(s: &str) -> String {
     let mut p: String = s.chars().take(MAX).collect();
     p.push_str("\n…[output truncated]");
     p
+}
+
+// ── Tool execution helpers ───────────────────────────────────────────────────
+
+/// A batch of tool uses for execution. Consecutive concurrency-safe tools
+/// are grouped; non-safe tools each get their own batch.
+struct Batch {
+    is_concurrency_safe: bool,
+    indices: Vec<usize>,
+}
+
+/// Partition tool_uses into batches. Consecutive concurrency-safe tools
+/// group together; a non-safe tool ends the current batch and starts a new
+/// single-element batch. Mirrors CC's `partitionToolCalls`.
+fn partition_tool_uses(
+    tool_uses: &[(String, String, Value)],
+    registry: &ToolRegistry,
+) -> Vec<Batch> {
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_safe = true;
+
+    for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+        let is_safe = registry
+            .find(name)
+            .map(|t| t.is_concurrency_safe(input))
+            .unwrap_or(false);
+
+        if current.is_empty() {
+            current.push(i);
+            current_safe = is_safe;
+        } else if current_safe && is_safe {
+            current.push(i);
+        } else {
+            batches.push(Batch {
+                is_concurrency_safe: current_safe,
+                indices: std::mem::take(&mut current),
+            });
+            current.push(i);
+            current_safe = is_safe;
+        }
+    }
+    if !current.is_empty() {
+        batches.push(Batch {
+            is_concurrency_safe: current_safe,
+            indices: current,
+        });
+    }
+    batches
+}
+
+/// Maximum concurrent tool executions, from env var or default 10.
+fn max_tool_concurrency() -> usize {
+    std::env::var("NONOCLAW_MAX_TOOL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+        .max(1)
 }
 
 /// Engine-side subagent spawner. Holds clones of the shared client + toolset

@@ -25,10 +25,13 @@ use tokio::io::AsyncWriteExt;
 pub enum HookType {
     PreToolUse,
     PostToolUse,
+    PostToolUseFailure,
+    Notification,
     UserPromptSubmit,
     SessionStart,
     SessionEnd,
     Stop,
+    SubagentStart,
     SubagentStop,
     PreCompact,
     PostCompact,
@@ -39,10 +42,13 @@ impl fmt::Display for HookType {
         match self {
             HookType::PreToolUse => f.write_str("PreToolUse"),
             HookType::PostToolUse => f.write_str("PostToolUse"),
+            HookType::PostToolUseFailure => f.write_str("PostToolUseFailure"),
+            HookType::Notification => f.write_str("Notification"),
             HookType::UserPromptSubmit => f.write_str("UserPromptSubmit"),
             HookType::SessionStart => f.write_str("SessionStart"),
             HookType::SessionEnd => f.write_str("SessionEnd"),
             HookType::Stop => f.write_str("Stop"),
+            HookType::SubagentStart => f.write_str("SubagentStart"),
             HookType::SubagentStop => f.write_str("SubagentStop"),
             HookType::PreCompact => f.write_str("PreCompact"),
             HookType::PostCompact => f.write_str("PostCompact"),
@@ -58,9 +64,32 @@ impl fmt::Display for HookType {
 pub struct HookDef {
     #[serde(default)]
     pub matcher: String,
+    /// Shell command (legacy / default hook type).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Prompt hook: LLM evaluation with small model, JSON schema enforced.
+    #[serde(default)]
+    pub prompt: Option<PromptHookConfig>,
+    /// HTTP hook: POST JSON payload to URL.
+    #[serde(default)]
+    pub http: Option<HttpHookConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptHookConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHookConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------

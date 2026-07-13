@@ -70,16 +70,23 @@ impl Tool for BashTool {
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
         let command = require_command(&input)?;
-        if input["run_in_background"].as_bool().unwrap_or(false) {
-            return Err(Error::Tool {
-                tool: "Bash".into(),
-                message: "run_in_background is not supported in Phase 0".into(),
-            });
-        }
         let timeout_ms = input["timeout_ms"]
             .as_u64()
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
+
+        // Background execution: spawn and return task ID immediately.
+        if input["run_in_background"].as_bool().unwrap_or(false) {
+            if let Some(ref reg) = ctx.background_registry {
+                let task_id = reg.lock().unwrap().spawn(&command, timeout_ms);
+                return Ok(ToolResult::ok(format!(
+                    "Background task started.\nTask ID: {task_id}\nUse TaskOutput to read results."
+                )));
+            }
+            return Ok(ToolResult::ok(
+                "Background execution requested but no task registry available. Command will run inline."
+            ));
+        }
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);

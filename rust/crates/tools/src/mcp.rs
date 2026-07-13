@@ -189,6 +189,41 @@ impl McpClient {
         Ok((text, is_error))
     }
 
+    /// List available prompts from the MCP server (MCP `prompts/list`).
+    pub async fn list_prompts(&self) -> Result<Vec<McpPromptDef>> {
+        let result = self.request("prompts/list", json!({})).await?;
+        let prompts = result.get("prompts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for p in prompts {
+            out.push(McpPromptDef {
+                name: p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                description: p.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Get a specific prompt's content (MCP `prompts/get`).
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<String> {
+        let result = self
+            .request("prompts/get", json!({"name": name, "arguments": arguments}))
+            .await?;
+        let mut text = String::new();
+        if let Some(messages) = result.get("messages").and_then(|v| v.as_array()) {
+            for msg in messages {
+                if let Some(content) = msg.get("content").and_then(|v| v.as_object()) {
+                    if content.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = content.get("text").and_then(|v| v.as_str()) {
+                            text.push_str(t);
+                            text.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        Ok(text)
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (otx, orx) = oneshot::channel();
@@ -297,6 +332,13 @@ async fn read_loop(
         // notifications / server-initiated messages: ignored in Phase 3.
     }
     pending.lock().expect("pending lock").clear();
+}
+
+/// A discovered MCP prompt definition.
+#[derive(Debug, Clone)]
+pub struct McpPromptDef {
+    pub name: String,
+    pub description: String,
 }
 
 /// A discovered MCP tool definition.

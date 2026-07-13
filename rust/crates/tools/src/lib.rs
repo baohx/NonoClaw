@@ -1,6 +1,7 @@
 //! Tool trait, registry, permission engine, and core tool implementations.
 //! Mirrors `src/Tool.ts`, `src/tools/`, `src/utils/permissions/`.
 
+pub mod background;
 pub mod builtin;
 pub mod mcp;
 pub mod mcp_server;
@@ -19,4 +20,5 @@ pub use tool::{
     ToolDefinition, ToolOptions, ToolResult,
 };
 
+pub use background::BackgroundTaskRegistry;
 pub use builtin::{TodoItem, TodoStatus, TodoStore};

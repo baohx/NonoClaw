@@ -658,6 +658,7 @@ mod tests {
         ];
 
         let mut message_id = String::new();
+        let mut model = String::new();
         let mut usage = Usage::default();
         let mut stop_reason: Option<StopReason> = None;
         let mut blocks: BTreeMap<usize, BlockBuilder> = BTreeMap::new();
@@ -668,6 +669,7 @@ mod tests {
             handle_frame(
                 f,
                 &mut message_id,
+                &mut model,
                 &mut usage,
                 &mut stop_reason,
                 &mut blocks,

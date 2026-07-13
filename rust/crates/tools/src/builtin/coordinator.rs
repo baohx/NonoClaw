@@ -23,6 +23,9 @@ impl Tool for CoordinatorTool {
     fn description(&self) -> &'static str {
         "Dispatch parallel subtasks to subagents and aggregate."
     }
+    fn should_defer(&self) -> bool {
+        true
+    }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"}},"required":["description","prompt"]}}},"required":["tasks"]})
     }

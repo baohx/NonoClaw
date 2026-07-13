@@ -195,6 +195,7 @@ mod tests {
             cancel: &cancel,
             subagent: None,
             question: None,
+            background_registry: None,
         };
         let input = json!({"todos":[
             {"content":"a","status":"completed"},

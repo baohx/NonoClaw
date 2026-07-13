@@ -121,6 +121,7 @@ async fn call_tool(
         cancel: &cancel,
         subagent: None,
         question: None,
+        background_registry: None,
     };
 
     let outcome = tool.call(args, &ctx, cancel.clone()).await;

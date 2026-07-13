@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use nonoclaw_api::Client;
 use nonoclaw_core::{Message, PermissionDecision};
-use nonoclaw_engine::{EngineEvent, EngineOptions, ModelProfile, PermissionRequest, QueryEngine};
+use nonoclaw_engine::{substitute_arguments, EngineEvent, EngineOptions, ModelProfile, PermissionRequest, QueryEngine, SkillsManager};
 use nonoclaw_tools::tool::{QuestionRequest, QuestionResolver};
 use nonoclaw_tools::{McpServerConfig, TodoStore, ToolRegistry};
 
@@ -58,6 +58,9 @@ enum ClientMsg {
         /// `/skill-name` slash command).
         #[serde(default)]
         append_system_prompt: Option<String>,
+        /// Raw argument string for skill invocation.
+        #[serde(default)]
+        arguments: Option<String>,
     },
     Cancel,
     Clear,
@@ -211,6 +214,10 @@ struct AppState {
     pending_questions: Arc<QuestionMap>,
     /// Runtime-mutable permission mode (switchable via UI).
     permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
+    /// Skill manager: discovers, parses, and dynamically activates skills.
+    skills_manager: Arc<RwLock<SkillsManager>>,
+    /// Background task registry for run_in_background bash commands.
+    background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
 }
 
 // ── Per-connection session ──────────────────────────────────────────────────
@@ -363,9 +370,12 @@ fn build_options(
     model: Option<String>,
     max_turns: Option<u32>,
     append: Option<String>,
+    arguments: Option<String>,
     tx: Tx,
     pending_permissions: Arc<PermissionMap>,
     permission_mode: nonoclaw_core::PermissionMode,
+    skills_manager: Arc<RwLock<SkillsManager>>,
+    background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
 ) -> EngineOptions {
     const DEFAULT_MAX_TURNS: u32 = 200;
     const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
@@ -382,14 +392,15 @@ fn build_options(
         add_dirs: vec![],
         max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
         append_system_prompt: append.clone(),
+        arguments,
         thinking: None,
         is_non_interactive: false,
         permission_resolver: Some(permission_resolver),
         question_resolver: None, // set per-engine below
         auto_compact: true,
-        // Fire compact early: many providers have ~1M context windows
-        // (DeepSeek: 1,048,565). 80K keeps history manageable.
         compact_threshold_tokens: 80_000,
+        skills_manager: Some(skills_manager),
+        background_registry: Some(background_registry),
     }
 }
 
@@ -724,8 +735,9 @@ pub async fn serve(
     let auth_token = Uuid::new_v4().to_string().replace('-', "");
     let active_model = model_profiles.iter()
         .find(|p| p.default)
+        .or_else(|| model_profiles.first())
         .map(|p| p.name.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
+        .unwrap_or_else(|| model.clone());
     tracing::info!(auth_token, %active_model, "mobile auth token generated");
     let state = Arc::new(AppState {
         model_profiles,
@@ -745,7 +757,17 @@ pub async fn serve(
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
+        skills_manager: Arc::new(RwLock::new(SkillsManager::new(&cwd))),
+        background_registry: Arc::new(std::sync::Mutex::new(
+            nonoclaw_tools::BackgroundTaskRegistry::new(),
+        )),
     });
+
+    // Spawn file watcher for hot-reloading skills.
+    crate::skill_watcher::spawn_skill_watcher(
+        Arc::clone(&state.skills_manager),
+        cwd.clone(),
+    );
 
     // Print QR code if a public URL is available (from --tunnel or --public-url).
     if let Some(ref url) = state.public_url {
@@ -938,7 +960,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         send_msg(
             &tx,
             ServerMsg::Info {
-                model: state.model.clone(),
+                model: state.active_model.lock().await.clone(),
                 auth_token: state.auth_token.clone(),
                 available_models: state.model_profiles.iter().map(|p| ModelInfo {
                     name: p.name.clone(),
@@ -960,15 +982,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         .await;
 
         // Send the full project context for the Insight rail + Git pane.
+        let skills_snapshot = state.skills_manager.read().unwrap().all_active();
+        let current_model = state.active_model.lock().await.clone();
         let info = gather(
             &state.cwd,
-            &state.model,
+            &current_model,
             &state.registry,
             &state.mcp_configs,
             &state.mcp_sources,
             state.context_window,
             state.compact_threshold,
             state.public_url.clone(),
+            &skills_snapshot,
         )
         .await;
         send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
@@ -1097,15 +1122,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 .await;
             }
             ClientMsg::ProjectInfoRefresh => {
+                let skills_snapshot = state.skills_manager.read().unwrap().all_active();
+                let current_model = state.active_model.lock().await.clone();
                 let info = gather(
                     &state.cwd,
-                    &state.model,
+                    &current_model,
                     &state.registry,
                     &state.mcp_configs,
                     &state.mcp_sources,
                     state.context_window,
                     state.compact_threshold,
                     state.public_url.clone(),
+                    &skills_snapshot,
                 )
                 .await;
                 send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
@@ -1176,6 +1204,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 model,
                 max_turns,
                 append_system_prompt,
+                arguments,
             } => {
                 tracing::info!(prompt = %prompt, model = ?model, "ws run request");
                 // Require an active session.
@@ -1234,15 +1263,109 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     s.active_model.lock().await.clone()
                 };
 
+                // Fork context: if the user typed /skill-name and the skill
+                // has context: "fork", execute it as an isolated sub-agent
+                // instead of injecting inline.
+                let fork_body: Option<String> = {
+                    let mgr = state.skills_manager.read().unwrap();
+                    // Extract skill name from prompt: "/name args..." -> "name"
+                    let skill_name = prompt
+                        .strip_prefix('/')
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .unwrap_or("");
+                    if !skill_name.is_empty() {
+                        if let Some(skill) = mgr.get_skill(skill_name) {
+                            if skill.context.as_deref() == Some("fork") {
+                                let args = arguments.as_deref().unwrap_or("");
+                                let sid = &session_id;
+                                let body = substitute_arguments(
+                                    &skill.body,
+                                    args,
+                                    &skill.argument_names,
+                                    Some(&skill.source),
+                                    Some(sid),
+                                );
+                                tracing::info!(
+                                    name = skill_name,
+                                    "executing skill in fork context"
+                                );
+                                Some(body)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 run_handle = Some(tokio::spawn(async move {
                     let request_id = Uuid::new_v4().to_string();
+
+                    // If executing in fork context: run as a fresh sub-engine.
+                    if let Some(body) = fork_body {
+                        let fork_request_id = Uuid::new_v4().to_string();
+                        let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
+                            request_id: format!("{fork_request_id}-q"),
+                            pending: Arc::clone(&s.pending_questions),
+                            tx: tx2.clone(),
+                        });
+                        let fork_opts = {
+                            let mut o = build_options(
+                                Some(model_used.clone()),
+                                None,
+                                Some(body.clone()),
+                                arguments.clone(),
+                                tx2.clone(),
+                                Arc::clone(&s.pending_permissions),
+                                *s.permission_mode.lock().await,
+                                Arc::clone(&s.skills_manager),
+                                Arc::clone(&s.background_registry),
+                            );
+                            o.max_turns = o.max_turns.min(20);
+                            o.is_non_interactive = true;
+                            o.question_resolver = Some(qr);
+                            o
+                        };
+                        let mut fork_engine = QueryEngine::with_session(
+                            s.client.clone(),
+                            s.registry.clone(),
+                            s.todos.clone(),
+                            fork_opts,
+                            Vec::new(),
+                            format!("fork-{}", Uuid::new_v4()),
+                            None,
+                        );
+                        match fork_engine.run(&body, &s.cwd, |_ev| {}).await {
+                            Ok(result) => {
+                                send_msg(&tx2, ServerMsg::Done {
+                                    text: result.text,
+                                    usage: serde_json::to_value(result.usage).unwrap_or_default(),
+                                    turns: result.turns,
+                                    stop_reason: result.stop_reason.as_ref().map(|s| s.as_str().to_string()),
+                                }).await;
+                            }
+                            Err(e) => {
+                                send_msg(&tx2, ServerMsg::Error {
+                                    message: format!("fork execution failed: {e}"),
+                                }).await;
+                            }
+                        }
+                        return;
+                    }
+
                     let mut options = build_options(
                         Some(model_used.clone()),
                         max_turns,
                         append_system_prompt.clone(),
+                        arguments.clone(),
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
                         *s.permission_mode.lock().await,
+                        Arc::clone(&s.skills_manager),
+                        Arc::clone(&s.background_registry),
                     );
 
                     // Question resolver (per-run to avoid oneshot key clashes).
@@ -1349,15 +1472,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
                             // Refresh project context: git status / files may
                             // have changed after the run.
+                            let skills_snapshot = s.skills_manager.read().unwrap().all_active();
+                            let current_model = s.active_model.lock().await.clone();
                             let info = gather(
                                 &s.cwd,
-                                &s.model,
+                                &current_model,
                                 &s.registry,
                                 &s.mcp_configs,
                                 &s.mcp_sources,
                                 s.context_window,
                                 s.compact_threshold,
                                 s.public_url.clone(),
+                                &skills_snapshot,
                             )
                             .await;
                             send_msg(&tx2, ServerMsg::ProjectInfo { info: info.clone() }).await;
@@ -1457,6 +1583,29 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                     *state.active_model.lock().await = name.clone();
                     tracing::info!(%name, "active model switched");
+                    // Push updated Info + ProjectInfo so the UI reflects the new model immediately.
+                    send_msg(&tx, ServerMsg::Info {
+                        model: name.clone(),
+                        auth_token: state.auth_token.clone(),
+                        available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                            name: p.name.clone(),
+                            label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                        }).collect(),
+                        session_id: session.lock().await.as_ref().map(|h| h.id.clone()).unwrap_or_default(),
+                    }).await;
+                    let skills_snapshot = state.skills_manager.read().unwrap().all_active();
+                    let info = gather(
+                        &state.cwd,
+                        &name,
+                        &state.registry,
+                        &state.mcp_configs,
+                        &state.mcp_sources,
+                        state.context_window,
+                        state.compact_threshold,
+                        state.public_url.clone(),
+                        &skills_snapshot,
+                    ).await;
+                    send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
                 } else {
                     tracing::warn!("unknown model `{name}` — ignored");
                 }
@@ -1503,9 +1652,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     None,
                     None,
                     None,
+                    None,
                     tx.clone(),
                     Arc::clone(&state.pending_permissions),
                     *state.permission_mode.lock().await,
+                    Arc::clone(&state.skills_manager),
+                    Arc::clone(&state.background_registry),
                 );
                 let mut eng = QueryEngine::with_session(
                     state.client.clone(),

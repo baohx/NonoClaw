@@ -531,10 +531,6 @@ function ProjectKv({ info }: { info: ProjectInfo | null }) {
         </span>
       </div>
       <div className="kv__row">
-        <span className="kv__k">model</span>
-        <span className="kv__v">{info?.model ?? "—"}</span>
-      </div>
-      <div className="kv__row">
         <span className="kv__k">window</span>
         <span className="kv__v">
           {info?.context_window ? `${info.context_window.toLocaleString()} tok` : "—"}
