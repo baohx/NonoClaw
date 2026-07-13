@@ -1,165 +1,362 @@
-# NonoClaw
+# NonoClaw [English/中文]
 
-**English** · [中文](#nonoclaw-zh)
+A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, TUI, and a **Web UI** with mobile PWA support. Strictly references the TypeScript source in `src/`.
-
-> **Goal**: a native CLI coding agent with a complete tool ecosystem, remote access, and a beautiful web interface.
+> **Goal**: a native CLI coding agent with a complete tool ecosystem, multi-model switching, remote access via Cloudflare Tunnel, and a bioluminescent web interface.
 
 ---
 
-## Features
-
-### Core Engine
-- **Streaming agent loop** — Anthropic Messages API with SSE parsing, auto-retry, multi-turn execution
-- **Tool system** — `Tool` trait, 12 built-in tools + MCP dynamic loading + custom skills
-- **Permission gate** — 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan
-- **Subagent recursion** — Agent tool for subtasks; Coordinator tool for **parallel** subagent dispatch
-- **Auto-compaction** — Smart summarisation of old conversations at plain-user-message boundaries
-- **Tool concurrency** — `is_concurrency_safe` tools execute in **parallel** within the same turn
-- **Multi-model support** — Pre-define profiles in `settings.json` (base_url + api_key per model); switch at runtime via UI dropdown
-- **Skills** — `/skill-name` injects skill instructions (with reference file loading) into system prompt
-
-### User Interfaces
-- **Web UI** (`--serve-http`) — Bio-luminescence dark theme with breathing aurora background, three-column layout, file tree, Git pane, Insight accordion, real-time chat
-- **PWA mobile** — Add to Home Screen, QR code auth/session-sync for remote access, mobile-responsive
-- **Cloudflare Tunnel** (`--tunnel`) — Auto-spawn cloudflared for public internet access (zero-config HTTPS)
-- **Interactive TUI** — ratatui + crossterm: REPL message flow, streaming text, status bar, permission popups
-- **Headless** (`-p` / `--print`) — Single-shot mode for scripts/SDK; text / JSON output
-
-### Sessions & Data
-- **Session persistence** — JSONL stored at `~/.nonoclaw/projects/<cwd>/sessions/<id>.jsonl`
-- **Resume** — `--resume <id>` / `--continue` / `--list-sessions`
-- **Skills loading** — `.nonoclaw/skills/*/SKILL.md` + `~/.nonoclaw/skills/` + plugin-contributed
-- **Plugin hooks** — `.nonoclaw/hooks.json` with PreToolUse / PostToolUse / session lifecycle hooks
-
-### MCP (Model Context Protocol)
-- **MCP client** (`--mcp-config`) — Connect to external MCP servers (stdio JSON-RPC)
-- **MCP server** (`--mcp-serve`) — Expose built-in tools as an MCP server over stdio
+## Table of Contents
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Multi-Model & Multi-Provider](#multi-model--multi-provider)
+- [Permission Modes](#permission-modes)
+- [Web UI](#web-ui)
+- [Mobile & Remote Access](#mobile--remote-access)
+- [Skills & Plugins](#skills--plugins)
+- [Configuration (settings.json)](#configuration-settingsjson)
+- [CLI Reference](#cli-reference)
+- [Architecture](#architecture)
+- [中文摘要](#中文摘要)
 
 ---
 
 ## Quick Start
 
 ### Requirements
-- **Rust 1.82+**
-- **Anthropic API Key** (or compatible endpoint like DeepSeek / GLM)
-- `ripgrep` (optional, for the Grep tool)
-- `cloudflared` (optional, for `--tunnel`)
+- Rust 1.82+
+- Anthropic API Key (or compatible endpoint: DeepSeek, GLM, etc.)
+- `ripgrep` (optional, for Grep tool)
 
-### Build & Install
+### Install
 
 ```bash
-# One-step install (Linux/macOS):
+# Linux / macOS — one command:
 cd rust && bash install.sh
+# → installs to ~/.local/bin/nonoclaw, sets up frontend
 
 # Windows:
-# powershell -ExecutionPolicy Bypass -File install.ps1
-
-# Or just build:
-cd rust && cargo build --release
-# Binary: rust/target/release/nonoclaw (~5-6 MB)
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-### Configure
+### Run
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic  # optional
+# Web UI (with multi-model switching):
+nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
+
+# With Cloudflare Tunnel (phone scans QR from anywhere):
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+
+# Headless:
+nonoclaw -p "explain Rust ownership"
 ```
 
-Or use `~/.nonoclaw/settings.json`:
+---
+
+## Features
+
+| Category | Details |
+|---|---|
+| **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing |
+| **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes (Kitchen Sink, Runaway Refactor, etc.), Karpathy's anti-overengineering patterns |
+| **12 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator |
+| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`) |
+| **Multi-Model** | Pre-define model profiles in `settings.json` → switch at runtime via UI dropdown or `/multi` slash command |
+| **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
+| **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions` |
+| **Context** | Auto-compaction ~80k tokens, configurable `contextWindow` |
+| **Skills** | `/skill-name` injects full skill directory (SKILL.md + reference .md files) into system prompt |
+| **Plugins** | `--plugin-add`, PreToolUse/PostToolUse hooks via `.nonoclaw/hooks.json` |
+| **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX rendering |
+| **PWA** | Add to Home Screen, offline SW cache, installable on Android/iOS |
+| **Mobile Sync** | QR code → shared session → real-time MessagesLoaded broadcast between desktop ↔ phone |
+| **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access with terminal ASCII QR code |
+| **Export** | Markdown copy + `.md` file download from assistant responses |
+
+---
+
+## Multi-Model & Multi-Provider
+
+Define provider profiles in `settings.json` — each with its own `baseUrl`, `apiKey`, and a `label` for the UI dropdown:
+
+```json
+{
+  "models": [
+    {
+      "name": "deepseek-v4-pro",
+      "label": "DeepSeek V4",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiKey": "sk-xxxx",
+      "default": true
+    },
+    {
+      "name": "glm-5.2",
+      "label": "GLM 5.2",
+      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "sk-yyyy"
+    },
+    {
+      "name": "claude-sonnet-4-5",
+      "label": "Claude Sonnet",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "sk-ant-zzzz"
+    }
+  ]
+}
+```
+
+**Runtime switching**: The status bar model name becomes a dropdown (when 2+ models configured). Switching rebuilds the API `Client` per-run with the matching endpoint and key — no restart required.
+
+**`/multi` slash command**: Compare answers from multiple models in one turn:
+```
+/multi deepseek-v4-pro,glm-5.2 compare Rust and Go error handling
+```
+Sends the prompt to both models sequentially, labels each response with the model name.
+
+---
+
+## Permission Modes
+
+All modes switchable at runtime via UI dropdown (status bar, next to the model dropdown):
+
+| Mode | Behavior | Color |
+|---|---|---|
+| `default` | Read-only tools auto-allowed; writes prompt a dialog | Mint |
+| `acceptEdits` | Auto-allow Read + Write + Edit; Bash still prompts | Violet |
+| `auto` | Auto-allow **everything** — no prompts at all | Mint |
+| `bypassPermissions` | Skip ALL checks (= `--dangerously-skip-permissions`) | Red |
+| `plan` | Read-only: writes are **hard-denied** | Sky Blue |
+
+Also configurable via `settings.json`:
+```json
+{ "permissions": { "defaultMode": "auto" } }
+```
+
+---
+
+## Web UI
+
+Start with `--serve-http 127.0.0.1:8765` and open the browser.
+
+### Layout (three-column)
+```
+┌─ StatusBar ─────────────────────────────────────────────────┐
+│ «NonoClaw»  [model▾] [mode▾]  tokens · session  ◰ theme ● │
+├──────┬──────────────────────────────────┬───────────────────┤
+│ FILE │  chat (Markdown + KaTeX)         │ INSIGHT accordion
+│ TREE │  ─────────────────────           │  ▸ Tools (12)
+│      │  message bubbles                │  ▸ MCP servers
+│──────│  user/assistant/tool cards      │  ▸ Models
+│ GIT  │                                  │  ▸ Skills
+│pane  │  ┌─ composer ─── [send↗] ───┐  │  ▸ Hooks
+│      │  └───────────────────────────┘  │  ▸ Slash cmds
+│      │                                  │  ▸ Docs & config
+│      │                                  │  ▸ CLI reference
+│      │                                  │  ▸ Project
+└──────┴──────────────────────────────────┴───────────────────┘
+```
+
+### Key UI Features
+- **Breathing background** — aurora orbs pulse in rhythm with token-stream velocity
+- **Three themes** — Biolume (cyan/mint) · Amber Forge (gold) · Glacial Frost (ice-blue) — cycled via status bar dot
+- **File tree** — click file → open in OS default editor; Shift+click → VS Code
+- **Git pane** — branch, ahead/behind, staged/modified/untracked counts, recent commits (click → `git show` modal), filter by author/subject
+- **Insight accordion** — Tools (click → expand input schema + prompt preview), MCP servers, Models, Skills, Hooks, Slash commands, Docs & config (clickable to edit), CLI reference, Project info
+- **Markdown rendering** — GFM tables, KaTeX math (inline `$...$` and block `$$...$$`), syntax highlighting
+- **Copy & Export** — copy assistant response as Markdown; download as `.md` file
+
+### /slash commands (type in composer)
+| Command | Description |
+|---|---|
+| `/clear` | Reset conversation (memory + disk) |
+| `/compact` | Summarise long context |
+| `/skill-name` | Inject a skill's instructions into system prompt |
+| `/multi model1,model2 <prompt>` | Compare answers from multiple models |
+
+---
+
+## Mobile & Remote Access
+
+### QR Code + Session Sync
+
+1. Desktop: `nonoclaw --serve-http 127.0.0.1:8765` → click ◰ in status bar → QR code appears
+2. Phone scans QR (same LAN or tunnel) → browser opens with `?token=...&session=...`
+3. Phone joins the **same session** as desktop — shared `SessionHandle`, real-time `MessagesLoaded` broadcast
+4. "Add to Home Screen" → standalone PWA app
+
+### Cloudflare Tunnel (`--tunnel`)
+
+```bash
+# One-time: install cloudflared
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ~/bin/cloudflared
+chmod +x ~/bin/cloudflared
+
+# Start with tunnel:
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+```
+
+What happens:
+1. NonoClaw auto-spawns `cloudflared tunnel --url http://127.0.0.1:8765`
+2. Captures the `*.trycloudflare.com` URL from cloudflared's output
+3. Prints an **ASCII QR code** to the terminal (scannable immediately)
+4. Sets `public_url` auto-matically — the web UI QR button uses the tunnel URL
+
+Phone can access NonoClaw from any network (4G/5G, different WiFi, abroad) — no port forwarding, no public IP needed.
+
+### Session Sync Logic
+
+```
+Desktop connects → shared_sid = most-recent-session → registry["abc123"]
+Mobile scans QR    → shared_sid = "abc123" from URL → registry["abc123"].txs += phone
+
+Desktop sends Run → events stream to desktop only
+                 → after Done: MessagesLoaded broadcast to phone
+                 → phone UI updates automatically
+```
+
+---
+
+## Skills & Plugins
+
+### Skills (`/skill-name`)
+
+Create `.nonoclaw/skills/<name>/SKILL.md`:
+
+```markdown
+---
+name: my-skill
+description: Refactor legacy patterns to modern Rust idioms
+---
+When refactoring:
+- Replace unwrap() with ? or proper error handling
+- Use iterators instead of for loops
+- Add unit tests for every modified function
+```
+
+Add reference files in `references/*.md` — they're auto-loaded and appended to the skill body. Use in conversation: `/my-skill help me refactor this file`.
+
+### Plugins
+
+```bash
+nonoclaw --plugin-add /path/to/plugin      # local dir
+nonoclaw --plugin-add https://github.com/... # git URL
+```
+Installed to `~/.nonoclaw/plugins/`. Skills contributed by plugins are auto-discovered.
+
+### Hooks (`.nonoclaw/hooks.json`)
+
+```json
+{
+  "hooks": {
+    "PreToolUse":  [{ "matcher": "Bash*", "command": "scripts/guard.sh" }],
+    "PostToolUse": [{ "matcher": "*", "command": "notify-send", "args": ["done"] }]
+  }
+}
+```
+- `PreToolUse`: non-zero exit → **denies** the tool call
+- Other hooks (`PostToolUse`, `SessionStart`, `PreCompact`, etc.): fire-and-forget
+
+---
+
+## Configuration (settings.json)
+
+Full example at `~/.nonoclaw/settings.json`:
+
 ```json
 {
   "model": "deepseek-v4-pro",
   "contextWindow": 1048576,
   "maxTokens": 8192,
-  "models": [
-    { "name": "deepseek-v4-pro", "label": "DeepSeek V4",
-      "baseUrl": "https://api.deepseek.com/anthropic",
-      "apiKey": "sk-xxx", "default": true },
-    { "name": "glm-5.2", "label": "GLM 5.2",
-      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "sk-yyy" }
-  ],
   "env": {
-    "ANTHROPIC_API_KEY": "sk-xxx",
+    "ANTHROPIC_API_KEY": "sk-xxxx",
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
     "BRAVE_API_KEY": "your-brave-key"
   },
+  "models": [
+    {
+      "name": "deepseek-v4-pro", "label": "DeepSeek V4",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiKey": "sk-xxxx", "default": true
+    },
+    {
+      "name": "glm-5.2", "label": "GLM 5.2",
+      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "sk-yyyy"
+    }
+  ],
   "mcpServers": {
-    "one_search": { "command": "python3.7", "args": ["/path/to/server.py"] }
-  }
+    "my-server": { "command": "npx", "args": ["-y", "@scope/mcp-server"] }
+  },
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": ["Bash(cargo build:*)"],
+    "deny": ["Bash(sudo:*)"]
+  },
+  "compactThreshold": 80000,
+  "autoCompact": true
 }
 ```
 
-### First Run
+### Top-level fields
 
-```bash
-# Web UI (default):
-nonoclaw --serve-http 127.0.0.1:8765
-# Open http://127.0.0.1:8765
-
-# With Cloudflare Tunnel (public internet access):
-nonoclaw --serve-http 127.0.0.1:8765 --tunnel
-
-# Headless:
-nonoclaw -p "What is Rust ownership?"
-
-# Interactive TUI:
-nonoclaw
-```
+| Field | Description |
+|---|---|
+| `model` | Default model (used when `models[]` is absent) |
+| `contextWindow` | Model's total context size in tokens (auto-calculates compact threshold) |
+| `maxTokens` | Max output tokens per turn |
+| `env` | Environment vars injected at startup (legacy single-model mode) |
+| `models[]` | Multi-model profiles: `name`, `label`, `baseUrl`, `apiKey`, `default` |
+| `mcpServers` | MCP server configs: `command`, `args`, `env` |
+| `permissions.defaultMode` | `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan` |
+| `permissions.allow` | Tool patterns to always allow |
+| `permissions.deny` | Tool patterns to always deny |
+| `compactThreshold` | Auto-compact trigger (estimated tokens) |
+| `autoCompact` | Enable/disable auto-compaction |
 
 ---
 
-## Execution Modes
+## CLI Reference
 
-### 1. Web UI (`--serve-http`)
-Start the HTTP + WebSocket server and open the browser.
-
-### 2. Headless (`-p`)
-Single-shot mode for scripting. `--output-format text|json`.
-
-### 3. Remote Sessions
 ```bash
-nonoclaw --serve 127.0.0.1:8765              # server (TCP + JSON-lines)
-nonoclaw --remote 127.0.0.1:8765 "prompt"     # client
+# Web UI
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+
+# Headless
+nonoclaw -p "summarize README"
+echo "fix the bug" | nonoclaw -p --allowed-tools Read,Edit,Bash
+
+# Sessions
+nonoclaw --continue "keep going"
+nonoclaw --list-sessions
+nonoclaw --resume abc123 "resume specific session"
+
+# MCP
+nonoclaw --mcp-config servers.json "call the weather tool"
+nonoclaw --mcp-serve  # expose as MCP server
+
+# Plugins
+nonoclaw --plugin-add ~/my-hooks
 ```
 
-### 4. MCP Mode
-```bash
-nonoclaw --mcp-config mcp.json "use external tools"  # MCP client
-nonoclaw --mcp-serve                                    # MCP server
-```
+### Key Flags
 
-### 5. All CLI Flags
-
-| Flag | Description |
-|---|---|
-| `-p, --print` | Force headless mode |
-| `--model <ID>` | Override model |
-| `--permission-mode <MODE>` | `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan` |
-| `--allowed-tools <LIST>` | Comma-separated tool allowlist |
-| `--disallowed-tools <LIST>` | Comma-separated tool denylist |
-| `--dangerously-skip-permissions` | Skip all checks (= `bypass`) |
-| `--max-turns <N>` | Max turns (default 200) |
-| `--max-tokens <N>` | Max output tokens/turn (default 8192) |
-| `--append-system-prompt <TXT>` | Append to system prompt |
-| `--add-dir <PATH>` | Extra CLAUDE.md search dir |
-| `--output-format text\|json` | Headless output format |
-| `--mcp-config <PATH>` | MCP server config JSON |
-| `--resume <ID>` | Resume session by id |
-| `--continue` | Resume most recent session |
-| `--list-sessions` | List sessions and exit |
-| `--no-session` | Disable session persistence |
-| `--compact-threshold <N>` | Auto-compact threshold (tokens) |
-| `--no-auto-compact` | Disable auto-compaction |
-| `--settings <PATH>` | Explicit settings file |
-| `--serve-http <ADDR>` | Start web UI server |
-| `--tunnel` | Auto-spawn cloudflared tunnel |
-| `--public-url <URL>` | QR code public URL |
-| `--context-window <N>` | Model context window (tokens) |
-| `--plugin-add <SOURCE>` | Install plugin |
-| `--verbose` | Verbose logging |
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `claude-sonnet-4-5` | Override model |
+| `--max-turns` | 200 | Max agentic loop turns |
+| `--max-tokens` | 8192 | Max output per turn |
+| `--permission-mode` | `default` | Permission posture |
+| `--context-window` | — | Model context size (auto-derives compact threshold) |
+| `--compact-threshold` | 80000 | Estimated-token auto-compact trigger |
+| `--no-auto-compact` | false | Disable auto-compaction |
+| `--allowed-tools` | — | Comma-separated tool allowlist |
+| `--disallowed-tools` | — | Comma-separated tool denylist |
+| `--dangerously-skip-permissions` | — | Bypass all permission checks |
+| `--append-system-prompt` | — | Extra system prompt text |
+| `--tunnel` | false | Auto-spawn cloudflared |
+| `--public-url` | — | Override QR code URL |
+| `--settings` | — | Explicit settings file path |
 
 ---
 
@@ -167,97 +364,60 @@ nonoclaw --mcp-serve                                    # MCP server
 
 ```
 NonoClaw/
-├── src/               TypeScript reference implementation (Claude Code source)
-├── rust/              Rust rewrite
+├── src/               TypeScript reference (read-only, not in git/build)
+├── rust/              Rust rewrite (active)
 │   ├── crates/
-│   │   ├── core/      nonoclaw-core     — messages, usage, permissions, errors
-│   │   ├── api/       nonoclaw-api      — Anthropic streaming client (SSE)
+│   │   ├── core/      nonoclaw-core     — messages, usage, permissions
+│   │   ├── api/       nonoclaw-api      — Anthropic streaming client
 │   │   ├── tools/     nonoclaw-tools    — Tool trait + registry + builtins + MCP
-│   │   ├── engine/    nonoclaw-engine   — query loop + system prompt + compact + session
+│   │   ├── engine/    nonoclaw-engine   — query loop + prompt + compact + session
 │   │   └── cli/       nonoclaw (bin)    — CLI + TUI + Web UI + remote + skills
-│   ├── Cargo.toml     workspace
-│   ├── install.sh     Linux/macOS installer
-│   └── install.ps1    Windows installer
-├── frontend/          React + Vite web UI (PWA)
-│   ├── src/           TypeScript + TSX components
-│   ├── index.html     design tokens + CSS
+│   ├── install.sh / install.ps1
+│   └── Cargo.toml
+├── frontend/          React + Vite (TypeScript)
+│   ├── src/           components, store, WebSocket client
+│   ├── index.html     CSS design tokens
 │   └── package.json
 ├── .gitignore
 └── README.md
 ```
 
+---
+
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | API Key (**required**) |
-| `ANTHROPIC_BASE_URL` | Custom base URL (default `api.anthropic.com`) |
-| `ANTHROPIC_AUTH_TOKEN` | Bearer auth (alternative to api key) |
-| `HTTP_PROXY` / `ALL_PROXY` | HTTP proxy |
-| `NONOCLAW_HOME` | Override session/plugin storage root (default `~/.nonoclaw`) |
-| `SERPER_API_KEY` | Serper backend for WebSearch |
-| `BRAVE_API_KEY` | Brave Search backend for WebSearch |
-| `RUST_LOG` | tracing log level (`warn`, `debug`, etc.) |
+| `ANTHROPIC_API_KEY` | API key |
+| `ANTHROPIC_BASE_URL` | Custom API endpoint |
+| `ANTHROPIC_AUTH_TOKEN` | Bearer auth (alternative) |
+| `NONOCLAW_HOME` | Override data root (`~/.nonoclaw`) |
+| `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch backends |
+| `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
+
+---
+
+## 中文摘要
+
+NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的 **Rust 重写版本**。完整实现智能体循环、12 个内置工具、5 级权限门禁、会话持久化（JSONL）、MCP 双向、TUI 交互界面和 Web UI（含 PWA 移动端支持）。
+
+### 核心特色
+- **多模型切换**：在 `settings.json` 的 `models[]` 数组中预配不同供应商（DeepSeek、GLM、Claude）的 endpoint 和 key，通过 UI 下拉框随时切换；`/multi` 斜杠命令支持一轮对话中用多个模型回答并对比
+- **Web UI**：三栏布局（文件树+Git面板 / 对话 / Insight 手风琴），生物发光暗色主题，呼吸式 aurora 背景（随 token 输出节奏脉动），支持 Markdown + KaTeX 数学公式渲染
+- **Cloudflare Tunnel**：`--tunnel` 自动启动 cloudflared 隧道，终端打印 ASCII 二维码，手机在任何网络扫码即可远程访问并共享同一 session
+- **权限模式**：UI 下拉框随时切换 `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan`
+- **增强 System Prompt**：包含手术级改动规则、6 种命名失败模式（厨房水槽、失控重构等）、Karpathy 反过度工程规则
+- **Skills 机制**：`/skill-name` 自动加载技能目录下所有 .md 文件（含 references 子文件）注入 system prompt
+- **配置灵活**：`settings.json` 集中管理模型、权限、上下文窗口、MCP server、Brave 搜索 key 等
+
+### 安装运行
+```bash
+cd rust && bash install.sh
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel --model deepseek-v4-pro
+```
 
 ---
 
 ## License
 
 MIT
-
----
-
-## NonoClaw 中文
-
-**NonoClaw** 是 [Claude Code](https://claude.ai/code)（Anthropic 智能体 CLI）的 **Rust 重写版本**。以 `src/` 中的 TypeScript 源码为参考实现，完整复刻智能体循环、工具派发、权限系统、会话持久化、MCP、TUI 及 Web 界面，并支持移动端 PWA。
-
-### 快速开始
-
-```bash
-cd rust && bash install.sh                    # 一键安装到 ~/.local/bin
-nonoclaw --serve-http 127.0.0.1:8765           # Web UI
-nonoclaw --serve-http 127.0.0.1:8765 --tunnel   # 带隧道（外网访问）
-nonoclaw -p "总结一下 README"                   # 无头模式
-nonoclaw                                         # TUI 交互
-```
-
-### 执行模式
-- **Web UI** (`--serve-http`) — 三栏布局 + 呼吸背景 + 文件树 + Git + Insight
-- **PWA 移动端** — 扫码连接 + 添加到主屏幕 + session 同步
-- **无头模式** (`-p`) — 适合脚本/SDK
-- **远程会话** (`--serve` / `--remote`)
-- **MCP 模式** (`--mcp-config` / `--mcp-serve`)
-
-### 配置
-
-`~/.nonoclaw/settings.json`:
-```json
-{
-  "model": "deepseek-v4-pro",
-  "contextWindow": 1048576,
-  "models": [
-    { "name": "deepseek-v4-pro", "label": "DeepSeek V4",
-      "baseUrl": "https://api.deepseek.com/anthropic",
-      "apiKey": "sk-xxx", "default": true },
-    { "name": "glm-5.2", "label": "GLM 5.2",
-      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "sk-yyy" }
-  ]
-}
-```
-
-### 内置工具
-Read · Write · Edit · Bash · Grep · Glob · TodoWrite · WebFetch · WebSearch · Agent · AskUserQuestion · Coordinator + MCP 动态加载
-
-### 权限模式
-`default` · `acceptEdits` · `auto` · `bypassPermissions` · `plan`
-
-### 特性
-- 会话持久化 (JSONL) + resume / continue
-- 自动上下文压缩
-- Skills (`/skill-name` 注入)
-- 插件 hooks
-- 多模型切换（UI 下拉框）
-- Cloudflare Tunnel 内网穿透
-- 终端 ASCII 二维码
-- PWA 离线安装
