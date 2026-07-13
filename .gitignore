@@ -1,5 +1,5 @@
 # TypeScript reference (not built — read-only research)
-src/
+/src/
 
 # Rust
 rust/target/
