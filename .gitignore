@@ -1,3 +1,6 @@
+# TypeScript reference (not built — read-only research)
+src/
+
 # Rust
 rust/target/
 **/*.rs.bk
