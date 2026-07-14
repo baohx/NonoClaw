@@ -233,20 +233,32 @@ async fn process_mistral(
         .map_err(|e| format!("failed to read file for OCR: {e}"))?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
 
-    let document_url = if mime.starts_with("image/") {
+    let is_image = mime.starts_with("image/");
+    let data_uri = if is_image {
         format!("data:{mime};base64,{b64}")
     } else {
         format!("data:application/pdf;base64,{b64}")
     };
 
-    let body = serde_json::json!({
-        "model": config.model,
-        "document": {
-            "type": "document_url",
-            "document_url": document_url
-        },
-        "include_image_base64": true
-    });
+    let body = if is_image {
+        serde_json::json!({
+            "model": config.model,
+            "document": {
+                "type": "image_url",
+                "image_url": data_uri
+            },
+            "include_image_base64": true
+        })
+    } else {
+        serde_json::json!({
+            "model": config.model,
+            "document": {
+                "type": "document_url",
+                "document_url": data_uri
+            },
+            "include_image_base64": true
+        })
+    };
 
     let client = reqwest::Client::new();
     let url = format!("{}/v1/ocr", config.base_url.trim_end_matches('/'));

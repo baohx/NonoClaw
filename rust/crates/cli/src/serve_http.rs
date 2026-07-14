@@ -347,7 +347,7 @@ fn enrich_prompt_with_attachments(
     }
 
     let mut parts = String::new();
-    parts.push_str("The user has attached the following files:\n\n");
+    parts.push_str("The user has attached the following files. Their content has already been extracted and is shown below — you do NOT need to read or process these files. Just use the content directly.\n\n");
     for a in atts {
         parts.push_str(&format!("## File: {}\n\n", a.filename));
         let text = &a.extracted_text;
