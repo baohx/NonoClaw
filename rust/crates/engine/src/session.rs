@@ -237,6 +237,8 @@ pub fn load_session(path: &Path) -> std::io::Result<(Option<String>, String, Vec
             _ => {}
         }
     }
+    // Repair any orphaned tool_use blocks from interrupted runs.
+    crate::loop_::repair_tool_pairing(&mut messages);
     Ok((started, summary, messages))
 }
 

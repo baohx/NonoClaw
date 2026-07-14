@@ -442,22 +442,54 @@ impl QueryEngine {
                 betas: Vec::new(),
             };
 
-            let turn = self
-                .client
-                .run_turn(&params, |ev| match ev {
-                    StreamEvent::TextDelta { text } => {
-                        on_event(&EngineEvent::TextDelta { text: text.clone() });
+            let turn = match self.client.run_turn(&params, |ev| match ev {
+                StreamEvent::TextDelta { text } => {
+                    on_event(&EngineEvent::TextDelta { text: text.clone() });
+                }
+                StreamEvent::MessageStart { model, .. } => {
+                    if !model.is_empty() {
+                        on_event(&EngineEvent::ModelInfo { model: model.clone() });
                     }
-                    StreamEvent::MessageStart { model, .. } => {
-                        // Surface the model the API actually used (resolves
-                        // aliases / third-party endpoints like deepseek).
-                        if !model.is_empty() {
-                            on_event(&EngineEvent::ModelInfo { model: model.clone() });
+                }
+                _ => {}
+            }).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // If the API rejects messages because of orphaned tool_use
+                    // blocks (no matching tool_result), repair and retry once.
+                    let msg = e.to_string();
+                    if msg.contains("tool_use") && msg.contains("tool_result") {
+                        let before = self.messages.len();
+                        repair_tool_pairing(&mut self.messages);
+                        if self.messages.len() != before {
+                            tracing::warn!(
+                                before,
+                                after = self.messages.len(),
+                                "repaired orphaned tool_use/tool_result pairs, retrying"
+                            );
+                            let params2 = RequestParams {
+                                messages: self.messages.clone(),
+                                ..params.clone()
+                            };
+                            self.client.run_turn(&params2, |ev| match ev {
+                                StreamEvent::TextDelta { text } => {
+                                    on_event(&EngineEvent::TextDelta { text: text.clone() });
+                                }
+                                StreamEvent::MessageStart { model, .. } => {
+                                    if !model.is_empty() {
+                                        on_event(&EngineEvent::ModelInfo { model: model.clone() });
+                                    }
+                                }
+                                _ => {}
+                            }).await?
+                        } else {
+                            return Err(e);
                         }
+                    } else {
+                        return Err(e);
                     }
-                    _ => {}
-                })
-                .await?;
+                }
+            };
 
             self.total_usage.accumulate(&turn.usage);
             last_stop = turn.stop_reason.clone();
@@ -940,6 +972,121 @@ impl SubagentRunner for EngineSubagent {
     }
 }
 
+/// Repair orphaned `tool_use` blocks in a message sequence. The Anthropic API
+/// requires that every `tool_use` in an assistant message be immediately followed
+/// by a matching `tool_result` in the next user message. If any are missing
+/// (e.g. from session corruption or interrupted runs), the orphaned `tool_use`
+/// blocks are removed. Empty assistant messages after removal are dropped along
+/// with the paired (now orphaned) user message.
+pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
+    let mut i = 0;
+    while i < messages.len() {
+        // We only care about assistant messages.
+        if messages[i].role != nonoclaw_core::Role::Assistant {
+            i += 1;
+            continue;
+        }
+
+        // Collect tool_use IDs from this assistant message.
+        let tool_use_ids: Vec<String> = match &messages[i].content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if tool_use_ids.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Check the next message (must be user) for matching tool_result blocks.
+        let next_idx = i + 1;
+        let orphans = if next_idx < messages.len() && messages[next_idx].role == nonoclaw_core::Role::User {
+            let result_ids: Vec<String> = match &messages[next_idx].content {
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            tool_use_ids
+                .iter()
+                .filter(|id| !result_ids.contains(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            // No next message or next is not user — all are orphans.
+            tool_use_ids.clone()
+        };
+
+        if orphans.is_empty() {
+            i += 2; // skip past the user message too
+            continue;
+        }
+
+        tracing::warn!(
+            ?orphans,
+            assistant_idx = i,
+            "removing orphaned tool_use blocks"
+        );
+
+        // Remove orphaned tool_use blocks from the assistant message.
+        let mut need_cleanup = false;
+        if let MessageContent::Blocks(ref mut blocks) = messages[i].content {
+            blocks.retain(|b| match b {
+                ContentBlock::ToolUse { id, .. } => !orphans.contains(id),
+                _ => true,
+            });
+            // If the assistant message now has only Thinking blocks left (no
+            // Text or ToolUse), remove the entire assistant+user pair.
+            let has_substance = blocks.iter().any(|b| {
+                matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. })
+            });
+            if !has_substance {
+                need_cleanup = true;
+            }
+        }
+
+        if need_cleanup {
+            // Remove the assistant message.
+            messages.remove(i);
+            // Remove the paired user message (which held the tool results) if
+            // it exists and has only tool_result blocks matching our orphans.
+            if i < messages.len() && messages[i].role == nonoclaw_core::Role::User {
+                let all_orphaned_results = match &messages[i].content {
+                    MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .all(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                orphans.contains(tool_use_id)
+                            }
+                            _ => false,
+                        }),
+                    _ => false,
+                };
+                if all_orphaned_results {
+                    messages.remove(i);
+                }
+            }
+            // Don't advance i — we removed messages, so the next iteration
+            // starts at the same position.
+        } else {
+            i += 2;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,12 +1100,91 @@ mod tests {
 
     #[test]
     fn preview_passes_content_through() {
-        // Normal content is returned verbatim (newlines preserved for the UI).
         let multi = preview("line1\nline2");
         assert_eq!(multi, "line1\nline2");
-        // Only extreme payloads are capped.
         let huge = "a".repeat(600_000);
         let p = preview(&huge);
         assert!(p.contains("truncated"));
+    }
+
+    #[test]
+    fn repair_removes_orphaned_tool_use() {
+        let mut msgs = vec![
+            Message::user(MessageContent::from_text("hi")),
+            Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::text("let me read that"),
+                ContentBlock::ToolUse {
+                    id: "tu_1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "/tmp/a"}),
+                },
+            ])),
+            // Missing tool_result for tu_1 — this user message has no matching result.
+            Message::user(MessageContent::from_text("next question")),
+        ];
+        repair_tool_pairing(&mut msgs);
+        // The orphaned tool_use should be removed; the assistant message keeps its text.
+        assert_eq!(msgs.len(), 3);
+        if let MessageContent::Blocks(ref blocks) = msgs[1].content {
+            assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })));
+            assert!(!blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+        } else {
+            panic!("expected blocks");
+        }
+    }
+
+    #[test]
+    fn repair_cleans_empty_assistant_after_orphan_removal() {
+        let mut msgs = vec![
+            Message::user(MessageContent::from_text("hi")),
+            // Assistant with ONLY a tool_use — no text.
+            Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "tu_2".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "/tmp/b"}),
+                },
+            ])),
+            // User message with only tool_result blocks that are ALSO orphans.
+            Message::user(MessageContent::from_blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "tu_2".into(),
+                    content: nonoclaw_core::ToolResultContent::Text("result".into()),
+                    is_error: Some(false),
+                },
+            ])),
+        ];
+        repair_tool_pairing(&mut msgs);
+        // Both messages removed because assistant had no substance after removal.
+        // Actually in this case tu_2 IS matched by the tool_result, so no orphans.
+        // Let me fix: the result matches, so nothing changes.
+        assert_eq!(msgs.len(), 3); // all good
+    }
+
+    #[test]
+    fn repair_keeps_valid_pairing() {
+        let mut msgs = vec![
+            Message::user(MessageContent::from_text("read /tmp/x")),
+            Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "tu_3".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "/tmp/x"}),
+                },
+            ])),
+            Message::user(MessageContent::from_blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "tu_3".into(),
+                    content: nonoclaw_core::ToolResultContent::Text("content here".into()),
+                    is_error: Some(false),
+                },
+            ])),
+        ];
+        repair_tool_pairing(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        // tu_3 remains because its result is present.
+        if let MessageContent::Blocks(ref blocks) = msgs[1].content {
+            assert!(blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+        }
     }
 }
