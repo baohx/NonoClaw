@@ -120,6 +120,13 @@ export default function App() {
           content: `[compare: ${models.map(label).join(", ")}]\n${realPrompt}`,
         });
         userScrolledUp.current = false;
+        // Label the first model before sending it (subsequent models are
+        // labelled in the websocket Done handler).
+        addMessage({
+          id: `sys-${Date.now()}`,
+          role: "system",
+          content: `🟢 running ${label(models[0])}…`,
+        });
         // Send the first model now; the websocket Done handler will chain the
         // rest via window.__nonoclaw_pending_multi (hacky but zero-new-infra).
         (window as any).__nonoclaw_pending_multi = {

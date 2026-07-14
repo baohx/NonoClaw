@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { ChatMessage } from "../types";
 import Markdown from "./Markdown";
@@ -222,19 +222,51 @@ function StreamingText({ text }: { text: string }) {
   );
 }
 
+/** Extract a one-line summary from a tool's input for display. */
+function toolInputPreview(name: string, input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const obj = input as Record<string, unknown>;
+  // Show the most relevant field for each tool.
+  const key = name === "Bash" ? "command" :
+    name === "WebFetch" ? "url" :
+    name === "WebSearch" ? "query" :
+    name === "Grep" ? "pattern" :
+    name === "Glob" ? "pattern" :
+    name === "TodoWrite" ? undefined :
+    Object.keys(obj)[0];
+  if (!key || !(key in obj)) return "";
+  const val = String(obj[key]);
+  const max = 200;
+  return val.length > max ? val.slice(0, max) + "…" : val;
+}
+
 const ToolCard = memo(function ToolCard({ msg }: { msg: ChatMessage }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
+  const prevStreaming = useRef(msg.streaming);
+
+  // Auto-collapse when the tool result arrives (streaming → done).
+  useEffect(() => {
+    if (prevStreaming.current && !msg.streaming) {
+      setCollapsed(true);
+    }
+    prevStreaming.current = msg.streaming;
+  }, [msg.streaming]);
+
   const running = msg.streaming;
   const failed = msg.toolOk === false;
   const statusClass = running ? "run" : failed ? "err" : "ok";
   const statusSym = running ? "◌" : failed ? "✕" : "✓";
   const name = msg.toolName || "tool";
+  const inputPreview = toolInputPreview(name, msg.toolInput);
 
   return (
     <div className="toolcard">
       <div className="toolcard__head" onClick={() => setCollapsed((c) => !c)}>
         <span className={`toolcard__status ${statusClass}`}>{statusSym}</span>
         <span className="toolcard__name">{name}</span>
+        {inputPreview && (
+          <code className="toolcard__cmd">{inputPreview}</code>
+        )}
         <span className="toolcard__chev">{collapsed ? "▸" : "▾"}</span>
       </div>
       {!collapsed && (
