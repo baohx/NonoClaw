@@ -273,15 +273,16 @@ async fn process_mistral(
         .map_err(|e| format!("Mistral OCR request failed: {e}"))?;
 
     let status = resp.status();
+    let resp_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mistral OCR returned {}: {}", status.as_u16(), err_body));
+        tracing::warn!(%status, %resp_text, "Mistral OCR error");
+        return Err(format!("Mistral OCR returned {}: {}", status.as_u16(), resp_text));
     }
 
-    let response: MistralOcrResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse Mistral OCR response: {e}"))?;
+    tracing::info!(len = resp_text.len(), "Mistral OCR response received");
+
+    let response: MistralOcrResponse = serde_json::from_str(&resp_text)
+        .map_err(|e| format!("failed to parse Mistral OCR response: {} (body head: {})", e, &resp_text[..resp_text.len().min(300)]))?;
 
     // Concatenate markdown from all pages.
     let mut text = String::new();
@@ -292,7 +293,15 @@ async fn process_mistral(
         image_count += page.images.len();
     }
 
-    Ok((text.trim().to_string(), image_count))
+    let result = text.trim().to_string();
+    tracing::info!(
+        pages = response.pages.len(),
+        chars = result.len(),
+        images = image_count,
+        "Mistral OCR extraction complete"
+    );
+
+    Ok((result, image_count))
 }
 
 #[derive(Debug, Deserialize)]

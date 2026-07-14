@@ -54,7 +54,8 @@ export default function InputBox({ onSubmit, disabled }: Props) {
         throw new Error(err.error || `HTTP ${resp.status}`);
       }
       const data: UploadResponse = await resp.json();
-      if (data.error) throw new Error(data.error);
+      const errMsg = data.error || (!data.extracted_text ? "no text extracted from file" : null);
+      if (errMsg) throw new Error(errMsg);
       setAttachments((prev) =>
         prev.map((a) =>
           a.id === id
@@ -215,11 +216,11 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           {attachments.map((a) => (
             <span
               key={a.id}
-              className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${a.error ? " composer__chip--error" : ""}`}
-              title={a.error || (a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`)}
+              className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${(a.error || !a.extracted_text) ? " composer__chip--error" : ""}`}
+              title={a.error || (!a.extracted_text ? "no text extracted" : a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`)}
             >
               <span className="composer__chip__icon">
-                {a.uploading ? "◌" : a.error ? "✕" : "✓"}
+                {a.uploading ? "◌" : (a.error || !a.extracted_text) ? "✕" : "✓"}
               </span>
               <span className="composer__chip__name">{a.filename}</span>
               {!a.uploading && (
