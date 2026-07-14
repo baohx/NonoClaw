@@ -97,6 +97,12 @@ export default function App() {
     (prompt: string, attachments: AttachmentRef[]) => {
       const cmd = prompt.trim();
       if (cmd === "/clear") {
+        // Cancel any running agent first, then clear — otherwise tool
+        // events keep arriving and resurrect tool cards after the clear.
+        if (agentRunning) {
+          useStore.getState().setAgentRunning(false);
+          send({ type: "cancel" });
+        }
         clearMessages();
         send({ type: "clear" });
         return;
