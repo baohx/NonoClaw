@@ -2,6 +2,7 @@
 //! `src/entrypoints/cli.tsx`. Runs headless (`--print`, piped input, or any
 //! positional prompt) or starts the web UI (`--serve-http`).
 
+mod attachments;
 mod commands;
 mod project_info;
 mod remote;
@@ -377,6 +378,7 @@ async fn main() -> Result<()> {
 
     // Web UI server: HTTP + WebSocket.
     if let Some(addr) = &cli.serve_http {
+        let doc_model = settings.doc_model.clone();
         tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
             addr,
@@ -392,6 +394,7 @@ async fn main() -> Result<()> {
             cli.public_url.clone(),
             cli.tunnel,
             model_profiles,
+            doc_model,
         )
         .await?;
         return Ok(());

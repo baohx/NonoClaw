@@ -17,6 +17,8 @@ import StatusBar from "./components/StatusBar";
 const WS_PROTO = window.location.protocol === "https:" ? "wss" : "ws";
 const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
 
+import type { AttachmentRef } from "./types";
+
 export default function App() {
   const { send, forceReconnect } = useWebSocket(WS_URL);
   const connectionStatus = useStore((s) => s.connectionStatus);
@@ -92,7 +94,7 @@ export default function App() {
   const agentRunning = useStore((s) => s.agentRunning);
 
   const handleSubmit = useCallback(
-    (prompt: string) => {
+    (prompt: string, attachments: AttachmentRef[]) => {
       const cmd = prompt.trim();
       if (cmd === "/clear") {
         clearMessages();
@@ -164,7 +166,7 @@ export default function App() {
       useStore.getState().setAgentRunning(true);
       const activeModel = useStore.getState().availableModels.length > 0
         ? useStore.getState().model : undefined;
-      send({ type: "run", prompt, model: activeModel, append_system_prompt: append });
+      send({ type: "run", prompt, model: activeModel, append_system_prompt: append, attachments: attachments.length ? attachments : undefined });
     },
     [send, clearMessages, addMessage]
   );

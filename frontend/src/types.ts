@@ -220,6 +220,20 @@ export type ServerMsg =
 
 // ── Browser → Server messages ─────────────────────────────────────────────
 
+export interface AttachmentRef {
+  id: string;
+  filename: string;
+  extracted_text: string;
+}
+
+export interface UploadResponse {
+  id: string;
+  filename: string;
+  extracted_text: string;
+  image_count: number;
+  error?: string;
+}
+
 export interface RunRequest {
   type: "run";
   prompt: string;
@@ -227,6 +241,8 @@ export interface RunRequest {
   max_turns?: number;
   /** Skill body injected into system prompt (from /skill-name). */
   append_system_prompt?: string;
+  /** Pre-extracted file attachments. */
+  attachments?: AttachmentRef[];
 }
 
 export interface CancelRequest {

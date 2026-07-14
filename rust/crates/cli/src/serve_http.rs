@@ -25,11 +25,12 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use nonoclaw_api::Client;
-use nonoclaw_core::{Message, PermissionDecision};
+use nonoclaw_core::{ContentBlock, ImageSource, Message, MessageContent, PermissionDecision};
 use nonoclaw_engine::{substitute_arguments, EngineEvent, EngineOptions, ModelProfile, PermissionRequest, QueryEngine, SkillsManager};
 use nonoclaw_tools::tool::{QuestionRequest, QuestionResolver};
 use nonoclaw_tools::{McpServerConfig, TodoStore, ToolRegistry};
 
+use crate::attachments;
 use crate::project_info::{gather, ProjectInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex};
@@ -61,6 +62,9 @@ enum ClientMsg {
         /// Raw argument string for skill invocation.
         #[serde(default)]
         arguments: Option<String>,
+        /// Attached files whose content has been pre-extracted.
+        #[serde(default)]
+        attachments: Option<Vec<AttachmentRef>>,
     },
     Cancel,
     Clear,
@@ -96,6 +100,24 @@ enum ClientMsg {
     SetPermissionMode { mode: String },
     /// Switch the active model at runtime (from the multi-model dropdown).
     SetModel { name: String },
+}
+
+/// Metadata for an uploaded + pre-extracted file attachment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachmentRef {
+    id: String,
+    filename: String,
+    extracted_text: String,
+}
+
+/// Response from POST /api/upload.
+#[derive(Debug, Serialize)]
+struct UploadResponse {
+    id: String,
+    filename: String,
+    extracted_text: String,
+    image_count: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -218,6 +240,10 @@ struct AppState {
     skills_manager: Arc<RwLock<SkillsManager>>,
     /// Background task registry for run_in_background bash commands.
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
+    /// Document processing model config (from settings).
+    doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
+    /// Directory where uploaded attachments are stored.
+    upload_dir: PathBuf,
 }
 
 // ── Per-connection session ──────────────────────────────────────────────────
@@ -305,6 +331,40 @@ impl QuestionResolver for WsQuestionResolver {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Prepend extracted file content to the user's prompt so the model receives
+/// document text as part of the conversation turn.
+fn enrich_prompt_with_attachments(
+    prompt: &str,
+    attachments: &Option<Vec<AttachmentRef>>,
+) -> String {
+    let atts = match attachments {
+        Some(a) => a,
+        None => return prompt.to_string(),
+    };
+    if atts.is_empty() {
+        return prompt.to_string();
+    }
+
+    let mut parts = String::new();
+    parts.push_str("The user has attached the following files:\n\n");
+    for a in atts {
+        parts.push_str(&format!("## File: {}\n\n", a.filename));
+        let text = &a.extracted_text;
+        if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
+            let truncated: String = text.chars().take(attachments::MAX_INLINE_TEXT_CHARS).collect();
+            parts.push_str(&truncated);
+            parts.push_str("\n\n[... content truncated — the full file is available on disk]\n\n");
+        } else {
+            parts.push_str(text);
+            parts.push_str("\n\n");
+        }
+    }
+    parts.push_str("---\n\n");
+    parts.push_str("## User message\n\n");
+    parts.push_str(prompt);
+    parts
+}
 
 fn serialize_event(ev: &EngineEvent) -> serde_json::Value {
     match serde_json::to_value(ev) {
@@ -698,6 +758,128 @@ async fn spawn_tunnel(local_addr: &str) -> Option<String> {
     found
 }
 
+// ── Upload handler ──────────────────────────────────────────────────────────
+
+async fn upload_handler(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+
+    // Check doc model is configured.
+    let doc_model = match &state.doc_model {
+        Some(c) if c.is_enabled() => c.clone(),
+        _ => {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_IMPLEMENTED)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"error":"document processing not configured; set docModel in settings.json"}"#,
+                ))
+                .unwrap();
+        }
+    };
+
+    // Parse the first file field.
+    let mut file_bytes: Vec<u8> = Vec::new();
+    let mut filename = String::new();
+
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            filename = field
+                .file_name()
+                .unwrap_or("untitled")
+                .to_string();
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        file_bytes.extend_from_slice(chunk.as_ref());
+                        if file_bytes.len() > attachments::MAX_FILE_SIZE as usize {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                .header("content-type", "application/json")
+                                .body(Body::from(format!(
+                                    r#"{{"error":"file exceeds {} MB limit"}}"#,
+                                    attachments::MAX_FILE_SIZE / (1024 * 1024)
+                                )))
+                                .unwrap();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("multipart chunk error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if file_bytes.is_empty() {
+        return axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"error":"no file provided"}"#))
+            .unwrap();
+    }
+
+    // Validate extension.
+    if !attachments::is_allowed_extension(&filename) {
+        return axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"error":"unsupported file type; allowed: {}"}}"#,
+                attachments::ALLOWED_EXTENSIONS.join(", ")
+            )))
+            .unwrap();
+    }
+
+    // Write file to disk.
+    let upload_id = Uuid::new_v4().to_string();
+    let safe_name = attachments::sanitize_filename(&filename);
+    let file_dir = state.upload_dir.join(&upload_id);
+    if let Err(e) = std::fs::create_dir_all(&file_dir) {
+        return axum::response::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"error":"storage error: {e}"}}"#)))
+            .unwrap();
+    }
+    let stored_path = file_dir.join(&safe_name);
+    if let Err(e) = std::fs::write(&stored_path, &file_bytes) {
+        return axum::response::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"error":"write error: {e}"}}"#)))
+            .unwrap();
+    }
+
+    // Process the file through the doc model.
+    let extracted = attachments::process_file(&doc_model, &stored_path, &safe_name, &upload_id).await;
+
+    let resp = UploadResponse {
+        id: extracted.id,
+        filename: extracted.filename,
+        extracted_text: extracted.extracted_text,
+        image_count: extracted.image_count,
+        error: extracted.error,
+    };
+
+    let body = match serde_json::to_string(&resp) {
+        Ok(s) => s,
+        Err(e) => format!(r#"{{"error":"serialization error: {e}"}}"#),
+    };
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 pub async fn serve(
     addr: &str,
     client: Arc<Client>,
@@ -712,6 +894,7 @@ pub async fn serve(
     public_url: Option<String>,
     tunnel: bool,
     model_profiles: Vec<ModelProfile>,
+    doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
 ) -> anyhow::Result<()> {
     // Bind the listener FIRST so the port is open before cloudflared tries
     // to connect (otherwise tunnel spawn races the bind and gets "connection
@@ -739,6 +922,19 @@ pub async fn serve(
         .map(|p| p.name.clone())
         .unwrap_or_else(|| model.clone());
     tracing::info!(auth_token, %active_model, "mobile auth token generated");
+
+    // File upload storage: ~/.nonoclaw/projects/<cwd>/uploads/
+    let upload_dir = nonoclaw_engine::session::home_root()
+        .map(|r| r.join("projects").join(
+            cwd.to_string_lossy()
+                .trim_start_matches('/')
+                .replace('/', "-")
+        ).join("uploads"))
+        .unwrap_or_else(|| cwd.join(".nonoclaw/uploads"));
+    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+        tracing::warn!(dir=%upload_dir.display(), "cannot create upload dir: {e}");
+    }
+
     let state = Arc::new(AppState {
         model_profiles,
         active_model: Arc::new(Mutex::new(active_model)),
@@ -761,6 +957,8 @@ pub async fn serve(
         background_registry: Arc::new(std::sync::Mutex::new(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
+        doc_model,
+        upload_dir,
     });
 
     // Spawn file watcher for hot-reloading skills.
@@ -791,6 +989,7 @@ pub async fn serve(
     // Always register the WebSocket route + PWA manifest + service worker.
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/upload", axum::routing::post(upload_handler))
         .route("/manifest.json", get(serve_manifest))
         .route("/sw.js", get(serve_sw))
         .with_state(state);
@@ -1205,6 +1404,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 max_turns,
                 append_system_prompt,
                 arguments,
+                attachments,
             } => {
                 tracing::info!(prompt = %prompt, model = ?model, "ws run request");
                 // Require an active session.
@@ -1413,6 +1613,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         Some(session_file),
                     );
 
+                    // Enrich the prompt with attachment content.
+                    let enriched_prompt = enrich_prompt_with_attachments(&prompt, &attachments);
+
                     // Order-preserving event relay: sync callback → channel →
                     // single consumer task → WebSocket.
                     let (ev_tx_chan, mut ev_rx_chan) =
@@ -1429,9 +1632,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         }
                     });
 
-                    tracing::debug!(prompt = %prompt, "starting engine run");
+                    tracing::debug!(prompt = %enriched_prompt, "starting engine run");
                     let result = engine
-                        .run(&prompt, &s.cwd, |ev| {
+                        .run(&enriched_prompt, &s.cwd, |ev| {
                             tracing::debug!(kind = ?ev, "engine event");
                             let msg = ServerMsg::Event {
                                 event: serialize_event(ev),

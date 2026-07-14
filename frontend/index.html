@@ -944,6 +944,97 @@
       .composer__send__arrow { transition: transform 0.15s ease; display: inline-block; }
       .composer__send:hover:not(:disabled) .composer__send__arrow { transform: translate(2px, -2px); }
 
+      /* ── Attachments (chips + drag-drop + paperclip) ──────────────────── */
+      .composer__attach {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+      }
+      .composer__attach:hover:not(:disabled) {
+        color: var(--mint);
+        border-color: var(--mint);
+        background: rgba(94, 234, 212, 0.08);
+      }
+      .composer__attach:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+      }
+      .composer__shell--dragover {
+        border-color: var(--mint) !important;
+        box-shadow: 0 0 0 1px var(--mint), 0 0 24px rgba(94, 234, 212, 0.18) !important;
+      }
+      .composer__attachments {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 6px 12px 2px;
+      }
+      .composer__chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 8px;
+        border-radius: 6px;
+        background: rgba(13, 20, 30, 0.7);
+        border: 1px solid var(--border);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text);
+        max-width: 240px;
+        transition: border-color 0.15s ease;
+      }
+      .composer__chip__icon {
+        flex-shrink: 0;
+        font-size: 10px;
+        width: 14px;
+        text-align: center;
+      }
+      .composer__chip--uploading { color: var(--amber); }
+      .composer__chip--uploading .composer__chip__icon { color: var(--amber); animation: spin 1s linear infinite; }
+      .composer__chip--error { color: var(--rose); border-color: rgba(251, 43, 115, 0.35); }
+      .composer__chip--error .composer__chip__icon { color: var(--rose); }
+      .composer__chip--done .composer__chip__icon { color: var(--mint); }
+      .composer__chip__name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .composer__chip__remove {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        border: none;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--faint);
+        cursor: pointer;
+        font-size: 12px;
+        flex-shrink: 0;
+        transition: color 0.15s ease, background 0.15s ease;
+      }
+      .composer__chip__remove:hover { color: var(--rose); background: rgba(251, 43, 115, 0.1); }
+
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      /* Mobile: composer tweaks */
+      @media (max-width: 768px) {
+        .composer__chip {
+          max-width: 160px;
+          font-size: 10px;
+        }
+      }
+
       /* ── Connect overlay ───────────────────────────────────────────────── */
       .connect-overlay {
         position: fixed; inset: 0; z-index: 50;

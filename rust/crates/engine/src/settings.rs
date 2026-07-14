@@ -51,6 +51,9 @@ pub struct SettingsFile {
     /// carries its own base_url + api_key so different providers can be used.
     #[serde(default)]
     pub models: Option<Vec<ModelProfile>>,
+    /// Document processing model for file attachment extraction.
+    #[serde(rename = "docModel", default)]
+    pub doc_model: Option<DocModelConfig>,
     // Passthrough: preserve unknown fields.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -68,6 +71,53 @@ pub struct ModelProfile {
     pub api_key: String,
     #[serde(default)]
     pub default: bool,
+}
+
+/// Document processing model config. When set, uploaded files (PDF, DOCX, images)
+/// are routed through a multimodal model for content extraction instead of using
+/// traditional OCR/text-extraction libraries.
+///
+/// Configured in settings.json under `docModel`:
+/// ```json
+/// { "docModel": { "provider": "mistral_ocr", "model": "mistral-ocr-latest",
+///   "baseUrl": "https://api.mistral.ai", "apiKey": "$MISTRAL_API_KEY" } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocModelConfig {
+    /// Provider backend: "mistral_ocr", "gemini", "generic_vision", or "none".
+    pub provider: String,
+    /// Model id (e.g. "mistral-ocr-latest", "gemini-3.5-flash", "gpt-4o").
+    pub model: String,
+    /// API base URL for the provider.
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    /// API key (supports $ENV_VAR substitution).
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+impl DocModelConfig {
+    /// Resolve `$VAR` references in api_key against the process environment.
+    pub fn resolved_api_key(&self) -> String {
+        resolve_env_var(&self.api_key)
+    }
+
+    /// Is document processing enabled?
+    pub fn is_enabled(&self) -> bool {
+        !self.provider.is_empty()
+            && self.provider != "none"
+            && !self.api_key.is_empty()
+            && !self.base_url.is_empty()
+    }
+}
+
+fn resolve_env_var(raw: &str) -> String {
+    if raw.starts_with('$') {
+        let var = &raw[1..];
+        std::env::var(var).unwrap_or_else(|_| raw.to_string())
+    } else {
+        raw.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +227,10 @@ pub fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
     // models: later overlay replaces the entire array.
     if overlay.models.is_some() {
         base.models = overlay.models.clone();
+    }
+    // docModel: later overlay replaces.
+    if overlay.doc_model.is_some() {
+        base.doc_model = overlay.doc_model.clone();
     }
     // passthrough extras: overwrite matching keys.
     for (k, v) in &overlay.extra {
