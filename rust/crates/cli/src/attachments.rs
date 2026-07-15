@@ -395,60 +395,50 @@ async fn process_deepseek_ocr(
 
     // DeepSeek OCR 2 uses the `<image>` token + specialised prompt format.
     const OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
-    // JPEG at 1024px produces ~20-60 KB — well under the 8192 token API limit.
-    const MAX_IMAGE_DIM: u32 = 1024;
+    const TILE_SIZE: u32 = 768;
+    const GLOBAL_SIZE: u32 = 1024;
 
     for (i, (_img_mime, img_bytes)) in images.iter().enumerate() {
-        let payload = resize_for_ocr(img_bytes, MAX_IMAGE_DIM);
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload);
-
-        let body = serde_json::json!({
-            "model": config.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:image/png;base64,{b64}") }
-                    },
-                    {
-                        "type": "text",
-                        "text": OCR_PROMPT
-                    }
-                ]
-            }],
-            "max_tokens": 8192,
-            "temperature": 0.0
-        });
-
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("DeepSeek OCR request failed for page {}: {e}", i + 1))?;
-
-        let status = resp.status();
-        let resp_text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            tracing::warn!(%status, %resp_text, "DeepSeek OCR error");
-            return Err(format!(
-                "DeepSeek OCR returned {} for page {}: {}",
-                status.as_u16(), i + 1, resp_text
-            ));
-        }
-
-        let response: serde_json::Value = serde_json::from_str(&resp_text)
-            .map_err(|e| format!("failed to parse DeepSeek OCR response: {e}"))?;
-
-        if let Some(t) = response["choices"][0]["message"]["content"].as_str() {
-            if images.len() > 1 {
-                full_text.push_str(&format!("## Page {}\n\n", i + 1));
+        let img = match image::load_from_memory(img_bytes) {
+            Ok(i) => i,
+            Err(_) => {
+                return Err("failed to decode image".into());
             }
-            full_text.push_str(t);
-            full_text.push_str("\n\n");
+        };
+        let (iw, ih) = (img.width(), img.height());
+
+        // Strategy: send one global downscaled view + tiles for detail.
+        // This mirrors the model's native crop_mode behaviour.
+        let global =
+            img.resize_exact(GLOBAL_SIZE, GLOBAL_SIZE, image::imageops::FilterType::Lanczos3);
+        let tiles = tile_image(&img, TILE_SIZE);
+
+        // 1. Global overview first.
+        let gb64 = encode_jpeg_base64(&global);
+        let page_text = call_ocr_page(&client, &url, &api_key, config, &gb64, "global").await?;
+        full_text.push_str(&page_text);
+        full_text.push('\n');
+
+        // 2. Then each tile.
+        for (ti, tile) in tiles.iter().enumerate() {
+            let tb64 = encode_jpeg_base64(tile);
+            let tile_text =
+                call_ocr_page(&client, &url, &api_key, config, &tb64, &format!("tile {ti}")).await?;
+            full_text.push_str(&tile_text);
+            full_text.push('\n');
         }
+
+        if images.len() > 1 {
+            full_text.push_str(&format!("\n## Page {} end\n\n", i + 1));
+        }
+
+        tracing::info!(
+            page = i,
+            dims = format!("{iw}x{ih}"),
+            tiles = tiles.len(),
+            chars = full_text.len(),
+            "DeepSeek OCR tiled extraction"
+        );
     }
 
     tracing::info!(
@@ -484,6 +474,107 @@ fn resize_for_ocr(bytes: &[u8], max_dim: u32) -> Vec<u8> {
         Ok(()) => out.into_inner(),
         Err(_) => bytes.to_vec(),
     }
+}
+
+/// Split an image into `tile_size × tile_size` tiles, with overlap.
+fn tile_image(img: &image::DynamicImage, tile_size: u32) -> Vec<image::DynamicImage> {
+    let (w, h) = (img.width(), img.height());
+    // If the image is smaller than tile_size, no tiling needed — just return it.
+    if w <= tile_size && h <= tile_size {
+        return vec![img.clone()];
+    }
+    let step = tile_size / 2; // 50 % overlap
+    let mut tiles = Vec::new();
+    let mut y = 0u32;
+    while y < h {
+        let mut x = 0u32;
+        while x < w {
+            let tw = tile_size.min(w - x);
+            let th = tile_size.min(h - y);
+            let tile = img.crop_imm(x, y, tw, th);
+            tiles.push(tile);
+            x += step;
+        }
+        y += step;
+    }
+    // Cap at 12 tiles (matches model's default MAX_CROPS=6 for 2-axis).
+    if tiles.len() > 12 {
+        tiles.truncate(12);
+    }
+    tiles
+}
+
+/// Encode an image as JPEG base64, for the OCR API.
+fn encode_jpeg_base64(img: &image::DynamicImage) -> String {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    // Best-effort: ignore encoding errors and fall back to raw bytes.
+    let data = if img
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .is_ok()
+    {
+        buf.into_inner()
+    } else {
+        return String::new();
+    };
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data)
+}
+
+/// Call the OCR API for one image (global or tile), return the markdown text.
+async fn call_ocr_page(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    config: &DocModelConfig,
+    b64: &str,
+    label: &str,
+) -> Result<String, String> {
+    if b64.is_empty() {
+        return Ok(String::new());
+    }
+    let body = serde_json::json!({
+        "model": config.model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/jpeg;base64,{b64}") }
+                },
+                {
+                    "type": "text",
+                    "text": "<image>\n<|grounding|>Convert the document to markdown."
+                }
+            ]
+        }],
+        "max_tokens": 4096,
+        "temperature": 0.0
+    });
+
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OCR request failed ({label}): {e}"))?;
+
+    let status = resp.status();
+    let resp_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "OCR returned {} ({label}): {}",
+            status.as_u16(),
+            resp_text
+        ));
+    }
+
+    let response: serde_json::Value = serde_json::from_str(&resp_text)
+        .map_err(|e| format!("OCR parse error ({label}): {e}"))?;
+
+    Ok(response["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 // ── Stub providers ──────────────────────────────────────────────────────────
