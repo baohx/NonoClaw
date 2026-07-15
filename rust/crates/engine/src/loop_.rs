@@ -265,10 +265,19 @@ impl QueryEngine {
     /// Run the agent loop on a user prompt. `on_event` receives live updates.
     pub async fn run(
         &mut self,
-        user_input: &str,
+        user_content: MessageContent,
         cwd: &Path,
         mut on_event: impl FnMut(&EngineEvent),
     ) -> Result<FinalResult> {
+        // Extract a plain-text preview for hooks / logging.
+        let user_text = match &user_content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(bs) => bs.iter()
+                .filter_map(|b| match b { ContentBlock::Text { text, .. } => Some(text.as_str()), _ => None })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+
         self.hooks = crate::hooks::load_hooks(cwd);
         // SessionStart + UserPromptSubmit hooks
         crate::hooks::run_hooks(
@@ -282,7 +291,7 @@ impl QueryEngine {
             &self.hooks,
             crate::hooks::HookType::UserPromptSubmit,
             "*",
-            &crate::hooks::prompt_context(user_input),
+            &crate::hooks::prompt_context(&user_text),
         )
         .await;
         // Begin persistence: write the session header once, then each message
@@ -294,7 +303,7 @@ impl QueryEngine {
                 tracing::warn!("failed to write session header: {e}");
             }
         }
-        let user_msg = Message::user(MessageContent::from_text(user_input));
+        let user_msg = Message::user(user_content.clone());
         self.messages.push(user_msg.clone());
         self.persist(&user_msg);
 
@@ -371,7 +380,7 @@ impl QueryEngine {
         let mut last_skills_version: u64 = 0;
         if let Some(ref mgr) = self.options.skills_manager {
             let mut guard = mgr.write().unwrap();
-            let triggered = guard.match_triggers(user_input);
+            let triggered = guard.match_triggers(&user_text);
             if !triggered.is_empty() {
                 tracing::info!(?triggered, "skills triggered by user input");
             }
@@ -1003,7 +1012,7 @@ impl SubagentRunner for EngineSubagent {
                 child_todos,
                 child_opts,
             );
-            let result = engine.run(prompt, &self.cwd, |_| {}).await?;
+            let result = engine.run(MessageContent::from_text(prompt), &self.cwd, |_| {}).await?;
             // SubagentStop hook (fire-and-forget)
             let text = result.text.clone();
             let hooks = self.hooks.clone();

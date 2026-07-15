@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use nonoclaw_api::{Client, ThinkingConfig};
-use nonoclaw_core::{Message, PermissionMode, Usage};
+use nonoclaw_core::{Message, MessageContent, PermissionMode, Usage};
 use nonoclaw_engine::{EngineEvent, EngineOptions, QueryEngine, SkillsManager};
 use nonoclaw_tools::register_all;
 use serde_json::json;
@@ -423,7 +423,7 @@ async fn main() -> Result<()> {
 
     let json = matches!(cli.output_format, OutputFormat::Json);
     let result = engine
-        .run(&prompt, &cwd, |ev| handle_event(json, ev))
+        .run(MessageContent::from_text(&prompt), &cwd, |ev| handle_event(json, ev))
         .await
         .context("agent run failed")?;
 

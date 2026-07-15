@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nonoclaw_api::Client;
-use nonoclaw_core::PermissionMode;
+use nonoclaw_core::{MessageContent, PermissionMode};
 use nonoclaw_engine::{EngineOptions, QueryEngine};
 use nonoclaw_tools::{register_all, ToolRegistry};
 
@@ -68,7 +68,7 @@ async fn main() {
         // --- Agent A: generate a problem ---
         questioner.clear();
         let q_result = questioner
-            .run("出一道2位数加减法题目", &cwd, |_| {})
+            .run(MessageContent::from_text("出一道2位数加减法题目"), &cwd, |_| {})
             .await
             .expect("questioner failed");
         let problem = q_result.text.trim().to_string();
@@ -77,7 +77,7 @@ async fn main() {
         // --- Agent B: answer the problem ---
         answerer.clear();
         let a_result = answerer
-            .run(&problem, &cwd, |_| {})
+            .run(MessageContent::from_text(&problem), &cwd, |_| {})
             .await
             .expect("answerer failed");
         let answer = a_result.text.trim().to_string();

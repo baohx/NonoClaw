@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nonoclaw_api::Client;
-use nonoclaw_core::PermissionMode;
+use nonoclaw_core::{MessageContent, PermissionMode};
 use nonoclaw_engine::{EngineEvent, EngineOptions, FinalResult, QueryEngine};
 use nonoclaw_tools::register_all;
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ async fn handle_conn(stream: TcpStream) -> Result<()> {
     });
 
     let result = engine
-        .run(&req.prompt, &cwd, |ev: &EngineEvent| {
+        .run(MessageContent::from_text(&req.prompt), &cwd, |ev: &EngineEvent| {
             let _ = tx.try_send(ToWire::Event(ev.clone()));
         })
         .await;

@@ -347,46 +347,64 @@ impl QuestionResolver for WsQuestionResolver {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Prepend extracted file content to the user's prompt so the model receives
-/// document text as part of the conversation turn. Extracted images are noted
-/// but passed as text for now (full ContentBlock::Image injection requires
-/// engine-level changes to the User message construction).
+/// Build a user message from attachment content + the user's prompt.
+///
+/// Files that were OCR'd / processed have their text prepended.  When the
+/// doc model returned extracted images (base64), they are injected as
+/// `ContentBlock::Image` blocks so multimodal models can "see" the document
+/// visually alongside the extracted text.
 fn enrich_prompt_with_attachments(
     prompt: &str,
     attachments: &Option<Vec<AttachmentRef>>,
-) -> String {
+) -> MessageContent {
     let atts = match attachments {
-        Some(a) => a,
-        None => return prompt.to_string(),
+        Some(a) if !a.is_empty() => a,
+        _ => return MessageContent::from_text(prompt),
     };
-    if atts.is_empty() {
-        return prompt.to_string();
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+
+    blocks.push(ContentBlock::text(
+        "The user has attached the following files. Their content has already been extracted and is shown below — you do NOT need to read or process these files. Just use the content directly.\n\n",
+    ));
+
+    for a in atts {
+        blocks.push(ContentBlock::text(format!("## File: {}\n\n", a.filename)));
+
+        // Inject extracted images first so the model can see them visually.
+        for img in &a.images {
+            if img.data.len() < 2_000_000 {
+                // ~1.5 MB base64 → API size-safe
+                blocks.push(ContentBlock::Image {
+                    source: ImageSource {
+                        kind: "base64".into(),
+                        media_type: img.media_type.clone(),
+                        data: img.data.clone(),
+                    },
+                });
+                blocks.push(ContentBlock::text(format!(
+                    "(extracted image: {})\n",
+                    img.media_type
+                )));
+            }
+        }
+
+        let text = &a.extracted_text;
+        let display = if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
+            let truncated: String =
+                text.chars().take(attachments::MAX_INLINE_TEXT_CHARS).collect();
+            format!("{truncated}\n\n[... content truncated — the full file is available on disk]\n\n")
+        } else {
+            format!("{text}\n\n")
+        };
+        blocks.push(ContentBlock::text(display));
     }
 
-    let mut parts = String::new();
-    parts.push_str("The user has attached the following files. Their content has already been extracted and is shown below — you do NOT need to read or process these files. Just use the content directly.\n\n");
-    for a in atts {
-        parts.push_str(&format!("## File: {}\n\n", a.filename));
-        if !a.images.is_empty() {
-            parts.push_str(&format!(
-                "({} image(s) were extracted from this file and are available for visual reference)\n\n",
-                a.images.len()
-            ));
-        }
-        let text = &a.extracted_text;
-        if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
-            let truncated: String = text.chars().take(attachments::MAX_INLINE_TEXT_CHARS).collect();
-            parts.push_str(&truncated);
-            parts.push_str("\n\n[... content truncated — the full file is available on disk]\n\n");
-        } else {
-            parts.push_str(text);
-            parts.push_str("\n\n");
-        }
-    }
-    parts.push_str("---\n\n");
-    parts.push_str("## User message\n\n");
-    parts.push_str(prompt);
-    parts
+    blocks.push(ContentBlock::text(format!(
+        "---\n\n## User message\n\n{prompt}"
+    )));
+
+    MessageContent::from_blocks(blocks)
 }
 
 fn serialize_event(ev: &EngineEvent) -> serde_json::Value {
@@ -1631,7 +1649,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             format!("fork-{}", Uuid::new_v4()),
                             None,
                         );
-                        match fork_engine.run(&body, &s.cwd, |_ev| {}).await {
+                        match fork_engine.run(MessageContent::from_text(&body), &s.cwd, |_ev| {}).await {
                             Ok(result) => {
                                 send_msg(&tx2, ServerMsg::Done {
                                     text: result.text,
@@ -1712,8 +1730,8 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         Some(session_file),
                     );
 
-                    // Enrich the prompt with attachment content.
-                    let enriched_prompt = enrich_prompt_with_attachments(&prompt, &attachments);
+                    // Enrich the prompt with attachment content + images.
+                    let enriched = enrich_prompt_with_attachments(&prompt, &attachments);
 
                     // Order-preserving event relay: sync callback → channel →
                     // single consumer task → WebSocket.
@@ -1731,9 +1749,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         }
                     });
 
-                    tracing::debug!(prompt = %enriched_prompt, "starting engine run");
+                    tracing::debug!("starting engine run (attachments: {})", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
                     let result = engine
-                        .run(&enriched_prompt, &s.cwd, |ev| {
+                        .run(enriched, &s.cwd, |ev| {
                             tracing::debug!(kind = ?ev, "engine event");
                             let msg = ServerMsg::Event {
                                 event: serialize_event(ev),
