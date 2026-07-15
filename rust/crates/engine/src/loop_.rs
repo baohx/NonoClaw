@@ -494,7 +494,7 @@ impl QueryEngine {
                 model: self.options.model.clone(),
                 max_tokens: self.options.max_tokens,
                 system: system_blocks.clone(),
-                messages: self.messages.clone(),
+                messages: strip_thinking(&self.messages),
                 tools: tool_defs.clone(),
                 tool_choice: None,
                 thinking: self.options.thinking.clone(),
@@ -528,7 +528,7 @@ impl QueryEngine {
                                 "repaired orphaned tool_use/tool_result pairs, retrying"
                             );
                             let params2 = RequestParams {
-                                messages: self.messages.clone(),
+                                messages: strip_thinking(&self.messages),
                                 ..params.clone()
                             };
                             self.client.run_turn(&params2, |ev| match ev {
@@ -1035,6 +1035,39 @@ impl SubagentRunner for EngineSubagent {
             futures::future::join_all(futs).await
         })
     }
+}
+
+/// Strip `thinking` blocks from every message so they aren't sent back to
+/// the API.  Needed for Bedrock-based proxies that reject `signature` fields
+/// in thinking blocks.  Thinking content is internal-only; stripping it is
+/// safe for all providers.
+pub fn strip_thinking(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| {
+            let content = match &m.content {
+                MessageContent::Text(_) => return m.clone(),
+                MessageContent::Blocks(blocks) => {
+                    let filtered: Vec<ContentBlock> = blocks
+                        .iter()
+                        .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                        .cloned()
+                        .collect();
+                    if filtered.is_empty() {
+                        // Don't send empty messages — replace with a
+                        // minimal placeholder.
+                        MessageContent::from_text("(thinking omitted)")
+                    } else {
+                        MessageContent::from_blocks(filtered)
+                    }
+                }
+            };
+            Message {
+                role: m.role,
+                content,
+            }
+        })
+        .collect()
 }
 
 /// Repair orphaned `tool_use` blocks in a message sequence. The Anthropic API
