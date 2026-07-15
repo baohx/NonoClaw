@@ -125,13 +125,29 @@ pub async fn process_file(
     }
 
     match result {
-        Ok((text, image_count, images)) => ExtractedDoc {
-            id: upload_id.into(),
-            filename: original_name.into(),
-            extracted_text: text,
-            image_count,
-            images_base64: images,
-            error: None,
+        Ok((text, image_count, mut images)) => {
+            // Fallback: if the input itself is an image but the doc model
+            // didn't extract any, include the original so the multimodal
+            // conversation model can still "see" it visually.
+            if images.is_empty() && mime.starts_with("image/") {
+                if let Ok(data) = std::fs::read(process_target) {
+                    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+                    if b64.len() < 2_000_000 {
+                        images.push(ImageB64 {
+                            media_type: mime.to_string(),
+                            data: b64,
+                        });
+                    }
+                }
+            }
+            ExtractedDoc {
+                id: upload_id.into(),
+                filename: original_name.into(),
+                extracted_text: text,
+                image_count,
+                images_base64: images,
+                error: None,
+            }
         },
         Err(e) => ExtractedDoc {
             id: upload_id.into(),
