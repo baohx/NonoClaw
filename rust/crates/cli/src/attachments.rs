@@ -397,7 +397,7 @@ async fn process_generic_vision_stub(
 
     let api_key = config.resolved_api_key();
     let url = format!(
-        "{}/chat/completions",
+        "{}/v1/chat/completions",
         config.base_url.trim_end_matches('/')
     );
     let client = reqwest::Client::new();
