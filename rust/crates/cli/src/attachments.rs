@@ -395,9 +395,14 @@ async fn process_deepseek_ocr(
 
     // DeepSeek OCR 2 uses the `<image>` token + specialised prompt format.
     const OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
+    // ~4 KB base64 after resize — fits comfortably in 8192 token context.
+    const MAX_IMAGE_DIM: u32 = 1600;
 
     for (i, (_img_mime, img_bytes)) in images.iter().enumerate() {
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, img_bytes);
+        // Resize large images so the base64 payload fits in the model's
+        // 8192-token context window.
+        let payload = resize_if_large(img_bytes, MAX_IMAGE_DIM);
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload);
 
         let body = serde_json::json!({
             "model": config.model,
@@ -455,6 +460,29 @@ async fn process_deepseek_ocr(
     );
 
     Ok((full_text.trim().to_string(), 0, vec![]))
+}
+
+/// Resize image bytes to fit within `max_dim` on the longest side.
+/// Returns the (possibly resized) PNG bytes.  Passes through unchanged if
+/// already small enough or if decoding fails.
+fn resize_if_large(bytes: &[u8], max_dim: u32) -> Vec<u8> {
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(_) => return bytes.to_vec(),
+    };
+    let (w, h) = (img.width(), img.height());
+    if w <= max_dim && h <= max_dim {
+        return bytes.to_vec();
+    }
+    let ratio = max_dim as f64 / w.max(h) as f64;
+    let nw = (w as f64 * ratio) as u32;
+    let nh = (h as f64 * ratio) as u32;
+    let resized = img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3);
+    let mut out = std::io::Cursor::new(Vec::new());
+    match resized.write_to(&mut out, image::ImageFormat::Png) {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes.to_vec(),
+    }
 }
 
 // ── Stub providers ──────────────────────────────────────────────────────────
