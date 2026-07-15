@@ -82,13 +82,17 @@ pub enum DocModelSetting {
 
 /// A model profile: name + endpoint + credentials, for multi-model switching.
 ///
-/// The optional `role` field tags the model's purpose:
-/// - absent / `"main"` → conversation model (appears in the UI dropdown)
-/// - `"doc"` → document-processing model (used by the attachment pipeline)
-/// - `"compact"` → summarization model (used for transcript compaction)
+/// The `role` field tags what this model is used for.  A model can have
+/// multiple roles — e.g. `["main", "compact"]` means the same model serves as
+/// both a conversation model and the compaction summarizer.
 ///
-/// When `role` is set, the model can be referenced by name from `docModel` /
-/// `compactModel` top-level settings instead of repeating credentials.
+/// Roles:
+/// - `"main"` → conversation model (appears in the UI dropdown)
+/// - `"doc"` → document-processing model (referenced by `docModel`)
+/// - `"compact"` → summarization model (referenced by `compactModel`)
+///
+/// When a model is referenced by name from `docModel` / `compactModel`, its
+/// credentials (base_url, api_key) are read from the matching `models[]` entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub name: String,
@@ -100,19 +104,52 @@ pub struct ModelProfile {
     pub api_key: String,
     #[serde(default)]
     pub default: bool,
-    /// Optional role tag: "main", "doc", or "compact". Defaults to "main".
-    #[serde(default)]
-    pub role: Option<String>,
-    /// Provider backend for doc models ("mistral_ocr", "gemini", "generic_vision").
-    /// Only meaningful when `role == "doc"`.
-    #[serde(default)]
-    pub provider: Option<String>,
+    /// Role tags.  Accepts a single string or an array in JSON.
+    /// Absent / empty → treated as `["main"]`.
+    #[serde(default, deserialize_with = "deserialize_roles")]
+    pub role: Vec<String>,
+}
+
+/// Accept `"role": "main"` (single string) or `"role": ["main", "doc"]` (array).
+fn deserialize_roles<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::de;
+    struct RoleVisitor;
+    impl<'de> de::Visitor<'de> for RoleVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<String>, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut v = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                v.push(s);
+            }
+            Ok(v)
+        }
+    }
+    d.deserialize_any(RoleVisitor)
 }
 
 impl ModelProfile {
     /// True if this model should appear in the frontend's model-selection dropdown.
     pub fn is_conversation_model(&self) -> bool {
-        self.role.is_none() || self.role.as_deref() == Some("main")
+        self.role.is_empty() || self.role.contains(&"main".to_string())
+    }
+
+    /// Check whether this model has a specific role tag.
+    pub fn has_role(&self, role: &str) -> bool {
+        self.role.contains(&role.to_string())
+    }
+
+    /// Infer the doc-provider backend from the model name.
+    pub fn infer_doc_provider(&self) -> &str {
+        let name = self.name.to_lowercase();
+        if name.contains("mistral") { "mistral_ocr" }
+        else if name.contains("gemini") { "gemini" }
+        else { "generic_vision" }
     }
 }
 
@@ -379,10 +416,7 @@ fn resolve_model_references(s: &mut SettingsFile) {
         match doc_setting {
             DocModelSetting::Name(name) => {
                 if let Some(profile) = models.and_then(|m| m.iter().find(|p| p.name == *name)) {
-                    let provider = profile
-                        .provider
-                        .clone()
-                        .unwrap_or_else(|| "mistral_ocr".into());
+                    let provider = profile.infer_doc_provider().to_string();
                     s.doc_model = Some(DocModelSetting::Full(DocModelConfig {
                         provider,
                         model: profile.name.clone(),
