@@ -225,11 +225,11 @@ async fn main() -> Result<()> {
     let settings = nonoclaw_engine::load_settings(&cwd, cli.settings.as_deref());
     nonoclaw_engine::settings::apply_env(&settings);
 
-    // Multi-model: conversation models are passed to serve_http for the UI
-    // dropdown + per-run Client rebuild on model switch.  Doc/compact models
-    // live in the same `models[]` array but are filtered out of the dropdown.
+    // Pass ALL model profiles to serve_http — per-model overrides
+    // (contextWindow, maxTokens, charsPerToken) are looked up at run time.
+    // The frontend dropdown filters to conversation models only.
     let model_profiles: Vec<nonoclaw_engine::ModelProfile> =
-        settings.conversation_models();
+        settings.all_models();
     for p in &model_profiles {
         if p.default {
             if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
@@ -286,7 +286,7 @@ async fn main() -> Result<()> {
     // Spawn file watcher for hot-reloading skills in headless mode.
     skill_watcher::spawn_skill_watcher(Arc::clone(&skills_manager), cwd.clone());
 
-    let options = EngineOptions {
+    let mut options = EngineOptions {
         model: cli
             .model
             .clone()
@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
         compact_threshold_tokens,
         compact_model: settings.compact_model.clone(),
         chars_per_token: settings.chars_per_token,
+        context_window: None, // resolved at run time via apply_model_profile
         skills_manager: Some(skills_manager),
         arguments: None,
         background_registry: Some(background_registry),
@@ -405,6 +406,10 @@ async fn main() -> Result<()> {
     }
 
     // --- Headless path ---
+    // Apply per-model overrides from the active model's profile.
+    if let Some(profile) = model_profiles.iter().find(|p| p.name == options.model) {
+        options.apply_model_profile(profile);
+    }
     let prompt = read_prompt(&cli)?;
     let mut engine = QueryEngine::with_session(
         Arc::new(client),

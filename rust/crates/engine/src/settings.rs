@@ -108,6 +108,19 @@ pub struct ModelProfile {
     /// Absent / empty → treated as `["main"]`.
     #[serde(default, deserialize_with = "deserialize_roles")]
     pub role: Vec<String>,
+    /// Model context window in tokens (e.g. DeepSeek V4 = 1_048_576,
+    /// Claude Sonnet = 200_000).  Used to compute the auto-compact
+    /// threshold and the context-occupancy ratio shown in the UI.
+    #[serde(rename = "contextWindow", default)]
+    pub context_window: Option<usize>,
+    /// Max output tokens per turn for this model (e.g. 8192).
+    /// Overrides the global `maxTokens` setting when present.
+    #[serde(rename = "maxTokens", default)]
+    pub max_tokens: Option<u32>,
+    /// Per-model chars-per-token divisor for the rough token estimator.
+    /// Defaults to the global `charsPerToken` (4) when unset.
+    #[serde(rename = "charsPerToken", default)]
+    pub chars_per_token: Option<usize>,
 }
 
 /// Accept `"role": "main"` (single string) or `"role": ["main", "doc"]` (array).

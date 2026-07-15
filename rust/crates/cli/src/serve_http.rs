@@ -135,6 +135,8 @@ struct UploadResponse {
 struct ModelInfo {
     name: String,
     label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -482,7 +484,8 @@ fn build_options(
         auto_compact: true,
         compact_threshold_tokens: 80_000,
         compact_model,
-        chars_per_token: 4, // default; could be passed from settings
+        chars_per_token: 4,
+        context_window: None, // resolved at run time via apply_model_profile
         skills_manager: Some(skills_manager),
         background_registry: Some(background_registry),
     }
@@ -1197,9 +1200,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             ServerMsg::Info {
                 model: state.active_model.lock().await.clone(),
                 auth_token: state.auth_token.clone(),
-                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
                     name: p.name.clone(),
                     label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                    context_window: p.context_window,
                 }).collect(),
                 session_id: sid,
             },
@@ -1290,9 +1294,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             ServerMsg::Info {
                                 model: state.active_model.lock().await.clone(),
                                 auth_token: state.auth_token.clone(),
-                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
                     name: p.name.clone(),
                     label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                    context_window: p.context_window,
                 }).collect(),
                                 session_id: sid,
                             },
@@ -1331,9 +1336,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         ServerMsg::Info {
                             model: state.active_model.lock().await.clone(),
                             auth_token: state.auth_token.clone(),
-                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
                     name: p.name.clone(),
                     label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                    context_window: p.context_window,
                 }).collect(),
                             session_id: sid,
                         },
@@ -1606,6 +1612,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         Arc::clone(&s.background_registry),
                     );
 
+                    // Apply per-model overrides (contextWindow, maxTokens, charsPerToken).
+                    if let Some(profile) = s.model_profiles.iter().find(|p| p.name == model_used) {
+                        options.apply_model_profile(profile);
+                    }
+
                     // Question resolver (per-run to avoid oneshot key clashes).
                     let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
                         request_id: format!("{request_id}-q"),
@@ -1828,9 +1839,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     send_msg(&tx, ServerMsg::Info {
                         model: name.clone(),
                         auth_token: state.auth_token.clone(),
-                        available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                        available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
                             name: p.name.clone(),
                             label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                            context_window: p.context_window,
                         }).collect(),
                         session_id: session.lock().await.as_ref().map(|h| h.id.clone()).unwrap_or_default(),
                     }).await;
@@ -1952,9 +1964,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             ServerMsg::Info {
                                 model: state.active_model.lock().await.clone(),
                                 auth_token: state.auth_token.clone(),
-                available_models: state.model_profiles.iter().map(|p| ModelInfo {
+                available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
                     name: p.name.clone(),
                     label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                    context_window: p.context_window,
                 }).collect(),
                                 session_id: String::new(),
                             },

@@ -48,7 +48,7 @@ export interface ErrorMsg {
   message: string;
 }
 
-export interface ModelInfo { name: string; label: string; }
+export interface ModelInfo { name: string; label: string; context_window?: number; }
 
 export interface InfoMsg {
   type: "info";

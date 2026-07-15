@@ -90,6 +90,30 @@ pub struct EngineOptions {
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
     pub chars_per_token: usize,
+    /// Active model's context window in tokens. Used to compute occupancy
+    /// ratio and auto-compact threshold. Falls back to the global
+    /// `contextWindow` setting when the model profile doesn't specify one.
+    pub context_window: Option<usize>,
+}
+
+impl EngineOptions {
+    /// Apply per-model overrides from a [`ModelProfile`].  Called after the
+    /// options are built but before the engine runs, so model-specific
+    /// `maxTokens`, `charsPerToken`, and `contextWindow` take effect.
+    pub fn apply_model_profile(&mut self, profile: &crate::settings::ModelProfile) {
+        if let Some(mt) = profile.max_tokens {
+            self.max_tokens = mt;
+        }
+        if let Some(cpt) = profile.chars_per_token {
+            self.chars_per_token = cpt;
+        }
+        if let Some(cw) = profile.context_window {
+            self.context_window = Some(cw);
+            // Recompute compact threshold from model-specific window.
+            self.compact_threshold_tokens =
+                cw.saturating_sub(self.max_tokens as usize + 2048);
+        }
+    }
 }
 
 impl Default for EngineOptions {
@@ -114,6 +138,7 @@ impl Default for EngineOptions {
             compact_threshold_tokens: 150_000,
             compact_model: None,
             chars_per_token: 4,
+            context_window: None,
         }
     }
 }
