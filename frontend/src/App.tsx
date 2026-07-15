@@ -288,7 +288,7 @@ export default function App() {
             <div ref={chatRef} className="chat-scroll" onScroll={handleScroll}>
               <ChatView messages={messages} streamingIdx={streamingIdx} />
             </div>
-            <InputBox onSubmit={handleSubmit} disabled={compacting} />
+            <InputBox onSubmit={handleSubmit} disabled={compacting || agentRunning} />
           </main>
           <aside className="insight">
             <InsightRail

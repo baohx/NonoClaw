@@ -14,11 +14,10 @@ const STALE_AFTER_MS = 12_000;
 // reconnect, so a just-typed prompt is resent after reconnect succeeds.
 const pending: ClientMsg[] = [];
 
-// Timestamp until which `messages_loaded` should be skipped. Every force-
-// reconnect sets this to now+2.5s so the handshake's MessagesLoaded (which
-// arrives *after* onopen has already flushed pending) doesn't wipe the
-// optimistic user message. After the window, sync-from-other-peers resumes.
-let skipLoadUntil = 0;
+// After a force-reconnect, skip exactly ONE MessagesLoaded (the handshake
+// replay) so it doesn't wipe the optimistic user message we just flushed.
+// Subsequent MessagesLoaded from peer sync broadcasts pass through normally.
+let skipOneLoad = false;
 
 export function useWebSocket(url: string) {
   const wsRef = useRef<WebSocket | null>(null);
@@ -103,11 +102,10 @@ export function useWebSocket(url: string) {
 
   /** Force a fresh connection right now (used by the refresh button + send). */
   const forceReconnect = useCallback(() => {
-    // Prevent the imminent handshake MessagesLoaded from clearing the UI:
-    // onopen flushes pending *before* the server's async MessagesLoaded
-    // arrives, so by then pending is already empty. This window keeps the
-    // load at bay until the run we just queued gets handled.
-    skipLoadUntil = Date.now() + 2500;
+    // Skip the handshake MessagesLoaded so it doesn't overwrite the
+    // optimistic user message we just flushed on open.  Only skip ONE —
+    // subsequent broadcast MessagesLoaded from peer sync pass through.
+    skipOneLoad = true;
     reconnectDelay.current = RECONNECT_DELAY_MS;
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     try { wsRef.current?.close(); } catch {}
@@ -184,10 +182,11 @@ function handleServerMsg(msg: ServerMsg) {
     }
 
     case "messages_loaded": {
-      // Skip the wholesale clear right after a forced reconnect: the handshake
-      // MessagesLoaded arrives AFTER onopen flushes pending, so by then pending
-      // is empty. The skip window preserves the optimistic user message.
-      if (Date.now() < skipLoadUntil || pending.length > 0) break;
+      // Skip exactly one load after reconnect (the handshake replay) so
+      // optimistic user messages aren't wiped.  Broadcast MessagesLoaded
+      // from peer sync always pass through.
+      if (skipOneLoad) { skipOneLoad = false; break; }
+      if (pending.length > 0) break;
       s.loadMessages(msg.messages);
       break;
     }

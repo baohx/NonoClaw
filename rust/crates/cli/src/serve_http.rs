@@ -407,6 +407,50 @@ async fn send_msg(tx: &Tx, msg: ServerMsg) {
     }
 }
 
+/// Broadcast the current session transcript to all peers EXCEPT `exclude`.
+/// Used after Run / Clear so all connected devices stay in sync.
+async fn sync_session_to_peers(
+    session_registry: &Arc<Mutex<HashMap<String, SharedEntry>>>,
+    session_id: &str,
+    exclude: &Tx,
+) {
+    let reg = session_registry.lock().await;
+    if let Some(entry) = reg.get(session_id) {
+        let updated: Vec<serde_json::Value> = entry
+            .handle
+            .lock()
+            .await
+            .as_ref()
+            .map(|h| {
+                h.messages
+                    .iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ml = ServerMsg::MessagesLoaded { messages: updated };
+        let mut dead = Vec::new();
+        for (i, peer) in entry.txs.iter().enumerate() {
+            if Arc::ptr_eq(peer, exclude) {
+                continue;
+            }
+            if !send_msg_ok(peer, &ml).await {
+                dead.push(i);
+            }
+        }
+        // Can't remove while iterating immutably — drop reg, re-lock.
+        drop(reg);
+        if !dead.is_empty() {
+            let mut reg = session_registry.lock().await;
+            if let Some(entry) = reg.get_mut(session_id) {
+                for i in dead.into_iter().rev() {
+                    entry.txs.remove(i);
+                }
+            }
+        }
+    }
+}
+
 /// Like `send_msg` but returns `true` on success so the caller can detect
 /// dead connections (e.g. during broadcasts) without logging a warning.
 async fn send_msg_ok(tx: &Tx, msg: &ServerMsg) -> bool {
@@ -1495,6 +1539,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 let new_cancel = CancellationToken::new();
                 cancel = Some(new_cancel.clone());
 
+                // Immediately sync the session state to other peers
+                // so mobile / other tabs see the incoming user message.
+                if let Some(ref cid) = shared_sid {
+                    sync_session_to_peers(&state.session_registry, cid, &tx).await;
+                }
+
                 let tx2 = tx.clone();
                 let s = state.clone();
                 let session2 = Arc::clone(&session);
@@ -1740,33 +1790,25 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             .await;
                             send_msg(&tx2, ServerMsg::ProjectInfo { info: info.clone() }).await;
 
-                            // Broadcast updated messages to all other peers
-                            // sharing this session (desktop ↔ mobile sync).
+                            // Broadcast updated messages + project info to all
+                            // other peers sharing this session.
                             if let Some(ref cid) = sync_sid {
-                                let mut reg = s.session_registry.lock().await;
-                                if let Some(entry) = reg.get_mut(cid) {
-                                    let updated: Vec<serde_json::Value> =
-                                        entry.handle.lock().await.as_ref()
-                                            .map(|h| h.messages.iter()
-                                                .filter_map(|m| serde_json::to_value(m).ok())
-                                                .collect())
-                                            .unwrap_or_default();
-                                    let n = updated.len();
-                                    let ml = ServerMsg::MessagesLoaded { messages: updated };
-                                    let pi = ServerMsg::ProjectInfo { info };
-                                    tracing::debug!(session=%cid, peers=entry.txs.len()-1, msgs=n, "broadcasting MessagesLoaded");
+                                sync_session_to_peers(&s.session_registry, cid, &tx2).await;
+                                // Also push ProjectInfo refresh.
+                                let pi = ServerMsg::ProjectInfo { info };
+                                let reg = s.session_registry.lock().await;
+                                if let Some(entry) = reg.get(cid) {
                                     let mut dead = Vec::new();
                                     for (i, peer) in entry.txs.iter().enumerate() {
-                                        if Arc::ptr_eq(peer, &tx2) {
-                                            continue;
-                                        }
-                                        if !send_msg_ok(peer, &ml).await || !send_msg_ok(peer, &pi).await {
-                                            dead.push(i);
-                                            tracing::debug!("removing dead peer from session broadcast");
-                                        }
+                                        if Arc::ptr_eq(peer, &tx2) { continue; }
+                                        if !send_msg_ok(peer, &pi).await { dead.push(i); }
                                     }
-                                    for i in dead.into_iter().rev() {
-                                        entry.txs.remove(i);
+                                    drop(reg);
+                                    if !dead.is_empty() {
+                                        let mut reg = s.session_registry.lock().await;
+                                        if let Some(entry) = reg.get_mut(cid) {
+                                            for i in dead.into_iter().rev() { entry.txs.remove(i); }
+                                        }
                                     }
                                 }
                             }
@@ -1886,24 +1928,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 let ml = ServerMsg::MessagesLoaded { messages: vec![] };
                 send_msg(&tx, ml.clone()).await;
 
-                // Broadcast the clear to all other peers sharing this session
-                // so desktop ↔ mobile stay in sync.
+                // Broadcast the clear to all other peers.
                 if let Some(ref cid) = shared_sid {
-                    let mut reg = state.session_registry.lock().await;
-                    if let Some(entry) = reg.get_mut(cid) {
-                        let mut dead = Vec::new();
-                        for (i, peer) in entry.txs.iter().enumerate() {
-                            if Arc::ptr_eq(peer, &tx) {
-                                continue;
-                            }
-                            if !send_msg_ok(peer, &ml).await {
-                                dead.push(i);
-                            }
-                        }
-                        for i in dead.into_iter().rev() {
-                            entry.txs.remove(i);
-                        }
-                    }
+                    sync_session_to_peers(&state.session_registry, cid, &tx).await;
                 }
             }
 
