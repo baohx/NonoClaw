@@ -395,13 +395,11 @@ async fn process_deepseek_ocr(
 
     // DeepSeek OCR 2 uses the `<image>` token + specialised prompt format.
     const OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
-    // ~4 KB base64 after resize — fits comfortably in 8192 token context.
-    const MAX_IMAGE_DIM: u32 = 1600;
+    // JPEG at 1024px produces ~20-60 KB — well under the 8192 token API limit.
+    const MAX_IMAGE_DIM: u32 = 1024;
 
     for (i, (_img_mime, img_bytes)) in images.iter().enumerate() {
-        // Resize large images so the base64 payload fits in the model's
-        // 8192-token context window.
-        let payload = resize_if_large(img_bytes, MAX_IMAGE_DIM);
+        let payload = resize_for_ocr(img_bytes, MAX_IMAGE_DIM);
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload);
 
         let body = serde_json::json!({
@@ -462,24 +460,27 @@ async fn process_deepseek_ocr(
     Ok((full_text.trim().to_string(), 0, vec![]))
 }
 
-/// Resize image bytes to fit within `max_dim` on the longest side.
-/// Returns the (possibly resized) PNG bytes.  Passes through unchanged if
-/// already small enough or if decoding fails.
-fn resize_if_large(bytes: &[u8], max_dim: u32) -> Vec<u8> {
+/// Resize for OCR API: scale to `max_dim`, output as JPEG (much smaller than
+/// PNG for photos).  Passes through unchanged if already small enough or if
+/// decoding fails.
+fn resize_for_ocr(bytes: &[u8], max_dim: u32) -> Vec<u8> {
     let img = match image::load_from_memory(bytes) {
         Ok(i) => i,
         Err(_) => return bytes.to_vec(),
     };
     let (w, h) = (img.width(), img.height());
-    if w <= max_dim && h <= max_dim {
-        return bytes.to_vec();
-    }
-    let ratio = max_dim as f64 / w.max(h) as f64;
+    // If already small, re-encode as JPEG anyway (may still shrink).
+    let ratio = if w <= max_dim && h <= max_dim {
+        1.0
+    } else {
+        max_dim as f64 / w.max(h) as f64
+    };
     let nw = (w as f64 * ratio) as u32;
     let nh = (h as f64 * ratio) as u32;
     let resized = img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3);
     let mut out = std::io::Cursor::new(Vec::new());
-    match resized.write_to(&mut out, image::ImageFormat::Png) {
+    // JPEG quality 80: good OCR readability at small file size.
+    match resized.write_to(&mut out, image::ImageFormat::Jpeg) {
         Ok(()) => out.into_inner(),
         Err(_) => bytes.to_vec(),
     }
