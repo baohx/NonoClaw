@@ -108,8 +108,8 @@ pub async fn process_file(
     // Route to the configured doc model provider.
     let result: Result<(String, usize, Vec<ImageB64>), String> = match config.provider.as_str() {
         "mistral_ocr" => process_mistral(config, process_target, &mime).await,
+        "deepseek_ocr" => process_deepseek_ocr(config, process_target, &mime).await,
         _ => {
-            // Stubs and other providers: no images extracted
             let r: Result<(String, usize), String> = match config.provider.as_str() {
                 "gemini" => process_gemini_stub(config, process_target, &mime).await,
                 "generic_vision" => process_generic_vision_stub(config, process_target, &mime).await,
@@ -368,6 +368,93 @@ struct MistralOcrPage {
     markdown: String,
     #[serde(default)]
     images: Vec<serde_json::Value>,
+}
+
+// ── DeepSeek OCR provider (OpenAI-compatible) ───────────────────────────────
+
+async fn process_deepseek_ocr(
+    config: &DocModelConfig,
+    file_path: &Path,
+    mime: &str,
+) -> Result<(String, usize, Vec<ImageB64>), String> {
+    let images: Vec<(String, Vec<u8>)> = if mime == "application/pdf" {
+        pdf_to_images(file_path)?
+    } else {
+        let bytes = std::fs::read(file_path)
+            .map_err(|e| format!("failed to read image: {e}"))?;
+        vec![(mime.to_string(), bytes)]
+    };
+
+    let api_key = config.resolved_api_key();
+    let url = format!(
+        "{}/v1/chat/completions",
+        config.base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    let mut full_text = String::new();
+
+    // DeepSeek OCR 2 uses the `<image>` token + specialised prompt format.
+    const OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
+
+    for (i, (_img_mime, img_bytes)) in images.iter().enumerate() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, img_bytes);
+
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:image/png;base64,{b64}") }
+                    },
+                    {
+                        "type": "text",
+                        "text": OCR_PROMPT
+                    }
+                ]
+            }],
+            "max_tokens": 8192,
+            "temperature": 0.0
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("DeepSeek OCR request failed for page {}: {e}", i + 1))?;
+
+        let status = resp.status();
+        let resp_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            tracing::warn!(%status, %resp_text, "DeepSeek OCR error");
+            return Err(format!(
+                "DeepSeek OCR returned {} for page {}: {}",
+                status.as_u16(), i + 1, resp_text
+            ));
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&resp_text)
+            .map_err(|e| format!("failed to parse DeepSeek OCR response: {e}"))?;
+
+        if let Some(t) = response["choices"][0]["message"]["content"].as_str() {
+            if images.len() > 1 {
+                full_text.push_str(&format!("## Page {}\n\n", i + 1));
+            }
+            full_text.push_str(t);
+            full_text.push_str("\n\n");
+        }
+    }
+
+    tracing::info!(
+        pages = images.len(),
+        chars = full_text.len(),
+        "DeepSeek OCR extraction complete"
+    );
+
+    Ok((full_text.trim().to_string(), 0, vec![]))
 }
 
 // ── Stub providers ──────────────────────────────────────────────────────────

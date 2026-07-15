@@ -161,6 +161,7 @@ impl ModelProfile {
     pub fn infer_doc_provider(&self) -> &str {
         let name = self.name.to_lowercase();
         if name.contains("mistral") { "mistral_ocr" }
+        else if name.contains("deepseek") && name.contains("ocr") { "deepseek_ocr" }
         else if name.contains("gemini") { "gemini" }
         else { "generic_vision" }
     }
