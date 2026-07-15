@@ -62,14 +62,33 @@ pub struct SettingsFile {
     #[serde(rename = "charsPerToken", default = "default_chars_per_token")]
     pub chars_per_token: usize,
     /// Document processing model for file attachment extraction.
+    /// Can be either a model name string (referencing a model in `models[]`)
+    /// or a full inline config object (backward-compatible).
     #[serde(rename = "docModel", default)]
-    pub doc_model: Option<DocModelConfig>,
+    pub doc_model: Option<DocModelSetting>,
     // Passthrough: preserve unknown fields.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
 
+/// Either a full inline `DocModelConfig` or a name string referencing a model
+/// in `models[]`.  `#[serde(untagged)]` tries the full-object variant first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DocModelSetting {
+    Full(DocModelConfig),
+    Name(String),
+}
+
 /// A model profile: name + endpoint + credentials, for multi-model switching.
+///
+/// The optional `role` field tags the model's purpose:
+/// - absent / `"main"` → conversation model (appears in the UI dropdown)
+/// - `"doc"` → document-processing model (used by the attachment pipeline)
+/// - `"compact"` → summarization model (used for transcript compaction)
+///
+/// When `role` is set, the model can be referenced by name from `docModel` /
+/// `compactModel` top-level settings instead of repeating credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub name: String,
@@ -81,6 +100,20 @@ pub struct ModelProfile {
     pub api_key: String,
     #[serde(default)]
     pub default: bool,
+    /// Optional role tag: "main", "doc", or "compact". Defaults to "main".
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Provider backend for doc models ("mistral_ocr", "gemini", "generic_vision").
+    /// Only meaningful when `role == "doc"`.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl ModelProfile {
+    /// True if this model should appear in the frontend's model-selection dropdown.
+    pub fn is_conversation_model(&self) -> bool {
+        self.role.is_none() || self.role.as_deref() == Some("main")
+    }
 }
 
 /// Document processing model config. When set, uploaded files (PDF, DOCX, images)
@@ -118,6 +151,34 @@ impl DocModelConfig {
             && self.provider != "none"
             && !self.api_key.is_empty()
             && !self.base_url.is_empty()
+    }
+}
+
+impl SettingsFile {
+    /// Resolved `DocModelConfig` (name-references already looked up).
+    pub fn resolved_doc_model(&self) -> Option<&DocModelConfig> {
+        match &self.doc_model {
+            Some(DocModelSetting::Full(cfg)) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Conversation models only (excludes doc/compact roles).
+    pub fn conversation_models(&self) -> Vec<ModelProfile> {
+        self.models
+            .as_ref()
+            .map(|ms| {
+                ms.iter()
+                    .filter(|m| m.is_conversation_model())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// All model profiles (including doc/compact).
+    pub fn all_models(&self) -> Vec<ModelProfile> {
+        self.models.clone().unwrap_or_default()
     }
 }
 
@@ -299,7 +360,59 @@ pub fn load_settings(cwd: &Path, flag_path: Option<&Path>) -> SettingsFile {
         };
         merge_settings(&mut merged, &overlay);
     }
+    resolve_model_references(&mut merged);
     merged
+}
+
+/// Resolve `docModel` and `compactModel` name references against `models[]`.
+///
+/// After merging, if `docModel` is a plain name string (not a full config
+/// object), look up the matching `ModelProfile` in `models[]` and construct a
+/// full `DocModelConfig` from it.  The same for `compactModel`: verify the
+/// named model exists in `models[]` (it is used as a model-name string at
+/// runtime, so no config reconstruction is needed).
+fn resolve_model_references(s: &mut SettingsFile) {
+    let models = s.models.as_ref();
+
+    // ── docModel ──────────────────────────────────────────────────────
+    if let Some(ref doc_setting) = s.doc_model {
+        match doc_setting {
+            DocModelSetting::Name(name) => {
+                if let Some(profile) = models.and_then(|m| m.iter().find(|p| p.name == *name)) {
+                    let provider = profile
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "mistral_ocr".into());
+                    s.doc_model = Some(DocModelSetting::Full(DocModelConfig {
+                        provider,
+                        model: profile.name.clone(),
+                        base_url: profile.base_url.clone(),
+                        api_key: profile.api_key.clone(),
+                    }));
+                } else {
+                    tracing::warn!(
+                        name,
+                        "docModel references unknown model — attachment processing disabled"
+                    );
+                    s.doc_model = None;
+                }
+            }
+            DocModelSetting::Full(_) => { /* already fully specified */ }
+        }
+    }
+
+    // ── compactModel ──────────────────────────────────────────────────
+    // compactModel is just a model name string; validate it exists.
+    if let Some(ref name) = s.compact_model {
+        if let Some(ms) = models {
+            if !ms.iter().any(|p| p.name == *name) {
+                tracing::warn!(
+                    name,
+                    "compactModel references unknown model — falling back to main model"
+                );
+            }
+        }
+    }
 }
 
 /// Load the standalone `.mcp.json` file's `mcpServers` map.

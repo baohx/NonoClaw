@@ -225,11 +225,11 @@ async fn main() -> Result<()> {
     let settings = nonoclaw_engine::load_settings(&cwd, cli.settings.as_deref());
     nonoclaw_engine::settings::apply_env(&settings);
 
-    // Multi-model: if models[] is present, apply the default profile's creds so
-    // the initial Client uses the default endpoint. Profiles are passed through
-    // to serve_http for per-run Client rebuild on model switch.
+    // Multi-model: conversation models are passed to serve_http for the UI
+    // dropdown + per-run Client rebuild on model switch.  Doc/compact models
+    // live in the same `models[]` array but are filtered out of the dropdown.
     let model_profiles: Vec<nonoclaw_engine::ModelProfile> =
-        settings.models.clone().unwrap_or_default();
+        settings.conversation_models();
     for p in &model_profiles {
         if p.default {
             if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
@@ -369,18 +369,18 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| settings.model.clone())
         .or_else(|| {
-            settings.models.as_ref().and_then(|ps| {
-                ps.iter()
-                    .find(|p| p.default)
-                    .or_else(|| ps.first())
-                    .map(|p| p.name.clone())
-            })
+            let profiles = settings.conversation_models();
+            profiles
+                .iter()
+                .find(|p| p.default)
+                .or_else(|| profiles.first())
+                .map(|p| p.name.clone())
         })
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".into());
 
     // Web UI server: HTTP + WebSocket.
     if let Some(addr) = &cli.serve_http {
-        let doc_model = settings.doc_model.clone();
+        let doc_model = settings.resolved_doc_model().cloned();
         let compact_model = settings.compact_model.clone();
         tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
