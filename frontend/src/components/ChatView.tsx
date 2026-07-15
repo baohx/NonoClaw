@@ -167,7 +167,7 @@ const MessageCard = memo(function MessageCard({
     <div className={`msg msg-enter msg--${isUser ? "user" : "assistant"}`}>
       <div className={`msg__role msg__role--${isUser ? "user" : "assistant"}`}>
         <span className="msg__role-mark" />
-        {isUser ? "you" : "assistant"}
+        {isUser ? "you" : "Nono"}
         {/* User message: copy button */}
         {isUser && (
           <button

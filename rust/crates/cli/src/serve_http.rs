@@ -1866,6 +1866,16 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
             // ── Clear (in-memory only; on-disk transcript is the archive) ───
             ClientMsg::Clear => {
+                // Cancel any in-progress agent first — otherwise tool events
+                // keep arriving and resurrect tool cards after the clear.
+                if let Some(ref c) = cancel {
+                    c.cancel();
+                }
+                if let Some(h) = run_handle.take() {
+                    h.abort();
+                }
+                cancel = None;
+                // Now clear the transcript.
                 if let Some(h) = session.lock().await.as_mut() {
                     h.messages.clear();
                     // Truncate the on-disk JSONL back to header-only.
