@@ -22,8 +22,12 @@ const PLATFORM_HINT: &str = {
     { "unknown" }
 };
 
-/// Build the `system` array for the API request. Returns two blocks: the main
-/// prompt (with a cache breakpoint) and the project/memory context.
+/// Build the `system` array for the API request. Returns two blocks:
+///
+/// **Block 1 (cached):** identity, environment, tool guidance, tool prompts,
+///   active skills, append. Stable across turns.
+/// **Block 2 (uncached):** git status, NONOCLAW.md, memory. Changes at least
+///   once per conversation (git) and may change between runs (NONOCLAW.md).
 pub fn build_system_blocks(
     cwd: &std::path::Path,
     system: &SystemContext,
@@ -41,11 +45,6 @@ pub fn build_system_blocks(
     ));
     main.push_str(&format!("- Platform: {PLATFORM_HINT}\n"));
     main.push_str(&format!("- Today's date: {}\n", user.date));
-    if !system.git_summary.is_empty() {
-        main.push_str("\n# Git\n```\n");
-        main.push_str(&system.git_summary);
-        main.push_str("```\n");
-    }
     main.push_str(TOOL_GUIDANCE);
     for (name, prompt) in tool_prompts {
         main.push_str(&format!("\n## Tool: {name}\n{prompt}\n"));
@@ -72,6 +71,52 @@ pub fn build_system_blocks(
     });
 
     let mut context = String::new();
+    // Git summary goes here (uncached) so it doesn't invalidate the prompt
+    // cache on every tool-execution that changes the working tree.
+    if !system.git_summary.is_empty() {
+        context.push_str("# Git status (snapshot at conversation start)\n```\n");
+        context.push_str(&system.git_summary);
+        context.push_str("```\n\n");
+    }
+    if !user.nonoclaw_md.is_empty() {
+        context.push_str(&user.nonoclaw_md);
+    }
+    if let Some(mem) = memory {
+        context.push_str("# Memory\n\n");
+        context.push_str(mem);
+        context.push('\n');
+    }
+    if !context.is_empty() {
+        blocks.push(SystemBlock {
+            kind: "text".into(),
+            text: context,
+            cache_control: None,
+        });
+    }
+    blocks
+}
+
+/// Rebuild only the uncached context block (Block 2) with fresh git status.
+/// Call this before each turn so the model sees up-to-date git info without
+/// invalidating the cached Block 1 (identity + tools + skills).
+pub fn refresh_context_block(
+    old_blocks: &[SystemBlock],
+    system: &SystemContext,
+    user: &UserContext,
+    memory: &Option<String>,
+) -> Vec<SystemBlock> {
+    let mut blocks = Vec::with_capacity(2);
+    // Block 1: preserved as-is (cached).
+    if let Some(first) = old_blocks.first() {
+        blocks.push(first.clone());
+    }
+    // Block 2: rebuilt with fresh git.
+    let mut context = String::new();
+    if !system.git_summary.is_empty() {
+        context.push_str("# Git status (live)\n```\n");
+        context.push_str(&system.git_summary);
+        context.push_str("```\n\n");
+    }
     if !user.nonoclaw_md.is_empty() {
         context.push_str(&user.nonoclaw_md);
     }
@@ -179,6 +224,21 @@ repeating verbatim file content.
 ## Dependencies
 - Every dependency is permanent code you do not control. Before adding one, \
 ask: can stdlib or existing deps already do this? Justify every addition.
+
+## Memory
+You have a persistent file-based memory at `<cwd>/.nonoclaw/memory/`. Write \
+individual fact files (one `.md` file per fact) using the Write tool. Each file \
+should have YAML frontmatter with `name` (short kebab-case slug), `description` \
+(one-line summary), and `metadata.type` (user/feedback/project/reference), \
+followed by the fact body. Link related memories with `[[name]]` syntax. The \
+index file `MEMORY.md` lists one-line pointers to each fact file.
+
+- **When to write**: the user shares a preference ("I like X"), gives feedback \
+("always do Y"), or important project context emerges that isn't captured in \
+NONOCLAW.md.
+- **Before writing**: check if a similar fact already exists — update rather \
+than duplicate.
+- **Delete stale facts**: if a fact is proven wrong, delete the file.
 
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.

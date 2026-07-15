@@ -35,9 +35,19 @@ pub fn estimate_message_tokens(m: &Message) -> usize {
 }
 
 /// Estimated total prompt tokens: system text + tool schemas + all messages.
-pub fn estimate_total(messages: &[Message], system_chars: usize, tools_chars: usize) -> usize {
+///
+/// `chars_per_token` adjusts for different tokenizers. Claude uses ~4 chars/token
+/// for English; DeepSeek/GLM tokenize Chinese more efficiently (fewer chars/token).
+/// Default 4 is a reasonable middle-ground.
+pub fn estimate_total(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+    chars_per_token: usize,
+) -> usize {
     let body: usize = messages.iter().map(message_char_len).sum();
-    (system_chars + tools_chars + body) / CHARS_PER_TOKEN + messages.len() * PER_MESSAGE_OVERHEAD
+    let cpt = if chars_per_token == 0 { CHARS_PER_TOKEN } else { chars_per_token };
+    (system_chars + tools_chars + body) / cpt + messages.len() * PER_MESSAGE_OVERHEAD
 }
 
 #[cfg(test)]
@@ -78,8 +88,8 @@ mod tests {
     fn total_scales_with_messages() {
         let one = Message::user(MessageContent::from_text("x".repeat(4000)));
         let many = vec![one.clone(); 10];
-        let t1 = estimate_total(&[one], 1000, 500);
-        let t2 = estimate_total(&many, 1000, 500);
+        let t1 = estimate_total(&[one], 1000, 500, 4);
+        let t2 = estimate_total(&many, 1000, 500, 4);
         assert!(t2 > t1 * 6); // ~10x body minus fixed overhead → well above 6x
     }
 }

@@ -134,14 +134,90 @@ fn append_md(buf: &mut String, source: &str, content: String) {
     buf.push_str(&format!("## from {source}\n\n{content}\n\n"));
 }
 
-/// Load the memory index (`.nonoclaw/memory/MEMORY.md`), capped at 200 lines /
-/// 25 KB. Mirrors `loadMemoryPrompt`.
+/// Load the memory index + individual fact files from `.nonoclaw/memory/`.
+///
+/// Loads:
+/// 1. `MEMORY.md` — the index (25 KB / 200 line cap)
+/// 2. Individual `.md` fact files (excluding `MEMORY.md`) — each file is one
+///    memory fact. Files with YAML frontmatter have it stripped; the body text
+///    is what the model sees.
+///
+/// Total output capped at ~50 KB. Returns `None` if the memory directory doesn't
+/// exist or contains nothing.
 pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
-    let path = cwd.join(".nonoclaw/memory/MEMORY.md");
-    let content = read_optional(&path)?;
-    let trimmed = truncate_chars(&content, 25_000);
-    let lines: Vec<&str> = trimmed.lines().take(200).collect();
-    Some(lines.join("\n"))
+    let mem_dir = cwd.join(".nonoclaw/memory");
+    if !mem_dir.is_dir() {
+        return None;
+    }
+
+    let mut buf = String::new();
+
+    // 1. MEMORY.md index
+    let index_path = mem_dir.join("MEMORY.md");
+    if let Some(index) = read_optional(&index_path) {
+        let trimmed = truncate_chars(&index, 25_000);
+        let lines: Vec<&str> = trimmed.lines().take(200).collect();
+        if !lines.is_empty() {
+            buf.push_str(&lines.join("\n"));
+            buf.push_str("\n\n");
+        }
+    }
+
+    // 2. Individual fact files
+    if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e == "md")
+                    .unwrap_or(false)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n != "MEMORY.md")
+                        .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        for p in &paths {
+            if let Some(content) = read_optional(p) {
+                let fact = strip_frontmatter(&content);
+                if !fact.trim().is_empty() {
+                    let name = p
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("fact");
+                    buf.push_str(&format!("**{name}**: {fact}\n\n"));
+                }
+            }
+        }
+    }
+
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&trimmed, 50_000))
+    }
+}
+
+/// Strip YAML frontmatter (`---\n...\n---\n`) from a string, returning the
+/// body text that follows. If no frontmatter is present, returns the original.
+fn strip_frontmatter(s: &str) -> String {
+    let s = s.trim();
+    if !s.starts_with("---") {
+        return s.to_string();
+    }
+    // Find the second `---` delimiter.
+    let after_first = &s[3..]; // skip opening ---
+    if let Some(pos) = after_first.find("\n---") {
+        let body = after_first[pos + 4..].trim();
+        body.to_string()
+    } else {
+        // Malformed frontmatter — return as-is.
+        s.to_string()
+    }
 }
 
 fn read_optional(path: &Path) -> Option<String> {

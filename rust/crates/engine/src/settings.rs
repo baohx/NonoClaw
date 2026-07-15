@@ -51,6 +51,16 @@ pub struct SettingsFile {
     /// carries its own base_url + api_key so different providers can be used.
     #[serde(default)]
     pub models: Option<Vec<ModelProfile>>,
+    /// Optional model to use for auto-compaction summarization. When set, the
+    /// engine uses this model instead of the main conversation model. Set it
+    /// to a cheap / fast model (e.g. haiku) to save cost on summarization.
+    #[serde(rename = "compactModel", default)]
+    pub compact_model: Option<String>,
+    /// Chars-per-token divisor for rough token estimation. Claude ≈ 4.
+    /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
+    /// for better compact-threshold accuracy on those models.
+    #[serde(rename = "charsPerToken", default = "default_chars_per_token")]
+    pub chars_per_token: usize,
     /// Document processing model for file attachment extraction.
     #[serde(rename = "docModel", default)]
     pub doc_model: Option<DocModelConfig>,
@@ -110,6 +120,8 @@ impl DocModelConfig {
             && !self.base_url.is_empty()
     }
 }
+
+fn default_chars_per_token() -> usize { 4 }
 
 fn resolve_env_var(raw: &str) -> String {
     if raw.starts_with('$') {
@@ -228,6 +240,14 @@ pub fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
     if overlay.models.is_some() {
         base.models = overlay.models.clone();
     }
+    // compactModel: later overlay replaces.
+    if overlay.compact_model.is_some() {
+        base.compact_model = overlay.compact_model.clone();
+    }
+    // charsPerToken: later overlay replaces.
+    if overlay.chars_per_token != 4 {
+        base.chars_per_token = overlay.chars_per_token;
+    }
     // docModel: later overlay replaces.
     if overlay.doc_model.is_some() {
         base.doc_model = overlay.doc_model.clone();
@@ -327,6 +347,10 @@ pub fn apply_settings(options: &mut EngineOptions, merged: &SettingsFile) {
     if let Some(ct) = merged.compact_threshold {
         options.compact_threshold_tokens = ct;
     }
+    if let Some(ref cm) = merged.compact_model {
+        options.compact_model = Some(cm.clone());
+    }
+    options.chars_per_token = merged.chars_per_token;
     if let Some(think) = &merged.thinking {
         if let Ok(cfg) = serde_json::from_value::<ThinkingConfig>(think.clone()) {
             options.thinking = Some(cfg);

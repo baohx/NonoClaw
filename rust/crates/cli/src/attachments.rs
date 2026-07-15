@@ -29,8 +29,19 @@ pub struct ExtractedDoc {
     pub extracted_text: String,
     /// Number of embedded images found in the document.
     pub image_count: usize,
+    /// First few extracted images as base64 (for multimodal model context).
+    /// Limited to 2 images, max ~500KB each when base64-encoded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images_base64: Vec<ImageB64>,
     /// Human-readable error if extraction partially failed (empty text + error).
     pub error: Option<String>,
+}
+
+/// A lightweight base64 image reference for passing to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageB64 {
+    pub media_type: String,
+    pub data: String,
 }
 
 /// Top-level router: detect file type, pre-process if needed, extract content.
@@ -53,6 +64,7 @@ pub async fn process_file(
                     filename: original_name.into(),
                     extracted_text: text,
                     image_count: 0,
+                    images_base64: vec![],
                     error: None,
                 };
             }
@@ -62,6 +74,7 @@ pub async fn process_file(
                     filename: original_name.into(),
                     extracted_text: String::new(),
                     image_count: 0,
+                    images_base64: vec![],
                     error: Some(format!("failed to read file: {e}")),
                 };
             }
@@ -82,6 +95,7 @@ pub async fn process_file(
                     filename: original_name.into(),
                     extracted_text: String::new(),
                     image_count: 0,
+                    images_base64: vec![],
                     error: Some(e),
                 };
             }
@@ -92,18 +106,16 @@ pub async fn process_file(
     };
 
     // Route to the configured doc model provider.
-    let result = match config.provider.as_str() {
+    let result: Result<(String, usize, Vec<ImageB64>), String> = match config.provider.as_str() {
         "mistral_ocr" => process_mistral(config, process_target, &mime).await,
-        "gemini" => process_gemini_stub(config, process_target, &mime).await,
-        "generic_vision" => process_generic_vision_stub(config, process_target, &mime).await,
-        other => {
-            return ExtractedDoc {
-                id: upload_id.into(),
-                filename: original_name.into(),
-                extracted_text: String::new(),
-                image_count: 0,
-                error: Some(format!("unknown doc_model.provider: {other}")),
+        _ => {
+            // Stubs and other providers: no images extracted
+            let r: Result<(String, usize), String> = match config.provider.as_str() {
+                "gemini" => process_gemini_stub(config, process_target, &mime).await,
+                "generic_vision" => process_generic_vision_stub(config, process_target, &mime).await,
+                other => Err(format!("unknown doc_model.provider: {other}")),
             };
+            r.map(|(t, c)| (t, c, vec![]))
         }
     };
 
@@ -113,11 +125,12 @@ pub async fn process_file(
     }
 
     match result {
-        Ok((text, image_count)) => ExtractedDoc {
+        Ok((text, image_count, images)) => ExtractedDoc {
             id: upload_id.into(),
             filename: original_name.into(),
             extracted_text: text,
             image_count,
+            images_base64: images,
             error: None,
         },
         Err(e) => ExtractedDoc {
@@ -125,6 +138,7 @@ pub async fn process_file(
             filename: original_name.into(),
             extracted_text: String::new(),
             image_count: 0,
+            images_base64: vec![],
             error: Some(e),
         },
     }
@@ -227,7 +241,7 @@ async fn process_mistral(
     config: &DocModelConfig,
     file_path: &Path,
     mime: &str,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize, Vec<ImageB64>), String> {
     let api_key = config.resolved_api_key();
     let bytes = std::fs::read(file_path)
         .map_err(|e| format!("failed to read file for OCR: {e}"))?;
@@ -287,10 +301,29 @@ async fn process_mistral(
     // Concatenate markdown from all pages.
     let mut text = String::new();
     let mut image_count = 0usize;
+    let mut images_base64: Vec<ImageB64> = Vec::new();
     for page in &response.pages {
         text.push_str(&page.markdown);
         text.push_str("\n\n");
         image_count += page.images.len();
+        // Collect up to 2 images (cap per-image data at ~500KB base64).
+        for img in &page.images {
+            if images_base64.len() >= 2 {
+                break;
+            }
+            if let Some(b64) = img.get("image_base64").and_then(|v| v.as_str()) {
+                if b64.len() < 700_000 {
+                    let media = img
+                        .get("media_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/png");
+                    images_base64.push(ImageB64 {
+                        media_type: media.to_string(),
+                        data: b64.to_string(),
+                    });
+                }
+            }
+        }
     }
 
     let result = text.trim().to_string();
@@ -298,10 +331,13 @@ async fn process_mistral(
         pages = response.pages.len(),
         chars = result.len(),
         images = image_count,
+        extracted_to_context = images_base64.len(),
         "Mistral OCR extraction complete"
     );
 
-    Ok((result, image_count))
+    // We return (text, image_count) but ExtractedDoc has images_base64.
+    // Let me restructure the return.
+    Ok((result, image_count, images_base64))
 }
 
 #[derive(Debug, Deserialize)]

@@ -220,10 +220,16 @@ export type ServerMsg =
 
 // ── Browser → Server messages ─────────────────────────────────────────────
 
+export interface ImageRef {
+  media_type: string;
+  data: string;
+}
+
 export interface AttachmentRef {
   id: string;
   filename: string;
   extracted_text: string;
+  images?: ImageRef[];
 }
 
 export interface UploadResponse {
@@ -231,6 +237,7 @@ export interface UploadResponse {
   filename: string;
   extracted_text: string;
   image_count: number;
+  images?: ImageRef[];
   error?: string;
 }
 

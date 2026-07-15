@@ -83,6 +83,13 @@ pub struct EngineOptions {
     pub auto_compact: bool,
     /// Estimated-token threshold above which auto-compact fires.
     pub compact_threshold_tokens: usize,
+    /// Optional model override for compaction summarization. Falls back to
+    /// `model` when unset. Set to a cheap model (e.g. haiku) to save costs.
+    pub compact_model: Option<String>,
+    /// Chars-per-token divisor for the token estimator. Default 4 (Claude).
+    /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
+    /// for better compact-threshold accuracy on those models.
+    pub chars_per_token: usize,
 }
 
 impl Default for EngineOptions {
@@ -105,6 +112,8 @@ impl Default for EngineOptions {
             question_resolver: None,
             auto_compact: true,
             compact_threshold_tokens: 150_000,
+            compact_model: None,
+            chars_per_token: 4,
         }
     }
 }
@@ -374,6 +383,18 @@ impl QueryEngine {
                 }
             }
 
+            // Refresh the uncached context block with live git status
+            // each turn so the model sees up-to-date working-tree state.
+            {
+                let live_git = get_system_context(cwd).await;
+                system_blocks = crate::prompt::refresh_context_block(
+                    &system_blocks,
+                    &live_git,
+                    &user_ctx,
+                    &memory,
+                );
+            }
+
             if turns_made >= self.options.max_turns {
                 break;
             }
@@ -381,7 +402,7 @@ impl QueryEngine {
             // Auto-compact: if the estimated prompt exceeds the threshold,
             // summarize the older transcript before the next turn.
             if self.options.auto_compact {
-                let est = estimate_total(&self.messages, system_chars, tools_chars);
+                let est = estimate_total(&self.messages, system_chars, tools_chars, self.options.chars_per_token);
                 if est > self.options.compact_threshold_tokens {
                     let before = self.messages.len();
                     let tokens_before = est;
@@ -393,14 +414,19 @@ impl QueryEngine {
                         &crate::hooks::compact_context(before, 0, est, 0),
                     )
                     .await;
+                    let compact_model = self
+                        .options
+                        .compact_model
+                        .as_deref()
+                        .unwrap_or(&self.options.model);
                     let compacted = compact_messages(
                         &self.client,
-                        &self.options.model,
+                        compact_model,
                         &self.messages,
                         KEEP_RECENT_MESSAGES,
                     )
                     .await?;
-                    let tokens_after = estimate_total(&compacted, system_chars, tools_chars);
+                    let tokens_after = estimate_total(&compacted, system_chars, tools_chars, self.options.chars_per_token);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
                     if removed > 0 {
@@ -818,9 +844,14 @@ impl QueryEngine {
     /// Returns (removed, kept) message counts, or `None` if nothing compacted.
     pub async fn compact_now(&mut self) -> Result<Option<(usize, usize)>> {
         let before = self.messages.len();
+        let compact_model = self
+            .options
+            .compact_model
+            .as_deref()
+            .unwrap_or(&self.options.model);
         let compacted = compact_messages(
             &self.client,
-            &self.options.model,
+            compact_model,
             &self.messages,
             KEEP_RECENT_MESSAGES,
         )

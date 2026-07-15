@@ -108,6 +108,15 @@ struct AttachmentRef {
     id: String,
     filename: String,
     extracted_text: String,
+    /// First few extracted images as base64 (for multimodal context).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    images: Vec<ImageRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageRef {
+    media_type: String,
+    data: String,
 }
 
 /// Response from POST /api/upload.
@@ -117,6 +126,8 @@ struct UploadResponse {
     filename: String,
     extracted_text: String,
     image_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<ImageRef>>,
     error: Option<String>,
 }
 
@@ -134,7 +145,7 @@ struct SessionInfoWire {
     summary: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum ServerMsg {
@@ -242,6 +253,8 @@ struct AppState {
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
     /// Document processing model config (from settings).
     doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
+    /// Optional model for compaction summarization (from settings).
+    compact_model: Option<String>,
     /// Directory where uploaded attachments are stored.
     upload_dir: PathBuf,
 }
@@ -333,7 +346,9 @@ impl QuestionResolver for WsQuestionResolver {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Prepend extracted file content to the user's prompt so the model receives
-/// document text as part of the conversation turn.
+/// document text as part of the conversation turn. Extracted images are noted
+/// but passed as text for now (full ContentBlock::Image injection requires
+/// engine-level changes to the User message construction).
 fn enrich_prompt_with_attachments(
     prompt: &str,
     attachments: &Option<Vec<AttachmentRef>>,
@@ -350,6 +365,12 @@ fn enrich_prompt_with_attachments(
     parts.push_str("The user has attached the following files. Their content has already been extracted and is shown below — you do NOT need to read or process these files. Just use the content directly.\n\n");
     for a in atts {
         parts.push_str(&format!("## File: {}\n\n", a.filename));
+        if !a.images.is_empty() {
+            parts.push_str(&format!(
+                "({} image(s) were extracted from this file and are available for visual reference)\n\n",
+                a.images.len()
+            ));
+        }
         let text = &a.extracted_text;
         if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
             let truncated: String = text.chars().take(attachments::MAX_INLINE_TEXT_CHARS).collect();
@@ -431,6 +452,7 @@ fn build_options(
     max_turns: Option<u32>,
     append: Option<String>,
     arguments: Option<String>,
+    compact_model: Option<String>,
     tx: Tx,
     pending_permissions: Arc<PermissionMap>,
     permission_mode: nonoclaw_core::PermissionMode,
@@ -459,6 +481,8 @@ fn build_options(
         question_resolver: None, // set per-engine below
         auto_compact: true,
         compact_threshold_tokens: 80_000,
+        compact_model,
+        chars_per_token: 4, // default; could be passed from settings
         skills_manager: Some(skills_manager),
         background_registry: Some(background_registry),
     }
@@ -860,11 +884,21 @@ async fn upload_handler(
     // Process the file through the doc model.
     let extracted = attachments::process_file(&doc_model, &stored_path, &safe_name, &upload_id).await;
 
+    let images = if extracted.images_base64.is_empty() {
+        None
+    } else {
+        Some(extracted.images_base64.iter().map(|i| ImageRef {
+            media_type: i.media_type.clone(),
+            data: i.data.clone(),
+        }).collect())
+    };
+
     let resp = UploadResponse {
         id: extracted.id,
         filename: extracted.filename,
         extracted_text: extracted.extracted_text,
         image_count: extracted.image_count,
+        images,
         error: extracted.error,
     };
 
@@ -895,6 +929,7 @@ pub async fn serve(
     tunnel: bool,
     model_profiles: Vec<ModelProfile>,
     doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
+    compact_model: Option<String>,
 ) -> anyhow::Result<()> {
     // Bind the listener FIRST so the port is open before cloudflared tries
     // to connect (otherwise tunnel spawn races the bind and gets "connection
@@ -958,6 +993,7 @@ pub async fn serve(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
         doc_model,
+        compact_model,
         upload_dir,
     });
 
@@ -1518,6 +1554,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 None,
                                 Some(body.clone()),
                                 arguments.clone(),
+                                s.compact_model.clone(),
                                 tx2.clone(),
                                 Arc::clone(&s.pending_permissions),
                                 *s.permission_mode.lock().await,
@@ -1561,6 +1598,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         max_turns,
                         append_system_prompt.clone(),
                         arguments.clone(),
+                        s.compact_model.clone(),
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
                         *s.permission_mode.lock().await,
@@ -1823,7 +1861,28 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         tracing::warn!("failed to clear session file: {e}");
                     }
                 }
-                send_msg(&tx, ServerMsg::MessagesLoaded { messages: vec![] }).await;
+                let ml = ServerMsg::MessagesLoaded { messages: vec![] };
+                send_msg(&tx, ml.clone()).await;
+
+                // Broadcast the clear to all other peers sharing this session
+                // so desktop ↔ mobile stay in sync.
+                if let Some(ref cid) = shared_sid {
+                    let mut reg = state.session_registry.lock().await;
+                    if let Some(entry) = reg.get_mut(cid) {
+                        let mut dead = Vec::new();
+                        for (i, peer) in entry.txs.iter().enumerate() {
+                            if Arc::ptr_eq(peer, &tx) {
+                                continue;
+                            }
+                            if !send_msg_ok(peer, &ml).await {
+                                dead.push(i);
+                            }
+                        }
+                        for i in dead.into_iter().rev() {
+                            entry.txs.remove(i);
+                        }
+                    }
+                }
             }
 
             // ── Manual /compact ─────────────────────────────────────────────
@@ -1856,6 +1915,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     None,
                     None,
                     None,
+                    state.compact_model.clone(),
                     tx.clone(),
                     Arc::clone(&state.pending_permissions),
                     *state.permission_mode.lock().await,

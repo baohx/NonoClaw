@@ -1,11 +1,12 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import type { AttachmentRef, UploadResponse } from "../types";
+import type { AttachmentRef, ImageRef, UploadResponse } from "../types";
 
 interface PendingAttachment {
   id: string;
   filename: string;
   extracted_text: string;
   image_count: number;
+  images?: ImageRef[];
   uploading: boolean;
   error?: string;
 }
@@ -59,7 +60,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
       setAttachments((prev) =>
         prev.map((a) =>
           a.id === id
-            ? { ...a, uploading: false, extracted_text: data.extracted_text, image_count: data.image_count }
+            ? { ...a, uploading: false, extracted_text: data.extracted_text, image_count: data.image_count, images: data.images }
             : a
         )
       );
@@ -146,7 +147,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
     setHasText(false);
     const ready: AttachmentRef[] = attachments
       .filter((a) => !a.error && a.extracted_text)
-      .map((a) => ({ id: a.id, filename: a.filename, extracted_text: a.extracted_text }));
+      .map((a) => ({ id: a.id, filename: a.filename, extracted_text: a.extracted_text, images: a.images }));
     onSubmit(text, ready);
     setAttachments([]);
   }, [disabled, onSubmit, attachments]);
