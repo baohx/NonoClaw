@@ -87,11 +87,13 @@ pub async fn process_file(
             Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
                 let images = extract_pdf_images(file_path);
                 let image_count = images.len();
-                tracing::info!(chars = text.len(), images = image_count, "PDF text + images extracted directly");
+                // OCR the embedded images so text-only models can see them too.
+                let enriched = ocr_embedded_images(config, &images, &text).await;
+                tracing::info!(chars = enriched.len(), images = image_count, "PDF text + images extracted");
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
-                    extracted_text: text,
+                    extracted_text: enriched,
                     image_count,
                     images_base64: images,
                     error: None,
@@ -113,11 +115,12 @@ pub async fn process_file(
             Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
                 let images = extract_docx_images(file_path);
                 let image_count = images.len();
-                tracing::info!(chars = text.len(), images = image_count, "DOCX text + images extracted directly");
+                let enriched = ocr_embedded_images(config, &images, &text).await;
+                tracing::info!(chars = enriched.len(), images = image_count, "DOCX text + images extracted");
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
-                    extracted_text: text,
+                    extracted_text: enriched,
                     image_count,
                     images_base64: images,
                     error: None,
@@ -295,6 +298,73 @@ fn extract_wt_text(xml: &str) -> String {
     if in_wt && !text_buf.is_empty() {
         if !out.is_empty() { out.push(' '); }
         out.push_str(&text_buf);
+    }
+    out
+}
+
+/// OCR each embedded image and append descriptions to the document text.
+/// Text-only models (DeepSeek V4) can't see ContentBlock::Image blocks,
+/// so we pre-OCR the images and include the text inline.
+async fn ocr_embedded_images(
+    config: &DocModelConfig,
+    images: &[ImageB64],
+    document_text: &str,
+) -> String {
+    if images.is_empty() {
+        return document_text.to_string();
+    }
+    let mut out = document_text.to_string();
+    let api_key = config.resolved_api_key();
+    let url = format!(
+        "{}/v1/chat/completions",
+        config.base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+
+    for (i, img) in images.iter().enumerate() {
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) }
+                    },
+                    {
+                        "type": "text",
+                        "text": "<image>\nDescribe this image briefly in Chinese. What is it? A photo, chart, signature, stamp, diagram? Include any visible text."
+                    }
+                ]
+            }],
+            "max_tokens": 300,
+            "temperature": 0.0
+        });
+
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(desc) = json["choices"][0]["message"]["content"].as_str() {
+                        out.push_str(&format!(
+                            "\n\n[Embedded Image {}]: {desc}",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!(status=%resp.status(), "embedded image OCR failed for image {}", i+1);
+            }
+            Err(e) => {
+                tracing::warn!("embedded image OCR request error: {e}");
+            }
+        }
     }
     out
 }
