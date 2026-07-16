@@ -1425,6 +1425,8 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 .await;
             }
             ClientMsg::ProjectInfoRefresh => {
+                // Re-scan for new skill directories the file watcher may have missed.
+                state.skills_manager.write().unwrap().rescan(&state.cwd);
                 let skills_snapshot = state.skills_manager.read().unwrap().all_active();
                 let current_model = state.active_model.lock().await.clone();
                 let info = gather(

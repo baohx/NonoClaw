@@ -317,6 +317,22 @@ impl SkillsManager {
         self.usage.save();
     }
 
+    /// Re-scan all skill directories and add newly discovered skills to
+    /// `dynamic_skills`.  Called when the user explicitly refreshes the
+    /// Insight panel (file watcher may miss new subdirectories).
+    pub fn rescan(&mut self, cwd: &Path) {
+        let discovered = discover(cwd);
+        for skill in discovered {
+            if !self.static_skills.iter().any(|s| s.name == skill.name)
+                && !self.dynamic_skills.contains_key(&skill.name)
+            {
+                tracing::info!(name = skill.name, "rescan discovered new skill");
+                self.dynamic_skills.insert(skill.name.clone(), skill);
+                self.bump();
+            }
+        }
+    }
+
     /// All active skills sorted by usage frequency (highest score first).
     pub fn ranked_active(&self) -> Vec<Skill> {
         let mut active = self.all_active();
