@@ -81,6 +81,54 @@ pub async fn process_file(
         }
     }
 
+    // ── PDF: try direct text extraction first ──────────────────────────
+    if mime == "application/pdf" {
+        match extract_pdf_text(file_path) {
+            Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
+                tracing::info!(chars = text.len(), "PDF text extracted directly");
+                return ExtractedDoc {
+                    id: upload_id.into(),
+                    filename: original_name.into(),
+                    extracted_text: text,
+                    image_count: 0,
+                    images_base64: vec![],
+                    error: None,
+                };
+            }
+            Ok(_) => {
+                tracing::info!("PDF has sparse text — falling back to OCR");
+            }
+            Err(e) => {
+                tracing::warn!("pdftotext failed: {e} — falling back to OCR");
+            }
+        }
+        // Fall through to OCR path below.
+    }
+
+    // ── DOCX: try direct text extraction first ─────────────────────────
+    if mime.contains("officedocument") || mime == "application/msword" {
+        match extract_docx_text(file_path) {
+            Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
+                tracing::info!(chars = text.len(), "DOCX text extracted directly");
+                return ExtractedDoc {
+                    id: upload_id.into(),
+                    filename: original_name.into(),
+                    extracted_text: text,
+                    image_count: 0,
+                    images_base64: vec![],
+                    error: None,
+                };
+            }
+            Ok(_) => {
+                tracing::info!("DOCX has sparse text — falling back to conversion + OCR");
+            }
+            Err(e) => {
+                tracing::warn!("DOCX text extraction failed: {e} — falling back to conversion + OCR");
+            }
+        }
+        // Fall through to libreoffice conversion + OCR below.
+    }
+
     // DOCX / DOC: convert to PDF via libreoffice first.
     let pdf_path: Option<PathBuf>;
     let process_target = if mime.contains("officedocument") || mime == "application/msword" {
@@ -158,6 +206,93 @@ pub async fn process_file(
             error: Some(e),
         },
     }
+}
+
+// ── Direct text extraction (no OCR needed) ─────────────────────────────────
+
+/// Extract text from a PDF using `pdftotext` (poppler-utils).
+fn extract_pdf_text(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg(path)
+        .arg("-") // stdout
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("pdftotext: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pdftotext failed: {stderr}"));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("invalid UTF-8: {e}"))
+}
+
+/// Extract text from a DOCX file (ZIP of XML).  Walks `word/document.xml`
+/// and collects text from `<w:t>` elements.
+fn extract_docx_text(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("not a valid ZIP/DOCX: {e}"))?;
+    let mut doc = archive
+        .by_name("word/document.xml")
+        .map_err(|e| format!("word/document.xml not found: {e}"))?;
+    let mut doc_str = String::new();
+    std::io::Read::read_to_string(&mut doc, &mut doc_str)
+        .map_err(|e| format!("failed to read document.xml: {e}"))?;
+    Ok(extract_wt_text(&doc_str))
+}
+
+/// Extract text from `<w:t>` elements in a DOCX document.xml string.
+/// Simple regex-free scan: finds `<w:t` ... `>` and collects content until `</w:t>`.
+fn extract_wt_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut in_wt = false;
+    let mut tag_buf = String::new();
+    let mut text_buf = String::new();
+
+    for ch in xml.chars() {
+        match ch {
+            '<' => {
+                if in_wt {
+                    // Flush buffered text.
+                    if !text_buf.is_empty() {
+                        if !out.is_empty() { out.push(' '); }
+                        out.push_str(&text_buf);
+                        text_buf.clear();
+                    }
+                }
+                in_tag = true;
+                tag_buf.clear();
+            }
+            '>' => {
+                if in_tag {
+                    let t = tag_buf.trim();
+                    if t.starts_with("w:t") || t.starts_with("/w:t") {
+                        in_wt = !t.starts_with("/");
+                        text_buf.clear();
+                    }
+                    in_tag = false;
+                    tag_buf.clear();
+                } else if in_wt {
+                    text_buf.push(ch);
+                }
+            }
+            _ => {
+                if in_tag {
+                    tag_buf.push(ch);
+                } else if in_wt {
+                    text_buf.push(ch);
+                }
+            }
+        }
+    }
+    // Flush remaining.
+    if in_wt && !text_buf.is_empty() {
+        if !out.is_empty() { out.push(' '); }
+        out.push_str(&text_buf);
+    }
+    out
 }
 
 // ── MIME detection ──────────────────────────────────────────────────────────
