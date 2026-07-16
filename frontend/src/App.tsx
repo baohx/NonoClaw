@@ -121,11 +121,27 @@ export default function App() {
       }
       // /multi model1,model2 <prompt> — run the same prompt against multiple
       // models sequentially and display results labeled by model name.
-      const multiMatch = cmd.match(/^\/multi\s+([\w\-.]+(?:,\s*[\w\-.]+)*)\s+(.+)/s);
-      if (multiMatch) {
+      if (cmd.startsWith("/multi")) {
+        const multiMatch = cmd.match(/^\/multi\s+([\w\-.]+(?:,\s*[\w\-.]+)*)\s+(.+)/s);
+        if (!multiMatch || multiMatch[2].trim().length === 0) {
+          addMessage({
+            id: `sys-${Date.now()}`,
+            role: "system",
+            content: "Usage: /multi model1,model2 your prompt\n\nExample: /multi deepseek-v4-pro,glm-5.2 你好\n\nAvailable models: " +
+              useStore.getState().availableModels.map(m => m.name).join(", "),
+          });
+          return;
+        }
         const models = multiMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
         const realPrompt = multiMatch[2].trim();
-        if (models.length < 2) return;
+        if (models.length < 2) {
+          addMessage({
+            id: `sys-${Date.now()}`,
+            role: "system",
+            content: "/multi needs at least 2 models, got: " + models.join(", "),
+          });
+          return;
+        }
         const label = (m: string) => {
           const info = useStore.getState().availableModels.find((x) => x.name === m);
           return info?.label || m;
