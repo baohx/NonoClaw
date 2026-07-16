@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.2.0 | **Goal**: a native CLI coding agent with a complete tool ecosystem, multi-model switching, remote access via Cloudflare Tunnel, and a bioluminescent web interface.
+> **Version**: v0.3.0 | **Goal**: a native CLI coding agent with file-attachment OCR, multimodal document understanding, unified model profiles, and a bioluminescent web interface.
 
 ---
 
@@ -60,21 +60,24 @@ nonoclaw -p "explain Rust ownership"
 
 | Category | Details |
 |---|---|
-| **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **batched parallel tool execution** (concurrency cap=10) |
-| **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes (Kitchen Sink, Runaway Refactor, etc.), Karpathy's anti-overengineering patterns, ToolSearch guidance for deferred tools |
+| **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **orphan repair** (auto-fix broken tool_use/tool_result pairs), **thinking-block strip** (Bedrock proxy compat), **batched parallel tool execution** (concurrency cap=10) |
+| **Memory System** | Multi-layer: MEMORY.md index + individual fact files with YAML frontmatter, model can write/update/delete memories, `[[link]]` references, **auto-loaded each run** |
+| **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
 | **17 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, **ToolSearch**, **TaskCreate/Get/List/Update** |
+| **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
-| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge** (`prompts/list` + `prompts/get`) |
-| **Multi-Model** | Pre-define model profiles in `settings.json` → switch at runtime via UI dropdown or `/multi` slash command |
+| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge** |
+| **Unified Model Profiles** | All models in single `models[]` array with `role` tags (`main`/`doc`/`compact`); `docModel` and `compactModel` reference by name; **per-model contextWindow / maxTokens / charsPerToken**; **compactModel** independent summarization model |
+| **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
-| **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming** (custom/ai/auto titles), **progressive metadata** (title, tag, mode) |
-| **Context** | Auto-compaction `compactThreshold` tokens, configurable `contextWindow`, **Prompt Caching** (ephemeral cache breakpoints on system prompt + tools) |
-| **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via `paths` globs / `triggers` regex / file-path discovery, **argument substitution** (`$1`, `$ARGUMENTS`, `${NONOCLAW_SKILL_DIR}`), **fork context** (`context: fork` → sub-agent), **usage tracking** (7-day half-life decay), **hot reload** (notify file watcher) |
-| **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP** hook kinds, 12 event types) |
-| **Task System** | File-persisted task store (`~/.nonoclaw/tasks/`), dependency graph (blocks/blockedBy), owner assignment, status lifecycle (pending→in_progress→completed) |
-| **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX rendering |
+| **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
+| **Context** | Auto-compaction `compactThreshold` tokens, configurable `contextWindow`, **Prompt Caching** (ephemeral, git excluded from cache), **per-model token estimation** (charsPerToken) |
+| **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload |
+| **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP**, 12 event types) |
+| **Task System** | File-persisted task store, dependency graph, owner assignment, status lifecycle |
+| **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX, **tool card auto-collapse + command preview**, **attachment chips with upload state**, **"Nono" assistant label** |
 | **PWA** | Add to Home Screen, offline SW cache, installable on Android/iOS |
-| **Mobile Sync** | QR code → shared session → real-time MessagesLoaded broadcast between desktop ↔ phone |
+| **Mobile Sync** | QR code → shared session → real-time MessagesLoaded broadcast; **skipOneLoad** for reliable peer sync; **sync_session_to_peers** on Run/Clear/post-run; **markClearing** prevents tool-card residue |
 | **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access with terminal ASCII QR code |
 | **Export** | Markdown copy + `.md` file download from assistant responses |
 
@@ -82,7 +85,7 @@ nonoclaw -p "explain Rust ownership"
 
 ## Multi-Model & Multi-Provider
 
-Define provider profiles in `settings.json` — each with its own `baseUrl`, `apiKey`, and a `label` for the UI dropdown:
+All models live in a single `models[]` array with `role` tags — main conversation models, document-processing models, and compaction models:
 
 ```json
 {
@@ -92,31 +95,75 @@ Define provider profiles in `settings.json` — each with its own `baseUrl`, `ap
       "label": "DeepSeek V4",
       "baseUrl": "https://api.deepseek.com/anthropic",
       "apiKey": "sk-xxxx",
-      "default": true
+      "role": ["main"],
+      "default": true,
+      "contextWindow": 1048576,
+      "maxTokens": 8192,
+      "charsPerToken": 3
     },
     {
-      "name": "glm-5.2",
-      "label": "GLM 5.2",
-      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "sk-yyyy"
-    },
-    {
-      "name": "claude-sonnet-4-5",
-      "label": "Claude Sonnet",
+      "name": "claude-sonnet-4-5-20250929",
+      "label": "Claude Sonnet 4.5",
       "baseUrl": "https://api.anthropic.com",
-      "apiKey": "sk-ant-zzzz"
+      "apiKey": "sk-ant-zzzz",
+      "role": ["main", "compact"],
+      "contextWindow": 200000,
+      "maxTokens": 8192,
+      "charsPerToken": 4
+    },
+    {
+      "name": "mistral-ocr-latest",
+      "label": "Mistral OCR",
+      "baseUrl": "https://api.mistral.ai",
+      "apiKey": "sk-mistral-xxxx",
+      "role": ["doc"]
     }
-  ]
+  ],
+  "docModel": "mistral-ocr-latest",
+  "compactModel": "claude-sonnet-4-5-20250929"
 }
 ```
 
-**Runtime switching**: The status bar model name becomes a dropdown (when 2+ models configured). Switching rebuilds the API `Client` per-run with the matching endpoint and key — no restart required.
+**Model roles**:
+| Role | Purpose | UI Dropdown |
+|------|---------|:-----------:|
+| `main` (or absent) | Conversation model | ✅ Yes |
+| `doc` | Document-processing (OCR / vision) | ❌ No |
+| `compact` | Summarization / compaction | ❌ No |
 
-**`/multi` slash command**: Compare answers from multiple models in one turn:
+A model can have multiple roles — e.g. `["main", "compact"]` for a model that serves both conversation and summarization.
+
+**Per-model fields**: `contextWindow` (total tokens), `maxTokens` (output limit), `charsPerToken` (tokenizer estimate) — override global defaults per model.
+
+**Runtime switching**: The status bar model name becomes a dropdown (when 2+ `main` models configured). Switching rebuilds the API `Client` per-run — no restart.
+
+**`/multi` slash command**: Compare answers from multiple models:
 ```
 /multi deepseek-v4-pro,glm-5.2 compare Rust and Go error handling
 ```
-Sends the prompt to both models sequentially, labels each response with the model name.
+Sends the prompt to both models sequentially, labels each response with the model name. Shows syntax help on malformed input.
+
+### Document Processing (File Attachments)
+
+Click the paperclip (📎), drag files, or paste to upload. Supported: PDF, DOCX, DOC, TXT, MD, PNG, JPG.
+
+**Processing pipeline**:
+```
+Upload
+├─ TXT/MD → direct read
+├─ PDF    → pdftotext (text) + pdfimages (embedded) → OCR if scanned
+├─ DOCX   → ZIP XML <w:t> (text) + word/media/ (embedded) → OCR if sparse
+└─ Images → DeepSeek OCR 2 (tiled) or Mistral OCR
+```
+
+**Doc model providers** (`provider` auto-inferred from model name):
+| Provider | Model Name Pattern | API Format |
+|----------|-------------------|------------|
+| `mistral_ocr` | contains `mistral` | `POST /v1/ocr` |
+| `deepseek_ocr` | contains `deepseek`+`ocr` | `POST /v1/chat/completions` (tiled) |
+| `generic_vision` | anything else | `POST /v1/chat/completions` |
+
+Embedded images are OCR'd individually so text-only models (DeepSeek V4) can "see" them as inline descriptions. Multimodal models (Sonnet) receive both `ContentBlock::Image` blocks and OCR text.
 
 ---
 
@@ -374,10 +421,13 @@ Full example at `~/.nonoclaw/settings.json`:
 | Field | Description |
 |---|---|
 | `model` | Default model (used when `models[]` is absent) |
-| `contextWindow` | Model's total context size in tokens (auto-calculates compact threshold) |
-| `maxTokens` | Max output tokens per turn |
-| `env` | Environment vars injected at startup (legacy single-model mode) |
-| `models[]` | Multi-model profiles: `name`, `label`, `baseUrl`, `apiKey`, `default` |
+| `contextWindow` | Global context window (overridden by per-model `contextWindow`) |
+| `maxTokens` | Global max output per turn (overridden by per-model `maxTokens`) |
+| `charsPerToken` | Global chars-per-token estimator (default 4; overridden per-model) |
+| `env` | Environment vars injected at startup |
+| `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken` |
+| `docModel` | Model name reference for document processing (OCR) |
+| `compactModel` | Model name reference for auto-compaction summarization |
 | `mcpServers` | MCP server configs: `command`, `args`, `env` |
 | `permissions.defaultMode` | `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan` |
 | `permissions.allow` | Tool patterns to always allow |
@@ -475,24 +525,25 @@ NonoClaw/
 
 NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的 **Rust 重写版本**。完整实现智能体循环、17 个内置工具、分批并发工具执行、后台 Bash 任务、5 级权限门禁、会话持久化（JSONL，支持命名）、MCP 双向（含 prompts→skill 桥接）、Web UI（含 PWA 移动端支持）。
 
-### v0.2.0 新增亮点
-- **分批工具并发**：按 CC 标准 `partitionToolCalls` 实现，连续并发安全工具自动分组并行执行（上限 10，可通过 `NONOCLAW_MAX_TOOL_CONCURRENCY` 配置）
-- **Bash 后台任务**：`run_in_background: true` 将长时间命令放入后台，输出持久化到磁盘，完成后自动注入 `<task_notification>`
-- **Task 工具集**：TaskCreate/Get/List/Update 四个工具，文件持久化到 `~/.nonoclaw/tasks/`，支持依赖图（blocks/blockedBy）和 owner 分配
-- **ToolSearch 按需加载**：WebSearch/WebFetch/Coordinator 等低频工具不在 system prompt 中出现，模型通过 ToolSearch 工具按关键词查找
-- **Skills 动态激活**：12 个内置技能 + 条件激活（paths glob 匹配）+ 正则触发器（triggers）+ 文件路径向上发现 + fork 上下文子代理 + 参数替换 + 使用跟踪 + 热重载
-- **Hooks 扩展**：支持 3 种执行方式（Shell 命令 / LLM Prompt 评估 / HTTP POST），12 种事件类型
-- **Session 丰富**：支持自定义标题、AI 生成标题、自动首句提取、标签、模式元数据
-- **MCP 技能桥**：`prompts/list` → 自动注册为 `/mcp__server__prompt` 可调用技能
+### v0.3.0 新增亮点
+- **文件附件上传**：支持 PDF/DOCX/DOC/TXT/MD/PNG/JPG，纸夹按钮 + 拖拽 + 粘贴三种上传方式。PDF/DOCX 优先直接提取文字（pdftotext / ZIP XML），扫描件自动降级 OCR。嵌入图片（公章、签名、图表）自动提取并 OCR 生成文字描述。
+- **统一模型配置**：所有模型集中在 `models[]` 数组，通过 `role` 标签区分用途（`main` 对话 / `doc` 文档处理 / `compact` 摘要压缩）。`docModel` 和 `compactModel` 以名称字符串引用。
+- **多模态文档理解**：支持 Mistral OCR（原生 PDF）和 DeepSeek OCR 2（切片式）两种文档处理后端。嵌入图片以 `ContentBlock::Image` 注入多模态模型（Sonnet），同时生成 OCR 文字描述供纯文本模型（DeepSeek V4）使用。
+- **记忆系统**：模型可通过 Write 工具创建/更新 `.nonoclaw/memory/*.md` 事实文件，带 YAML frontmatter 和 `[[link]]` 引用。MEMORY.md 索引 + 独立 fact 文件双层结构。
+- **Per-Model 参数**：每个模型可配专属 `contextWindow`、`maxTokens`、`charsPerToken`，自动压缩阈值和 token 估算更精确。
+- **同步机制重构**：`skipOneLoad` 替代时间窗口，`sync_session_to_peers` 统一广播，Run 到达时立即同步，`markClearing` 防止 /clear 残留。
+- **Prompt Cache 优化**：Git 上下文从 cached block 移至 uncached block，缓存不会每次工具执行后失效。Thinking 块自动过滤（Bedrock 代理兼容）。
+- **工具卡片增强**：自动折叠 + 命令预览（Bash/WebFetch/WebSearch/Grep 等显示关键参数）。`/multi` 语法错误时显示帮助提示。
 
 ### 核心特色
-- **多模型切换**：在 `settings.json` 的 `models[]` 数组中预配不同供应商（DeepSeek、GLM、Claude）的 endpoint 和 key，通过 UI 下拉框随时切换；`/multi` 斜杠命令支持一轮对话中用多个模型回答并对比
-- **Web UI**：三栏布局（文件树+Git面板 / 对话 / Insight 手风琴），生物发光暗色主题，呼吸式 aurora 背景（随 token 输出节奏脉动），支持 Markdown + KaTeX 数学公式渲染
-- **Cloudflare Tunnel**：`--tunnel` 自动启动 cloudflared 隧道，终端打印 ASCII 二维码，手机在任何网络扫码即可远程访问并共享同一 session
-- **权限模式**：UI 下拉框随时切换 `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan`
-- **增强 System Prompt**：包含手术级改动规则、6 种命名失败模式（厨房水槽、失控重构等）、Karpathy 反过度工程规则、ToolSearch 使用指南
-- **Skills 机制**：12 个内置技能 + 15 种 frontmatter 字段 + 5 种动态激活方式 + 参数替换 + 使用排名 + 热重载
-- **配置灵活**：`settings.json` 集中管理模型、权限、上下文窗口、MCP server、Brave 搜索 key 等
+- **多模型切换**：统一 `models[]` 数组，`role` 标签区分用途，UI 下拉框切换对话模型，`/multi` 多模型对比
+- **文档处理**：上传即 OCR，Mistral OCR ($4/千页) 或 DeepSeek OCR 2 ($0.03/M tokens)，文字型文档直读零成本
+- **Web UI**：三栏布局，生物发光暗色主题，呼吸式 aurora 背景，Markdown + KaTeX 渲染，附件 chips 状态指示
+- **记忆持久化**：模型可读写 `.nonoclaw/memory/` 事实文件，跨 session 持久化用户偏好和项目上下文
+- **Cloudflare Tunnel**：`--tunnel` 自动隧道 + ASCII 二维码，手机扫码远程访问共享 session
+- **权限模式**：UI 下拉框切换 5 种模式
+- **增强 System Prompt**：手术级改动规则、6 种命名失败模式、反过度工程规则、记忆写入指令
+- **配置灵活**：每模型专属窗口/令牌/估值，集中管理
 
 ### 安装运行
 ```bash
