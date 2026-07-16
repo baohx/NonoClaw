@@ -303,8 +303,8 @@ fn extract_wt_text(xml: &str) -> String {
 }
 
 /// OCR each embedded image and append descriptions to the document text.
-/// Text-only models (DeepSeek V4) can't see ContentBlock::Image blocks,
-/// so we pre-OCR the images and include the text inline.
+/// For Mistral OCR, uses `/v1/ocr`; for OpenAI-compatible providers
+/// (deepseek_ocr, generic_vision), uses `/v1/chat/completions`.
 async fn ocr_embedded_images(
     config: &DocModelConfig,
     images: &[ImageB64],
@@ -315,54 +315,101 @@ async fn ocr_embedded_images(
     }
     let mut out = document_text.to_string();
     let api_key = config.resolved_api_key();
-    let url = format!(
-        "{}/v1/chat/completions",
-        config.base_url.trim_end_matches('/')
-    );
     let client = reqwest::Client::new();
 
-    for (i, img) in images.iter().enumerate() {
-        let body = serde_json::json!({
-            "model": config.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) }
-                    },
-                    {
-                        "type": "text",
-                        "text": "<image>\nDescribe this image briefly in Chinese. What is it? A photo, chart, signature, stamp, diagram? Include any visible text."
-                    }
-                ]
-            }],
-            "max_tokens": 300,
-            "temperature": 0.0
-        });
+    let is_mistral = config.provider == "mistral_ocr";
 
-        match client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(desc) = json["choices"][0]["message"]["content"].as_str() {
-                        out.push_str(&format!(
-                            "\n\n[Embedded Image {}]: {desc}",
-                            i + 1
-                        ));
+    for (i, img) in images.iter().enumerate() {
+        let result: Result<String, _> = if is_mistral {
+            // Mistral OCR: POST /v1/ocr with image_url
+            let url = format!("{}/v1/ocr", config.base_url.trim_end_matches('/'));
+            let body = serde_json::json!({
+                "model": config.model,
+                "document": {
+                    "type": "image_url",
+                    "image_url": format!("data:{};base64,{}", img.media_type, img.data)
+                }
+            });
+            match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        let text: String = json["pages"]
+                            .as_array()
+                            .map(|pages| {
+                                pages
+                                    .iter()
+                                    .filter_map(|p| p["markdown"].as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        Ok(text)
+                    } else {
+                        Err("parse error".to_string())
                     }
                 }
+                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                Err(e) => Err(format!("{e}")),
             }
-            Ok(resp) => {
-                tracing::warn!(status=%resp.status(), "embedded image OCR failed for image {}", i+1);
+        } else {
+            // OpenAI-compatible: POST /v1/chat/completions
+            let url = format!(
+                "{}/v1/chat/completions",
+                config.base_url.trim_end_matches('/')
+            );
+            let body = serde_json::json!({
+                "model": config.model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.data) }
+                        },
+                        {
+                            "type": "text",
+                            "text": "<image>\nDescribe this image briefly in Chinese. What is it? A photo, chart, signature, stamp, diagram? Include any visible text."
+                        }
+                    ]
+                }],
+                "max_tokens": 300,
+                "temperature": 0.0
+            });
+            match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        Ok(json["choices"][0]["message"]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string())
+                    } else {
+                        Err("parse error".to_string())
+                    }
+                }
+                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                Err(e) => Err(format!("{e}")),
             }
+        };
+
+        match result {
+            Ok(desc) if !desc.is_empty() => {
+                out.push_str(&format!("\n\n[Embedded Image {}]: {desc}", i + 1));
+            }
+            Ok(_) => {}
             Err(e) => {
-                tracing::warn!("embedded image OCR request error: {e}");
+                tracing::warn!("embedded image OCR failed for image {}: {e}", i + 1);
             }
         }
     }
