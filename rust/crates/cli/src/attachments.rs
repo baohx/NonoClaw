@@ -85,13 +85,15 @@ pub async fn process_file(
     if mime == "application/pdf" {
         match extract_pdf_text(file_path) {
             Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
-                tracing::info!(chars = text.len(), "PDF text extracted directly");
+                let images = extract_pdf_images(file_path);
+                let image_count = images.len();
+                tracing::info!(chars = text.len(), images = image_count, "PDF text + images extracted directly");
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
                     extracted_text: text,
-                    image_count: 0,
-                    images_base64: vec![],
+                    image_count,
+                    images_base64: images,
                     error: None,
                 };
             }
@@ -109,13 +111,15 @@ pub async fn process_file(
     if mime.contains("officedocument") || mime == "application/msword" {
         match extract_docx_text(file_path) {
             Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
-                tracing::info!(chars = text.len(), "DOCX text extracted directly");
+                let images = extract_docx_images(file_path);
+                let image_count = images.len();
+                tracing::info!(chars = text.len(), images = image_count, "DOCX text + images extracted directly");
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
                     extracted_text: text,
-                    image_count: 0,
-                    images_base64: vec![],
+                    image_count,
+                    images_base64: images,
                     error: None,
                 };
             }
@@ -293,6 +297,92 @@ fn extract_wt_text(xml: &str) -> String {
         out.push_str(&text_buf);
     }
     out
+}
+
+/// Extract embedded images from a PDF using `pdfimages` (poppler-utils).
+/// Returns base64-encoded JPEGs, capped at 8 images, each <1 MB.
+fn extract_pdf_images(path: &Path) -> Vec<ImageB64> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = dir.join(format!("nonoclaw_pdfimg_{}", uuid::Uuid::new_v4()));
+    let result = std::process::Command::new("pdfimages")
+        .arg("-j") // JPEG output
+        .arg(path)
+        .arg(&prefix)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let mut images = Vec::new();
+    if result.is_err() {
+        return images;
+    }
+    let prefix_str = prefix.file_name().unwrap_or_default().to_string_lossy().to_string();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix_str))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        for p in paths.iter().take(8) {
+            if let Ok(data) = std::fs::read(p) {
+                if data.len() < 1_000_000 {
+                    let b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &data,
+                    );
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+                    images.push(ImageB64 {
+                        media_type: format!("image/{ext}"),
+                        data: b64,
+                    });
+                }
+            }
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    images
+}
+
+/// Extract embedded images from a DOCX file (`word/media/` in the ZIP).
+fn extract_docx_images(path: &Path) -> Vec<ImageB64> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return vec![],
+    };
+    let mut images = Vec::new();
+    // Collect all media file names first (can't borrow archive mutably
+    // and immutably at the same time in zip v2).
+    let media_names: Vec<String> = archive
+        .file_names()
+        .filter(|n| n.starts_with("word/media/"))
+        .map(|n| n.to_string())
+        .collect();
+    for name in media_names.iter().take(8) {
+        if let Ok(mut f) = archive.by_name(name) {
+            let mut buf = Vec::new();
+            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() && buf.len() < 1_000_000 {
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &buf,
+                );
+                let ext = name.rsplit('.').next().unwrap_or("png");
+                images.push(ImageB64 {
+                    media_type: format!("image/{ext}"),
+                    data: b64,
+                });
+            }
+        }
+    }
+    images
 }
 
 // ── MIME detection ──────────────────────────────────────────────────────────
