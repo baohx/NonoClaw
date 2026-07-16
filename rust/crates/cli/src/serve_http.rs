@@ -2012,22 +2012,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         send_msg(&tx, ServerMsg::Event { event: ev }).await;
                     }
                     Ok(None) => {
+                        let count = handle_owned.messages.len();
                         handle_owned.messages = eng.take_messages();
                         *session.lock().await = Some(handle_owned);
-                        send_msg(
-                            &tx,
-                            ServerMsg::Info {
-                                model: state.active_model.lock().await.clone(),
-                                auth_token: state.auth_token.clone(),
-                available_models: state.model_profiles.iter().filter(|p| p.is_conversation_model()).map(|p| ModelInfo {
-                    name: p.name.clone(),
-                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
-                    context_window: p.context_window,
-                }).collect(),
-                                session_id: String::new(),
-                            },
-                        )
-                        .await;
+                        // Nothing to compact — tell the UI.
+                        let ev = serde_json::json!({
+                            "kind": "compacted",
+                            "removed": 0,
+                            "kept": count,
+                            "tokens_before": 0,
+                            "tokens_after": 0,
+                        });
+                        send_msg(&tx, ServerMsg::Event { event: ev }).await;
                     }
                     Err(e) => {
                         handle_owned.messages = eng.take_messages();

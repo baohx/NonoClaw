@@ -107,6 +107,15 @@ export default function App() {
         return;
       }
       if (cmd === "/compact") {
+        if (agentRunning) {
+          useStore.getState().setAgentRunning(false);
+          send({ type: "cancel" });
+        }
+        addMessage({
+          id: `sys-${Date.now()}`,
+          role: "system",
+          content: "compacting…",
+        });
         send({ type: "compact" });
         return;
       }

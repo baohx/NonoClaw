@@ -248,9 +248,20 @@ function handleServerMsg(msg: ServerMsg) {
           break;
         }
         case "model_info": {
-          // Show the model the API actually used (e.g. deepseek-chat) instead
-          // of the configured default.
           if (ev.model) s.setModel(ev.model);
+          break;
+        }
+        case "compacting": {
+          s.setCompacting(true);
+          break;
+        }
+        case "compacted": {
+          s.setCompacting(false);
+          s.addMessage({
+            id: `compacted-${Date.now()}`,
+            role: "system",
+            content: `compacted: removed ${ev.removed ?? 0}, kept ${ev.kept ?? 0} messages`,
+          });
           break;
         }
       }
