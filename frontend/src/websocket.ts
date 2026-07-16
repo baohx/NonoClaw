@@ -19,6 +19,17 @@ const pending: ClientMsg[] = [];
 // Subsequent MessagesLoaded from peer sync broadcasts pass through normally.
 let skipOneLoad = false;
 
+// After /clear, ignore all engine events until MessagesLoaded arrives.
+// The server abort may leave buffered tool_use_start events in the channel
+// that would otherwise resurrect tool cards after the clear.
+let ignoreUntilLoad = false;
+
+/** Signal that a /clear is in flight — drop incoming tool events until the
+ *  server responds with MessagesLoaded. */
+export function markClearing() {
+  ignoreUntilLoad = true;
+}
+
 export function useWebSocket(url: string) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -183,10 +194,10 @@ function handleServerMsg(msg: ServerMsg) {
 
     case "messages_loaded": {
       // Skip exactly one load after reconnect (the handshake replay) so
-      // optimistic user messages aren't wiped.  Broadcast MessagesLoaded
-      // from peer sync always pass through.
+      // optimistic user messages aren't wiped.
       if (skipOneLoad) { skipOneLoad = false; break; }
       if (pending.length > 0) break;
+      ignoreUntilLoad = false; // /clear completed — resume accepting events
       s.loadMessages(msg.messages);
       break;
     }
@@ -207,6 +218,9 @@ function handleServerMsg(msg: ServerMsg) {
     }
 
     case "event": {
+      // Drop events during a /clear flush — they are tool cards from
+      // the aborted run that haven't been drained yet.
+      if (ignoreUntilLoad) break;
       const ev = msg.event;
       switch (ev.kind) {
         case "text_delta": {

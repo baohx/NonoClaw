@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import { useStore } from "./store";
-import { useWebSocket } from "./websocket";
+import { useWebSocket, markClearing } from "./websocket";
 import BreathField from "./components/BreathField";
 import ChatView from "./components/ChatView";
 import CommitDialog from "./components/CommitDialog";
@@ -97,7 +97,10 @@ export default function App() {
     (prompt: string, attachments: AttachmentRef[]) => {
       const cmd = prompt.trim();
       if (cmd === "/clear") {
-        // Server handles both cancel + clear atomically.
+        // Block incoming tool events until the server responds with
+        // MessagesLoaded — prevents buffered events from resurrecting
+        // tool cards after the clear.
+        markClearing();
         useStore.getState().setAgentRunning(false);
         clearMessages();
         send({ type: "clear" });
