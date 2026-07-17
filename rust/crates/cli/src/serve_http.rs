@@ -1429,14 +1429,19 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 state.skills_manager.write().unwrap().rescan(&state.cwd);
                 let skills_snapshot = state.skills_manager.read().unwrap().all_active();
                 let current_model = state.active_model.lock().await.clone();
+                let profile = state.model_profiles.iter().find(|p| p.name == current_model);
+                let cw = profile.and_then(|p| p.context_window).or(state.context_window);
+                let ct = profile.and_then(|p| {
+                    p.context_window.map(|cw| cw.saturating_sub(p.max_tokens.unwrap_or(8192) as usize + 2048))
+                }).unwrap_or(state.compact_threshold);
                 let info = gather(
                     &state.cwd,
                     &current_model,
                     &state.registry,
                     &state.mcp_configs,
                     &state.mcp_sources,
-                    state.context_window,
-                    state.compact_threshold,
+                    cw,
+                    ct,
                     state.public_url.clone(),
                     &skills_snapshot,
                 )
@@ -1897,6 +1902,13 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                     *state.active_model.lock().await = name.clone();
                     tracing::info!(%name, "active model switched");
+                    // Resolve per-model context_window + compact_threshold.
+                    let profile = state.model_profiles.iter().find(|p| p.name == name);
+                    let cw = profile.and_then(|p| p.context_window)
+                        .or(state.context_window);
+                    let ct = profile.and_then(|p| {
+                        p.context_window.map(|cw| cw.saturating_sub(p.max_tokens.unwrap_or(8192) as usize + 2048))
+                    }).unwrap_or(state.compact_threshold);
                     // Push updated Info + ProjectInfo so the UI reflects the new model immediately.
                     send_msg(&tx, ServerMsg::Info {
                         model: name.clone(),
@@ -1915,8 +1927,8 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         &state.registry,
                         &state.mcp_configs,
                         &state.mcp_sources,
-                        state.context_window,
-                        state.compact_threshold,
+                        cw,
+                        ct,
                         state.public_url.clone(),
                         &skills_snapshot,
                     ).await;
