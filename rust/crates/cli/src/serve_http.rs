@@ -407,6 +407,32 @@ fn enrich_prompt_with_attachments(
     MessageContent::from_blocks(blocks)
 }
 
+/// Re-read MCP configs from settings and .mcp.json on refresh, so newly
+/// added servers appear in the Insight panel without restarting.
+fn refresh_mcp_configs(
+    cwd: &Path,
+    existing: &[(String, McpServerConfig)],
+) -> Vec<(String, McpServerConfig)> {
+    let mut merged: std::collections::HashMap<String, McpServerConfig> = existing
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let settings = nonoclaw_engine::load_settings(cwd, None);
+    if let Some(servers) = settings.mcp_servers {
+        for (k, v) in servers {
+            merged.entry(k).or_insert(v);
+        }
+    }
+    if let Some(more) = nonoclaw_engine::settings::load_mcp_json(cwd) {
+        for (k, v) in more {
+            merged.entry(k).or_insert(v);
+        }
+    }
+    let mut out: Vec<_> = merged.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn serialize_event(ev: &EngineEvent) -> serde_json::Value {
     match serde_json::to_value(ev) {
         Ok(v) => v,
@@ -1434,12 +1460,15 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 let ct = profile.and_then(|p| {
                     p.context_window.map(|cw| cw.saturating_sub(p.max_tokens.unwrap_or(8192) as usize + 2048))
                 }).unwrap_or(state.compact_threshold);
+                // Re-scan MCP configs for newly added servers.
+                let live_mcp = refresh_mcp_configs(&state.cwd, &state.mcp_configs);
+                let mcp_sources_clone = state.mcp_sources.clone();
                 let info = gather(
                     &state.cwd,
                     &current_model,
                     &state.registry,
-                    &state.mcp_configs,
-                    &state.mcp_sources,
+                    &live_mcp,
+                    &mcp_sources_clone,
                     cw,
                     ct,
                     state.public_url.clone(),

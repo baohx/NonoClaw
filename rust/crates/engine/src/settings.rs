@@ -464,7 +464,7 @@ fn resolve_model_references(s: &mut SettingsFile) {
 }
 
 /// Load the standalone `.mcp.json` file's `mcpServers` map.
-fn load_mcp_json(cwd: &Path) -> Option<HashMap<String, McpServerConfig>> {
+pub fn load_mcp_json(cwd: &Path) -> Option<HashMap<String, McpServerConfig>> {
     let path = cwd.join(".nonoclaw").join("mcp.json");
     let text = std::fs::read_to_string(&path).ok()?;
     #[derive(Deserialize)]
