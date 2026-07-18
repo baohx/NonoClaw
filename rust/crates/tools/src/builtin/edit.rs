@@ -32,9 +32,10 @@ impl Tool for EditTool {
                 "file_path": {"type":"string","description":"The absolute path to the file to modify"},
                 "old_string": {"type":"string","description":"The text to replace"},
                 "new_string": {"type":"string","description":"The text to replace it with (must be different from old_string)"},
+                "hash_line": {"type":"string","description":"Hash of the line to replace (alternative to old_string; survives whitespace/indentation drift)"},
                 "replace_all": {"type":"boolean","description":"Replace all occurrences of old_string (default false)"}
             },
-            "required": ["file_path", "old_string", "new_string"]
+            "required": ["file_path", "new_string"]
         })
     }
 
@@ -59,17 +60,9 @@ impl Tool for EditTool {
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
         let file_path = require_str(&input, "file_path")?;
-        let old_string = require_str(&input, "old_string")?;
         let new_string = require_str(&input, "new_string")?;
-        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
         let path = resolve_path(ctx.cwd, file_path);
 
-        if old_string == new_string {
-            return Err(Error::Tool {
-                tool: "Edit".into(),
-                message: "new_string must be different from old_string".into(),
-            });
-        }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -80,6 +73,21 @@ impl Tool for EditTool {
                 tool: "Edit".into(),
                 message: format!("{}: {e}", path.display()),
             })?;
+
+        // Hash-line mode: find a line by content fingerprint.
+        if let Some(hash) = input["hash_line"].as_str() {
+            return edit_by_hash_line(&path, &content, hash, new_string);
+        }
+
+        let old_string = require_str(&input, "old_string")?;
+        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+
+        if old_string == new_string {
+            return Err(Error::Tool {
+                tool: "Edit".into(),
+                message: "new_string must be different from old_string".into(),
+            });
+        }
 
         let count = content.matches(old_string).count();
         if count == 0 {
@@ -127,6 +135,59 @@ impl Tool for EditTool {
             new_string,
         )))
     }
+}
+
+/// Compute a stable hash of a line's trimmed content.  Survives whitespace
+/// and indentation drift — `"  let x = 1"` and `"let x = 1"` have the same hash.
+pub fn hash_line(line: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    line.trim().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Find a line by its content hash and replace it.
+fn edit_by_hash_line(
+    path: &std::path::Path,
+    content: &str,
+    target_hash: &str,
+    new_text: &str,
+) -> Result<ToolResult> {
+    let lines: Vec<&str> = content.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|line| hash_line(line) == target_hash)
+        .ok_or_else(|| Error::Tool {
+            tool: "Edit".into(),
+            message: format!(
+                "hash_line '{target_hash}' not found in {}. Re-read the file to get current line hashes.",
+                path.display()
+            ),
+        })?;
+
+    let mut updated = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == idx {
+            updated.push_str(new_text);
+        } else {
+            updated.push_str(line);
+        }
+        updated.push('\n');
+    }
+    std::fs::write(path, &updated).map_err(|e| Error::Tool {
+        tool: "Edit".into(),
+        message: format!("{}: {e}", path.display()),
+    })?;
+    let short = path
+        .strip_prefix(std::env::current_dir().unwrap_or_default())
+        .unwrap_or(path);
+    Ok(ToolResult::ok(format!(
+        "{} (line {idx}, hash_line)\n-{}\n+{}",
+        short.display(),
+        lines[idx],
+        new_text,
+    )))
 }
 
 #[cfg(test)]

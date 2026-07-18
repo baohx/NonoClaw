@@ -196,6 +196,8 @@ pub struct QueryEngine {
     session_id: String,
     session_file: Option<PathBuf>,
     hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
+    /// Background compaction task spawned when tokens reach 80% threshold.
+    pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
 }
 
 impl QueryEngine {
@@ -215,6 +217,7 @@ impl QueryEngine {
             session_id: new_session_id(),
             session_file: None,
             hooks: Vec::new(),
+            pending_compact: None,
         }
     }
 
@@ -240,6 +243,7 @@ impl QueryEngine {
             session_id,
             session_file,
             hooks: Vec::new(),
+            pending_compact: None,
         }
     }
 
@@ -433,10 +437,52 @@ impl QueryEngine {
                 break;
             }
 
+            // Two-pass auto-compact: check for completed background compact first.
+            let compact_done = if let Some(ref handle) = self.pending_compact {
+                handle.is_finished()
+            } else {
+                false
+            };
+            if compact_done {
+                let handle = self.pending_compact.take().unwrap();
+                match handle.await {
+                    Ok(Ok(compacted)) => {
+                        let kept = compacted.len();
+                        let removed = self.messages.len().saturating_sub(kept);
+                        if removed > 0 {
+                            if let Some(first) = compacted.first() {
+                                self.persist(first);
+                            }
+                            self.messages = compacted;
+                            on_event(&EngineEvent::Compacted {
+                                removed, kept, tokens_before: 0, tokens_after: 0,
+                            });
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("background compact failed: {e}"),
+                    Err(e) => tracing::warn!("background compact panicked: {e}"),
+                }
+            }
+
             // Auto-compact: if the estimated prompt exceeds the threshold,
             // summarize the older transcript before the next turn.
             if self.options.auto_compact {
                 let est = estimate_total(&self.messages, system_chars, tools_chars, self.options.chars_per_token);
+                // Pre-fire: spawn background compact at 80% of threshold.
+                if est > self.options.compact_threshold_tokens * 8 / 10
+                    && self.pending_compact.is_none()
+                {
+                    let client = Arc::clone(&self.client);
+                    let model = self.options.compact_model.clone()
+                        .unwrap_or_else(|| self.options.model.clone());
+                    let messages = self.messages.clone();
+                    let keep = KEEP_RECENT_TURNS;
+                    let handle = tokio::spawn(async move {
+                        compact_messages(&client, &model, &messages, keep, crate::compact::CompactMode::Segments).await
+                    });
+                    self.pending_compact = Some(handle);
+                }
+
                 if est > self.options.compact_threshold_tokens {
                     let before = self.messages.len();
                     let tokens_before = est;
