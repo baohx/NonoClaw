@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-const PROMPT: &str = "Memory tool for the Mneme cross-session memory system and LLM Wiki knowledge base.\n\nActions:\n- `search`: search facts by query string. Returns ranked results.\n- `save`: create or update a fact. Requires name, title, content, type, importance, confidence, tags.\n- `forget`: mark a fact as superseded. Requires name and superseded_by reason.\n- `beads`: list active (non-done) beads.\n- `bead_save`: create or update a bead. Requires title, status, priority, content.\n- `bead_done`: mark a bead as done. Requires id.\n- `wiki_search`: search wiki pages by query. Returns ranked results with page name, type, summary.\n- `wiki_ingest`: ingest a raw source file from raw/ into the wiki. Reads the source, creates/updates wiki pages. Requires source_path.\n- `wiki_lint`: list stale or orphan wiki pages. No arguments needed.";
+const PROMPT: &str = "Memory tool for the Mneme cross-session memory system and LLM Wiki knowledge base.\n\nActions:\n- `search`: search facts by query string. Returns ranked results.\n- `save`: create or update a fact. Requires name, title, content, type, importance, confidence, tags.\n- `forget`: mark a fact as superseded. Requires name and superseded_by reason.\n- `beads`: list active (non-done) beads.\n- `bead_save`: create or update a bead. Requires title, status, priority, content.\n- `bead_done`: mark a bead as done. Requires id.\n- `wiki_search`: search wiki pages by query. Returns ranked results with page name, type, summary.\n- `wiki_ingest`: ingest a raw source file from raw/ into the wiki. Reads the source, creates/updates wiki pages. Requires source_path.\n- `wiki_lint`: list stale or orphan wiki pages. No arguments needed.\n- `goal_create`: create a multi-step goal plan. Requires title, steps[], verification.\n- `goal_update`: update goal status or steps. Requires id, optional status, optional steps.\n- `goal_list`: list all goals (active + completed). No arguments needed.";
 
 pub struct MemoryTool;
 
@@ -30,7 +30,7 @@ impl Tool for MemoryTool {
                 "action": {
                     "type": "string",
                     "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
-                    "enum": ["search", "save", "forget", "beads", "bead_save", "bead_done", "wiki_search", "wiki_ingest", "wiki_lint"]
+                    "enum": ["search", "save", "forget", "beads", "bead_save", "bead_done", "wiki_search", "wiki_ingest", "wiki_lint", "goal_create", "goal_update", "goal_list"]
                 },
                 "query": { "type": "string", "description": "Search query (for action: search)" },
                 "name": { "type": "string", "description": "Fact name/slug (for actions: save, forget)" },
@@ -59,7 +59,7 @@ impl Tool for MemoryTool {
     fn is_read_only(&self, input: &Value) -> bool {
         matches!(
             input["action"].as_str(),
-            Some("search") | Some("beads") | Some("wiki_search") | Some("wiki_lint")
+            Some("search") | Some("beads") | Some("wiki_search") | Some("wiki_lint") | Some("goal_list")
         )
     }
     fn is_concurrency_safe(&self, _: &Value) -> bool { true }
@@ -90,6 +90,9 @@ impl Tool for MemoryTool {
             "wiki_search" => wiki_search(ctx.cwd, &input),
             "wiki_ingest" => wiki_ingest(ctx.cwd, &input),
             "wiki_lint" => wiki_lint(ctx.cwd),
+            "goal_create" => goal_create(ctx.cwd, &input),
+            "goal_update" => goal_update(ctx.cwd, &input),
+            "goal_list" => goal_list(ctx.cwd),
             _ => Err(Error::Tool {
                 tool: "Memory".into(),
                 message: format!("unknown action: {action}"),
@@ -323,6 +326,76 @@ fn wiki_lint(cwd: &Path) -> Result<ToolResult> {
         }
         Ok(ToolResult::ok(out))
     }
+}
+
+fn goal_create(cwd: &Path, input: &Value) -> Result<ToolResult> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let title = require_str(input, "title")?.to_string();
+    let goal = crate::memory::Goal {
+        id: id.clone(),
+        title,
+        status: crate::memory::GoalStatus::InProgress,
+        steps: input["steps"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        verification: input["verification"].as_str().unwrap_or("").to_string(),
+        created: chrono_now(),
+        updated: chrono_now(),
+        content: input["content"].as_str().unwrap_or("").to_string(),
+    };
+    goal.save(cwd).map_err(|e| Error::Tool {
+        tool: "Memory".into(),
+        message: format!("failed to save goal: {e}"),
+    })?;
+    Ok(ToolResult::ok(format!("Goal `{}` created (id: {id}).", goal.title)))
+}
+
+fn goal_update(cwd: &Path, input: &Value) -> Result<ToolResult> {
+    let id = require_str(input, "id")?;
+    let mut goals = crate::memory::load_goals(cwd);
+    if let Some(g) = goals.iter_mut().find(|g| g.id == id) {
+        if let Some(s) = input["status"].as_str() {
+            g.status = match s {
+                "completed" => crate::memory::GoalStatus::Completed,
+                "blocked" => crate::memory::GoalStatus::Blocked,
+                "abandoned" => crate::memory::GoalStatus::Abandoned,
+                _ => crate::memory::GoalStatus::InProgress,
+            };
+        }
+        if let Some(steps) = input["steps"].as_array() {
+            g.steps = steps.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+        g.updated = chrono_now();
+        g.save(cwd).map_err(|e| Error::Tool {
+            tool: "Memory".into(),
+            message: format!("failed to save goal: {e}"),
+        })?;
+        Ok(ToolResult::ok(format!("Goal `{id}` updated.")))
+    } else {
+        Err(Error::Tool { tool: "Memory".into(), message: format!("no goal with id `{id}`") })
+    }
+}
+
+fn goal_list(cwd: &Path) -> Result<ToolResult> {
+    let goals = crate::memory::load_goals(cwd);
+    if goals.is_empty() {
+        return Ok(ToolResult::ok("No goals."));
+    }
+    let mut out = String::new();
+    for g in &goals {
+        let icon = match g.status {
+            crate::memory::GoalStatus::Completed => "✅",
+            crate::memory::GoalStatus::InProgress => "🔄",
+            crate::memory::GoalStatus::Blocked => "🚫",
+            crate::memory::GoalStatus::Abandoned => "❌",
+        };
+        out.push_str(&format!("{icon} **{title}** [{status:?}]\n", title = g.title, status = g.status));
+        out.push_str(&format!("  id: {}\n", g.id));
+        let done = g.steps.iter().filter(|s| s.starts_with("[x]")).count();
+        out.push_str(&format!("  steps: {done}/{total}\n\n", total = g.steps.len()));
+    }
+    Ok(ToolResult::ok(out))
 }
 
 fn chrono_now() -> String {

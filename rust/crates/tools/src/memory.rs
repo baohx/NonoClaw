@@ -303,6 +303,90 @@ pub fn supersede_fact(cwd: &Path, name: &str, superseded_by: &str) -> std::io::R
     std::fs::write(&path, new)
 }
 
+// ── Goals (multi-step task plans, extends beads) ──────────────────────────
+
+/// A multi-step task plan that survives sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Goal {
+    /// UUID for this goal.
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Current status.
+    #[serde(default)]
+    pub status: GoalStatus,
+    /// Steps with checkboxes: `[x] done`, `[ ] pending`.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// How to verify completion.
+    #[serde(default)]
+    pub verification: String,
+    /// ISO-8601 creation timestamp.
+    #[serde(default)]
+    pub created: String,
+    /// ISO-8601 last-updated timestamp.
+    #[serde(default)]
+    pub updated: String,
+    /// Markdown body — plan, progress log.
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Blocked,
+    Abandoned,
+}
+
+impl Goal {
+    pub fn from_file(path: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let body = strip_frontmatter(&raw);
+        let fm_text = extract_frontmatter_raw(&raw)?;
+        let mut goal: Goal = serde_yaml::from_str(&fm_text).ok()?;
+        goal.content = body;
+        Some(goal)
+    }
+
+    pub fn save(&self, cwd: &Path) -> std::io::Result<()> {
+        let dir = cwd.join(".nonoclaw/memory/goals");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.md", &self.id));
+        let mut out = String::new();
+        let fm = serde_yaml::to_string(&serde_json::to_value(self).unwrap_or_default())
+            .unwrap_or_default();
+        out.push_str("---\n");
+        out.push_str(&fm);
+        out.push_str("---\n\n");
+        out.push_str(&self.content);
+        if !out.ends_with('\n') { out.push('\n'); }
+        std::fs::write(&path, out)
+    }
+}
+
+/// Load all goals from `memory/goals/*.md`.
+pub fn load_goals(cwd: &Path) -> Vec<Goal> {
+    let dir = cwd.join(".nonoclaw/memory/goals");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return vec![] };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter_map(|p| Goal::from_file(&p))
+        .collect()
+}
+
+/// Active (non-completed, non-abandoned) goals.
+pub fn active_goals(goals: &[Goal]) -> Vec<&Goal> {
+    goals
+        .iter()
+        .filter(|g| g.status != GoalStatus::Completed && g.status != GoalStatus::Abandoned)
+        .collect()
+}
+
 // ── Auto-capture ────────────────────────────────────────────────────────────
 
 /// Extract candidate facts from a transcript (v1: model-initiated).
