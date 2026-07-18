@@ -129,45 +129,66 @@ struct TypedHooks {
 // Loading
 // ---------------------------------------------------------------------------
 
-/// Load all hooks from `.nonoclaw/hooks.json` in cwd.
-/// Returns a flat `Vec<(HookType, HookDef)>`.
+/// Load all hooks from `.nonoclaw/hooks.json` in cwd, merged with
+/// `~/.nonoclaw/hooks.json` (user-global). Project hooks override user
+/// hooks with the same matcher+type.
 pub fn load_hooks(cwd: &Path) -> Vec<(HookType, HookDef)> {
-    let path = cwd.join(".nonoclaw").join("hooks.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return vec![];
-    };
-    let Ok(f) = serde_json::from_str::<HooksFile>(&text) else {
-        return vec![];
-    };
-    let h = f.hooks;
     let mut out = Vec::new();
-    for d in h.pre_tool_use {
-        out.push((HookType::PreToolUse, d));
+
+    // 1. User-global: ~/.nonoclaw/hooks.json
+    if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
+        let user_path = home.join("hooks.json");
+        if let Ok(text) = std::fs::read_to_string(&user_path) {
+            if let Some(h) = parse_hooks_json(&text) {
+                let mut u = flatten_hooks(h);
+                out.append(&mut u);
+            }
+        }
     }
-    for d in h.post_tool_use {
-        out.push((HookType::PostToolUse, d));
+
+    // 2. Project: <cwd>/.nonoclaw/hooks.json (overrides user on conflict)
+    let proj_path = cwd.join(".nonoclaw").join("hooks.json");
+    if let Ok(text) = std::fs::read_to_string(&proj_path) {
+        if let Some(h) = parse_hooks_json(&text) {
+            let proj = flatten_hooks(h);
+            // Remove user hooks that conflict with project hooks.
+            out.retain(|(ut, ud)| {
+                !proj.iter().any(|(pt, pd)| {
+                    pt == ut && pd.matcher == ud.matcher
+                })
+            });
+            out.extend(proj);
+        }
     }
-    for d in h.user_prompt_submit {
-        out.push((HookType::UserPromptSubmit, d));
+
+    // Dedup by (HookType, matcher): later wins.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(t, d)| seen.insert((t.clone(), d.matcher.clone())));
+
+    out
+}
+
+/// Try both `{"hooks": {...}}` (wrapped) and `{"PreToolUse": [...]}` (flat).
+fn parse_hooks_json(text: &str) -> Option<TypedHooks> {
+    // Try wrapped format first.
+    if let Ok(f) = serde_json::from_str::<HooksFile>(text) {
+        return Some(f.hooks);
     }
-    for d in h.session_start {
-        out.push((HookType::SessionStart, d));
-    }
-    for d in h.session_end {
-        out.push((HookType::SessionEnd, d));
-    }
-    for d in h.stop {
-        out.push((HookType::Stop, d));
-    }
-    for d in h.subagent_stop {
-        out.push((HookType::SubagentStop, d));
-    }
-    for d in h.pre_compact {
-        out.push((HookType::PreCompact, d));
-    }
-    for d in h.post_compact {
-        out.push((HookType::PostCompact, d));
-    }
+    // Try flat format.
+    serde_json::from_str::<TypedHooks>(text).ok()
+}
+
+fn flatten_hooks(h: TypedHooks) -> Vec<(HookType, HookDef)> {
+    let mut out = Vec::new();
+    for d in h.pre_tool_use { out.push((HookType::PreToolUse, d)); }
+    for d in h.post_tool_use { out.push((HookType::PostToolUse, d)); }
+    for d in h.user_prompt_submit { out.push((HookType::UserPromptSubmit, d)); }
+    for d in h.session_start { out.push((HookType::SessionStart, d)); }
+    for d in h.session_end { out.push((HookType::SessionEnd, d)); }
+    for d in h.stop { out.push((HookType::Stop, d)); }
+    for d in h.subagent_stop { out.push((HookType::SubagentStop, d)); }
+    for d in h.pre_compact { out.push((HookType::PreCompact, d)); }
+    for d in h.post_compact { out.push((HookType::PostCompact, d)); }
     out
 }
 
