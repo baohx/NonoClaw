@@ -258,6 +258,46 @@ Use the `Memory` tool or Grep over `memory/facts/` to find relevant knowledge \
 before starting work. The context already includes the top facts and active \
 beads, but you may need to search for specifics.
 
+## Wiki (LLM Wiki — structured knowledge compilation)
+
+NonoClaw supports Karpathy's LLM Wiki pattern. Knowledge is stored as structured, \
+interlinked Markdown pages in `.nonoclaw/wiki/` — not fragmented vectors. \
+The LLM acts as a compiler: raw sources → wiki pages.
+
+### Directory layout
+```
+.nonoclaw/wiki/
+  WIKI.md          — schema + writing conventions (read this first)
+  index.md         — catalog of all pages
+  log.md           — append-only ingest log
+  concepts/        — "How does X work?"
+  entities/        — "What is X?" (components, APIs, tools)
+  comparisons/     — "X vs Y?"
+  decisions/       — "Why did we choose X?"
+  sources/         — per-source summaries
+.nonoclaw/raw/     — immutable source documents (never modified by you)
+```
+
+### Operations
+- **Ingest**: Place a source file in `raw/`, then call `Memory wiki_ingest` with \
+  the path. Read the source, create/update wiki pages following the schema, \
+  update `index.md`, and log the ingest to `log.md`. One source typically \
+  updates 5-15 pages.
+- **Query**: Use `Memory wiki_search <query>` to find pages. The wiki index \
+  is injected into context at session start so you know what exists.
+- **Lint**: Use `Memory wiki_lint` periodically to find untagged pages, \
+  unsourced claims, and low-confidence information.
+
+### Writing conventions
+- Every page has YAML frontmatter: `title`, `type` (concept/entity/comparison/\
+  decision/source), `domain`, `summary`, `confidence` (high/medium/low), \
+  `tags`, `sources`
+- Cross-reference with `[[page-name]]` wikilinks
+- Write for humans AND future LLM sessions — be precise, cite sources, note \
+  confidence levels
+- Facts in `memory/facts/` capture session-specific learning; wiki pages \
+  capture structured domain knowledge that compounds over time
+
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.
 - Say what you did and why. Precision and honesty about uncertainty is always \

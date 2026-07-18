@@ -168,6 +168,14 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
         }
     }
 
+    // 0.5 Wiki index (LLM Wiki knowledge base)
+    if let Some(wiki_index) = nonoclaw_tools::memory::load_wiki_index(cwd) {
+        let preview = truncate_chars(&wiki_index, 5000);
+        buf.push_str("## Knowledge Base (Wiki Index)\n\n");
+        buf.push_str(&preview);
+        buf.push_str("\n\n---\n\n");
+    }
+
     // 1. MEMORY.md index
     let index_path = mem_dir.join("MEMORY.md");
     if let Some(index) = read_optional(&index_path) {

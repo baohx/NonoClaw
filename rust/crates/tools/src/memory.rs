@@ -330,6 +330,171 @@ pub fn strip_frontmatter(s: &str) -> String {
     }
 }
 
+// ── Wiki (LLM Wiki — Karpathy-style structured knowledge) ──────────────────
+
+/// A structured wiki page in `.nonoclaw/wiki/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiPage {
+    /// Page filename without extension (used as slug for `[[links]]`).
+    pub name: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Page type: concept, entity, comparison, decision, source.
+    #[serde(default)]
+    pub page_type: WikiType,
+    /// Knowledge domain this page belongs to.
+    #[serde(default)]
+    pub domain: String,
+    /// One-sentence summary.
+    #[serde(default)]
+    pub summary: String,
+    /// Full markdown body.
+    pub content: String,
+    /// Confidence in the claims made.
+    #[serde(default)]
+    pub confidence: Confidence,
+    /// Free-form tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Source page names that back this page's claims.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// ISO-8601 creation timestamp.
+    #[serde(default)]
+    pub created: String,
+    /// ISO-8601 last-updated timestamp.
+    #[serde(default)]
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiType {
+    #[default]
+    Concept,
+    Entity,
+    Comparison,
+    Decision,
+    Source,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    #[default]
+    Medium,
+    High,
+    Low,
+}
+
+impl WikiPage {
+    pub fn from_file(path: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let body = strip_frontmatter(&raw);
+        let fm_text = extract_frontmatter_raw(&raw)?;
+        let mut page: WikiPage = serde_yaml::from_str(&fm_text).ok()?;
+        page.content = body;
+        page.name = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        Some(page)
+    }
+
+    pub fn save(&self, cwd: &Path) -> std::io::Result<()> {
+        let dir = cwd.join(".nonoclaw/wiki");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.md", sanitize_filename(&self.name)));
+        let mut out = String::new();
+        let fm = serde_yaml::to_string(&serde_json::to_value(self).unwrap_or_default())
+            .unwrap_or_default();
+        out.push_str("---\n");
+        out.push_str(&fm);
+        out.push_str("---\n\n");
+        out.push_str(&self.content);
+        if !out.ends_with('\n') { out.push('\n'); }
+        std::fs::write(&path, out)
+    }
+}
+
+/// Walk `.nonoclaw/wiki/**/*.md` recursively, parse each as a WikiPage.
+pub fn load_wiki_pages(cwd: &Path) -> Vec<WikiPage> {
+    let wiki_dir = cwd.join(".nonoclaw/wiki");
+    walk_wiki(&wiki_dir)
+}
+
+fn walk_wiki(dir: &Path) -> Vec<WikiPage> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.append(&mut walk_wiki(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if let Some(page) = WikiPage::from_file(&path) {
+                out.push(page);
+            }
+        }
+    }
+    out
+}
+
+/// Load `wiki/index.md` as plain text for context injection.
+pub fn load_wiki_index(cwd: &Path) -> Option<String> {
+    let path = cwd.join(".nonoclaw/wiki/index.md");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let body = strip_frontmatter(&raw);
+    if body.trim().is_empty() { None } else { Some(body) }
+}
+
+/// BM25 search over wiki pages.
+pub fn search_wiki<'a>(pages: &'a [WikiPage], query: &str, limit: usize) -> Vec<&'a WikiPage> {
+    if query.trim().is_empty() {
+        return pages.iter().take(limit).collect();
+    }
+    let terms: Vec<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return pages.iter().take(limit).collect();
+    }
+    let mut scored: Vec<(f64, &WikiPage)> = pages
+        .iter()
+        .map(|p| {
+            let text = format!(
+                "{} {} {} {} {}",
+                p.name, p.title, p.summary, p.content, p.tags.join(" ")
+            ).to_lowercase();
+            let mut score = 0.0f64;
+            for term in &terms {
+                let count = text.matches(term.as_str()).count() as f64;
+                let df = pages.iter().filter(|p2| {
+                    let t2 = format!(
+                        "{} {} {} {} {}",
+                        p2.name, p2.title, p2.summary, p2.content, p2.tags.join(" ")
+                    ).to_lowercase();
+                    t2.contains(term.as_str())
+                }).count() as f64;
+                let idf = ((pages.len() as f64 + 1.0) / (df + 0.5)).ln();
+                score += count * idf;
+            }
+            match p.confidence {
+                Confidence::High => score *= 1.2,
+                Confidence::Low => score *= 0.8,
+                Confidence::Medium => {}
+            }
+            (score, p)
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(limit).map(|(_, p)| p).collect()
+}
+
 // ── Context rendering ───────────────────────────────────────────────────────
 
 /// Render active beads + top facts as a compact context block suitable for

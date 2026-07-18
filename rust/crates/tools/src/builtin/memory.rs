@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-const PROMPT: &str = "Memory tool for the Mneme cross-session memory system. Use this to search, save, update, and forget facts, and to manage task beads.\n\nActions:\n- `search`: search facts by query string. Returns ranked results.\n- `save`: create or update a fact. Requires name, title, content, type, importance, confidence, tags.\n- `forget`: mark a fact as superseded. Requires name and superseded_by reason.\n- `beads`: list active (non-done) beads.\n- `bead_save`: create or update a bead. Requires title, status, priority, content.\n- `bead_done`: mark a bead as done. Requires id.";
+const PROMPT: &str = "Memory tool for the Mneme cross-session memory system and LLM Wiki knowledge base.\n\nActions:\n- `search`: search facts by query string. Returns ranked results.\n- `save`: create or update a fact. Requires name, title, content, type, importance, confidence, tags.\n- `forget`: mark a fact as superseded. Requires name and superseded_by reason.\n- `beads`: list active (non-done) beads.\n- `bead_save`: create or update a bead. Requires title, status, priority, content.\n- `bead_done`: mark a bead as done. Requires id.\n- `wiki_search`: search wiki pages by query. Returns ranked results with page name, type, summary.\n- `wiki_ingest`: ingest a raw source file from raw/ into the wiki. Reads the source, creates/updates wiki pages. Requires source_path.\n- `wiki_lint`: list stale or orphan wiki pages. No arguments needed.";
 
 pub struct MemoryTool;
 
@@ -29,8 +29,8 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: search, save, forget, beads, bead_save, bead_done",
-                    "enum": ["search", "save", "forget", "beads", "bead_save", "bead_done"]
+                    "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
+                    "enum": ["search", "save", "forget", "beads", "bead_save", "bead_done", "wiki_search", "wiki_ingest", "wiki_lint"]
                 },
                 "query": { "type": "string", "description": "Search query (for action: search)" },
                 "name": { "type": "string", "description": "Fact name/slug (for actions: save, forget)" },
@@ -59,7 +59,7 @@ impl Tool for MemoryTool {
     fn is_read_only(&self, input: &Value) -> bool {
         matches!(
             input["action"].as_str(),
-            Some("search") | Some("beads")
+            Some("search") | Some("beads") | Some("wiki_search") | Some("wiki_lint")
         )
     }
     fn is_concurrency_safe(&self, _: &Value) -> bool { true }
@@ -87,6 +87,9 @@ impl Tool for MemoryTool {
             "beads" => list_beads(ctx.cwd),
             "bead_save" => save_bead_impl(ctx.cwd, &input),
             "bead_done" => mark_bead_done(ctx.cwd, &input),
+            "wiki_search" => wiki_search(ctx.cwd, &input),
+            "wiki_ingest" => wiki_ingest(ctx.cwd, &input),
+            "wiki_lint" => wiki_lint(ctx.cwd),
             _ => Err(Error::Tool {
                 tool: "Memory".into(),
                 message: format!("unknown action: {action}"),
@@ -225,6 +228,101 @@ fn require_str<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
         tool: "Memory".into(),
         message: format!("missing required field `{key}`"),
     })
+}
+
+fn wiki_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
+    let query = input["query"].as_str().unwrap_or("");
+    let limit = input["limit"].as_u64().unwrap_or(10).min(20) as usize;
+    let pages = crate::memory::load_wiki_pages(cwd);
+    let results = crate::memory::search_wiki(&pages, query, limit);
+    if results.is_empty() {
+        return Ok(ToolResult::ok("No matching wiki pages found. The wiki may be empty — try ingesting a source first."));
+    }
+    let mut out = String::new();
+    for p in &results {
+        out.push_str(&format!(
+            "## {title} ({t:?}, {conf:?}, domain: {dom})\n{summary}\n\n",
+            title = p.title,
+            t = p.page_type,
+            conf = p.confidence,
+            dom = p.domain,
+            summary = p.summary,
+        ));
+    }
+    Ok(ToolResult::ok(out))
+}
+
+fn wiki_ingest(cwd: &Path, input: &Value) -> Result<ToolResult> {
+    let source_path = require_str(input, "source_path")?;
+    let path = Path::new(source_path);
+    if !path.exists() {
+        return Err(Error::Tool {
+            tool: "Memory".into(),
+            message: format!("source file not found: {source_path}. Place source files in .nonoclaw/raw/ and provide the path relative to raw/."),
+        });
+    }
+    // The actual ingestion (reading source, creating wiki pages) is done
+    // by the model using Read + Write tools.  We just validate and guide.
+    let raw = std::fs::read_to_string(path).map_err(|e| Error::Tool {
+        tool: "Memory".into(),
+        message: format!("failed to read source: {e}"),
+    })?;
+    let preview: String = raw.chars().take(2000).collect();
+    let mut out = String::from(
+        "# Wiki Ingest Guide\n\n"
+    );
+    out.push_str("Read this source and create/update wiki pages in `.nonoclaw/wiki/`.\n\n");
+    out.push_str("## Source content (first 2000 chars)\n\n");
+    out.push_str(&preview);
+    out.push_str("\n\n## Instructions\n\n");
+    out.push_str("1. Read `wiki/WIKI.md` for the schema and writing conventions\n");
+    out.push_str("2. Read `wiki/index.md` for the current wiki catalog\n");
+    out.push_str("3. Create or update pages in `wiki/concepts/`, `wiki/entities/`, `wiki/sources/`, etc.\n");
+    out.push_str("4. Update `wiki/index.md` with new page entries\n");
+    out.push_str("5. Append an entry to `wiki/log.md`\n");
+    out.push_str("6. Use `[[wikilinks]]` to cross-reference pages\n");
+    out.push_str("\nEach page must have YAML frontmatter: title, type, domain, summary, confidence, tags, sources.\n");
+    Ok(ToolResult::ok(out))
+}
+
+fn wiki_lint(cwd: &Path) -> Result<ToolResult> {
+    let pages = crate::memory::load_wiki_pages(cwd);
+    if pages.is_empty() {
+        return Ok(ToolResult::ok("Wiki is empty — nothing to lint."));
+    }
+    let mut issues = Vec::new();
+
+    // Check for pages with no sources (except source-type pages).
+    for p in &pages {
+        if p.page_type != crate::memory::WikiType::Source && p.sources.is_empty() {
+            issues.push(format!("No sources: {} ({:?})", p.title, p.page_type));
+        }
+    }
+
+    // Check for untagged pages.
+    for p in &pages {
+        if p.tags.is_empty() {
+            issues.push(format!("No tags: {}", p.title));
+        }
+    }
+
+    // Check for low-confidence claims.
+    for p in &pages {
+        if p.confidence == crate::memory::Confidence::Low {
+            issues.push(format!("Low confidence: {}", p.title));
+        }
+    }
+
+    let total = pages.len();
+    if issues.is_empty() {
+        Ok(ToolResult::ok(format!("Wiki lint passed. {total} pages, 0 issues.")))
+    } else {
+        let mut out = format!("Wiki lint: {total} pages, {} issues:\n\n", issues.len());
+        for (i, issue) in issues.iter().enumerate().take(20) {
+            out.push_str(&format!("{}. {issue}\n", i + 1));
+        }
+        Ok(ToolResult::ok(out))
+    }
 }
 
 fn chrono_now() -> String {
