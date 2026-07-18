@@ -13,6 +13,24 @@ use serde_json::Value;
 const SUMMARY_SYSTEM: &str = "You are a summarization assistant. Produce a concise but complete summary of the conversation that preserves everything a continuing assistant needs: the user's goal and constraints, key decisions and their rationale, files read or modified (with paths and the important snippets), commands run and their outcomes, the current state of work, and any open questions or next steps. Do NOT omit concrete technical details (paths, names, values).";
 const MAX_SUMMARY_TOKENS: u32 = 4096;
 
+/// Compaction strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactMode {
+    /// Summarize everything older than `keep_recent` messages (current behaviour).
+    Summary,
+    /// Keep the last N complete turns (user→assistant→tool→result) verbatim;
+    /// summarize only the older prefix.  Each turn boundary is a plain user
+    /// prompt (no pending tool results).
+    Segments,
+}
+
+/// Minimum number of complete turns kept verbatim in segments mode.
+pub const KEEP_RECENT_TURNS: usize = 3;
+
+impl Default for CompactMode {
+    fn default() -> Self { CompactMode::Segments }
+}
+
 /// Find a safe split point so the kept tail starts at a plain user prompt
 /// (not a tool_result), guaranteeing no `tool_use` is orphaned from its result.
 /// Returns the index of the first kept message, or `None` if no safe split
@@ -48,14 +66,37 @@ fn is_plain_user_prompt(m: &Message) -> bool {
 }
 
 /// Compact `messages`: summarize the older prefix, keep the recent tail.
-/// `keep_recent` is the minimum number of messages to keep verbatim.
+/// `keep_recent` is the minimum number of messages / turns to keep verbatim
+/// (interpretation depends on `mode`).
 pub async fn compact_messages(
     client: &Client,
     model: &str,
     messages: &[Message],
     keep_recent: usize,
+    mode: CompactMode,
 ) -> Result<Vec<Message>> {
-    let Some(split) = find_split(messages, keep_recent) else {
+    // In segments mode, `keep_recent` counts turns, not messages.
+    let effective_keep = match mode {
+        CompactMode::Segments => {
+            // Count KEEP_RECENT_TURNS complete turns backwards.
+            let mut turns = 0usize;
+            let mut idx = messages.len();
+            for (i, m) in messages.iter().enumerate().rev() {
+                if is_plain_user_prompt(m) {
+                    turns += 1;
+                    if turns >= keep_recent {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+            // We always summarize from the beginning; keep from `idx`.
+            messages.len().saturating_sub(idx)
+        }
+        CompactMode::Summary => keep_recent,
+    };
+
+    let Some(split) = find_split(messages, effective_keep) else {
         return Ok(messages.to_vec());
     };
     let to_compact = &messages[..split];

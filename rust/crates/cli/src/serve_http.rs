@@ -1726,6 +1726,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     // Apply per-model overrides (contextWindow, maxTokens, charsPerToken).
                     if let Some(profile) = s.model_profiles.iter().find(|p| p.name == model_used) {
                         options.apply_model_profile(profile);
+                        // Apply agent profile if this model has one.
+                        if let Some(ref name) = profile.profile {
+                            if let Some(ap) = nonoclaw_engine::agents::load_profile(&s.cwd, name) {
+                                nonoclaw_engine::agents::apply_profile(&mut options, &ap);
+                            }
+                        }
                     }
 
                     // Question resolver (per-run to avoid oneshot key clashes).

@@ -121,6 +121,11 @@ pub struct ModelProfile {
     /// Defaults to the global `charsPerToken` (4) when unset.
     #[serde(rename = "charsPerToken", default)]
     pub chars_per_token: Option<usize>,
+    /// Optional agent profile name. References a file in
+    /// `.nonoclaw/agents/<profile>.md` that overrides system prompt,
+    /// tools, and permission mode.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Accept `"role": "main"` (single string) or `"role": ["main", "doc"]` (array).

@@ -1,6 +1,7 @@
 //! Agentic query loop, system prompt assembly, and context.
 //! Mirrors `src/query.ts`, `src/QueryEngine.ts`, `src/context.ts`.
 
+pub mod agents;
 pub mod compact;
 pub mod context;
 pub mod hooks;

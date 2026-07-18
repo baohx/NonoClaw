@@ -409,6 +409,12 @@ async fn main() -> Result<()> {
     // Apply per-model overrides from the active model's profile.
     if let Some(profile) = model_profiles.iter().find(|p| p.name == options.model) {
         options.apply_model_profile(profile);
+        // Apply agent profile if this model has one.
+        if let Some(ref name) = profile.profile {
+            if let Some(ap) = nonoclaw_engine::agents::load_profile(&cwd, name) {
+                nonoclaw_engine::agents::apply_profile(&mut options, &ap);
+            }
+        }
     }
     let prompt = read_prompt(&cli)?;
     let mut engine = QueryEngine::with_session(

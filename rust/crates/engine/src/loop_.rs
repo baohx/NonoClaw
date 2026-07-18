@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::compact::compact_messages;
+use crate::compact::{compact_messages, KEEP_RECENT_TURNS};
 use crate::context::{get_system_context, get_user_context, load_memory_prompt};
 use crate::prompt::build_system_blocks;
 use crate::session::{append_message, new_session_id, write_header};
@@ -457,7 +457,8 @@ impl QueryEngine {
                         &self.client,
                         compact_model,
                         &self.messages,
-                        KEEP_RECENT_MESSAGES,
+                        KEEP_RECENT_TURNS,
+                        crate::compact::CompactMode::Segments,
                     )
                     .await?;
                     let tokens_after = estimate_total(&compacted, system_chars, tools_chars, self.options.chars_per_token);
@@ -887,7 +888,8 @@ impl QueryEngine {
             &self.client,
             compact_model,
             &self.messages,
-            KEEP_RECENT_MESSAGES,
+            KEEP_RECENT_TURNS,
+            crate::compact::CompactMode::Segments,
         )
         .await?;
         let kept = compacted.len();
