@@ -1209,6 +1209,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     let mut cancel: Option<CancellationToken> = None;
     /// JoinHandle of the current run — aborted on Cancel to stop the engine hard.
     let mut run_handle: Option<tokio::task::JoinHandle<()>> = None;
+    /// Consumer abort handle, shared between the spawned run task and the
+    /// main handler loop (Clear / Cancel).  Wrapped in Arc<Mutex> because
+    /// it is set inside the spawned task and read from the outer scope.
+    let consumer_handle: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     // Capture before any inner shadow (the Run arm destructures session_id).
     // Desktop (no URL param): auto-resume the most recent session.
@@ -1647,7 +1652,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                 };
 
+                let ch = Arc::clone(&consumer_handle);
                 run_handle = Some(tokio::spawn(async move {
+                    let _ch = ch;
                     let request_id = Uuid::new_v4().to_string();
 
                     // If executing in fork context: run as a fresh sub-engine.
@@ -1779,11 +1786,13 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             if let Err(e) =
                                 tx_for_consumer.lock().await.send(WsMessage::Text(text)).await
                             {
-                                tracing::warn!("ws send error: {e}");
                                 break;
                             }
                         }
                     });
+                    // Stash handle so Clear/Cancel can abort consumer before
+                    // sending MessagesLoaded — prevents tool-card residue.
+                    *_ch.lock().await = Some(consumer.abort_handle());
 
                     tracing::debug!("starting engine run (attachments: {})", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
                     let result = engine
@@ -1885,8 +1894,15 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 // Abort the spawned task to stop the engine immediately —
                 // CancellationToken only gates between turns, not during
                 // an in-flight API streaming call.
+                // Abort the spawned task to stop engine + consumer immediately.
                 if let Some(h) = run_handle.take() {
                     h.abort();
+                }
+                if let Some(ch) = consumer_handle.lock().await.take() {
+                    ch.abort();
+                }
+                cancel = None;
+                {
                     // Notify the UI that the run was cancelled so agentRunning
                     // flips back to false.
                     send_msg(&tx, ServerMsg::Done {
@@ -1969,15 +1985,22 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
             // ── Clear (in-memory only; on-disk transcript is the archive) ───
             ClientMsg::Clear => {
-                // Cancel any in-progress agent first — otherwise tool events
-                // keep arriving and resurrect tool cards after the clear.
+                // Cancel + abort engine + consumer so no buffered tool events
+                // can arrive after we send MessagesLoaded.
                 if let Some(ref c) = cancel {
                     c.cancel();
                 }
                 if let Some(h) = run_handle.take() {
                     h.abort();
                 }
+                if let Some(ch) = consumer_handle.lock().await.take() {
+                    ch.abort();
+                }
                 cancel = None;
+                // Brief yield so the consumer task has time to observe the
+                // abort and stop processing its channel (prevents events
+                // arriving after MessagesLoaded).
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 // Now clear the transcript.
                 if let Some(h) = session.lock().await.as_mut() {
                     h.messages.clear();
