@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.3.0 | **Goal**: a native CLI coding agent with file-attachment OCR, multimodal document understanding, unified model profiles, and a bioluminescent web interface.
+> **Version**: v0.4.0 | **Goal**: a native CLI coding agent with cross-session memory, file-attachment OCR, multimodal document understanding, and a bioluminescent web interface.
 
 ---
 
@@ -10,6 +10,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Quick Start](#quick-start)
 - [Features](#features)
 - [Multi-Model & Multi-Provider](#multi-model--multi-provider)
+- [Cross-Session Memory (Mneme)](#cross-session-memory-mneme)
 - [Permission Modes](#permission-modes)
 - [Web UI](#web-ui)
 - [Mobile & Remote Access](#mobile--remote-access)
@@ -61,7 +62,7 @@ nonoclaw -p "explain Rust ownership"
 | Category | Details |
 |---|---|
 | **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **orphan repair** (auto-fix broken tool_use/tool_result pairs), **thinking-block strip** (Bedrock proxy compat), **batched parallel tool execution** (concurrency cap=10) |
-| **Memory System** | Multi-layer: MEMORY.md index + individual fact files with YAML frontmatter, model can write/update/delete memories, `[[link]]` references, **auto-loaded each run** |
+| **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). BM25 search with importance ranking. `Memory` tool (18th built-in). Auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
 | **17 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, **ToolSearch**, **TaskCreate/Get/List/Update** |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
@@ -164,6 +165,123 @@ Upload
 | `generic_vision` | anything else | `POST /v1/chat/completions` |
 
 Embedded images are OCR'd individually so text-only models (DeepSeek V4) can "see" them as inline descriptions. Multimodal models (Sonnet) receive both `ContentBlock::Image` blocks and OCR text.
+
+---
+
+## Cross-Session Memory (Mneme)
+
+NonoClaw features a three-layer memory system inspired by [agentmemory](https://github.com/rohitg00/agentmemory). Every session starts with the previous session's knowledge and task state injected into context — no more "starting fresh" and re-explaining everything.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Layer 3: TRANSCRIPT — per-session JSONL (automatic)      │
+│   ~/.nonoclaw/projects/<cwd>/sessions/<uuid>.jsonl      │
+├──────────────────────────────────────────────────────────┤
+│ Layer 2: BEADS — task continuity (survives sessions)     │
+│   <cwd>/.nonoclaw/memory/beads/*.md                      │
+│   Active tasks, blocked items, progress trackers.        │
+├──────────────────────────────────────────────────────────┤
+│ Layer 1: FACTS — immutable knowledge (permanent)         │
+│   <cwd>/.nonoclaw/memory/facts/*.md                      │
+│   Conventions, preferences, decisions, bug patterns.     │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Facts (`memory/facts/*.md`)
+
+One markdown file per immutable fact with YAML frontmatter. Types: `preference`, `convention`, `decision`, `architecture`, `bug`. Facts are **never deleted** — wrong ones get `superseded_by` pointing to the replacement.
+
+```markdown
+---
+name: pip-use-tsinghua-mirror
+title: Use Tsinghua mirror for pip installs
+type: preference
+importance: 0.9
+confidence: 0.95
+tags: [python, pip, china]
+---
+
+Always use pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+when installing Python packages.
+```
+
+### Beads (`memory/beads/*.md`)
+
+Each bead tracks one active task across sessions. Status: `todo` → `in_progress` → `blocked` → `done`.
+
+```markdown
+---
+id: bead-abc123
+title: Fix login timeout in production
+status: in_progress
+priority: 8
+session: abc123
+---
+
+## Progress
+- [x] Reproduced in staging
+- [ ] Root cause: connection pool exhaustion
+- [ ] Implement circuit breaker
+
+## Blockers
+None.
+```
+
+### Memory Tool (18th built-in)
+
+| Action | Description |
+|--------|-------------|
+| `Memory search <query>` | BM25 search over all facts, ranked by relevance × importance |
+| `Memory save` | Create or update a fact (name, title, type, importance, tags) |
+| `Memory forget <name>` | Mark a fact as superseded |
+| `Memory beads` | List all active (non-done) beads, sorted by priority |
+| `Memory bead_save` | Create or update a task bead |
+| `Memory bead_done <id>` | Mark a bead as completed |
+
+The model can also use standard `Read`/`Write`/`Edit` tools directly on `memory/` files.
+
+### Context Injection
+
+At session start, `SystemBlock #2` (uncached) automatically includes:
+
+```
+## Active Tasks (beads)
+◌ Fix login timeout [priority 8]
+  Investigating connection pool issue...
+
+## Key Facts
+- **pip-use-tsinghua-mirror** (preference): Use Tsinghua mirror for pip
+- **rust-edition-2024** (convention): New projects use Rust 2024
+```
+
+Active beads (max 5) + top important facts (max 10). Capped at 50KB total.
+
+### Example Session Flow
+
+```
+SESSION 1 — Discovery
+  You:   "pip install 太慢了"
+  Nono:  "网络问题。记住用清华源可以吗？"
+  You:   "好"
+  Nono:  → Memory save: pip-use-tsinghua-mirror.md
+         → Memory bead_save: 优化 pip 安装速度
+
+SESSION 2 — Next Day (automatic resume)
+  [System prompt already contains:]
+    ◌ 优化 pip 安装速度 [done, session 1]
+    - pip-use-tsinghua-mirror (preference)
+
+  You:   "装一个 requests 库"
+  Nono:  "pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple requests"
+         ↑ 自动用了清华源，不需要你再提醒
+
+SESSION 3 — One Week Later
+  You:   "这个项目之前遇到过什么网络问题？"
+  Nono:  → Memory search: "network pip mirror"
+         返回 pip-use-tsinghua-mirror 事实，告诉你历史上下文
+```
 
 ---
 
@@ -521,34 +639,42 @@ NonoClaw/
 
 ---
 
-## 中文摘要
+## Summary
 
-NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的 **Rust 重写版本**。完整实现智能体循环、17 个内置工具、分批并发工具执行、后台 Bash 任务、5 级权限门禁、会话持久化（JSONL，支持命名）、MCP 双向（含 prompts→skill 桥接）、Web UI（含 PWA 移动端支持）。
+NonoClaw is a **high-performance Rust rewrite** of Claude Code (Anthropic's agent CLI). It delivers a complete agentic coding experience: streaming SSE turns, 18 built-in tools, batched parallel tool execution, background Bash tasks, 5-tier permission gating, JSONL session persistence with resume/continue/list, bidirectional MCP (client + server with prompts→skill bridge), plugin system with 12 hook events, and a bioluminescent Web UI with PWA mobile support.
 
-### v0.3.0 新增亮点
-- **文件附件上传**：支持 PDF/DOCX/DOC/TXT/MD/PNG/JPG，纸夹按钮 + 拖拽 + 粘贴三种上传方式。PDF/DOCX 优先直接提取文字（pdftotext / ZIP XML），扫描件自动降级 OCR。嵌入图片（公章、签名、图表）自动提取并 OCR 生成文字描述。
-- **统一模型配置**：所有模型集中在 `models[]` 数组，通过 `role` 标签区分用途（`main` 对话 / `doc` 文档处理 / `compact` 摘要压缩）。`docModel` 和 `compactModel` 以名称字符串引用。
-- **多模态文档理解**：支持 Mistral OCR（原生 PDF）和 DeepSeek OCR 2（切片式）两种文档处理后端。嵌入图片以 `ContentBlock::Image` 注入多模态模型（Sonnet），同时生成 OCR 文字描述供纯文本模型（DeepSeek V4）使用。
-- **记忆系统**：模型可通过 Write 工具创建/更新 `.nonoclaw/memory/*.md` 事实文件，带 YAML frontmatter 和 `[[link]]` 引用。MEMORY.md 索引 + 独立 fact 文件双层结构。
-- **Per-Model 参数**：每个模型可配专属 `contextWindow`、`maxTokens`、`charsPerToken`，自动压缩阈值和 token 估算更精确。
-- **同步机制重构**：`skipOneLoad` 替代时间窗口，`sync_session_to_peers` 统一广播，Run 到达时立即同步，`markClearing` 防止 /clear 残留。
-- **Prompt Cache 优化**：Git 上下文从 cached block 移至 uncached block，缓存不会每次工具执行后失效。Thinking 块自动过滤（Bedrock 代理兼容）。
-- **工具卡片增强**：自动折叠 + 命令预览（Bash/WebFetch/WebSearch/Grep 等显示关键参数）。`/multi` 语法错误时显示帮助提示。
+### What's New in v0.4.0
 
-### 核心特色
-- **多模型切换**：统一 `models[]` 数组，`role` 标签区分用途，UI 下拉框切换对话模型，`/multi` 多模型对比
-- **文档处理**：上传即 OCR，Mistral OCR ($4/千页) 或 DeepSeek OCR 2 ($0.03/M tokens)，文字型文档直读零成本
-- **Web UI**：三栏布局，生物发光暗色主题，呼吸式 aurora 背景，Markdown + KaTeX 渲染，附件 chips 状态指示
-- **记忆持久化**：模型可读写 `.nonoclaw/memory/` 事实文件，跨 session 持久化用户偏好和项目上下文
-- **Cloudflare Tunnel**：`--tunnel` 自动隧道 + ASCII 二维码，手机扫码远程访问共享 session
-- **权限模式**：UI 下拉框切换 5 种模式
-- **增强 System Prompt**：手术级改动规则、6 种命名失败模式、反过度工程规则、记忆写入指令
-- **配置灵活**：每模型专属窗口/令牌/估值，集中管理
+- **Cross-Session Memory (Mneme)**: Three-layer memory system — Facts (immutable knowledge in `memory/facts/*.md`), Beads (task continuity in `memory/beads/*.md`), and Transcript (per-session JSONL). 18th built-in `Memory` tool with BM25 search, save/forget/beads actions. Active beads and top facts auto-injected into SystemBlock #2 at session start. Git-friendly markdown files, zero external dependencies.
 
-### 安装运行
+### What's New in v0.3.0
+
+- **File Attachments**: Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-and-drop, or paste. PDF/DOCX text extracted directly (pdftotext / ZIP XML) — OCR only when needed. Embedded images (stamps, signatures, charts) auto-extracted and OCR'd.
+- **Unified Model Profiles**: All models in a single `models[]` array with `role` tags (`main`/`doc`/`compact`). `docModel` and `compactModel` reference by name. Per-model `contextWindow`, `maxTokens`, and `charsPerToken`.
+- **Multimodal Document Understanding**: Mistral OCR (native PDF) and DeepSeek OCR 2 (tiled) backends. `ContentBlock::Image` injection for multimodal models (Sonnet) with inline OCR descriptions for text-only models.
+- **Memory System**: Model writes facts to `.nonoclaw/memory/*.md` with YAML frontmatter and `[[link]]` references. `MEMORY.md` index + individual fact files.
+- **Sync Overhaul**: `skipOneLoad` replaces time-window guard. `sync_session_to_peers` on Run/Clear/post-run. `markClearing` prevents tool-card residue after `/clear`.
+- **Prompt Cache Optimization**: Git context moved from cached Block 1 to uncached Block 2 — cache survives per-turn tool executions. Thinking blocks auto-stripped for Bedrock proxy compatibility.
+- **Tool Card UX**: Auto-collapse on completion, command preview (Bash/WebFetch/WebSearch/Grep). `/multi` syntax help on error.
+
+### Key Features
+
+- **18 Built-in Tools**: Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, ToolSearch, TaskCreate/Get/List/Update, **Memory** (v0.4.0)
+- **Cross-Session Memory**: Facts + Beads + Transcript. Search, save, forget. Auto-loaded at session start. Git-friendly markdown.
+- **Unified Model Profiles**: `role` arrays for main/doc/compact models. Per-model context window, token budget, and tokenizer estimates.
+- **Document Processing**: Upload → auto-OCR via Mistral ($4/1K pages) or DeepSeek OCR 2 ($0.03/M tokens). Editable PDFs/DOCX read directly at zero cost.
+- **Web UI**: Three-column layout. Bioluminescent dark theme with breathing aurora background. Markdown + KaTeX rendering. Attachment chips with upload state. "Nono" assistant label.
+- **Cloudflare Tunnel**: `--tunnel` auto-spawns `cloudflared`, prints ASCII QR code. Phone scans to access from any network.
+- **5 Permission Modes**: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown.
+- **Enhanced System Prompt**: Surgical-editing rules, 6 named failure modes, anti-overengineering patterns, memory write-back instructions.
+- **Per-Model Configuration**: Dedicated `contextWindow`, `maxTokens`, `charsPerToken` per model entry. Auto-compact threshold calculated from model-specific window.
+- **Mobile Sync**: QR code → shared session → real-time MessagesLoaded broadcast. Desktop ↔ phone sync.
+
+### Install & Run
+
 ```bash
 cd rust && bash install.sh
-nonoclaw --serve-http 127.0.0.1:8765 --tunnel --model deepseek-v4-pro
+nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
 ```
 
 ---
