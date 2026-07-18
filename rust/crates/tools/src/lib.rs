@@ -4,6 +4,7 @@
 pub mod background;
 pub mod builtin;
 pub mod mcp;
+pub mod memory;
 pub mod mcp_server;
 pub mod permissions;
 pub mod registry;

@@ -152,6 +152,22 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
 
     let mut buf = String::new();
 
+    // 0. Active beads + important facts (cross-session memory)
+    let beads = nonoclaw_tools::memory::load_beads(cwd);
+    let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads).into_iter().take(5).collect();
+    let facts = nonoclaw_tools::memory::load_facts(cwd);
+    let mut top_facts: Vec<&nonoclaw_tools::memory::Fact> = facts.iter().collect();
+    top_facts.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    top_facts.truncate(10);
+
+    if !active.is_empty() || !top_facts.is_empty() {
+        let ctx = nonoclaw_tools::memory::render_memory_context(&active, &top_facts, 20_000);
+        if !ctx.is_empty() {
+            buf.push_str(&ctx);
+            buf.push_str("\n---\n\n");
+        }
+    }
+
     // 1. MEMORY.md index
     let index_path = mem_dir.join("MEMORY.md");
     if let Some(index) = read_optional(&index_path) {
@@ -204,7 +220,7 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
 
 /// Strip YAML frontmatter (`---\n...\n---\n`) from a string, returning the
 /// body text that follows. If no frontmatter is present, returns the original.
-fn strip_frontmatter(s: &str) -> String {
+pub fn strip_frontmatter(s: &str) -> String {
     let s = s.trim();
     if !s.starts_with("---") {
         return s.to_string();

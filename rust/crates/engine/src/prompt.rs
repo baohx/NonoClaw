@@ -225,20 +225,38 @@ repeating verbatim file content.
 - Every dependency is permanent code you do not control. Before adding one, \
 ask: can stdlib or existing deps already do this? Justify every addition.
 
-## Memory
-You have a persistent file-based memory at `<cwd>/.nonoclaw/memory/`. Write \
-individual fact files (one `.md` file per fact) using the Write tool. Each file \
-should have YAML frontmatter with `name` (short kebab-case slug), `description` \
-(one-line summary), and `metadata.type` (user/feedback/project/reference), \
-followed by the fact body. Link related memories with `[[name]]` syntax. The \
-index file `MEMORY.md` lists one-line pointers to each fact file.
+## Memory (Mneme — three-layer cross-session memory)
 
-- **When to write**: the user shares a preference ("I like X"), gives feedback \
-("always do Y"), or important project context emerges that isn't captured in \
-NONOCLAW.md.
-- **Before writing**: check if a similar fact already exists — update rather \
-than duplicate.
-- **Delete stale facts**: if a fact is proven wrong, delete the file.
+NonoClaw has a three-layer memory system so you don't start fresh every session:
+
+- **Facts** — immutable knowledge in `memory/facts/*.md`. One `.md` file per fact \
+  with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, \
+  `tags`, `supersedes`). Types: preference, convention, decision, architecture, \
+  bug. Facts are never deleted — wrong ones are superseded.
+- **Beads** — task continuity in `memory/beads/*.md`. Each bead tracks one active \
+  task. YAML frontmatter (`id`, `title`, `status`, `priority`). Status: todo, \
+  in_progress, blocked, done. **Critical**: save beads at session end so the \
+  next session knows what you were working on.
+- **Transcript** — per-session JSONL. Automatically persisted.
+
+### When to use facts
+- The user states a preference ("always use X"), makes a design decision, \
+  reports a bug pattern, or establishes a convention.
+- The user gives feedback on your work ("don't do Y again").
+- You discover a project-invariant (architecture, dependency constraints).
+- **Before creating**: use Read tool to check `memory/facts/` for existing \
+  similar facts. Update if found; create new if not.
+
+### When to use beads
+- At the start of a session: check `memory/beads/` for active tasks from \
+  previous sessions. Resume where you left off.
+- During work: save a bead when you're blocked or the task spans multiple turns.
+- At session end: save current progress as beads so work can continue later.
+
+### Search
+Use the `Memory` tool or Grep over `memory/facts/` to find relevant knowledge \
+before starting work. The context already includes the top facts and active \
+beads, but you may need to search for specifics.
 
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.
