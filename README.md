@@ -679,6 +679,46 @@ nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
 
 ---
 
+## 中文摘要
+
+NonoClaw 是 Claude Code（Anthropic 智能体 CLI 命令行工具）的**高性能 Rust 重写版本**。提供完整的智能体编程体验：流式 SSE 对话轮次、18 个内置工具、分批并行工具执行、后台 Bash 任务、5 级权限门禁、JSONL 会话持久化（支持 resume/continue/list）、双向 MCP（客户端 + 服务端，含 prompts→skill 桥接）、12 种 Hook 事件的插件系统，以及带 PWA 移动端支持的生物发光 Web 界面。
+
+### v0.4.0 新增亮点
+
+- **跨会话记忆系统（Mneme）**：三层记忆架构 — Facts（`memory/facts/*.md` 中的不可变知识）、Beads（`memory/beads/*.md` 中的任务连续性）、Transcript（每次会话的 JSONL 记录）。第 18 个内置 `Memory` 工具，支持 BM25 搜索、save/forget/beads 操作。活跃的 beads 和重要 facts 在会话启动时自动注入 SystemBlock #2。纯 Markdown 文件，Git 友好，零外部依赖。
+
+### v0.3.0 新增亮点
+
+- **文件附件上传**：支持 PDF/DOCX/DOC/TXT/MD/PNG/JPG 格式，通过纸夹按钮、拖拽或粘贴上传。PDF/DOCX 优先直接提取文字（pdftotext / ZIP XML 解析），仅在需要时启用 OCR。嵌入图片（公章、签名、图表）自动提取并 OCR 生成文字描述。
+- **统一模型配置**：所有模型集中在单一 `models[]` 数组中，通过 `role` 标签（`main`/`doc`/`compact`）区分用途。`docModel` 和 `compactModel` 通过名称字符串引用。每个模型可配置专属的 `contextWindow`、`maxTokens` 和 `charsPerToken`。
+- **多模态文档理解**：支持 Mistral OCR（原生 PDF 处理）和 DeepSeek OCR 2（切片式处理）两种文档处理后端。以 `ContentBlock::Image` 将图片注入多模态模型（Sonnet），同时为纯文本模型（DeepSeek V4）生成内联 OCR 文字描述。
+- **记忆系统**：模型可将事实写入 `.nonoclaw/memory/*.md` 文件，带 YAML frontmatter 和 `[[link]]` 引用。`MEMORY.md` 索引 + 独立事实文件双层结构。
+- **同步机制重构**：`skipOneLoad` 替代时间窗口守卫。Run/Clear/运行完成后统一通过 `sync_session_to_peers` 广播。`markClearing` 防止 `/clear` 后工具卡片残留。
+- **Prompt Cache 优化**：Git 上下文从缓存的 Block 1 移至非缓存的 Block 2——缓存可以跨轮次的工具执行保持有效。Thinking 块自动过滤以兼容 Bedrock 代理。
+- **工具卡片体验**：完成后自动折叠，命令预览（Bash/WebFetch/WebSearch/Grep 等显示关键参数）。`/multi` 语法错误时显示帮助提示。
+
+### 核心特色
+
+- **18 个内置工具**：Read、Write、Edit、Bash、Grep、Glob、TodoWrite、WebFetch、WebSearch、Agent、AskUserQuestion、Coordinator、ToolSearch、TaskCreate/Get/List/Update、**Memory**（v0.4.0）
+- **跨会话记忆**：Facts + Beads + Transcript 三层架构。搜索、保存、遗忘。会话启动时自动加载。Git 友好的 Markdown 格式。
+- **统一模型配置**：`role` 数组区分 main/doc/compact 模型。每个模型专属的上下文窗口、令牌预算和分词器估算参数。
+- **文档处理**：上传即自动 OCR，支持 Mistral（$4/千页）或 DeepSeek OCR 2（$0.03/M tokens）。可编辑型 PDF/DOCX 直读零成本。
+- **Web 界面**：三栏布局。生物发光暗色主题，呼吸式 aurora 背景。Markdown + KaTeX 数学公式渲染。附件 chips 状态指示。"Nono" 助手标签。
+- **Cloudflare Tunnel**：`--tunnel` 自动启动 `cloudflared`，终端打印 ASCII 二维码。手机扫码即可从任何网络远程访问。
+- **5 种权限模式**：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过界面下拉框随时切换。
+- **增强 System Prompt**：手术级改动规则、6 种命名失败模式、反过度工程规则、记忆写入指令。
+- **Per-Model 配置**：每个模型条目专属的 `contextWindow`、`maxTokens`、`charsPerToken`。自动压缩阈值根据模型专属窗口计算。
+- **移动端同步**：二维码 → 共享 session → 实时 MessagesLoaded 广播。桌面端与手机端同步。
+
+### 安装运行
+
+```bash
+cd rust && bash install.sh
+nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
+```
+
+---
+
 ## License
 
 MIT
