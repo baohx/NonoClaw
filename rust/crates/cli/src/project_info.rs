@@ -175,7 +175,7 @@ pub async fn gather(
         })
         .collect();
 
-    let plugins = list_plugins();
+    let plugins = list_plugins(cwd);
     let hooks = nonoclaw_engine::hooks::load_hooks(cwd)
         .into_iter()
         .map(|(t, d)| HookEntry {
@@ -206,38 +206,42 @@ pub async fn gather(
     }
 }
 
-/// Scan `~/.nonoclaw/plugins/<name>`; count each plugin's contributed skills.
-fn list_plugins() -> Vec<PluginInfo> {
-    let Some(home) = nonoclaw_home() else {
-        return Vec::new();
-    };
-    let plugins_dir = home.join("plugins");
-    let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
-        return Vec::new();
-    };
+/// Scan plugin directories for contributed skills.
+/// Checks both `~/.nonoclaw/plugins/` (user-global) and
+/// `<cwd>/.nonoclaw/plugins/` (project).
+fn list_plugins(cwd: &Path) -> Vec<PluginInfo> {
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+    let mut dirs_to_scan: Vec<PathBuf> = Vec::new();
+
+    // User-global
+    if let Some(home) = nonoclaw_home() {
+        dirs_to_scan.push(home.join("plugins"));
+    }
+    // Project
+    dirs_to_scan.push(cwd.join(".nonoclaw").join("plugins"));
+
+    for plugins_dir in &dirs_to_scan {
+        let Ok(entries) = std::fs::read_dir(plugins_dir) else {
             continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Count <plugin>/skills/<skill>/SKILL.md
+            let skill_count = std::fs::read_dir(path.join("skills"))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().join("SKILL.md").exists())
+                        .count()
+                })
+                .unwrap_or(0);
+            out.push(PluginInfo {
+                name,
+                dir: path.to_string_lossy().to_string(),
+                skill_count,
+            });
         }
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
-        // Count <plugin>/skills/<skill>/SKILL.md
-        let skill_count = std::fs::read_dir(path.join("skills"))
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().join("SKILL.md").exists())
-                    .count()
-            })
-            .unwrap_or(0);
-        out.push(PluginInfo {
-            name,
-            dir: path.to_string_lossy().to_string(),
-            skill_count,
-        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
