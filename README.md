@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.4.0 | **Goal**: a native CLI coding agent with cross-session memory, file-attachment OCR, multimodal document understanding, and a bioluminescent web interface.
+> **Version**: v0.5.0 | **Goal**: a native CLI coding agent with agent profiles, goal tracking, LSP code intelligence, cross-session memory, and a bioluminescent web interface.
 
 ---
 
@@ -65,7 +65,8 @@ nonoclaw -p "explain Rust ownership"
 | **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). BM25 search with importance ranking. `Memory` tool (18th built-in). Auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
 | **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. No embeddings, no vector DB. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
-| **17 Built-in Tools** | Read, Write, Edit, Bash, Grep, Glob, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, **ToolSearch**, **TaskCreate/Get/List/Update** |
+| **19 Built-in Tools** | Read, Write, Edit (exact + **hash_line mode**), Bash, Grep, Glob, **LSP**, TodoWrite, WebFetch, WebSearch, Agent, AskUserQuestion, Coordinator, **ToolSearch**, **TaskCreate/Get/List/Update**, **Memory** (12 actions) |
+| **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts, tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
 | **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge** |
@@ -73,7 +74,8 @@ nonoclaw -p "explain Rust ownership"
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
-| **Context** | Auto-compaction `compactThreshold` tokens, configurable `contextWindow`, **Prompt Caching** (ephemeral, git excluded from cache), **per-model token estimation** (charsPerToken) |
+| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching**, **per-model token estimation** |
+| **Goal Tracking** | Multi-step task plans in `memory/goals/*.md`. Agent self-manages steps, verification criteria, and progress. `Memory goal_create/goal_update/goal_list` actions. |
 | **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload |
 | **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP**, 12 event types) |
 | **Task System** | File-persisted task store, dependency graph, owner assignment, status lifecycle |
@@ -81,6 +83,7 @@ nonoclaw -p "explain Rust ownership"
 | **PWA** | Add to Home Screen, offline SW cache, installable on Android/iOS |
 | **Mobile Sync** | QR code → shared session → real-time MessagesLoaded broadcast; **skipOneLoad** for reliable peer sync; **sync_session_to_peers** on Run/Clear/post-run; **markClearing** prevents tool-card residue |
 | **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access with terminal ASCII QR code |
+| **LSP Code Intelligence** | goToDefinition, findReferences, documentSymbol, workspaceSymbol via ripgrep. No language server required. |
 | **Export** | Markdown copy + `.md` file download from assistant responses |
 
 ---
@@ -716,7 +719,7 @@ NonoClaw/
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.4.0 | **目标**: 一个原生 CLI 编程智能体，具备跨会话记忆、文件附件 OCR、多模态文档理解和生物发光 Web 界面。
+> **版本**: v0.5.0 | **目标**: 一个原生 CLI 编程智能体，具备 agent 配置文件、目标追踪、LSP 代码智能、跨会话记忆和生物发光 Web 界面。
 
 ---
 
@@ -779,7 +782,8 @@ nonoclaw -p "解释 Rust 所有权机制"
 | **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。BM25 搜索 + 重要性排序。`Memory` 工具（第 18 个内置工具）。每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。灵感来源于 agentmemory。 |
 | **LLM Wiki** | Karpathy 风格的结构化知识编译：`wiki/` 目录含有 concepts、entities、comparisons、decisions、sources 页面。`raw/` 存放不可变的源文档。LLM 充当编译器——摄入原始资料，创建/更新互链的 wiki 页面。BM25 搜索 + `Memory` 工具操作（`wiki_search`、`wiki_ingest`、`wiki_lint`）。`wiki/index.md` 在会话启动时自动注入。无嵌入向量，无向量数据库。 |
 | **系统提示词** | 增强型：手术级编辑规则、6 种命名失败模式、反过度工程规则、ToolSearch 使用指南、**Git 上下文在非缓存块中**（缓存跨轮次保持有效）、**记忆回写指令** |
-| **18 个内置工具** | Read、Write、Edit、Bash、Grep、Glob、TodoWrite、WebFetch、WebSearch、Agent、AskUserQuestion、Coordinator、ToolSearch、TaskCreate/Get/List/Update、**Memory** |
+| **19 个内置工具** | Read、Write、Edit（含 **hash_line 模式**）、Bash、Grep、Glob、**LSP**、TodoWrite、WebFetch、WebSearch、Agent、AskUserQuestion、Coordinator、ToolSearch、TaskCreate/Get/List/Update、**Memory**（12 个操作） |
+| **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。 |
 | **文件附件** | 通过纸夹按钮、拖拽或粘贴上传 PDF/DOCX/DOC/TXT/MD/PNG/JPG；通过可配置的 Mistral/DeepSeek 文档模型**自动 OCR**；**直接文本提取**（pdftotext + ZIP XML）尽可能跳过 OCR；**嵌入图片提取**（pdfimages + word/media）并为每张图片生成 OCR 描述；多模态模型的 **ContentBlock::Image 注入** |
 | **Bash 后台任务** | `run_in_background: true` 启动分离进程，输出持久化到磁盘，完成时注入 `<task_notification>` |
 | **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接** |
@@ -787,7 +791,8 @@ nonoclaw -p "解释 Rust 所有权机制"
 | **多模型切换** | 通过 UI 下拉框或 `/multi` 斜杠命令切换模型；`/multi` 语法错误时显示帮助提示 |
 | **权限** | 5 种模式：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过 UI 下拉框切换 |
 | **会话** | 按工作目录的 JSONL 持久化，`--resume` / `--continue` / `--list-sessions`，**会话命名**，渐进式元数据 |
-| **上下文** | 自动压缩 `compactThreshold` tokens，可配置 `contextWindow`，**Prompt Cache**（ephemeral，Git 排除在缓存外），**每模型 token 估算**（charsPerToken） |
+| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**、**每模型 token 估算** |
+| **目标追踪** | `memory/goals/*.md` 中的多步骤任务计划。Agent 自主管理步骤、验证标准和进度。`Memory goal_create/goal_update/goal_list` 操作。 |
 | **技能** | `/skill-name` 注入，**12 个内置技能**，通过路径/触发器/文件发现**动态激活**，参数替换，fork 上下文，使用追踪，热重载 |
 | **插件** | `--plugin-add`，通过 `.nonoclaw/hooks.json` 配置钩子（**shell + prompt + HTTP**，12 种事件类型） |
 | **任务系统** | 文件持久化任务存储，依赖图，owner 分配，状态生命周期 |
@@ -795,6 +800,7 @@ nonoclaw -p "解释 Rust 所有权机制"
 | **PWA** | 添加到主屏幕，离线 SW 缓存，可在 Android/iOS 上安装 |
 | **手机同步** | 二维码 → 共享 session → 实时 MessagesLoaded 广播；**skipOneLoad** 确保可靠的端到端同步；**sync_session_to_peers** 在 Run/Clear/运行后广播；**markClearing** 防止工具卡片残留 |
 | **隧道** | `--tunnel` 自动启动 Cloudflare Tunnel，终端打印 ASCII 二维码，实现公网 HTTPS 访问 |
+| **LSP 代码智能** | goToDefinition、findReferences、documentSymbol、workspaceSymbol，基于 ripgrep。无需安装语言服务器。 |
 | **导出** | Markdown 复制 + `.md` 文件下载助手回复 |
 
 ---
