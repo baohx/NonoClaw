@@ -109,9 +109,11 @@ impl EngineOptions {
         }
         if let Some(cw) = profile.context_window {
             self.context_window = Some(cw);
-            // Recompute compact threshold from model-specific window.
-            self.compact_threshold_tokens =
-                cw.saturating_sub(self.max_tokens as usize + 2048);
+            // Conservative: 75% of context window.  chars/token estimation is
+            // rough — the real token count can be 20-30% higher, especially
+            // with Chinese text or tool-heavy prompts.  The 25% margin absorbs
+            // estimation error before the API hard-rejects.
+            self.compact_threshold_tokens = cw * 3 / 4;
         }
     }
 }
