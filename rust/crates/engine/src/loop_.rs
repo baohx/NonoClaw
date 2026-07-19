@@ -198,6 +198,8 @@ pub struct QueryEngine {
     hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
     /// Background compaction task spawned when tokens reach 80% threshold.
     pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
+    /// Message count when background compact was spawned (for correct delta).
+    pending_compact_msg_count: usize,
 }
 
 impl QueryEngine {
@@ -218,6 +220,7 @@ impl QueryEngine {
             session_file: None,
             hooks: Vec::new(),
             pending_compact: None,
+            pending_compact_msg_count: 0,
         }
     }
 
@@ -244,6 +247,7 @@ impl QueryEngine {
             session_file,
             hooks: Vec::new(),
             pending_compact: None,
+            pending_compact_msg_count: 0,
         }
     }
 
@@ -445,11 +449,17 @@ impl QueryEngine {
             };
             if compact_done {
                 let handle = self.pending_compact.take().unwrap();
+                let msg_count_at_spawn = self.pending_compact_msg_count;
                 match handle.await {
                     Ok(Ok(compacted)) => {
                         let kept = compacted.len();
-                        let removed = self.messages.len().saturating_sub(kept);
-                        if removed > 0 {
+                        // Use the message count from when the compact was
+                        // spawned, NOT the current count (which may have grown).
+                        let removed = msg_count_at_spawn.saturating_sub(kept);
+                        if removed > 0 && compacted.len() < self.messages.len() {
+                            // Only swap if the compacted result is actually
+                            // smaller than the current transcript.
+                            // Persist the first (summary) message.
                             if let Some(first) = compacted.first() {
                                 self.persist(first);
                             }
@@ -457,6 +467,8 @@ impl QueryEngine {
                             on_event(&EngineEvent::Compacted {
                                 removed, kept, tokens_before: 0, tokens_after: 0,
                             });
+                        } else {
+                            tracing::debug!("background compact stale — messages have grown since spawn, discarding");
                         }
                     }
                     Ok(Err(e)) => tracing::warn!("background compact failed: {e}"),
@@ -477,6 +489,7 @@ impl QueryEngine {
                         .unwrap_or_else(|| self.options.model.clone());
                     let messages = self.messages.clone();
                     let keep = KEEP_RECENT_TURNS;
+                    self.pending_compact_msg_count = messages.len();
                     let handle = tokio::spawn(async move {
                         compact_messages(&client, &model, &messages, keep, crate::compact::CompactMode::Segments).await
                     });
