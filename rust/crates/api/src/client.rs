@@ -167,6 +167,8 @@ impl Client {
         }
         let http = reqwest::Client::builder()
             .user_agent(concat!("nonoclaw/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| Error::Network(e.to_string()))?;
         Ok(Client {

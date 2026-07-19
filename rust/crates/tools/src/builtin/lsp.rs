@@ -22,18 +22,23 @@ impl LspTool {
 }
 
 async fn rg(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = tokio::process::Command::new("rg")
-        .args(args)
-        .current_dir(cwd)
-        .arg("--no-heading")
-        .arg("--color=never")
-        .output()
-        .await;
-    match output {
-        Ok(o) => Ok(String::from_utf8_lossy(&o.stdout).to_string()),
-        Err(e) => Err(Error::Tool { tool: "LSP".into(), message: format!("rg: {e}") }),
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(RG_TIMEOUT_SECS),
+        tokio::process::Command::new("rg")
+            .args(args)
+            .current_dir(cwd)
+            .arg("--no-heading")
+            .arg("--color=never")
+            .output(),
+    ).await;
+    match result {
+        Ok(Ok(o)) => Ok(String::from_utf8_lossy(&o.stdout).to_string()),
+        Ok(Err(e)) => Err(Error::Tool { tool: "LSP".into(), message: format!("rg: {e}") }),
+        Err(_) => Err(Error::Tool { tool: "LSP".into(), message: "rg timed out".into() }),
     }
 }
+
+const RG_TIMEOUT_SECS: u64 = 15;
 
 /// List symbols in a file by grepping for common patterns.
 fn symbols_in_file(path: &Path) -> Result<String> {
