@@ -46,9 +46,22 @@ pub fn build_system_blocks(
     main.push_str(&format!("- Platform: {PLATFORM_HINT}\n"));
     main.push_str(&format!("- Today's date: {}\n", user.date));
     main.push_str(TOOL_GUIDANCE);
-    for (name, prompt) in tool_prompts {
-        main.push_str(&format!("\n## Tool: {name}\n{prompt}\n"));
-    }
+    // Compact tool listing: name + first line only (the full prompt is
+    // available via the tool schema's `description` field).  With MCP
+    // servers adding 30+ tools, embedding full prompts bloats the system
+    // block to millions of chars — fatal for OpenAI-format models (Kimi).
+    let tools_list: Vec<String> = tool_prompts
+        .iter()
+        .map(|(name, prompt)| {
+            let first_line = prompt.lines().next().unwrap_or("");
+            format!("- **{name}**: {first_line}")
+        })
+        .collect();
+    main.push_str(&format!(
+        "\n## Available Tools ({})\n\n{}\n",
+        tool_prompts.len(),
+        tools_list.join("\n"),
+    ));
     // Inject active skills (static + dynamically activated/discovered).
     if let Some(mgr) = skills_manager {
         let skill_prompt = mgr.read().unwrap().render_prompt();

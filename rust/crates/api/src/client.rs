@@ -690,10 +690,10 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
         body["temperature"] = serde_json::json!(t);
     }
 
-    // Suppress reasoning for models that default to thinking mode (Kimi K3).
-    // OpenAI format doesn't have a "thinking" param — use temperature instead.
-    if params.thinking.is_none() {
-        body["temperature"] = serde_json::json!(0.7);
+    // Only set temperature if explicitly configured.
+    // Some models (Kimi K3) reject non-1.0 values.
+    if let Some(t) = params.temperature {
+        body["temperature"] = serde_json::json!(t);
     }
 
     Ok(serde_json::to_string(&body)?)
@@ -792,6 +792,13 @@ fn dump_prompt_openai(params: &RequestParams, _body: &str) {
     let thin = "─".repeat(72);
 
     let sys_chars: usize = params.system.iter().map(|b| b.text.chars().count()).sum();
+    // Per-block breakdown for debugging large system prompts.
+    let block_sizes: Vec<String> = params.system.iter().enumerate().map(|(i, b)| {
+        let cached = if b.cache_control.is_some() { "[CACHED]" } else { "[UNCACHED]" };
+        let lines = b.text.lines().count();
+        format!("Block#{} {} {}chars {}lines", i+1, cached, b.text.chars().count(), lines)
+    }).collect();
+
     let msg_chars: usize = params.messages.iter().map(|m| match &m.content {
         nonoclaw_core::MessageContent::Text(s) => s.chars().count(),
         nonoclaw_core::MessageContent::Blocks(bs) => {
@@ -810,6 +817,7 @@ fn dump_prompt_openai(params: &RequestParams, _body: &str) {
     }).sum();
 
     let trace = params.trace_label.as_deref().unwrap_or("?");
+    let block_detail = block_sizes.join("\n  ");
 
     tracing::info!(
         "\n{sep}\n\
@@ -818,7 +826,8 @@ fn dump_prompt_openai(params: &RequestParams, _body: &str) {
          Model:     {model}\n\
          Max out:   {max_tok} tokens\n\
          {thin}\n\
-           SYSTEM   · {s_chars:>6} chars ({n_sys} blocks)\n\
+           SYSTEM   · {s_chars:>6} chars ({n_sys} blocks):\n  {blocks}\n\
+         {thin}\n\
            MESSAGES · {n_msgs:>2} total · {m_chars:>6} chars · {img} images\n\
          {thin}\n\
          Message roles: {roles}\n\
@@ -828,6 +837,7 @@ fn dump_prompt_openai(params: &RequestParams, _body: &str) {
         max_tok = params.max_tokens,
         s_chars = sys_chars,
         n_sys = params.system.len(),
+        blocks = block_detail,
         n_msgs = params.messages.len(),
         m_chars = msg_chars,
         img = img_count,
