@@ -739,6 +739,15 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     Ok(serde_json::to_string(&body)?)
 }
 
+/// OpenAI usage fields use different names than Anthropic.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
 /// Parse a non-streaming OpenAI Chat Completions response into TurnOutput.
 async fn fold_openai_non_streaming(
     response: reqwest::Response,
@@ -753,13 +762,21 @@ async fn fold_openai_non_streaming(
     let msg = &body["choices"][0]["message"];
     let content_text = msg["content"].as_str().unwrap_or("").to_string();
 
-    let usage = serde_json::from_value::<UsagePart>(body["usage"].clone())
+    // OpenAI returns prompt_tokens/completion_tokens, not input_tokens/output_tokens.
+    let usage = serde_json::from_value::<OpenAiUsage>(body["usage"].clone())
         .unwrap_or_default();
 
+    // Emit a synthetic usage event for the UI token counter.
+    let usage_part = nonoclaw_core::UsagePart {
+        input_tokens: Some(usage.prompt_tokens),
+        output_tokens: Some(usage.completion_tokens),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
     on_event(&StreamEvent::MessageStart {
         message_id: msg_id.clone(),
         model: model.clone(),
-        usage: usage.clone(),
+        usage: usage_part,
     });
 
     if !content_text.is_empty() {
@@ -811,10 +828,10 @@ async fn fold_openai_non_streaming(
         content,
         stop_reason,
         usage: nonoclaw_core::Usage {
-            input_tokens: usage.input_tokens.unwrap_or(0),
-            output_tokens: usage.output_tokens.unwrap_or(0),
-            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         },
     })
 }
