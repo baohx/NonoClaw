@@ -433,6 +433,13 @@ fn refresh_mcp_configs(
     out
 }
 
+/// Look up the compact model's credentials from the profiles list.
+fn compact_creds(profiles: &[nonoclaw_engine::settings::ModelProfile], name: &Option<String>) -> Option<(String, String, Option<String>)> {
+    let name = name.as_ref()?;
+    let p = profiles.iter().find(|p| &p.name == name)?;
+    Some((p.base_url.clone(), p.api_key.clone(), p.api_format.clone()))
+}
+
 fn serialize_event(ev: &EngineEvent) -> serde_json::Value {
     match serde_json::to_value(ev) {
         Ok(v) => v,
@@ -543,6 +550,7 @@ fn build_options(
     append: Option<String>,
     arguments: Option<String>,
     compact_model: Option<String>,
+    compact_model_creds: Option<(String, String, Option<String>)>,
     tx: Tx,
     pending_permissions: Arc<PermissionMap>,
     permission_mode: nonoclaw_core::PermissionMode,
@@ -572,6 +580,7 @@ fn build_options(
         auto_compact: true,
         compact_threshold_tokens: 80_000,
         compact_model,
+        compact_model_creds,
         chars_per_token: 4,
         context_window: None, // resolved at run time via apply_model_profile
         skills_manager: Some(skills_manager),
@@ -1672,6 +1681,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 Some(body.clone()),
                                 arguments.clone(),
                                 s.compact_model.clone(),
+                                compact_creds(&s.model_profiles, &s.compact_model),
                                 tx2.clone(),
                                 Arc::clone(&s.pending_permissions),
                                 *s.permission_mode.lock().await,
@@ -1716,6 +1726,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         append_system_prompt.clone(),
                         arguments.clone(),
                         s.compact_model.clone(),
+                        compact_creds(&s.model_profiles, &s.compact_model),
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
                         *s.permission_mode.lock().await,
@@ -2058,6 +2069,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     None,
                     None,
                     state.compact_model.clone(),
+                    compact_creds(&state.model_profiles, &state.compact_model),
                     tx.clone(),
                     Arc::clone(&state.pending_permissions),
                     *state.permission_mode.lock().await,

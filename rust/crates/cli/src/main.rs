@@ -322,6 +322,11 @@ async fn main() -> Result<()> {
         },
         compact_threshold_tokens,
         compact_model: settings.compact_model.clone(),
+        compact_model_creds: settings.compact_model.as_ref().and_then(|name| {
+            settings.all_models().iter().find(|p| &p.name == name).map(|p| {
+                (p.base_url.clone(), p.api_key.clone(), p.api_format.clone())
+            })
+        }),
         chars_per_token: settings.chars_per_token,
         context_window: None, // resolved at run time via apply_model_profile
         skills_manager: Some(skills_manager),

@@ -86,6 +86,11 @@ pub struct EngineOptions {
     /// Optional model override for compaction summarization. Falls back to
     /// `model` when unset. Set to a cheap model (e.g. haiku) to save costs.
     pub compact_model: Option<String>,
+    /// Credentials for the compact model (if different from main model).
+    /// Stored so we can build a separate client for cross-format compaction.
+    #[allow(clippy::type_complexity)]
+    pub compact_model_creds: Option<(String, String, Option<String>)>,
+    // (base_url, api_key, api_format)
     /// Chars-per-token divisor for the token estimator. Default 4 (Claude).
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
@@ -139,6 +144,7 @@ impl Default for EngineOptions {
             auto_compact: true,
             compact_threshold_tokens: 150_000,
             compact_model: None,
+            compact_model_creds: None,
             chars_per_token: 4,
             context_window: None,
         }
@@ -486,14 +492,17 @@ impl QueryEngine {
                 if est > self.options.compact_threshold_tokens * 8 / 10
                     && self.pending_compact.is_none()
                 {
-                    let client = Arc::clone(&self.client);
                     let model = self.options.compact_model.clone()
                         .unwrap_or_else(|| self.options.model.clone());
+                    let compact_client = resolve_compact_client(
+                        &self.client, &self.options, &model,
+                    );
                     let messages = self.messages.clone();
                     let keep = KEEP_RECENT_TURNS;
+                    let m = model.clone();
                     self.pending_compact_msg_count = messages.len();
                     let handle = tokio::spawn(async move {
-                        compact_messages(&client, &model, &messages, keep, crate::compact::CompactMode::Segments).await
+                        compact_messages(compact_client.as_ref(), &m, &messages, keep, crate::compact::CompactMode::Segments).await
                     });
                     self.pending_compact = Some(handle);
                 }
@@ -514,30 +523,19 @@ impl QueryEngine {
                         .compact_model
                         .as_deref()
                         .unwrap_or(&self.options.model);
-                    // Try compact model first; fall back to main model on failure
-                    // (e.g. compact model uses a different API format/provider).
-                    let compacted = match compact_messages(
-                        &self.client,
+                    // Build a client for the compact model if it uses a
+                    // different API format/provider than the main model.
+                    let compact_client = resolve_compact_client(
+                        &self.client, &self.options, compact_model,
+                    );
+                    let compacted = compact_messages(
+                        compact_client.as_ref(),
                         compact_model,
                         &self.messages,
                         KEEP_RECENT_TURNS,
                         crate::compact::CompactMode::Segments,
                     )
-                    .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("compaction with {compact_model} failed ({e}) — falling back to main model");
-                            compact_messages(
-                                &self.client,
-                                &self.options.model,
-                                &self.messages,
-                                KEEP_RECENT_TURNS,
-                                crate::compact::CompactMode::Segments,
-                            )
-                            .await?
-                        }
-                    };
+                    .await?;
                     let tokens_after = estimate_total(&compacted, system_chars, tools_chars, self.options.chars_per_token);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
@@ -961,28 +959,17 @@ impl QueryEngine {
             .compact_model
             .as_deref()
             .unwrap_or(&self.options.model);
-        let compacted = match compact_messages(
-            &self.client,
+        let compact_client = resolve_compact_client(
+            &self.client, &self.options, compact_model,
+        );
+        let compacted = compact_messages(
+            compact_client.as_ref(),
             compact_model,
             &self.messages,
             KEEP_RECENT_TURNS,
             crate::compact::CompactMode::Segments,
         )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("manual compact with {compact_model} failed ({e}) — falling back to main model");
-                compact_messages(
-                    &self.client,
-                    &self.options.model,
-                    &self.messages,
-                    KEEP_RECENT_TURNS,
-                    crate::compact::CompactMode::Segments,
-                )
-                .await?
-            }
-        };
+        .await?;
         let kept = compacted.len();
         if kept < before {
             if let Some(first) = compacted.first() {
@@ -1161,6 +1148,39 @@ pub fn strip_thinking(messages: &[Message]) -> Vec<Message> {
             }
         })
         .collect()
+}
+
+/// Build a client for the compact model if it has different credentials
+/// than the main model. Returns a ref to the main client if they match.
+fn resolve_compact_client(
+    main_client: &Arc<nonoclaw_api::Client>,
+    options: &EngineOptions,
+    compact_model: &str,
+) -> Arc<nonoclaw_api::Client> {
+    if let Some((ref base_url, ref api_key, ref api_format)) = options.compact_model_creds {
+        let format = match api_format.as_deref() {
+            Some("openai") => nonoclaw_api::ApiFormat::OpenAI,
+            _ => nonoclaw_api::ApiFormat::Anthropic,
+        };
+        // Only build a new client if credentials or format differ.
+        if base_url != main_client.base_url()
+            || api_key.as_str() != main_client.api_key().unwrap_or_default()
+            || format != main_client.api_format()
+        {
+            match nonoclaw_api::Client::new(
+                Some(api_key.clone()), None, base_url.clone(),
+            ).map(|c| c.with_format(format)) {
+                Ok(c) => {
+                    tracing::debug!(%compact_model, %base_url, ?format, "compaction client rebuilt");
+                    return Arc::new(c);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to build compact client: {e} — using main client");
+                }
+            }
+        }
+    }
+    Arc::clone(main_client)
 }
 
 /// Repair orphaned `tool_use` blocks in a message sequence. The Anthropic API
