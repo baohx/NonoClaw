@@ -599,6 +599,13 @@ fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     Ok(serde_json::to_string(&body)?)
 }
 
+fn role_str(role: nonoclaw_core::Role) -> &'static str {
+    match role {
+        nonoclaw_core::Role::User => "user",
+        nonoclaw_core::Role::Assistant => "assistant",
+    }
+}
+
 /// Serialize in OpenAI Chat Completions format.
 /// Converts Anthropic-style content blocks to OpenAI format on the fly.
 fn serialize_body_openai(params: &RequestParams) -> Result<String> {
@@ -616,57 +623,83 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
         }));
     }
 
-    // Convert each message.
+    // Convert each message — process entire Messages, not individual blocks.
     for msg in &params.messages {
-        let role = match msg.role {
-            nonoclaw_core::Role::User => "user",
-            nonoclaw_core::Role::Assistant => "assistant",
-        };
-        let content = match &msg.content {
-            MessageContent::Text(s) => serde_json::json!(s),
-            MessageContent::Blocks(blocks) => {
-                let parts: Vec<serde_json::Value> = blocks.iter().filter_map(|b| match b {
-                    ContentBlock::Text { text, .. } => {
-                        Some(serde_json::json!({"type": "text", "text": text}))
-                    }
-                    ContentBlock::Image { source } => {
-                        Some(serde_json::json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{};base64,{}", source.media_type, source.data)
-                            }
-                        }))
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some(serde_json::json!({
-                            "role": "assistant",
-                            "tool_calls": [{
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input).unwrap_or_default()
-                                }
-                            }]
-                        }))
-                    }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                        let text = match content {
-                            nonoclaw_core::ToolResultContent::Text(s) => s.clone(),
-                            _ => String::new(),
-                        };
-                        Some(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": text,
-                        }))
-                    }
-                    ContentBlock::Thinking { .. } => None,
-                }).collect();
-                serde_json::json!(parts)
+        match &msg.content {
+            MessageContent::Text(s) => {
+                let role = role_str(msg.role);
+                messages.push(serde_json::json!({"role": role, "content": s}));
             }
-        };
-        messages.push(serde_json::json!({"role": role, "content": content}));
+            MessageContent::Blocks(blocks) => {
+                // Separate blocks by kind: Text/Image vs ToolUse vs ToolResult
+                let mut text_parts: Vec<serde_json::Value> = Vec::new();
+                let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+                let mut tool_results: Vec<serde_json::Value> = Vec::new();
+
+                for b in blocks {
+                    match b {
+                        ContentBlock::Text { text, .. } => {
+                            text_parts.push(serde_json::json!({"type":"text","text":text}));
+                        }
+                        ContentBlock::Image { source } => {
+                            text_parts.push(serde_json::json!({
+                                "type":"image_url",
+                                "image_url":{"url": format!("data:{};base64,{}", source.media_type, source.data)}
+                            }));
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            tool_calls.push(serde_json::json!({
+                                "id": id, "type": "function",
+                                "function": {"name": name, "arguments": serde_json::to_string(input).unwrap_or_default()}
+                            }));
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                            let text = match content {
+                                nonoclaw_core::ToolResultContent::Text(s) => s.clone(),
+                                _ => String::new(),
+                            };
+                            tool_results.push(serde_json::json!({
+                                "role":"tool", "tool_call_id": tool_use_id, "content": text
+                            }));
+                        }
+                        ContentBlock::Thinking { .. } => {}
+                    }
+                }
+
+                // Combine text parts into a single content value.
+                let content_val = if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(if text_parts.len() == 1 {
+                        text_parts.into_iter().next().unwrap()
+                    } else {
+                        serde_json::json!(text_parts)
+                    })
+                };
+
+                match msg.role {
+                    nonoclaw_core::Role::User => {
+                        for tr in &tool_results {
+                            messages.push(tr.clone());
+                        }
+                        if let Some(c) = content_val {
+                            messages.push(serde_json::json!({"role":"user","content":c}));
+                        }
+                    }
+                    nonoclaw_core::Role::Assistant => {
+                        if !tool_calls.is_empty() {
+                            let mut m = serde_json::json!({"role":"assistant","tool_calls":tool_calls});
+                            if let Some(c) = &content_val {
+                                m["content"] = c.clone();
+                            }
+                            messages.push(m);
+                        } else if let Some(c) = content_val {
+                            messages.push(serde_json::json!({"role":"assistant","content":c}));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Convert tool definitions to OpenAI format.
@@ -689,6 +722,9 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     });
     if !tools.is_empty() {
         body["tools"] = serde_json::json!(tools);
+        // Tell the model it can use tools.  "auto" lets the model decide;
+        // use tool_choice to force a specific tool when needed.
+        body["tool_choice"] = serde_json::json!("auto");
     }
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
