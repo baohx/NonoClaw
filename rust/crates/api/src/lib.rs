@@ -5,7 +5,7 @@ pub mod retry;
 pub mod sse;
 
 pub use client::{
-    Client, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolChoice, ToolSchema,
-    TurnOutput, DEFAULT_BASE_URL,
+    ApiFormat, Client, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolChoice,
+    ToolSchema, TurnOutput, DEFAULT_BASE_URL,
 };
 pub use retry::{with_retry, RetryConfig};

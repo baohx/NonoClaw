@@ -126,6 +126,19 @@ pub struct ModelProfile {
     /// tools, and permission mode.
     #[serde(default)]
     pub profile: Option<String>,
+    /// API format: "anthropic" (default) or "openai".
+    /// OpenAI-compatible models use /v1/chat/completions with Bearer auth.
+    #[serde(rename = "apiFormat", default)]
+    pub api_format: Option<String>,
+}
+
+impl ModelProfile {
+    pub fn api_format(&self) -> nonoclaw_api::ApiFormat {
+        match self.api_format.as_deref() {
+            Some("openai") => nonoclaw_api::ApiFormat::OpenAI,
+            _ => nonoclaw_api::ApiFormat::Anthropic,
+        }
+    }
 }
 
 /// Accept `"role": "main"` (single string) or `"role": ["main", "doc"]` (array).

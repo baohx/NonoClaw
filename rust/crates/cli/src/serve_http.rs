@@ -1749,14 +1749,17 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         let profile = s.model_profiles.iter()
                             .find(|p| p.name == model_used);
                         match profile {
-                            Some(p) if p.base_url != s.client.base_url() || p.api_key != s.client.api_key().unwrap_or_default() => {
+                            Some(p) if p.base_url != s.client.base_url()
+                                || p.api_key != s.client.api_key().unwrap_or_default()
+                                || p.api_format() != s.client.api_format() =>
+                            {
                                 match nonoclaw_api::Client::new(
                                     Some(p.api_key.clone()),
                                     None,
                                     p.base_url.clone(),
-                                ) {
+                                ).map(|c| c.with_format(p.api_format())) {
                                     Ok(c) => {
-                                        tracing::info!(model=%model_used, url=%p.base_url, "per-run client rebuilt");
+                                        tracing::info!(model=%model_used, url=%p.base_url, format=?p.api_format(), "per-run client rebuilt");
                                         Arc::new(c)
                                     }
                                     Err(e) => {

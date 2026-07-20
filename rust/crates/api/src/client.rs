@@ -146,12 +146,23 @@ pub struct TurnOutput {
     pub usage: Usage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFormat {
+    Anthropic,
+    OpenAI,
+}
+
+impl Default for ApiFormat {
+    fn default() -> Self { ApiFormat::Anthropic }
+}
+
 pub struct Client {
     http: reqwest::Client,
     api_key: Option<String>,
     auth_token: Option<String>,
     base_url: String,
     retry: RetryConfig,
+    format: ApiFormat,
 }
 
 impl Client {
@@ -177,8 +188,16 @@ impl Client {
             auth_token,
             base_url,
             retry: RetryConfig::default(),
+            format: ApiFormat::default(),
         })
     }
+
+    pub fn with_format(mut self, format: ApiFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    pub fn api_format(&self) -> ApiFormat { self.format }
 
     /// Build a client from the standard environment variables:
     /// `ANTHROPIC_API_KEY` (x-api-key) and/or `ANTHROPIC_AUTH_TOKEN` (Bearer),
@@ -202,21 +221,37 @@ impl Client {
     }
 
     fn build_request(&self, params: &RequestParams) -> Result<reqwest::RequestBuilder> {
-        let body = serialize_body(params)?;
-        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut req = self
-            .http
-            .post(url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json");
-        if let Some(key) = &self.api_key {
-            req = req.header("x-api-key", key);
-        }
-        if let Some(token) = &self.auth_token {
-            req = req.header("authorization", format!("Bearer {token}"));
-        }
-        if !params.betas.is_empty() {
-            req = req.header("anthropic-beta", params.betas.join(","));
+        let (url, body) = match self.format {
+            ApiFormat::Anthropic => {
+                let body = serialize_body_anthropic(params)?;
+                let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+                (url, body)
+            }
+            ApiFormat::OpenAI => {
+                let body = serialize_body_openai(params)?;
+                let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+                (url, body)
+            }
+        };
+        let mut req = self.http.post(url).header("content-type", "application/json");
+        match self.format {
+            ApiFormat::Anthropic => {
+                req = req.header("anthropic-version", ANTHROPIC_VERSION);
+                if let Some(key) = &self.api_key {
+                    req = req.header("x-api-key", key);
+                }
+                if let Some(token) = &self.auth_token {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+                if !params.betas.is_empty() {
+                    req = req.header("anthropic-beta", params.betas.join(","));
+                }
+            }
+            ApiFormat::OpenAI => {
+                if let Some(key) = &self.api_key {
+                    req = req.header("Authorization", format!("Bearer {key}"));
+                }
+            }
         }
         Ok(req.body(body))
     }
@@ -531,7 +566,7 @@ fn handle_frame(
 }
 
 /// Build the streaming request body JSON.
-fn serialize_body(params: &RequestParams) -> Result<String> {
+fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     let mut body = serde_json::json!({
         "model": params.model,
         "max_tokens": params.max_tokens,
@@ -553,6 +588,110 @@ fn serialize_body(params: &RequestParams) -> Result<String> {
     if let Some(t) = params.temperature {
         body["temperature"] = t.into();
     }
+    Ok(serde_json::to_string(&body)?)
+}
+
+/// Serialize in OpenAI Chat Completions format.
+/// Converts Anthropic-style content blocks to OpenAI format on the fly.
+fn serialize_body_openai(params: &RequestParams) -> Result<String> {
+    use nonoclaw_core::ContentBlock;
+    use nonoclaw_core::MessageContent;
+
+    // Convert messages: Anthropic → OpenAI format
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    // System prompt becomes a system message.
+    for block in &params.system {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": block.text,
+        }));
+    }
+
+    // Convert each message.
+    for msg in &params.messages {
+        let role = match msg.role {
+            nonoclaw_core::Role::User => "user",
+            nonoclaw_core::Role::Assistant => "assistant",
+        };
+        let content = match &msg.content {
+            MessageContent::Text(s) => serde_json::json!(s),
+            MessageContent::Blocks(blocks) => {
+                let parts: Vec<serde_json::Value> = blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => {
+                        Some(serde_json::json!({"type": "text", "text": text}))
+                    }
+                    ContentBlock::Image { source } => {
+                        Some(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", source.media_type, source.data)
+                            }
+                        }))
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        Some(serde_json::json!({
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_default()
+                                }
+                            }]
+                        }))
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        let text = match content {
+                            nonoclaw_core::ToolResultContent::Text(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                        Some(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": text,
+                        }))
+                    }
+                    ContentBlock::Thinking { .. } => None,
+                }).collect();
+                serde_json::json!(parts)
+            }
+        };
+        messages.push(serde_json::json!({"role": role, "content": content}));
+    }
+
+    // Convert tool definitions to OpenAI format.
+    let tools: Vec<serde_json::Value> = params.tools.iter().map(|t| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            }
+        })
+    }).collect();
+
+    let mut body = serde_json::json!({
+        "model": params.model,
+        "max_tokens": params.max_tokens,
+        "stream": true,
+        "messages": messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = serde_json::json!(tools);
+    }
+    if let Some(t) = params.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+
+    // Suppress reasoning for models that default to thinking mode (Kimi K3).
+    // OpenAI format doesn't have a "thinking" param — use temperature instead.
+    if params.thinking.is_none() {
+        body["temperature"] = serde_json::json!(0.7);
+    }
+
     Ok(serde_json::to_string(&body)?)
 }
 
