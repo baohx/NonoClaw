@@ -288,7 +288,11 @@ impl Client {
     ) -> Result<TurnOutput> {
         let retry = self.retry.clone();
         let response = with_retry(&retry, || self.send_request(params)).await?;
-        fold_stream(response, &mut on_event).await
+        if self.format == ApiFormat::OpenAI {
+            fold_openai_non_streaming(response, params, &mut on_event).await
+        } else {
+            fold_stream(response, &mut on_event).await
+        }
     }
 }
 
@@ -680,7 +684,7 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     let mut body = serde_json::json!({
         "model": params.model,
         "max_tokens": params.max_tokens,
-        "stream": true,
+        "stream": false,
         "messages": messages,
     });
     if !tools.is_empty() {
@@ -697,6 +701,60 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     }
 
     Ok(serde_json::to_string(&body)?)
+}
+
+/// Parse a non-streaming OpenAI Chat Completions response into TurnOutput.
+async fn fold_openai_non_streaming(
+    response: reqwest::Response,
+    params: &RequestParams,
+    on_event: &mut impl FnMut(&StreamEvent),
+) -> Result<TurnOutput> {
+    let body: serde_json::Value = response.json().await
+        .map_err(|e| Error::Network(format!("OpenAI parse: {e}")))?;
+
+    let model = body["model"].as_str().unwrap_or(&params.model).to_string();
+    let msg_id = body["id"].as_str().unwrap_or("").to_string();
+    let content_text = body["choices"][0]["message"]["content"]
+        .as_str().unwrap_or("").to_string();
+
+    let usage = serde_json::from_value::<UsagePart>(body["usage"].clone())
+        .unwrap_or_default();
+
+    on_event(&StreamEvent::MessageStart {
+        message_id: msg_id.clone(),
+        model: model.clone(),
+        usage: usage.clone(),
+    });
+
+    if !content_text.is_empty() {
+        on_event(&StreamEvent::TextDelta { text: content_text.clone() });
+    }
+
+    let stop = body["choices"][0]["finish_reason"].as_str().unwrap_or("stop");
+    let stop_reason = match stop {
+        "stop" | "end_turn" => Some(nonoclaw_core::StopReason::EndTurn),
+        "length" | "max_tokens" => Some(nonoclaw_core::StopReason::MaxTokens),
+        "tool_calls" => Some(nonoclaw_core::StopReason::ToolUse),
+        other => Some(nonoclaw_core::StopReason::Other(other.to_string())),
+    };
+
+    let content = vec![ContentBlock::Text {
+        text: content_text,
+        cache_control: None,
+    }];
+
+    Ok(TurnOutput {
+        message_id: msg_id,
+        model,
+        content,
+        stop_reason,
+        usage: nonoclaw_core::Usage {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        },
+    })
 }
 
 // ── Prompt dump (structured logging) ────────────────────────────────────────
