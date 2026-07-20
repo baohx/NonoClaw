@@ -386,7 +386,16 @@ impl SkillsManager {
                 out.push_str(&format!("**Usage**: /{} {}\n", skill.name, hint));
             }
             out.push('\n');
-            out.push_str(&skill.body);
+            // Cap skill body to avoid bloating the system prompt (firecrawl
+            // skills can have 100+ KB of reference docs each).  The model
+            // can read the full skill via `/skill-name` or Read tool.
+            let body_short = crate::skills::truncate_str(&skill.body, 2000);
+            out.push_str(&body_short);
+            if body_short.len() < skill.body.len() {
+                out.push_str("\n*(body truncated — use /");
+                out.push_str(&skill.name);
+                out.push_str(" to load full skill)*\n");
+            }
             if !skill.body.ends_with('\n') {
                 out.push('\n');
             }
@@ -1188,6 +1197,14 @@ fn parse_args(args: &str) -> Vec<String> {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// Truncate a string to `max` chars, appending `…` if clipped.
+pub fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
 
 #[cfg(test)]
 mod tests {
