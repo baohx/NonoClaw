@@ -750,8 +750,8 @@ async fn fold_openai_non_streaming(
 
     let model = body["model"].as_str().unwrap_or(&params.model).to_string();
     let msg_id = body["id"].as_str().unwrap_or("").to_string();
-    let content_text = body["choices"][0]["message"]["content"]
-        .as_str().unwrap_or("").to_string();
+    let msg = &body["choices"][0]["message"];
+    let content_text = msg["content"].as_str().unwrap_or("").to_string();
 
     let usage = serde_json::from_value::<UsagePart>(body["usage"].clone())
         .unwrap_or_default();
@@ -766,18 +766,44 @@ async fn fold_openai_non_streaming(
         on_event(&StreamEvent::TextDelta { text: content_text.clone() });
     }
 
+    // Parse tool_calls from the response.
+    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    if !content_text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text: content_text, cache_control: None });
+    }
+
+    let mut has_tool_calls = false;
+    if let Some(tool_calls) = msg["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            if !id.is_empty() && !name.is_empty() {
+                on_event(&StreamEvent::ToolUseStart {
+                    index: content_blocks.len(),
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                has_tool_calls = true;
+            }
+        }
+    }
+
     let stop = body["choices"][0]["finish_reason"].as_str().unwrap_or("stop");
-    let stop_reason = match stop {
-        "stop" | "end_turn" => Some(nonoclaw_core::StopReason::EndTurn),
-        "length" | "max_tokens" => Some(nonoclaw_core::StopReason::MaxTokens),
-        "tool_calls" => Some(nonoclaw_core::StopReason::ToolUse),
-        other => Some(nonoclaw_core::StopReason::Other(other.to_string())),
+    let stop_reason = if has_tool_calls {
+        Some(nonoclaw_core::StopReason::ToolUse)
+    } else {
+        match stop {
+            "stop" | "end_turn" => Some(nonoclaw_core::StopReason::EndTurn),
+            "length" | "max_tokens" => Some(nonoclaw_core::StopReason::MaxTokens),
+            "tool_calls" => Some(nonoclaw_core::StopReason::ToolUse),
+            other => Some(nonoclaw_core::StopReason::Other(other.to_string())),
+        }
     };
 
-    let content = vec![ContentBlock::Text {
-        text: content_text,
-        cache_control: None,
-    }];
+    let content = content_blocks;
 
     Ok(TurnOutput {
         message_id: msg_id,
