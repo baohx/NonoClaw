@@ -514,14 +514,30 @@ impl QueryEngine {
                         .compact_model
                         .as_deref()
                         .unwrap_or(&self.options.model);
-                    let compacted = compact_messages(
+                    // Try compact model first; fall back to main model on failure
+                    // (e.g. compact model uses a different API format/provider).
+                    let compacted = match compact_messages(
                         &self.client,
                         compact_model,
                         &self.messages,
                         KEEP_RECENT_TURNS,
                         crate::compact::CompactMode::Segments,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("compaction with {compact_model} failed ({e}) — falling back to main model");
+                            compact_messages(
+                                &self.client,
+                                &self.options.model,
+                                &self.messages,
+                                KEEP_RECENT_TURNS,
+                                crate::compact::CompactMode::Segments,
+                            )
+                            .await?
+                        }
+                    };
                     let tokens_after = estimate_total(&compacted, system_chars, tools_chars, self.options.chars_per_token);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
@@ -945,14 +961,28 @@ impl QueryEngine {
             .compact_model
             .as_deref()
             .unwrap_or(&self.options.model);
-        let compacted = compact_messages(
+        let compacted = match compact_messages(
             &self.client,
             compact_model,
             &self.messages,
             KEEP_RECENT_TURNS,
             crate::compact::CompactMode::Segments,
         )
-        .await?;
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("manual compact with {compact_model} failed ({e}) — falling back to main model");
+                compact_messages(
+                    &self.client,
+                    &self.options.model,
+                    &self.messages,
+                    KEEP_RECENT_TURNS,
+                    crate::compact::CompactMode::Segments,
+                )
+                .await?
+            }
+        };
         let kept = compacted.len();
         if kept < before {
             if let Some(first) = compacted.first() {
