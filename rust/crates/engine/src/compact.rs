@@ -122,6 +122,7 @@ pub async fn compact_messages(
         thinking: None,
         temperature: Some(0.0),
         betas: vec![],
+        trace_label: Some("compact".into()),
     };
     let turn = client.run_turn(&params, |_| {}).await?;
     let summary: String = turn

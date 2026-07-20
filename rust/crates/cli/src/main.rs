@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     let filter = if cli.verbose {
         "debug,hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,tokio_tungstenite=warn,tungstenite=warn"
     } else {
-        "warn"
+        "nonoclaw_api=info,warn"
     };
     tracing_subscriber::fmt()
         .with_env_filter(

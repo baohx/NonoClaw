@@ -95,6 +95,8 @@ pub struct RequestParams {
     pub thinking: Option<ThinkingConfig>,
     pub temperature: Option<f64>,
     pub betas: Vec<String>,
+    /// Optional trace label printed in prompt dump (e.g. "sess-abc:turn-3").
+    pub trace_label: Option<String>,
 }
 
 /// Events surfaced to the caller as the stream progresses. The final folded
@@ -224,11 +226,13 @@ impl Client {
         let (url, body) = match self.format {
             ApiFormat::Anthropic => {
                 let body = serialize_body_anthropic(params)?;
+                dump_prompt_anthropic(params, &body);
                 let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
                 (url, body)
             }
             ApiFormat::OpenAI => {
                 let body = serialize_body_openai(params)?;
+                dump_prompt_openai(params, &body);
                 let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
                 (url, body)
             }
@@ -693,6 +697,146 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     }
 
     Ok(serde_json::to_string(&body)?)
+}
+
+// ── Prompt dump (structured logging) ────────────────────────────────────────
+
+fn dump_prompt_anthropic(params: &RequestParams, _body: &str) {
+    let sep = "═".repeat(72);
+    let thin = "─".repeat(72);
+
+    // ── System blocks ──
+    let mut sys_chars = 0usize;
+    let mut block1 = String::new();
+    let mut block2 = String::new();
+    for (i, b) in params.system.iter().enumerate() {
+        let label = if b.cache_control.is_some() {
+            "BLOCK #1  [CACHED · ephemeral]"
+        } else {
+            "BLOCK #2  [UNCACHED]"
+        };
+        let chars = b.text.chars().count();
+        sys_chars += chars;
+        let preview = b.text.lines().take(8).collect::<Vec<_>>().join("\n");
+        if i == 0 {
+            block1 = format!("  {label:36} {chars:>6} chars");
+        } else {
+            block2 = format!("  {label:36} {chars:>6} chars");
+        }
+    }
+
+    // ── Tools ──
+    let tools_chars: usize = params
+        .tools
+        .iter()
+        .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    let tool_names: Vec<&str> = params.tools.iter().map(|t| t.name.as_str()).collect();
+
+    // ── Messages ──
+    let msg_chars: usize = params
+        .messages
+        .iter()
+        .map(|m| match &m.content {
+            nonoclaw_core::MessageContent::Text(s) => s.chars().count(),
+            nonoclaw_core::MessageContent::Blocks(bs) => {
+                bs.iter()
+                    .map(|b| match b {
+                        nonoclaw_core::ContentBlock::Text { text, .. } => text.chars().count(),
+                        nonoclaw_core::ContentBlock::Image { .. } => 1200,
+                        _ => 200,
+                    })
+                    .sum()
+            }
+        })
+        .sum();
+    let est_tokens = (sys_chars + tools_chars + msg_chars) / 4 + params.messages.len() * 4;
+    let trace = params.trace_label.as_deref().unwrap_or("?");
+
+    tracing::info!(
+        "\n{sep}\n\
+         📤  TURN REQUEST  [{trace}]\n\
+         {sep}\n\
+         Model:     {model}\n\
+         Max out:   {max_tok} tokens\n\
+         Sessions:  {n_msgs} messages · ~{est} est. tokens\n\
+         {thin}\n\
+         {b1}\n\
+         {b2}\n\
+         {thin}\n\
+           TOOLS   · {n_tools:>2} total · {t_chars:>6} chars  {t_names}\n\
+         {thin}\n\
+           MESSAGES · {n_msgs:>2} total · {m_chars:>6} chars\n\
+         {thin}\n\
+         Message roles: {roles}\n\
+         {sep}",
+        model = params.model,
+        max_tok = params.max_tokens,
+        n_msgs = params.messages.len(),
+        est = est_tokens,
+        b1 = block1,
+        b2 = block2,
+        n_tools = params.tools.len(),
+        t_chars = tools_chars,
+        t_names = tool_names.join(", "),
+        m_chars = msg_chars,
+        roles = params.messages.iter().map(|m| match m.role {
+            nonoclaw_core::Role::User => "U",
+            nonoclaw_core::Role::Assistant => "A",
+        }).collect::<Vec<_>>().join(" "),
+    );
+}
+
+fn dump_prompt_openai(params: &RequestParams, _body: &str) {
+    let sep = "═".repeat(72);
+    let thin = "─".repeat(72);
+
+    let sys_chars: usize = params.system.iter().map(|b| b.text.chars().count()).sum();
+    let msg_chars: usize = params.messages.iter().map(|m| match &m.content {
+        nonoclaw_core::MessageContent::Text(s) => s.chars().count(),
+        nonoclaw_core::MessageContent::Blocks(bs) => {
+            bs.iter().map(|b| match b {
+                nonoclaw_core::ContentBlock::Text { text, .. } => text.chars().count(),
+                nonoclaw_core::ContentBlock::Image { .. } => 1200,
+                _ => 200,
+            }).sum()
+        }
+    }).sum();
+    let est_tokens = (sys_chars + msg_chars) / 4 + params.messages.len() * 4;
+
+    let img_count: usize = params.messages.iter().map(|m| match &m.content {
+        nonoclaw_core::MessageContent::Blocks(bs) => bs.iter().filter(|b| matches!(b, nonoclaw_core::ContentBlock::Image { .. })).count(),
+        _ => 0,
+    }).sum();
+
+    let trace = params.trace_label.as_deref().unwrap_or("?");
+
+    tracing::info!(
+        "\n{sep}\n\
+         📤  TURN REQUEST  [OpenAI] [{trace}]\n\
+         {sep}\n\
+         Model:     {model}\n\
+         Max out:   {max_tok} tokens\n\
+         {thin}\n\
+           SYSTEM   · {s_chars:>6} chars ({n_sys} blocks)\n\
+           MESSAGES · {n_msgs:>2} total · {m_chars:>6} chars · {img} images\n\
+         {thin}\n\
+         Message roles: {roles}\n\
+         ~{est} est. tokens\n\
+         {sep}",
+        model = params.model,
+        max_tok = params.max_tokens,
+        s_chars = sys_chars,
+        n_sys = params.system.len(),
+        n_msgs = params.messages.len(),
+        m_chars = msg_chars,
+        img = img_count,
+        est = est_tokens,
+        roles = params.messages.iter().map(|m| match m.role {
+            nonoclaw_core::Role::User => "U",
+            nonoclaw_core::Role::Assistant => "A",
+        }).collect::<Vec<_>>().join(" "),
+    );
 }
 
 /// Translate a non-2xx response (or `event: error` payload) into an [`Error`],

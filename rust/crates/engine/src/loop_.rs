@@ -576,6 +576,7 @@ impl QueryEngine {
                 thinking: self.options.thinking.clone(),
                 temperature: None,
                 betas: Vec::new(),
+                trace_label: Some(format!("{}:turn-{}", &self.session_id[..8.min(self.session_id.len())], turns_made)),
             };
 
             let turn = match self.client.run_turn(&params, |ev| match ev {
@@ -605,6 +606,7 @@ impl QueryEngine {
                             );
                             let params2 = RequestParams {
                                 messages: strip_thinking(&self.messages),
+                                trace_label: Some(format!("{}:retry", &self.session_id[..8.min(self.session_id.len())])),
                                 ..params.clone()
                             };
                             self.client.run_turn(&params2, |ev| match ev {
