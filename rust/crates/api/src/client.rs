@@ -666,15 +666,15 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
                     }
                 }
 
-                // Combine text parts into a single content value.
+                // Combine text parts: single text → plain string;
+                // multiple parts (text + image) → content array.
                 let content_val = if text_parts.is_empty() {
                     None
+                } else if text_parts.len() == 1 && text_parts[0].get("text").is_some() {
+                    // Plain text → send as string, not {"type":"text","text":"..."}
+                    text_parts[0]["text"].as_str().map(|s| serde_json::json!(s))
                 } else {
-                    Some(if text_parts.len() == 1 {
-                        text_parts.into_iter().next().unwrap()
-                    } else {
-                        serde_json::json!(text_parts)
-                    })
+                    Some(serde_json::json!(text_parts))
                 };
 
                 match msg.role {
