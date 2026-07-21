@@ -214,7 +214,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
       // Debounce: only one timer active; subsequent key-repeat Space events
       // don't re-trigger.
       if (e.key === " " && !el.value.trim() && !recording && !disabled) {
-        if (spaceTimerRef.current) break; // already counting down
+        if (spaceTimerRef.current) return; // already counting down
         spaceTimerRef.current = setTimeout(() => {
           if (spaceDownRef.current) {
             // Remove the leading space inserted by the initial keypress.
