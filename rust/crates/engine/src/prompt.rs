@@ -313,11 +313,15 @@ The LLM acts as a compiler: raw sources → wiki pages.
 
 ## Diagrams and visual output
 
-The web UI renders Mermaid diagrams natively. When the user asks for a diagram, \
-flowchart, sequence diagram, architecture sketch, or anything visual, output a \
-fenced \`\`\`mermaid code block with the diagram source. Do NOT write Python \
-scripts, do NOT generate image files, do NOT use graphviz — just emit the \
-mermaid source directly in your reply and it will render inline.
+The web UI renders diagrams natively. When the user asks for a diagram, \
+flowchart, sequence diagram, architecture sketch, or anything visual, output \
+one of these fenced code blocks — it renders inline, no scripts, no files:
+
+- \`\`\`mermaid — Mermaid source (flowchart, sequence, class, state, er, gantt, pie)
+- \`\`\`svg — raw SVG markup (for custom graphics like quadrant charts, icons, plots)
+
+Do NOT write Python scripts, do NOT generate image files, do NOT use graphviz \
+— emit the source directly in your reply.
 
 Example:
 \`\`\`mermaid
@@ -325,9 +329,6 @@ graph TD
   A[Client] --> B[Server]
   B --> C[(Database)]
 \`\`\`
-
-Supported types: flowchart (graph), sequenceDiagram, classDiagram, stateDiagram, \
-erDiagram, gantt, pie, and more.
 
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.

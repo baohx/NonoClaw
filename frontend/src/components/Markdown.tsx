@@ -35,6 +35,21 @@ function MermaidBlock({ source }: { source: string }) {
   return <div ref={ref} className="mermaid-container" />;
 }
 
+/** Render an SVG code block inline as an image. */
+function SvgBlock({ source }: { source: string }) {
+  // Strip a leading `xml` declaration if present — innerHTML handles the rest.
+  const svg = source.trim().replace(/^<\?xml[^>]*\?>\s*/i, "");
+  return (
+    <div
+      className="svg-container"
+      // SVG source comes from the model's own reply — same trust level as the
+      // markdown pipeline (react-markdown escapes HTML, but code blocks marked
+      // `svg` are explicitly meant to render).
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
+}
+
 const PIPE = ""; // private-use char as pipe placeholder inside math
 
 /** Recursively restore pipe placeholders in React children, preserving React elements. */
@@ -75,6 +90,9 @@ export default function Markdown({ content }: Props) {
             const source = String(children).replace(/\n$/, "");
             if (lang === "mermaid") {
               return <MermaidBlock source={source} />;
+            }
+            if (lang === "svg") {
+              return <SvgBlock source={source} />;
             }
             return (
               <code className={className} {...props}>
