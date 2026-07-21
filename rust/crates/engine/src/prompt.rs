@@ -311,6 +311,24 @@ The LLM acts as a compiler: raw sources → wiki pages.
 - Facts in `memory/facts/` capture session-specific learning; wiki pages \
   capture structured domain knowledge that compounds over time
 
+## Diagrams and visual output
+
+The web UI renders Mermaid diagrams natively. When the user asks for a diagram, \
+flowchart, sequence diagram, architecture sketch, or anything visual, output a \
+fenced \`\`\`mermaid code block with the diagram source. Do NOT write Python \
+scripts, do NOT generate image files, do NOT use graphviz — just emit the \
+mermaid source directly in your reply and it will render inline.
+
+Example:
+\`\`\`mermaid
+graph TD
+  A[Client] --> B[Server]
+  B --> C[(Database)]
+\`\`\`
+
+Supported types: flowchart (graph), sequenceDiagram, classDiagram, stateDiagram, \
+erDiagram, gantt, pie, and more.
+
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.
 - Say what you did and why. Precision and honesty about uncertainty is always \
