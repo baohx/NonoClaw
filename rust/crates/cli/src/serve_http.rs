@@ -1053,6 +1053,7 @@ async fn stt_handler(
             .unwrap();
     }
 
+    let audio_len = audio_bytes.len();
     let client = reqwest::Client::new();
     let form = reqwest::multipart::Form::new()
         .text("model_id", "scribe_v2")
@@ -1060,7 +1061,7 @@ async fn stt_handler(
             .file_name("recording.webm")
             .mime_str("audio/webm").unwrap());
 
-    tracing::info!("sending STT request to ElevenLabs ({} bytes)", audio_bytes.len());
+    tracing::info!("sending STT request to ElevenLabs ({audio_len} bytes)");
     match client
         .post("https://api.elevenlabs.io/v1/speech-to-text")
         .header("xi-api-key", key)
