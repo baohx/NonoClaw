@@ -35,6 +35,17 @@ function MermaidBlock({ source }: { source: string }) {
   return <div ref={ref} className="mermaid-container" />;
 }
 
+/** Recursively extract plain text from React children (pierces hljs spans). */
+function extractText(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join("");
+  if (React.isValidElement<{ children?: ReactNode }>(node)) {
+    return extractText(node.props.children);
+  }
+  return "";
+}
+
 /** Render an SVG code block inline as an image. */
 function SvgBlock({ source }: { source: string }) {
   // Strip a leading `xml` declaration if present — innerHTML handles the rest.
@@ -84,21 +95,23 @@ export default function Markdown({ content }: Props) {
         remarkPlugins={[remarkMath, remarkGfm]}
         rehypePlugins={[rehypeHighlight, rehypeKatex]}
         components={{
-          code({ className, children, ...props }: any) {
-            const match = /language-(\w+)/.exec(className || "");
-            const lang = match?.[1];
-            const source = String(children).replace(/\n$/, "");
+          pre({ children, ...props }: any) {
+            // children is the <code> element; with rehype-highlight its
+            // children are highlighted spans — pierce them for raw source.
+            const codeEl = Array.isArray(children) ? children[0] : children;
+            const codeProps = React.isValidElement<{ className?: string }>(codeEl)
+              ? (codeEl.props as { className?: string })
+              : {};
+            const className = codeProps.className || "";
+            const lang = /language-(\w+)/.exec(className)?.[1];
+            const source = extractText(children).replace(/\n$/, "");
             if (lang === "mermaid") {
               return <MermaidBlock source={source} />;
             }
             if (lang === "svg") {
               return <SvgBlock source={source} />;
             }
-            return (
-              <code className={className} {...props}>
-                {children}
-              </code>
-            );
+            return <pre {...props}>{children}</pre>;
           },
           a: ({ href, children }) => (
             <a href={href} target="_blank" rel="noopener noreferrer">
