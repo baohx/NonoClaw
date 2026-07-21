@@ -79,70 +79,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
     setRecording(false);
   }, []);
 
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      const el = textareaRef.current;
-      if (!el) return;
-
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-        e.preventDefault();
-        submit();
-        return;
-      }
-
-      // Space bar: long press to start recording (only when not already typing).
-      if (e.key === " " && !el.value.trim() && !recording && !disabled) {
-        // Let the space go through for normal typing if the user already
-        // has text (they're typing, not wanting to dictate).
-        if (el.value.length > 0) return;
-        e.preventDefault();
-        if (spaceTimerRef.current) clearTimeout(spaceTimerRef.current);
-        spaceTimerRef.current = setTimeout(() => {
-          if (spaceDownRef.current) startRecording();
-        }, 400);
-      }
-
-      if (e.key === "ArrowUp" && !el.value) {
-        e.preventDefault();
-        if (historyIdx.current === historyRef.current.length) draftRef.current = el.value;
-        if (historyIdx.current > 0) {
-          historyIdx.current--;
-          el.value = historyRef.current[historyIdx.current] || "";
-          setHasText(el.value.trim().length > 0);
-        }
-        return;
-      }
-      if (e.key === "ArrowDown" && !el.value) {
-        e.preventDefault();
-        if (historyIdx.current < historyRef.current.length - 1) {
-          historyIdx.current++;
-          el.value = historyRef.current[historyIdx.current] || "";
-        } else {
-          historyIdx.current = historyRef.current.length;
-          el.value = draftRef.current;
-        }
-        setHasText(el.value.trim().length > 0);
-        return;
-      }
-    },
-    [submit, recording, disabled, startRecording]
-  );
-
-  const handleKeyUp = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === " ") {
-        spaceDownRef.current = false;
-        if (spaceTimerRef.current) clearTimeout(spaceTimerRef.current);
-        if (recording) stopRecording();
-      }
-    },
-    [recording, stopRecording]
-  );
-
-  const handleKeyDownCapture = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === " ") spaceDownRef.current = true;
-  }, []);
-
   // ── File upload ─────────────────────────────────────────────────────────
 
   const uploadFile = useCallback(async (file: File) => {
@@ -261,6 +197,57 @@ export default function InputBox({ onSubmit, disabled }: Props) {
     onSubmit(text, ready);
     setAttachments([]);
   }, [disabled, onSubmit, attachments]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      const el = textareaRef.current;
+      if (!el) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        submit();
+        return;
+      }
+
+      // Space bar: long press to start recording, textarea must be empty.
+      if (e.key === " " && !el.value.trim() && !recording && !disabled) {
+        e.preventDefault();
+        spaceTimerRef.current = setTimeout(() => {
+          if (spaceDownRef.current) startRecording();
+        }, 400);
+      }
+
+      if (e.key === "ArrowUp" && !el.value) {
+        e.preventDefault();
+        if (historyIdx.current === historyRef.current.length) draftRef.current = el.value;
+        if (historyIdx.current > 0) { historyIdx.current--; el.value = historyRef.current[historyIdx.current] || ""; setHasText(el.value.trim().length > 0); }
+        return;
+      }
+      if (e.key === "ArrowDown" && !el.value) {
+        e.preventDefault();
+        if (historyIdx.current < historyRef.current.length - 1) { historyIdx.current++; el.value = historyRef.current[historyIdx.current] || ""; }
+        else { historyIdx.current = historyRef.current.length; el.value = draftRef.current; }
+        setHasText(el.value.trim().length > 0);
+        return;
+      }
+    },
+    [submit, recording, disabled, startRecording]
+  );
+
+  const handleKeyUp = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === " ") {
+        spaceDownRef.current = false;
+        if (spaceTimerRef.current) clearTimeout(spaceTimerRef.current);
+        if (recording) stopRecording();
+      }
+    },
+    [recording, stopRecording]
+  );
+
+  const handleKeyDownCapture = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === " ") spaceDownRef.current = true;
+  }, []);
 
   const handleInput = useCallback(() => {
     const el = textareaRef.current;

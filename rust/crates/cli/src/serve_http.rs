@@ -1037,7 +1037,7 @@ async fn stt_handler(
     };
 
     let mut audio_bytes = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         if field.name() == Some("audio") {
             while let Ok(Some(chunk)) = field.chunk().await {
                 audio_bytes.extend_from_slice(chunk.as_ref());
