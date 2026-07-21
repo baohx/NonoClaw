@@ -48,17 +48,43 @@ function extractText(node: ReactNode): string {
 
 /** Render an SVG code block inline as an image. */
 function SvgBlock({ source }: { source: string }) {
-  // Strip a leading `xml` declaration if present — innerHTML handles the rest.
   const svg = source.trim().replace(/^<\?xml[^>]*\?>\s*/i, "");
   return (
     <div
       className="svg-container"
-      // SVG source comes from the model's own reply — same trust level as the
-      // markdown pipeline (react-markdown escapes HTML, but code blocks marked
-      // `svg` are explicitly meant to render).
       dangerouslySetInnerHTML={{ __html: svg }}
     />
   );
+}
+
+/** Render an ECharts chart from a JSON option block. */
+function EChartsBlock({ source }: { source: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const win = window as any;
+    if (!win.echarts) {
+      el.innerHTML = `<pre class="mermaid-raw">ECharts not loaded</pre>`;
+      return;
+    }
+    try {
+      const option = JSON.parse(source);
+      const chart = win.echarts.init(el, undefined, {
+        width: undefined,
+        height: 400,
+      });
+      chart.setOption(option);
+      const onResize = () => chart.resize();
+      window.addEventListener("resize", onResize);
+      return () => { window.removeEventListener("resize", onResize); chart.dispose(); };
+    } catch {
+      el.innerHTML = `<pre class="mermaid-raw">${source}</pre>`;
+    }
+  }, [source]);
+
+  return <div ref={ref} style={{ width: "100%", minHeight: 320 }} />;
 }
 
 const PIPE = ""; // private-use char as pipe placeholder inside math
@@ -110,6 +136,9 @@ export default function Markdown({ content }: Props) {
             }
             if (lang === "svg") {
               return <SvgBlock source={source} />;
+            }
+            if (lang === "echarts") {
+              return <EChartsBlock source={source} />;
             }
             return <pre {...props}>{children}</pre>;
           },

@@ -319,11 +319,16 @@ one of these fenced code blocks — it renders inline, no scripts, no files:
 
 - \`\`\`mermaid — Mermaid source (flowchart, sequence, class, state, er, gantt, pie)
 - \`\`\`svg — raw SVG markup (for custom graphics like quadrant charts, icons, plots)
+- \`\`\`echarts — JSON ECharts option for bar/line/pie/scatter/radar/heatmap charts
 
 Do NOT write Python scripts, do NOT generate image files, do NOT use graphviz \
 — emit the source directly in your reply.
 
-Example:
+Examples:
+\`\`\`echarts
+{"title":{"text":"Sales"},"xAxis":{"data":["Q1","Q2","Q3","Q4"]},"series":[{"type":"bar","data":[120,200,150,80]}]}
+\`\`\`
+
 \`\`\`mermaid
 graph TD
   A[Client] --> B[Server]
