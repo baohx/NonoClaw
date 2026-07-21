@@ -388,6 +388,7 @@ async fn main() -> Result<()> {
     if let Some(addr) = &cli.serve_http {
         let doc_model = settings.resolved_doc_model().cloned();
         let compact_model = settings.compact_model.clone();
+        let elevenlabs_api_key = settings.elevenlabs_api_key.clone();
         tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
             addr,
@@ -405,6 +406,7 @@ async fn main() -> Result<()> {
             model_profiles,
             doc_model,
             compact_model,
+            elevenlabs_api_key,
         )
         .await?;
         return Ok(());

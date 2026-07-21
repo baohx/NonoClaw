@@ -1020,6 +1020,24 @@
       }
       [data-theme="frost"] .composer__attach { background: rgba(255, 255, 255, 0.08); }
       .composer__attach:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); }
+      .composer__mic {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border: none;
+        border-radius: 50%;
+        background: rgba(0, 0, 0, 0.05);
+        color: var(--muted);
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: color 0.15s ease, background 0.15s ease, transform 0.12s;
+      }
+      [data-theme="frost"] .composer__mic { background: rgba(255, 255, 255, 0.08); }
+      .composer__mic:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); }
+      .composer__mic--active { color: var(--rose); background: rgba(255, 69, 58, 0.18) !important; transform: scale(1.12); }
+      .composer__mic:disabled { opacity: 0.35; cursor: not-allowed; }
       .composer__attach:disabled { opacity: 0.35; cursor: not-allowed; }
       .composer__shell--dragover {
         border-color: var(--accent) !important;

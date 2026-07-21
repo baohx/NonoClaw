@@ -56,6 +56,9 @@ pub struct SettingsFile {
     /// to a cheap / fast model (e.g. haiku) to save cost on summarization.
     #[serde(rename = "compactModel", default)]
     pub compact_model: Option<String>,
+    /// ElevenLabs API key for speech-to-text voice input (optional).
+    #[serde(rename = "elevenlabsApiKey", default)]
+    pub elevenlabs_api_key: Option<String>,
     /// Chars-per-token divisor for rough token estimation. Claude ≈ 4.
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
@@ -373,6 +376,10 @@ pub fn merge_settings(base: &mut SettingsFile, overlay: &SettingsFile) {
     // compactModel: later overlay replaces.
     if overlay.compact_model.is_some() {
         base.compact_model = overlay.compact_model.clone();
+    }
+    // elevenlabsApiKey: later overlay replaces.
+    if overlay.elevenlabs_api_key.is_some() {
+        base.elevenlabs_api_key = overlay.elevenlabs_api_key.clone();
     }
     // charsPerToken: later overlay replaces.
     if overlay.chars_per_token != 4 {

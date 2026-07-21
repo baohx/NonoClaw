@@ -255,6 +255,8 @@ struct AppState {
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
     /// Document processing model config (from settings).
     doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
+    /// ElevenLabs API key for speech-to-text (optional).
+    elevenlabs_api_key: Option<String>,
     /// Optional model for compaction summarization (from settings).
     compact_model: Option<String>,
     /// Directory where uploaded attachments are stored.
@@ -1014,6 +1016,75 @@ async fn upload_handler(
         .unwrap()
 }
 
+// ── Speech-to-text handler ──────────────────────────────────────────────────
+
+async fn stt_handler(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+
+    let key = match &state.elevenlabs_api_key {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_IMPLEMENTED)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"elevenlabsApiKey not configured"}"#))
+                .unwrap();
+        }
+    };
+
+    let mut audio_bytes = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("audio") {
+            while let Ok(Some(chunk)) = field.chunk().await {
+                audio_bytes.extend_from_slice(chunk.as_ref());
+            }
+        }
+    }
+
+    if audio_bytes.is_empty() {
+        return axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"error":"no audio provided"}"#))
+            .unwrap();
+    }
+
+    let client = reqwest::Client::new();
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(audio_bytes)
+            .file_name("recording.webm")
+            .mime_str("audio/webm").unwrap());
+
+    match client
+        .post("https://api.elevenlabs.io/v1/speech-to-text")
+        .header("xi-api-key", key)
+        .multipart(form)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            axum::response::Response::builder()
+                .status(if status.is_success() { StatusCode::OK } else { StatusCode::BAD_GATEWAY })
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        Err(e) => {
+            axum::response::Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"error":"{e}"}}"#)))
+                .unwrap()
+        }
+    }
+}
+
 pub async fn serve(
     addr: &str,
     client: Arc<Client>,
@@ -1030,6 +1101,7 @@ pub async fn serve(
     model_profiles: Vec<ModelProfile>,
     doc_model: Option<nonoclaw_engine::settings::DocModelConfig>,
     compact_model: Option<String>,
+    elevenlabs_api_key: Option<String>,
 ) -> anyhow::Result<()> {
     // Bind the listener FIRST so the port is open before cloudflared tries
     // to connect (otherwise tunnel spawn races the bind and gets "connection
@@ -1094,6 +1166,7 @@ pub async fn serve(
         )),
         doc_model,
         compact_model,
+        elevenlabs_api_key,
         upload_dir,
     });
 
@@ -1126,6 +1199,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/upload", axum::routing::post(upload_handler))
+        .route("/api/stt", axum::routing::post(stt_handler))
         .route("/manifest.json", get(serve_manifest))
         .route("/sw.js", get(serve_sw))
         .with_state(state);
