@@ -237,6 +237,8 @@ impl Client {
                 (url, body)
             }
         };
+        // Write full raw context to .nonoclaw/logs/ for inspection.
+        write_prompt_log(params, &body, &url);
         let mut req = self.http.post(url).header("content-type", "application/json");
         match self.format {
             ApiFormat::Anthropic => {
@@ -834,6 +836,29 @@ async fn fold_openai_non_streaming(
             cache_read_input_tokens: 0,
         },
     })
+}
+
+/// Write the full raw prompt body to `.nonoclaw/logs/prompts/<trace>.json`.
+fn write_prompt_log(params: &RequestParams, body: &str, _url: &str) {
+    let trace = params.trace_label.as_deref().unwrap_or("unknown");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let log_dir = cwd.join(".nonoclaw/logs/prompts");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        tracing::warn!("cannot create prompt log dir: {e}");
+        return;
+    }
+    // Sanitize the trace label for a filename.
+    let safe = trace.replace(['/', '\\', ':', ' '], "-");
+    let path = log_dir.join(format!("{safe}.json"));
+    // Pretty-print the JSON body for readability.
+    let pretty = if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.to_string())
+    } else {
+        body.to_string()
+    };
+    if let Err(e) = std::fs::write(&path, &pretty) {
+        tracing::warn!("failed to write prompt log {}: {e}", path.display());
+    }
 }
 
 // ── Prompt dump (structured logging) ────────────────────────────────────────
