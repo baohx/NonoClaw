@@ -209,11 +209,22 @@ export default function InputBox({ onSubmit, disabled }: Props) {
         return;
       }
 
-      // Space bar: long press to start recording, textarea must be empty.
+      // Space bar: long press (≥400ms) on empty textarea → voice input.
+      // Quick press: let the space through normally for typing.
+      // Debounce: only one timer active; subsequent key-repeat Space events
+      // don't re-trigger.
       if (e.key === " " && !el.value.trim() && !recording && !disabled) {
-        e.preventDefault();
+        if (spaceTimerRef.current) break; // already counting down
         spaceTimerRef.current = setTimeout(() => {
-          if (spaceDownRef.current) startRecording();
+          if (spaceDownRef.current) {
+            // Remove the leading space inserted by the initial keypress.
+            const ta = textareaRef.current;
+            if (ta) {
+              ta.value = ta.value.replace(/^ /, "");
+              setHasText(false);
+            }
+            startRecording();
+          }
         }, 400);
       }
 
@@ -246,7 +257,8 @@ export default function InputBox({ onSubmit, disabled }: Props) {
   );
 
   const handleKeyDownCapture = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === " ") spaceDownRef.current = true;
+    const el = textareaRef.current;
+    if (e.key === " " && (!el || !el.value.trim())) spaceDownRef.current = true;
   }, []);
 
   const handleInput = useCallback(() => {
