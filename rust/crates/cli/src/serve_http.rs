@@ -1055,10 +1055,12 @@ async fn stt_handler(
 
     let client = reqwest::Client::new();
     let form = reqwest::multipart::Form::new()
+        .text("model_id", "scribe_v2")
         .part("file", reqwest::multipart::Part::bytes(audio_bytes)
             .file_name("recording.webm")
             .mime_str("audio/webm").unwrap());
 
+    tracing::info!("sending STT request to ElevenLabs ({} bytes)", audio_bytes.len());
     match client
         .post("https://api.elevenlabs.io/v1/speech-to-text")
         .header("xi-api-key", key)
@@ -1069,6 +1071,8 @@ async fn stt_handler(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            let truncated = body.chars().take(500).collect::<String>();
+            tracing::info!(%status, %truncated, "ElevenLabs STT response");
             axum::response::Response::builder()
                 .status(if status.is_success() { StatusCode::OK } else { StatusCode::BAD_GATEWAY })
                 .header("content-type", "application/json")
@@ -1076,6 +1080,7 @@ async fn stt_handler(
                 .unwrap()
         }
         Err(e) => {
+            tracing::warn!("ElevenLabs STT request failed: {e}");
             axum::response::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("content-type", "application/json")
