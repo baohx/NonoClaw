@@ -30,8 +30,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
   const dragCounter = useRef(0);
   const [recording, setRecording] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
-  const spaceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const spaceDownRef = useRef(false);
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -209,25 +207,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
         return;
       }
 
-      // Space bar: long press (≥400ms) on empty textarea → voice input.
-      // Quick press: let the space through normally for typing.
-      // Debounce: only one timer active; subsequent key-repeat Space events
-      // don't re-trigger.
-      if (e.key === " " && !el.value.trim() && !recording && !disabled) {
-        if (spaceTimerRef.current) return; // already counting down
-        spaceTimerRef.current = setTimeout(() => {
-          if (spaceDownRef.current) {
-            // Remove the leading space inserted by the initial keypress.
-            const ta = textareaRef.current;
-            if (ta) {
-              ta.value = ta.value.replace(/^ /, "");
-              setHasText(false);
-            }
-            startRecording();
-          }
-        }, 400);
-      }
-
       if (e.key === "ArrowUp" && !el.value) {
         e.preventDefault();
         if (historyIdx.current === historyRef.current.length) draftRef.current = el.value;
@@ -242,24 +221,8 @@ export default function InputBox({ onSubmit, disabled }: Props) {
         return;
       }
     },
-    [submit, recording, disabled, startRecording]
+    [submit]
   );
-
-  const handleKeyUp = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === " ") {
-        spaceDownRef.current = false;
-        if (spaceTimerRef.current) clearTimeout(spaceTimerRef.current);
-        if (recording) stopRecording();
-      }
-    },
-    [recording, stopRecording]
-  );
-
-  const handleKeyDownCapture = useCallback((e: React.KeyboardEvent) => {
-    const el = textareaRef.current;
-    if (e.key === " " && (!el || !el.value.trim())) spaceDownRef.current = true;
-  }, []);
 
   const handleInput = useCallback(() => {
     const el = textareaRef.current;
@@ -322,8 +285,6 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           ref={textareaRef}
           className="composer__textarea"
           onKeyDown={handleKeyDown}
-          onKeyUp={handleKeyUp}
-          onKeyDownCapture={handleKeyDownCapture}
           onInput={handleInput}
           disabled={disabled}
           placeholder={recording ? "🎙️ listening…" : disabled ? "connecting…" : "message NonoClaw…"}
