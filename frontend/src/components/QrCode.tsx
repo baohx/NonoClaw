@@ -38,8 +38,9 @@ export default function QrCode() {
       style={{
         display: "block",
         borderRadius: 12,
-        background: "#070a0f",
+        background: "#ffffff",
         padding: 8,
+        boxShadow: "var(--shadow-sm)",
       }}
     />
   );

@@ -29,15 +29,47 @@ type Orb = {
   bp: number;
 };
 
-// Bioluminescence palette — cyan / mint / magenta / violet, all in 0-255 rgb.
-const PALETTE: [number, number, number][] = [
-  [45, 212, 191], // cyan   #2dd4bf
-  [94, 234, 212], // mint   #5eead4
-  [129, 140, 248], // violet #818cf8
-  [232, 121, 249], // magenta #e879f9
-  [56, 189, 248], // sky    #38bdf8
-  [167, 243, 208], // pale mint #a7f3d0
+// Light theme ("Studio"): soft pastel tones, reads on #f5f5f7.
+const PALETTE_LIGHT: [number, number, number][] = [
+  [127, 216, 240], // soft cyan
+  [165, 230, 207], // pastel mint
+  [195, 194, 255], // lavender
+  [242, 196, 255], // lilac
+  [165, 216, 255], // powder blue
+  [255, 212, 222], // blush
 ];
+
+// Warm light theme ("Warm"): peachy/amber pastels.
+const PALETTE_WARM: [number, number, number][] = [
+  [255, 214, 140], // honey
+  [255, 199, 169], // apricot
+  [255, 224, 189], // cream peach
+  [250, 214, 235], // rose cream
+  [255, 231, 179], // wheat
+  [255, 212, 207], // coral light
+];
+
+// Dark theme ("Night"): bioluminescence on near-black (original palette).
+const PALETTE_DARK: [number, number, number][] = [
+  [45, 212, 191], // cyan
+  [94, 234, 212], // mint
+  [129, 140, 248], // violet
+  [232, 121, 249], // magenta
+  [56, 189, 248], // sky
+  [167, 243, 208], // pale mint
+];
+
+function paletteFor(theme: string | null): [number, number, number][] {
+  if (theme === "frost") return PALETTE_DARK;
+  if (theme === "amber") return PALETTE_WARM;
+  return PALETTE_LIGHT;
+}
+
+function bgFor(theme: string | null): string {
+  if (theme === "frost") return "#161619";
+  if (theme === "amber") return "#faf6ef";
+  return "#f5f5f7";
+}
 
 // Deterministic pseudo-random in [0,1) from a seed — keeps the field stable
 // across renders (no Math.random so the layout doesn't jump on hot reload).
@@ -47,7 +79,7 @@ function rng(seed: number) {
   return () => (s = (s * 16807) % 2147483647) / 2147483647;
 }
 
-function makeOrbs(): Orb[] {
+function makeOrbs(palette: [number, number, number][]): Orb[] {
   const rand = rng(982451653);
   return Array.from({ length: 6 }, (_, i) => {
     const r = rand();
@@ -60,7 +92,7 @@ function makeOrbs(): Orb[] {
       sy: 0.03 + rand() * 0.05,
       phase: rand() * Math.PI * 2,
       r: 0.34 + rand() * 0.28,
-      c: PALETTE[i % PALETTE.length],
+      c: palette[i % palette.length],
       bp: rand() * Math.PI * 2,
     };
   });
@@ -78,7 +110,7 @@ export default function BreathField() {
     let w = 0;
     let h = 0;
     let dpr = 1;
-    const orbs = makeOrbs();
+    let orbs = makeOrbs(paletteFor(document.documentElement.getAttribute("data-theme")));
 
     const resize = () => {
       dpr = Math.min(window.devicePixelRatio || 1, 1.5);
@@ -101,19 +133,30 @@ export default function BreathField() {
       const t = (performance.now() - start) / 1000;
       const { velocity, intensity } = breathMeter.sample();
 
+      // Theme-aware: palette + background + blend mode, re-read per frame so
+      // theme switches apply live.
+      const theme = document.documentElement.getAttribute("data-theme");
+      const isDark = theme === "frost";
+      const palette = paletteFor(theme);
+      if (orbs.length && orbs[0].c !== palette[0]) {
+        orbs = makeOrbs(palette);
+      }
+
       // Breath frequency: idle ~0.16 Hz (slow sigh), full stream ~1.05 Hz.
       const breathHz = 0.16 + velocity * 0.89;
 
-      // Base background — near-black with a faint teal cast.
+      // Base background.
       ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = "#070a0f";
+      ctx.fillStyle = bgFor(theme);
       ctx.fillRect(0, 0, w, h);
 
       // Overall ambient lift from velocity + tool flares.
       const lift = Math.min(0.5, velocity * 0.4 + intensity * 0.5);
 
       const minDim = Math.min(w, h);
-      ctx.globalCompositeOperation = "lighter";
+      // Dark: additive glow. Light: normal alpha-blended pastel washes
+      // (additive on white would be invisible).
+      ctx.globalCompositeOperation = isDark ? "lighter" : "source-over";
 
       for (const o of orbs) {
         // Slow positional drift.
@@ -126,9 +169,14 @@ export default function BreathField() {
         const radius = o.r * minDim * scale;
 
         // Alpha: idle baseline so it always glows softly; brighter when active.
-        const baseA = 0.05 + velocity * 0.16;
-        const flareA = lift * 0.12;
-        const alpha = Math.min(0.62, baseA + flareA + Math.max(0, breath) * (0.03 + velocity * 0.05));
+        // Light themes need ~2.2x the alpha of the additive dark path to read.
+        const alphaScale = isDark ? 1 : 2.2;
+        const baseA = (0.05 + velocity * 0.16) * alphaScale;
+        const flareA = lift * 0.12 * alphaScale;
+        const alpha = Math.min(
+          isDark ? 0.62 : 0.5,
+          baseA + flareA + Math.max(0, breath) * (0.03 + velocity * 0.05) * alphaScale
+        );
 
         const [cr, cg, cb] = o.c;
         const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
@@ -146,8 +194,11 @@ export default function BreathField() {
         const cx = w / 2;
         const cy = h * 0.62;
         const gr = ctx.createRadialGradient(cx, cy, 0, cx, cy, minDim * 0.7);
-        gr.addColorStop(0, `rgba(94,234,212,${lift * 0.06})`);
-        gr.addColorStop(1, "rgba(94,234,212,0)");
+        const bloom = isDark
+          ? `rgba(94,234,212,${lift * 0.06})`
+          : `rgba(127,216,240,${lift * 0.10})`;
+        gr.addColorStop(0, bloom);
+        gr.addColorStop(1, "rgba(127,216,240,0)");
         ctx.fillStyle = gr;
         ctx.fillRect(0, 0, w, h);
       }

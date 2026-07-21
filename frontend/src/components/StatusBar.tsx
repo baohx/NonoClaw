@@ -38,7 +38,7 @@ export default function StatusBar({
   const availableModels = useStore((s) => s.availableModels);
 
   const cycleTheme = useStore((s) => s.cycleTheme);
-  const dotColor = theme === "amber" ? "#fbbf24" : theme === "frost" ? "#93c5fd" : "#5eead4";
+  const dotColor = theme === "amber" ? "#ff9f0a" : theme === "frost" ? "#0a84ff" : "#0071e3";
 
   const dotClass =
     connectionStatus === "connected"
