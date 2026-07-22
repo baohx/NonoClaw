@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1307,7 +1307,6 @@ dependencies = [
  "nonoclaw-engine",
  "nonoclaw-tools",
  "notify",
- "qrcode",
  "reqwest",
  "serde",
  "serde_json",
@@ -1323,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1341,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "schemars",
@@ -1353,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1375,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-tools"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1551,15 +1550,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
-dependencies = [
- "image",
-]
 
 [[package]]
 name = "quinn"

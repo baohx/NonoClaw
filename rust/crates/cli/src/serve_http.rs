@@ -1182,23 +1182,10 @@ pub async fn serve(
         cwd.clone(),
     );
 
-    // Print QR code if a public URL is available (from --tunnel or --public-url).
+    // Print tunnel URL (no QR code — mobile users get the link from the Web UI).
     if let Some(ref url) = state.public_url {
         let full = format!("{url}/?token={}", state.auth_token);
-        use qrcode::QrCode;
-        match QrCode::new(&full) {
-            Ok(qr) => {
-                let s = qr.render::<char>().quiet_zone(true).module_dimensions(4, 2).build();
-                let bar = "═".repeat(56);
-                eprintln!("\n\x1b[1;36m{bar}");
-                eprintln!("{s}"); eprintln!("{bar}\x1b[0m");
-            }
-            Err(_) => {
-                let bar = "═".repeat(full.len() + 4);
-                eprintln!("\n\x1b[1;36m ╔{bar}╗\n ║  {full}  ║\n ╚{bar}╝\x1b[0m");
-            }
-        }
-        eprintln!("  \x1b[1;33m{full}\x1b[0m\n  \x1b[1;33mScan with your phone\x1b[0m\n");
+        eprintln!("\n  Tunnel ready: \x1b[1;33m{full}\x1b[0m\n");
     }
 
     // Always register the WebSocket route + PWA manifest + service worker.
