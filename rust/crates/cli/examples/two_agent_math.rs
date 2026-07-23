@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nonoclaw_api::Client;
-use nonoclaw_core::{MessageContent, PermissionMode};
-use nonoclaw_engine::{EngineOptions, QueryEngine};
+use nonoclaw_core::MessageContent;
+use nonoclaw_engine::{EngineOptions, FinalResult, QueryEngine, RunController, RunTerminalStatus};
 use nonoclaw_tools::{register_all, ToolRegistry};
 
 const ROUNDS: usize = 4;
@@ -66,20 +66,22 @@ async fn main() {
         println!("══════ Round {}/{} ══════", round, ROUNDS);
 
         // --- Agent A: generate a problem ---
-        questioner.clear();
-        let q_result = questioner
-            .run(MessageContent::from_text("出一道2位数加减法题目"), &cwd, |_| {})
-            .await
-            .expect("questioner failed");
+        questioner.clear().await.expect("clear questioner");
+        let (next_questioner, q_result) = run_once(
+            questioner,
+            &cwd,
+            MessageContent::from_text("出一道2位数加减法题目"),
+        )
+        .await;
+        questioner = next_questioner;
         let problem = q_result.text.trim().to_string();
         println!("🧑‍🏫 出题官: {problem}");
 
         // --- Agent B: answer the problem ---
-        answerer.clear();
-        let a_result = answerer
-            .run(MessageContent::from_text(&problem), &cwd, |_| {})
-            .await
-            .expect("answerer failed");
+        answerer.clear().await.expect("clear answerer");
+        let (next_answerer, a_result) =
+            run_once(answerer, &cwd, MessageContent::from_text(&problem)).await;
+        answerer = next_answerer;
         let answer = a_result.text.trim().to_string();
         println!("🎓 答题者: {answer}");
 
@@ -88,6 +90,28 @@ async fn main() {
     }
 
     println!("✅ 所有 {ROUNDS} 轮完成！最后一道题: {last_problem}");
+}
+
+async fn run_once(
+    engine: QueryEngine,
+    cwd: &std::path::Path,
+    content: MessageContent,
+) -> (QueryEngine, FinalResult) {
+    let controller = RunController::for_engine(&engine, cwd.to_path_buf());
+    let completion = controller.start(engine, content, |_| async {}).wait().await;
+    let engine = completion.engine.expect("run task lost its engine");
+    match completion.terminal.status {
+        RunTerminalStatus::Done => (
+            engine,
+            completion
+                .terminal
+                .result
+                .expect("completed run missing result"),
+        ),
+        RunTerminalStatus::Cancelled | RunTerminalStatus::Error => {
+            panic!("agent failed: {:?}", completion.terminal.reason)
+        }
+    }
 }
 
 fn build_engine(
@@ -100,21 +124,10 @@ fn build_engine(
         model: std::env::var("NONOCLAW_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".into()),
         max_tokens: 256,
-        permission_mode: PermissionMode::Default,
-        allowed_tools: vec![],          // no tools needed — pure text
-        disallowed_tools: vec![],
-        add_dirs: vec![],
-        max_turns: 1,                   // single turn per Q / per A
+        max_turns: 1, // single turn per Q / per A
         append_system_prompt: Some(hint.to_string()),
-        thinking: None,
-        is_non_interactive: true,
-        permission_resolver: None,
-        question_resolver: None,
         auto_compact: false,
-        compact_threshold_tokens: 150_000,
-        skills_manager: None,
-        arguments: None,
-        background_registry: None,
+        ..EngineOptions::default()
     };
     QueryEngine::new(client, registry, todos, options)
 }

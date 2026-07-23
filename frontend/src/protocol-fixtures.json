@@ -1,0 +1,54 @@
+{
+  "event": {
+    "type": "event",
+    "protocol_version": 1,
+    "event_id": "event-fixture",
+    "run_id": "run-fixture",
+    "session_id": "session-fixture",
+    "session_revision": 7,
+    "sequence": 3,
+    "timestamp_ms": 1700000000000,
+    "event": { "kind": "text_delta", "text": "hello" }
+  },
+  "snapshot": {
+    "type": "messages_loaded",
+    "protocol_version": 1,
+    "session_id": "session-fixture",
+    "revision": 7,
+    "timestamp_ms": 1700000000001,
+    "messages": []
+  },
+  "done": {
+    "type": "done",
+    "protocol_version": 1,
+    "run_id": "run-fixture",
+    "session_id": "session-fixture",
+    "session_revision": 8,
+    "sequence": 4,
+    "timestamp_ms": 1700000000002,
+    "text": "hello",
+    "usage": {
+      "input_tokens": 1,
+      "output_tokens": 1,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0
+    },
+    "turns": 1,
+    "stop_reason": "end_turn"
+  },
+  "error": {
+    "type": "error",
+    "protocol_version": 1,
+    "run_id": "run-fixture",
+    "session_id": "session-fixture",
+    "session_revision": 8,
+    "sequence": 4,
+    "timestamp_ms": 1700000000002,
+    "code": "internal",
+    "message": "fixture failure",
+    "retryable": false,
+    "operation": "fixture",
+    "trace_id": "trace-fixture",
+    "safe_details": {}
+  }
+}

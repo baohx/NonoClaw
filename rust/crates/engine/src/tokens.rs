@@ -46,7 +46,11 @@ pub fn estimate_total(
     chars_per_token: usize,
 ) -> usize {
     let body: usize = messages.iter().map(message_char_len).sum();
-    let cpt = if chars_per_token == 0 { CHARS_PER_TOKEN } else { chars_per_token };
+    let cpt = if chars_per_token == 0 {
+        CHARS_PER_TOKEN
+    } else {
+        chars_per_token
+    };
     (system_chars + tools_chars + body) / cpt + messages.len() * PER_MESSAGE_OVERHEAD
 }
 

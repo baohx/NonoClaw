@@ -13,13 +13,21 @@ use crate::skills::SkillsManager;
 
 const PLATFORM_HINT: &str = {
     #[cfg(target_os = "windows")]
-    { "Windows" }
+    {
+        "Windows"
+    }
     #[cfg(target_os = "macos")]
-    { "macOS" }
+    {
+        "macOS"
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
-    { "Linux" }
+    {
+        "Linux"
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-    { "unknown" }
+    {
+        "unknown"
+    }
 };
 
 /// Build the `system` array for the API request. Returns two blocks:

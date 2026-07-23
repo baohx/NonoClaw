@@ -301,6 +301,7 @@ mod tests {
             cwd,
             options: &opts,
             cancel: &cancel,
+            task_scope: Some("webfetch-test"),
             subagent: None,
             question: None,
             background_registry: None,

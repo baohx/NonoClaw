@@ -1,0 +1,593 @@
+[
+  {
+    "input_schema": {
+      "properties": {
+        "file_path": {
+          "description": "The absolute path to the file to read",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of lines to read (default 2000)",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "The line number to start reading from (1-based)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "type": "object"
+    },
+    "name": "Read"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "content": {
+          "description": "The content to write to the file",
+          "type": "string"
+        },
+        "file_path": {
+          "description": "The absolute path to the file to write (must be absolute, not relative)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "Write"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "file_path": {
+          "description": "The absolute path to the file to modify",
+          "type": "string"
+        },
+        "hash_line": {
+          "description": "Hash of the line to replace (alternative to old_string; survives whitespace/indentation drift)",
+          "type": "string"
+        },
+        "new_string": {
+          "description": "The text to replace it with (must be different from old_string)",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "The text to replace",
+          "type": "string"
+        },
+        "replace_all": {
+          "description": "Replace all occurrences of old_string (default false)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "file_path",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "name": "Edit"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "command": {
+          "description": "The bash command to execute",
+          "type": "string"
+        },
+        "run_in_background": {
+          "description": "Run as a managed background task and return its task ID",
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "description": "Optional timeout in milliseconds (max 1200000)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "Bash"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "block": {
+          "description": "Wait for the task to finish before returning",
+          "type": "boolean"
+        },
+        "task_id": {
+          "description": "Background task ID returned by Bash",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Maximum wait when block=true (default 30000, max 120000)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "TaskOutput"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "task_id": {
+          "description": "Background task ID returned by Bash",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "TaskStop"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "-i": {
+          "description": "Case-insensitive",
+          "type": "boolean"
+        },
+        "-n": {
+          "description": "Show line numbers (content mode, default true)",
+          "type": "boolean"
+        },
+        "glob": {
+          "description": "Glob filter, e.g. \"*.js\"",
+          "type": "string"
+        },
+        "multiline": {
+          "description": "Enable multiline matching",
+          "type": "boolean"
+        },
+        "output_mode": {
+          "description": "Default files_with_matches",
+          "enum": [
+            "content",
+            "files_with_matches",
+            "count"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "File or directory to search (absolute or relative to cwd)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "The regular expression to search for",
+          "type": "string"
+        },
+        "type": {
+          "description": "File type filter, e.g. \"rust\"",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "Grep"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "path": {
+          "description": "Directory to search in (default cwd)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Glob pattern, e.g. \"**/*.rs\"",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "Glob"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "todos": {
+          "items": {
+            "properties": {
+              "activeForm": {
+                "description": "Present-continuous form for the spinner",
+                "type": "string"
+              },
+              "content": {
+                "description": "The task description",
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "content",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "todos"
+      ],
+      "type": "object"
+    },
+    "name": "TodoWrite"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "prompt": {
+          "description": "What to extract or focus on (optional)",
+          "type": "string"
+        },
+        "url": {
+          "description": "The absolute URL to fetch",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "name": "WebFetch"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "query": {
+          "description": "Search query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "WebSearch"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "action": {
+          "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
+          "enum": [
+            "search",
+            "save",
+            "forget",
+            "beads",
+            "bead_save",
+            "bead_done",
+            "wiki_search",
+            "wiki_ingest",
+            "wiki_lint",
+            "goal_create",
+            "goal_update",
+            "goal_list"
+          ],
+          "type": "string"
+        },
+        "confidence": {
+          "description": "Fact confidence 0.0-1.0",
+          "type": "number"
+        },
+        "content": {
+          "description": "Fact or bead body content",
+          "type": "string"
+        },
+        "id": {
+          "description": "Bead UUID (for bead_done)",
+          "type": "string"
+        },
+        "importance": {
+          "description": "Fact importance 0.0-1.0",
+          "type": "number"
+        },
+        "name": {
+          "description": "Fact name/slug (for actions: save, forget)",
+          "type": "string"
+        },
+        "priority": {
+          "description": "Bead priority 0-10",
+          "type": "integer"
+        },
+        "query": {
+          "description": "Search query (for action: search)",
+          "type": "string"
+        },
+        "status": {
+          "description": "Bead status",
+          "enum": [
+            "todo",
+            "in_progress",
+            "blocked",
+            "done"
+          ],
+          "type": "string"
+        },
+        "superseded_by": {
+          "description": "Name of fact that replaces this one (for action: forget)",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Tags",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "Fact or bead title",
+          "type": "string"
+        },
+        "type": {
+          "description": "Fact type: preference, convention, decision, architecture, bug, general",
+          "enum": [
+            "preference",
+            "convention",
+            "decision",
+            "architecture",
+            "bug",
+            "general"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "Memory"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "character": {
+          "description": "Character offset (1-based)",
+          "type": "integer"
+        },
+        "filePath": {
+          "description": "File path (absolute)",
+          "type": "string"
+        },
+        "line": {
+          "description": "Line number (1-based)",
+          "type": "integer"
+        },
+        "operation": {
+          "description": "Operation: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol",
+          "enum": [
+            "goToDefinition",
+            "findReferences",
+            "hover",
+            "documentSymbol",
+            "workspaceSymbol"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "description": "Symbol name or pattern to search (workspaceSymbol)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "filePath",
+        "line",
+        "character"
+      ],
+      "type": "object"
+    },
+    "name": "LSP"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "description": {
+          "description": "A short (3-5 word) description of the task",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Fully self-contained instruction for the subagent",
+          "type": "string"
+        }
+      },
+      "required": [
+        "description",
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "name": "Agent"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "options": {
+          "description": "2-4 short options",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4,
+          "minItems": 2,
+          "type": "array"
+        },
+        "question": {
+          "description": "The question to ask",
+          "type": "string"
+        }
+      },
+      "required": [
+        "question",
+        "options"
+      ],
+      "type": "object"
+    },
+    "name": "AskUserQuestion"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "tasks": {
+          "items": {
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "prompt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
+    },
+    "name": "Coordinator"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "activeForm": {
+          "description": "Present continuous (e.g. 'Running tests')",
+          "type": "string"
+        },
+        "description": {
+          "description": "Task details",
+          "type": "string"
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "subject": {
+          "description": "Task title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "description"
+      ],
+      "type": "object"
+    },
+    "name": "TaskCreate"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "taskId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId"
+      ],
+      "type": "object"
+    },
+    "name": "TaskGet"
+  },
+  {
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "TaskList"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "addBlockedBy": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "addBlocks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId"
+      ],
+      "type": "object"
+    },
+    "name": "TaskUpdate"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "query": {
+          "description": "Keywords. Use `select:<tool-name>` for exact match.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "ToolSearch"
+  }
+]

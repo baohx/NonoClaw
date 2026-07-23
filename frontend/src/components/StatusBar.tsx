@@ -33,19 +33,23 @@ export default function StatusBar({
   const inputTokens = useStore((s) => s.inputTokens);
   const outputTokens = useStore((s) => s.outputTokens);
   const theme = useStore((s) => s.theme);
-  const authToken = useStore((s) => s.authToken);
+  const hasMobileAccessToken = useStore((s) => s.hasMobileAccessToken);
   const permissionMode = useStore((s) => s.permissionMode);
   const availableModels = useStore((s) => s.availableModels);
+  const breathState = useStore((s) => s.breathState);
+  const breathLabel = useStore((s) => s.breathLabel);
 
   const cycleTheme = useStore((s) => s.cycleTheme);
   const dotColor = theme === "amber" ? "#ff9f0a" : theme === "frost" ? "#0a84ff" : "#0071e3";
 
-  const dotClass =
-    connectionStatus === "connected"
-      ? "breath-dot"
-      : connectionStatus === "connecting"
-      ? "breath-dot connecting"
-      : "breath-dot off";
+  const dotClass = [
+    "breath-dot",
+    breathState === "connecting" || breathState === "reconnecting" || breathState.startsWith("waiting")
+      ? "connecting"
+      : breathState === "error"
+      ? "off"
+      : "",
+  ].filter(Boolean).join(" ");
 
   return (
     <div className="statusbar">
@@ -125,7 +129,7 @@ export default function StatusBar({
         >
           {insightCollapsed ? "«" : "»"}
         </button>
-        {authToken && (
+        {hasMobileAccessToken && (
           <button
             className="iconbtn"
             onClick={onShowQr}
@@ -135,7 +139,10 @@ export default function StatusBar({
             &#x25f0;
           </button>
         )}
-        <span className={dotClass} title={connectionStatus} />
+        <span className="breath-status" role="status" aria-live="polite">
+          {breathLabel}
+        </span>
+        <span className={dotClass} title={`${breathLabel} · ${connectionStatus}`} data-phase={breathState} />
       </div>
     </div>
   );

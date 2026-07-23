@@ -1,15 +1,8 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import type { AttachmentRef, ImageRef, UploadResponse } from "../types";
-
-interface PendingAttachment {
-  id: string;
-  filename: string;
-  extracted_text: string;
-  image_count: number;
-  images?: ImageRef[];
-  uploading: boolean;
-  error?: string;
-}
+import { useStore } from "../store";
+import { sanitizeBrowserText } from "../security";
+import type { MediaAttachment } from "../store/slices";
+import type { AttachmentRef, UploadResponse } from "../types";
 
 interface Props {
   onSubmit: (text: string, attachments: AttachmentRef[]) => void;
@@ -18,107 +11,144 @@ interface Props {
 
 const ALLOWED_EXT = ".pdf,.docx,.doc,.txt,.md,.markdown,.png,.jpg,.jpeg";
 
+function authenticatedApiUrl(path: string): string {
+  const token = new URLSearchParams(window.location.search).get("token");
+  return token ? `${path}?token=${encodeURIComponent(token)}` : path;
+}
+
 export default function InputBox({ onSubmit, disabled }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyRef = useRef<string[]>([]);
   const historyIdx = useRef(-1);
   const draftRef = useRef("");
-  const [hasText, setHasText] = useState(false);
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const draft = useStore((state) => state.draft);
+  const setDraft = useStore((state) => state.setDraft);
+  const attachments = useStore((state) => state.attachments);
+  const addAttachment = useStore((state) => state.addAttachment);
+  const updateAttachment = useStore((state) => state.updateAttachment);
+  const removeMediaAttachment = useStore((state) => state.removeAttachment);
+  const clearAttachments = useStore((state) => state.clearAttachments);
+  const recording = useStore((state) => state.recording);
+  const setRecording = useStore((state) => state.setRecording);
+  const sessionId = useStore((state) => state.sessionId);
   const [dragOver, setDragOver] = useState(false);
   const dragCounter = useRef(0);
-  const [recording, setRecording] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const cancelRecordingRef = useRef(false);
 
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    return () => {
+      cancelRecordingRef.current = true;
+      const recorder = recorderRef.current;
+      recorderRef.current = null;
+      if (recorder?.state === "recording") {
+        try { recorder.stop(); } catch {}
+      }
+      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+      recordingStreamRef.current = null;
+      const state = useStore.getState();
+      state.setRecording(false);
+      state.clearAttachments();
+    };
+  }, [sessionId]);
 
   // ── Voice input (ElevenLabs STT) ────────────────────────────────────────
 
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordingStreamRef.current = stream;
+      cancelRecordingRef.current = false;
       const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       recorderRef.current = recorder;
       const chunks: BlobPart[] = [];
       recorder.ondataavailable = (e) => chunks.push(e.data);
       recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
+        stream.getTracks().forEach((track) => track.stop());
+        recordingStreamRef.current = null;
+        if (cancelRecordingRef.current) return;
         const blob = new Blob(chunks, { type: "audio/webm" });
         if (blob.size < 500) return; // too short — ignore
         try {
           const form = new FormData();
           form.append("audio", blob, "recording.webm");
-          const resp = await fetch("/api/stt", { method: "POST", body: form });
+          const resp = await fetch(authenticatedApiUrl("/api/stt"), { method: "POST", body: form });
+          if (!resp.ok) return;
           const data = await resp.json();
-          const text: string = data.text || data.error || "";
+          const text = typeof data.text === "string" ? data.text : "";
           if (text && text !== "error") {
             const el = textareaRef.current;
             if (!el) return;
             const start = el.selectionStart ?? el.value.length;
             const end = el.selectionEnd ?? el.value.length;
-            el.value = el.value.slice(0, start) + text + el.value.slice(end);
-            el.focus();
-            setHasText(el.value.trim().length > 0);
+            const value = el.value.slice(0, start) + text + el.value.slice(end);
+            setDraft(value);
+            window.requestAnimationFrame(() => {
+              el.focus();
+              el.setSelectionRange(start + text.length, start + text.length);
+            });
           }
         } catch { /* STT failed silently */ }
       };
       recorder.start();
       setRecording(true);
     } catch { /* mic denied */ }
-  }, []);
+  }, [setDraft, setRecording]);
 
   const stopRecording = useCallback(() => {
     if (recorderRef.current?.state === "recording") {
       recorderRef.current.stop();
     }
     setRecording(false);
-  }, []);
+  }, [setRecording]);
 
   // ── File upload ─────────────────────────────────────────────────────────
 
   const uploadFile = useCallback(async (file: File) => {
     const id = crypto.randomUUID();
-    const chip: PendingAttachment = {
+    const chip: MediaAttachment = {
       id,
       filename: file.name,
       extracted_text: "",
       image_count: 0,
       uploading: true,
     };
-    setAttachments((prev) => [...prev, chip]);
+    addAttachment(chip);
 
     try {
       const form = new FormData();
       form.append("file", file);
-      const resp = await fetch("/api/upload", { method: "POST", body: form });
+      const resp = await fetch(authenticatedApiUrl("/api/upload"), { method: "POST", body: form });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
         throw new Error(err.error || `HTTP ${resp.status}`);
       }
       const data: UploadResponse = await resp.json();
-      const errMsg = data.error || (!data.extracted_text ? "no text extracted from file" : null);
+      const errMsg = data.error || null;
       if (errMsg) throw new Error(errMsg);
-      setAttachments((prev) =>
-        prev.map((a) =>
-          a.id === id
-            ? { ...a, uploading: false, extracted_text: data.extracted_text, image_count: data.image_count, images: data.images }
-            : a
-        )
-      );
+      updateAttachment(id, {
+        id: data.id,
+        filename: data.filename,
+        uploading: false,
+        extracted_text: "",
+        image_count: data.image_count,
+        images: undefined,
+      });
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "upload failed";
-      setAttachments((prev) =>
-        prev.map((a) => (a.id === id ? { ...a, uploading: false, error: msg } : a))
-      );
+      const msg = e instanceof Error ? sanitizeBrowserText(e.message) : "upload failed";
+      updateAttachment(id, { uploading: false, error: msg });
     }
-  }, []);
+  }, [addAttachment, updateAttachment]);
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  }, []);
+    removeMediaAttachment(id);
+  }, [removeMediaAttachment]);
 
   const handleFiles = useCallback(
     (files: FileList | File[]) => {
@@ -178,58 +208,54 @@ export default function InputBox({ onSubmit, disabled }: Props) {
   // ── Submit ──────────────────────────────────────────────────────────────
 
   const submit = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    const text = el.value.trim();
-    if (!text || disabled) return;
-    // Only submit if all attachments are done uploading.
-    if (attachments.some((a) => a.uploading)) return;
+    const text = draft.trim();
+    if (!text || disabled || attachments.some((attachment) => attachment.uploading)) return;
     historyRef.current.push(text);
     historyIdx.current = historyRef.current.length;
     draftRef.current = "";
-    el.value = "";
-    setHasText(false);
     const ready: AttachmentRef[] = attachments
-      .filter((a) => !a.error && a.extracted_text)
-      .map((a) => ({ id: a.id, filename: a.filename, extracted_text: a.extracted_text, images: a.images }));
+      .filter((attachment) => !attachment.error && !attachment.uploading)
+      .map((attachment) => ({
+        id: attachment.id,
+        filename: attachment.filename,
+        extracted_text: "",
+      }));
+    setDraft("");
+    clearAttachments();
     onSubmit(text, ready);
-    setAttachments([]);
-  }, [disabled, onSubmit, attachments]);
+  }, [attachments, clearAttachments, disabled, draft, onSubmit, setDraft]);
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      const el = textareaRef.current;
-      if (!el) return;
-
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-        e.preventDefault();
+    (event: React.KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
         submit();
         return;
       }
-
-      if (e.key === "ArrowUp" && !el.value) {
-        e.preventDefault();
-        if (historyIdx.current === historyRef.current.length) draftRef.current = el.value;
-        if (historyIdx.current > 0) { historyIdx.current--; el.value = historyRef.current[historyIdx.current] || ""; setHasText(el.value.trim().length > 0); }
+      if (event.key === "ArrowUp" && !draft) {
+        event.preventDefault();
+        if (historyIdx.current === historyRef.current.length) draftRef.current = draft;
+        if (historyIdx.current > 0) {
+          historyIdx.current -= 1;
+          setDraft(historyRef.current[historyIdx.current] || "");
+        }
         return;
       }
-      if (e.key === "ArrowDown" && !el.value) {
-        e.preventDefault();
-        if (historyIdx.current < historyRef.current.length - 1) { historyIdx.current++; el.value = historyRef.current[historyIdx.current] || ""; }
-        else { historyIdx.current = historyRef.current.length; el.value = draftRef.current; }
-        setHasText(el.value.trim().length > 0);
-        return;
+      if (event.key === "ArrowDown" && !draft) {
+        event.preventDefault();
+        if (historyIdx.current < historyRef.current.length - 1) {
+          historyIdx.current += 1;
+          setDraft(historyRef.current[historyIdx.current] || "");
+        } else {
+          historyIdx.current = historyRef.current.length;
+          setDraft(draftRef.current);
+        }
       }
     },
-    [submit]
+    [draft, setDraft, submit]
   );
 
-  const handleInput = useCallback(() => {
-    const el = textareaRef.current;
-    setHasText(!!el && el.value.trim().length > 0);
-  }, []);
-
-  const canSend = hasText && !disabled && !attachments.some((a) => a.uploading);
+  const canSend = draft.trim().length > 0 && !disabled && !attachments.some((attachment) => attachment.uploading);
 
   return (
     <div className="composer">
@@ -252,11 +278,11 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           {attachments.map((a) => (
             <span
               key={a.id}
-              className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${(a.error || !a.extracted_text) ? " composer__chip--error" : ""}`}
-              title={a.error || (!a.extracted_text ? "no text extracted" : a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`)}
+              className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${a.error ? " composer__chip--error" : ""}`}
+              title={a.error || (a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`) }
             >
               <span className="composer__chip__icon">
-                {a.uploading ? "◌" : (a.error || !a.extracted_text) ? "✕" : "✓"}
+                {a.uploading ? "◌" : a.error ? "✕" : "✓"}
               </span>
               <span className="composer__chip__name">{a.filename}</span>
               {!a.uploading && (
@@ -284,8 +310,9 @@ export default function InputBox({ onSubmit, disabled }: Props) {
         <textarea
           ref={textareaRef}
           className="composer__textarea"
+          value={draft}
           onKeyDown={handleKeyDown}
-          onInput={handleInput}
+          onChange={(event) => setDraft(event.target.value)}
           disabled={disabled}
           placeholder={recording ? "🎙️ listening…" : disabled ? "connecting…" : "message NonoClaw…"}
           rows={1}

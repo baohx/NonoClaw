@@ -5,10 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::tool::{matches_name, Tool, ToolDefinition};
+use nonoclaw_core::{ExtensionDescriptor, ExtensionDiagnostic};
 
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    extension_descriptors: Vec<ExtensionDescriptor>,
+    extension_diagnostics: Vec<ExtensionDiagnostic>,
     /// Map from lowercased name/alias -> index into `tools`. Names are matched
     /// case-sensitively against the stored name; this index is a fast path.
     index: HashMap<String, usize>,
@@ -117,10 +120,28 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
+    pub fn add_extension_descriptor(&mut self, descriptor: ExtensionDescriptor) {
+        self.extension_descriptors.push(descriptor);
+    }
+
+    pub fn add_extension_diagnostic(&mut self, diagnostic: ExtensionDiagnostic) {
+        self.extension_diagnostics.push(diagnostic);
+    }
+
+    pub fn extension_descriptors(&self) -> &[ExtensionDescriptor] {
+        &self.extension_descriptors
+    }
+
+    pub fn extension_diagnostics(&self) -> &[ExtensionDiagnostic] {
+        &self.extension_diagnostics
+    }
+
     /// Build a new registry containing the same tools except those whose name
     /// matches an entry in `exclude` (used to keep subagents from recursing).
     pub fn filtered(&self, exclude: &[&str]) -> ToolRegistry {
         let mut out = ToolRegistry::new();
+        out.extension_descriptors = self.extension_descriptors.clone();
+        out.extension_diagnostics = self.extension_diagnostics.clone();
         for t in &self.tools {
             if exclude.contains(&t.name()) {
                 continue;

@@ -12,11 +12,15 @@
 //! - .docx/.doc  → libreoffice → PDF → doc model
 //! - .png/.jpg   → sent to the doc model as image
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nonoclaw_engine::settings::DocModelConfig;
 use serde::{Deserialize, Serialize};
+
+const MAX_EXTRACTED_DOCX_XML_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_EMBEDDED_IMAGE_BYTES: u64 = 1024 * 1024;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -47,13 +51,14 @@ pub struct ImageB64 {
 /// Top-level router: detect file type, pre-process if needed, extract content.
 pub async fn process_file(
     config: &DocModelConfig,
+    http: &reqwest::Client,
     file_path: &Path,
     original_name: &str,
     upload_id: &str,
 ) -> ExtractedDoc {
     let mime = mime_type(file_path, original_name);
 
-    tracing::info!(%original_name, %mime, "processing attachment");
+    tracing::info!(%mime, "processing attachment (filename omitted)");
 
     // TXT / MD: direct read — no model needed.
     if mime == "text/plain" || mime == "text/markdown" || mime == "text/x-markdown" {
@@ -88,8 +93,12 @@ pub async fn process_file(
                 let images = extract_pdf_images(file_path);
                 let image_count = images.len();
                 // OCR the embedded images so text-only models can see them too.
-                let enriched = ocr_embedded_images(config, &images, &text).await;
-                tracing::info!(chars = enriched.len(), images = image_count, "PDF text + images extracted");
+                let enriched = ocr_embedded_images(config, http, &images, &text).await;
+                tracing::info!(
+                    chars = enriched.len(),
+                    images = image_count,
+                    "PDF text + images extracted"
+                );
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
@@ -102,8 +111,8 @@ pub async fn process_file(
             Ok(_) => {
                 tracing::info!("PDF has sparse text — falling back to OCR");
             }
-            Err(e) => {
-                tracing::warn!("pdftotext failed: {e} — falling back to OCR");
+            Err(_) => {
+                tracing::warn!("pdftotext failed — falling back to OCR (details redacted)");
             }
         }
         // Fall through to OCR path below.
@@ -115,8 +124,12 @@ pub async fn process_file(
             Ok(text) if text.chars().filter(|c| !c.is_whitespace()).count() > 50 => {
                 let images = extract_docx_images(file_path);
                 let image_count = images.len();
-                let enriched = ocr_embedded_images(config, &images, &text).await;
-                tracing::info!(chars = enriched.len(), images = image_count, "DOCX text + images extracted");
+                let enriched = ocr_embedded_images(config, http, &images, &text).await;
+                tracing::info!(
+                    chars = enriched.len(),
+                    images = image_count,
+                    "DOCX text + images extracted"
+                );
                 return ExtractedDoc {
                     id: upload_id.into(),
                     filename: original_name.into(),
@@ -129,8 +142,10 @@ pub async fn process_file(
             Ok(_) => {
                 tracing::info!("DOCX has sparse text — falling back to conversion + OCR");
             }
-            Err(e) => {
-                tracing::warn!("DOCX text extraction failed: {e} — falling back to conversion + OCR");
+            Err(_) => {
+                tracing::warn!(
+                    "DOCX text extraction failed — falling back to conversion + OCR (details redacted)"
+                );
             }
         }
         // Fall through to libreoffice conversion + OCR below.
@@ -162,12 +177,14 @@ pub async fn process_file(
 
     // Route to the configured doc model provider.
     let result: Result<(String, usize, Vec<ImageB64>), String> = match config.provider.as_str() {
-        "mistral_ocr" => process_mistral(config, process_target, &mime).await,
-        "deepseek_ocr" => process_deepseek_ocr(config, process_target, &mime).await,
+        "mistral_ocr" => process_mistral(config, http, process_target, &mime).await,
+        "deepseek_ocr" => process_deepseek_ocr(config, http, process_target, &mime).await,
         _ => {
             let r: Result<(String, usize), String> = match config.provider.as_str() {
                 "gemini" => process_gemini_stub(config, process_target, &mime).await,
-                "generic_vision" => process_generic_vision_stub(config, process_target, &mime).await,
+                "generic_vision" => {
+                    process_generic_vision_stub(config, http, process_target, &mime).await
+                }
                 other => Err(format!("unknown doc_model.provider: {other}")),
             };
             r.map(|(t, c)| (t, c, vec![]))
@@ -186,7 +203,8 @@ pub async fn process_file(
             // conversation model can still "see" it visually.
             if images.is_empty() && mime.starts_with("image/") {
                 if let Ok(data) = std::fs::read(process_target) {
-                    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+                    let b64 =
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     if b64.len() < 2_000_000 {
                         images.push(ImageB64 {
                             media_type: mime.to_string(),
@@ -203,7 +221,7 @@ pub async fn process_file(
                 images_base64: images,
                 error: None,
             }
-        },
+        }
         Err(e) => ExtractedDoc {
             id: upload_id.into(),
             filename: original_name.into(),
@@ -240,13 +258,34 @@ fn extract_docx_text(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("not a valid ZIP/DOCX: {e}"))?;
-    let mut doc = archive
-        .by_name("word/document.xml")
-        .map_err(|e| format!("word/document.xml not found: {e}"))?;
-    let mut doc_str = String::new();
-    std::io::Read::read_to_string(&mut doc, &mut doc_str)
-        .map_err(|e| format!("failed to read document.xml: {e}"))?;
-    Ok(extract_wt_text(&doc_str))
+    let bytes = read_zip_entry_bounded(
+        &mut archive,
+        "word/document.xml",
+        MAX_EXTRACTED_DOCX_XML_BYTES,
+    )?;
+    let doc = String::from_utf8(bytes).map_err(|_| "document.xml is not UTF-8".to_string())?;
+    Ok(extract_wt_text(&doc))
+}
+
+fn read_zip_entry_bounded<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|_| format!("{name} not found"))?;
+    if entry.size() > max_bytes {
+        return Err(format!("{name} exceeds extraction limit"));
+    }
+    let mut bytes = Vec::with_capacity(entry.size().min(max_bytes) as usize);
+    std::io::Read::take(&mut entry, max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("failed to read {name}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{name} exceeds extraction limit"));
+    }
+    Ok(bytes)
 }
 
 /// Extract text from `<w:t>` elements in a DOCX document.xml string.
@@ -264,7 +303,9 @@ fn extract_wt_text(xml: &str) -> String {
                 if in_wt {
                     // Flush buffered text.
                     if !text_buf.is_empty() {
-                        if !out.is_empty() { out.push(' '); }
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
                         out.push_str(&text_buf);
                         text_buf.clear();
                     }
@@ -296,7 +337,9 @@ fn extract_wt_text(xml: &str) -> String {
     }
     // Flush remaining.
     if in_wt && !text_buf.is_empty() {
-        if !out.is_empty() { out.push(' '); }
+        if !out.is_empty() {
+            out.push(' ');
+        }
         out.push_str(&text_buf);
     }
     out
@@ -307,6 +350,7 @@ fn extract_wt_text(xml: &str) -> String {
 /// (deepseek_ocr, generic_vision), uses `/v1/chat/completions`.
 async fn ocr_embedded_images(
     config: &DocModelConfig,
+    http: &reqwest::Client,
     images: &[ImageB64],
     document_text: &str,
 ) -> String {
@@ -314,8 +358,8 @@ async fn ocr_embedded_images(
         return document_text.to_string();
     }
     let mut out = document_text.to_string();
-    let api_key = config.resolved_api_key();
-    let client = reqwest::Client::new();
+    let api_key = config.api_key.clone();
+    let client = http;
 
     let is_mistral = config.provider == "mistral_ocr";
 
@@ -408,8 +452,11 @@ async fn ocr_embedded_images(
                 out.push_str(&format!("\n\n[Embedded Image {}]: {desc}", i + 1));
             }
             Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("embedded image OCR failed for image {}: {e}", i + 1);
+            Err(_) => {
+                tracing::warn!(
+                    image_index = i + 1,
+                    "embedded image OCR failed (details redacted)"
+                );
             }
         }
     }
@@ -432,7 +479,11 @@ fn extract_pdf_images(path: &Path) -> Vec<ImageB64> {
     if result.is_err() {
         return images;
     }
-    let prefix_str = prefix.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let prefix_str = prefix
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut paths: Vec<PathBuf> = entries
             .flatten()
@@ -448,10 +499,8 @@ fn extract_pdf_images(path: &Path) -> Vec<ImageB64> {
         for p in paths.iter().take(8) {
             if let Ok(data) = std::fs::read(p) {
                 if data.len() < 1_000_000 {
-                    let b64 = base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &data,
-                    );
+                    let b64 =
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
                     images.push(ImageB64 {
                         media_type: format!("image/{ext}"),
@@ -484,19 +533,13 @@ fn extract_docx_images(path: &Path) -> Vec<ImageB64> {
         .map(|n| n.to_string())
         .collect();
     for name in media_names.iter().take(8) {
-        if let Ok(mut f) = archive.by_name(name) {
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() && buf.len() < 1_000_000 {
-                let b64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &buf,
-                );
-                let ext = name.rsplit('.').next().unwrap_or("png");
-                images.push(ImageB64 {
-                    media_type: format!("image/{ext}"),
-                    data: b64,
-                });
-            }
+        if let Ok(buf) = read_zip_entry_bounded(&mut archive, name, MAX_EMBEDDED_IMAGE_BYTES) {
+            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
+            let ext = name.rsplit('.').next().unwrap_or("png");
+            images.push(ImageB64 {
+                media_type: format!("image/{ext}"),
+                data: b64,
+            });
         }
     }
     images
@@ -521,7 +564,9 @@ fn mime_type(file_path: &Path, original_name: &str) -> String {
         "jpg" | "jpeg" => "image/jpeg".into(),
         _ => {
             // Try magic bytes.
-            if let Ok(bytes) = std::fs::read(file_path).map(|b| b.into_iter().take(8).collect::<Vec<u8>>()) {
+            if let Ok(bytes) =
+                std::fs::read(file_path).map(|b| b.into_iter().take(8).collect::<Vec<u8>>())
+            {
                 if bytes.starts_with(b"%PDF") {
                     return "application/pdf".into();
                 }
@@ -550,12 +595,9 @@ fn mime_type(file_path: &Path, original_name: &str) -> String {
 
 fn docx_to_pdf(input: &Path) -> Result<PathBuf, String> {
     let dir = input.parent().unwrap_or_else(|| Path::new("."));
-    let output = dir.join(format!(
-        "nonoclaw_convert_{}.pdf",
-        uuid::Uuid::new_v4()
-    ));
+    let output = dir.join(format!("nonoclaw_convert_{}.pdf", uuid::Uuid::new_v4()));
 
-    tracing::info!(input=%input.display(), output=%output.display(), "converting to PDF via libreoffice");
+    tracing::info!("converting attachment to PDF via libreoffice (paths omitted)");
 
     let status = Command::new("libreoffice")
         .args([
@@ -582,8 +624,7 @@ fn docx_to_pdf(input: &Path) -> Result<PathBuf, String> {
     let expected = dir.join(format!("{}.pdf", stem.to_string_lossy()));
     if expected.exists() {
         // Rename to our UUID name.
-        std::fs::rename(&expected, &output)
-            .map_err(|e| format!("failed to rename PDF: {e}"))?;
+        std::fs::rename(&expected, &output).map_err(|e| format!("failed to rename PDF: {e}"))?;
     } else if output.exists() {
         // Already at the target name.
     } else {
@@ -597,12 +638,13 @@ fn docx_to_pdf(input: &Path) -> Result<PathBuf, String> {
 
 async fn process_mistral(
     config: &DocModelConfig,
+    http: &reqwest::Client,
     file_path: &Path,
     mime: &str,
 ) -> Result<(String, usize, Vec<ImageB64>), String> {
-    let api_key = config.resolved_api_key();
-    let bytes = std::fs::read(file_path)
-        .map_err(|e| format!("failed to read file for OCR: {e}"))?;
+    let api_key = config.api_key.clone();
+    let bytes =
+        std::fs::read(file_path).map_err(|e| format!("failed to read file for OCR: {e}"))?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
 
     let is_image = mime.starts_with("image/");
@@ -632,9 +674,9 @@ async fn process_mistral(
         })
     };
 
-    let client = reqwest::Client::new();
+    let client = http;
     let url = format!("{}/v1/ocr", config.base_url.trim_end_matches('/'));
-    tracing::debug!(%url, "calling Mistral OCR");
+    tracing::debug!("calling Mistral OCR (endpoint omitted)");
 
     let resp = client
         .post(&url)
@@ -647,14 +689,14 @@ async fn process_mistral(
     let status = resp.status();
     let resp_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        tracing::warn!(%status, %resp_text, "Mistral OCR error");
-        return Err(format!("Mistral OCR returned {}: {}", status.as_u16(), resp_text));
+        tracing::warn!(%status, "Mistral OCR request failed (body redacted)");
+        return Err(format!("Mistral OCR returned HTTP {}", status.as_u16()));
     }
 
     tracing::info!(len = resp_text.len(), "Mistral OCR response received");
 
     let response: MistralOcrResponse = serde_json::from_str(&resp_text)
-        .map_err(|e| format!("failed to parse Mistral OCR response: {} (body head: {})", e, &resp_text[..resp_text.len().min(300)]))?;
+        .map_err(|_| "failed to parse Mistral OCR response".to_string())?;
 
     // Concatenate markdown from all pages.
     let mut text = String::new();
@@ -714,29 +756,30 @@ struct MistralOcrPage {
 
 // ── DeepSeek OCR provider (OpenAI-compatible) ───────────────────────────────
 
+const DEEPSEEK_OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
+
 async fn process_deepseek_ocr(
     config: &DocModelConfig,
+    http: &reqwest::Client,
     file_path: &Path,
     mime: &str,
 ) -> Result<(String, usize, Vec<ImageB64>), String> {
     let images: Vec<(String, Vec<u8>)> = if mime == "application/pdf" {
         pdf_to_images(file_path)?
     } else {
-        let bytes = std::fs::read(file_path)
-            .map_err(|e| format!("failed to read image: {e}"))?;
+        let bytes = std::fs::read(file_path).map_err(|e| format!("failed to read image: {e}"))?;
         vec![(mime.to_string(), bytes)]
     };
 
-    let api_key = config.resolved_api_key();
+    let api_key = config.api_key.clone();
     let url = format!(
         "{}/v1/chat/completions",
         config.base_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
+    let client = http;
     let mut full_text = String::new();
 
     // DeepSeek OCR 2 uses the `<image>` token + specialised prompt format.
-    const OCR_PROMPT: &str = "<image>\n<|grounding|>Convert the document to markdown.";
     const TILE_SIZE: u32 = 768;
     const GLOBAL_SIZE: u32 = 1024;
 
@@ -751,13 +794,16 @@ async fn process_deepseek_ocr(
 
         // Strategy: send one global downscaled view + tiles for detail.
         // This mirrors the model's native crop_mode behaviour.
-        let global =
-            img.resize_exact(GLOBAL_SIZE, GLOBAL_SIZE, image::imageops::FilterType::Lanczos3);
+        let global = img.resize_exact(
+            GLOBAL_SIZE,
+            GLOBAL_SIZE,
+            image::imageops::FilterType::Lanczos3,
+        );
         let tiles = tile_image(&img, TILE_SIZE);
 
         // 1. Global overview first.
         let gb64 = encode_jpeg_base64(&global);
-        let page_text = call_ocr_page(&client, &url, &api_key, config, &gb64, "global").await?;
+        let page_text = call_ocr_page(client, &url, &api_key, config, &gb64, "global").await?;
         full_text.push_str(&page_text);
         full_text.push('\n');
 
@@ -765,7 +811,7 @@ async fn process_deepseek_ocr(
         for (ti, tile) in tiles.iter().enumerate() {
             let tb64 = encode_jpeg_base64(tile);
             let tile_text =
-                call_ocr_page(&client, &url, &api_key, config, &tb64, &format!("tile {ti}")).await?;
+                call_ocr_page(client, &url, &api_key, config, &tb64, &format!("tile {ti}")).await?;
             full_text.push_str(&tile_text);
             full_text.push('\n');
         }
@@ -790,32 +836,6 @@ async fn process_deepseek_ocr(
     );
 
     Ok((full_text.trim().to_string(), 0, vec![]))
-}
-
-/// Resize for OCR API: scale to `max_dim`, output as JPEG (much smaller than
-/// PNG for photos).  Passes through unchanged if already small enough or if
-/// decoding fails.
-fn resize_for_ocr(bytes: &[u8], max_dim: u32) -> Vec<u8> {
-    let img = match image::load_from_memory(bytes) {
-        Ok(i) => i,
-        Err(_) => return bytes.to_vec(),
-    };
-    let (w, h) = (img.width(), img.height());
-    // If already small, re-encode as JPEG anyway (may still shrink).
-    let ratio = if w <= max_dim && h <= max_dim {
-        1.0
-    } else {
-        max_dim as f64 / w.max(h) as f64
-    };
-    let nw = (w as f64 * ratio) as u32;
-    let nh = (h as f64 * ratio) as u32;
-    let resized = img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3);
-    let mut out = std::io::Cursor::new(Vec::new());
-    // JPEG quality 80: good OCR readability at small file size.
-    match resized.write_to(&mut out, image::ImageFormat::Jpeg) {
-        Ok(()) => out.into_inner(),
-        Err(_) => bytes.to_vec(),
-    }
 }
 
 /// Split an image into `tile_size × tile_size` tiles, with overlap.
@@ -850,10 +870,7 @@ fn tile_image(img: &image::DynamicImage, tile_size: u32) -> Vec<image::DynamicIm
 fn encode_jpeg_base64(img: &image::DynamicImage) -> String {
     let mut buf = std::io::Cursor::new(Vec::new());
     // Best-effort: ignore encoding errors and fall back to raw bytes.
-    let data = if img
-        .write_to(&mut buf, image::ImageFormat::Jpeg)
-        .is_ok()
-    {
+    let data = if img.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
         buf.into_inner()
     } else {
         return String::new();
@@ -884,7 +901,7 @@ async fn call_ocr_page(
                 },
                 {
                     "type": "text",
-                    "text": "<image>\n<|grounding|>Convert the document to markdown."
+                    "text": DEEPSEEK_OCR_PROMPT
                 }
             ]
         }],
@@ -903,15 +920,11 @@ async fn call_ocr_page(
     let status = resp.status();
     let resp_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "OCR returned {} ({label}): {}",
-            status.as_u16(),
-            resp_text
-        ));
+        return Err(format!("OCR returned HTTP {} ({label})", status.as_u16()));
     }
 
     let response: serde_json::Value = serde_json::from_str(&resp_text)
-        .map_err(|e| format!("OCR parse error ({label}): {e}"))?;
+        .map_err(|_| format!("OCR returned an invalid response ({label})"))?;
 
     Ok(response["choices"][0]["message"]["content"]
         .as_str()
@@ -931,6 +944,7 @@ async fn process_gemini_stub(
 
 async fn process_generic_vision_stub(
     config: &DocModelConfig,
+    http: &reqwest::Client,
     file_path: &Path,
     mime: &str,
 ) -> Result<(String, usize), String> {
@@ -939,17 +953,16 @@ async fn process_generic_vision_stub(
     let images: Vec<(String, Vec<u8>)> = if mime == "application/pdf" {
         pdf_to_images(file_path)?
     } else {
-        let bytes = std::fs::read(file_path)
-            .map_err(|e| format!("failed to read image: {e}"))?;
+        let bytes = std::fs::read(file_path).map_err(|e| format!("failed to read image: {e}"))?;
         vec![(mime.to_string(), bytes)]
     };
 
-    let api_key = config.resolved_api_key();
+    let api_key = config.api_key.clone();
     let url = format!(
         "{}/v1/chat/completions",
         config.base_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
+    let client = http;
     let mut full_text = String::new();
 
     for (i, (_img_mime, img_bytes)) in images.iter().enumerate() {
@@ -983,12 +996,10 @@ async fn process_generic_vision_stub(
 
         let status = resp.status();
         if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
             return Err(format!(
-                "vision model returned {} for page {}: {}",
+                "vision model returned HTTP {} for page {}",
                 status.as_u16(),
-                i + 1,
-                err_body
+                i + 1
             ));
         }
 
@@ -1012,12 +1023,9 @@ async fn process_generic_vision_stub(
 /// Convert PDF pages to PNG images using `pdftoppm` (from poppler-utils).
 fn pdf_to_images(file_path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
-    let prefix = dir.join(format!(
-        "nonoclaw_page_{}",
-        uuid::Uuid::new_v4()
-    ));
+    let prefix = dir.join(format!("nonoclaw_page_{}", uuid::Uuid::new_v4()));
 
-    tracing::info!(input=%file_path.display(), "converting PDF to images via pdftoppm");
+    tracing::info!("converting PDF attachment to images (path omitted)");
 
     let output = Command::new("pdftoppm")
         .args(["-png", "-r", "200"])
@@ -1026,9 +1034,9 @@ fn pdf_to_images(file_path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!(
-            "pdftoppm not found — install it: sudo apt install poppler-utils (error: {e})"
-        ))?;
+        .map_err(|e| {
+            format!("pdftoppm not found — install it: sudo apt install poppler-utils (error: {e})")
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1058,7 +1066,7 @@ fn pdf_to_images(file_path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         for p in &paths {
             match std::fs::read(p) {
                 Ok(data) => images.push(("image/png".into(), data)),
-                Err(e) => tracing::warn!(path=%p.display(), "failed to read page image: {e}"),
+                Err(_) => tracing::warn!("failed to read generated page image (details redacted)"),
             }
             let _ = std::fs::remove_file(p);
         }
@@ -1090,9 +1098,42 @@ pub fn is_allowed_extension(filename: &str) -> bool {
     }
 }
 
+/// Validate that the declared extension agrees with a minimal deterministic
+/// content signature. This blocks extension spoofing before parser/tooling
+/// invocation while retaining all historically supported formats.
+pub fn file_signature_matches(filename: &str, bytes: &[u8]) -> bool {
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "txt" | "md" | "markdown" => !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok(),
+        "pdf" => bytes.starts_with(b"%PDF-"),
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "doc" => bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+        "docx" => {
+            let cursor = std::io::Cursor::new(bytes);
+            zip::ZipArchive::new(cursor)
+                .map(|archive| archive.file_names().any(|name| name == "word/document.xml"))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// Sanitize a filename: strip path separators and `..`.
 pub fn sanitize_filename(name: &str) -> String {
-    name.replace(['/', '\\', '\0'], "_")
+    name.chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
         .replace("..", "__")
         .trim_start_matches('.')
         .to_string()
@@ -1102,3 +1143,62 @@ pub fn sanitize_filename(name: &str) -> String {
 /// If the text exceeds this, it is truncated and the server path is noted so the
 /// model can use the Read tool to access the full content.
 pub const MAX_INLINE_TEXT_CHARS: usize = 50_000;
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn upload_signature_allowlist_rejects_spoofed_and_binary_text_files() {
+        // **Validates: Requirements 8.8, 11.2**
+        assert!(file_signature_matches("notes.md", b"safe utf-8 text"));
+        assert!(file_signature_matches("scan.pdf", b"%PDF-1.7\nfixture"));
+        assert!(file_signature_matches(
+            "image.png",
+            b"\x89PNG\r\n\x1a\nfixture"
+        ));
+        assert!(!file_signature_matches("scan.pdf", b"not a pdf"));
+        assert!(!file_signature_matches("notes.txt", b"safe\0hidden"));
+        assert!(!file_signature_matches("payload.jpg", b"#!/bin/sh"));
+    }
+
+    #[test]
+    fn filename_sanitization_never_preserves_path_components() {
+        for name in [
+            "../../secret.txt",
+            "..\\..\\secret.txt",
+            ".hidden",
+            "a\0b.txt",
+            "line\nbreak.txt",
+        ] {
+            let safe = sanitize_filename(name);
+            assert!(!safe.contains('/'));
+            assert!(!safe.contains('\\'));
+            assert!(!safe.contains(".."));
+            assert!(!safe.starts_with('.'));
+            assert!(!safe.contains('\0'));
+            assert!(!safe.chars().any(char::is_control));
+        }
+    }
+
+    #[test]
+    fn docx_zip_entries_are_read_with_a_hard_decompressed_limit() {
+        // **Validates: Requirements 8.8, 11.2**
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut encoded);
+            writer
+                .start_file(
+                    "word/document.xml",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &vec![b'x'; 4096]).unwrap();
+            writer.finish().unwrap();
+        }
+        encoded.set_position(0);
+        let mut archive = zip::ZipArchive::new(encoded).unwrap();
+        assert!(read_zip_entry_bounded(&mut archive, "word/document.xml", 1024).is_err());
+    }
+}

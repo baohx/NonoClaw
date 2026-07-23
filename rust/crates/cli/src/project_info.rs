@@ -5,11 +5,16 @@
 //! plugins, the layered NONOCLAW.md / settings files, and a structured git
 //! snapshot. Sent to the browser as `ServerMsg::ProjectInfo`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use clap::CommandFactory;
+use nonoclaw_core::redact_text;
 use nonoclaw_engine::skills::Skill;
-use nonoclaw_tools::{McpServerConfig, ToolRegistry};
+use nonoclaw_engine::{
+    ConfigDiagnostic, ConfigFieldReference, ExtensionDescriptor, ExtensionDiagnostic,
+    ExtensionKind, ResolvedConfig,
+};
+use nonoclaw_tools::ToolRegistry;
 use serde::Serialize;
 
 /// The full project-context payload sent to the browser.
@@ -21,9 +26,19 @@ pub struct ProjectInfo {
     pub mcp_servers: Vec<McpServerInfo>,
     pub skills: Vec<SkillInfo>,
     pub plugins: Vec<PluginInfo>,
+    /// Shared source/status records for Skills, Profiles, Plugins, and MCP.
+    pub extensions: Vec<ExtensionDescriptor>,
+    /// Non-fatal load and deterministic name-conflict diagnostics.
+    pub extension_diagnostics: Vec<ExtensionDiagnostic>,
     pub hooks: Vec<HookEntry>,
     pub docs: Vec<PathLayer>,
     pub settings: Vec<PathLayer>,
+    /// Generated from the Clap command definition used by the executable.
+    pub cli_reference: Vec<ReferenceItem>,
+    /// Shared top-level settings metadata also used by unknown-field diagnostics.
+    pub config_reference: Vec<ConfigFieldReference>,
+    /// Safe field/file-level configuration diagnostics for the Insight rail.
+    pub config_diagnostics: Vec<ConfigDiagnosticInfo>,
     pub git: Option<GitInfo>,
     /// Configured model context window (tokens), if set.
     pub context_window: Option<usize>,
@@ -65,7 +80,7 @@ pub struct SkillInfo {
 #[derive(Debug, Serialize, Clone)]
 pub struct PluginInfo {
     pub name: String,
-    pub dir: String,   // abs install dir
+    pub dir: String, // abs install dir
     pub skill_count: usize,
 }
 
@@ -79,8 +94,42 @@ pub struct HookEntry {
 #[derive(Debug, Serialize, Clone)]
 pub struct PathLayer {
     pub label: String,
-    pub path: String,  // absolute, for click-to-open
+    pub path: String, // absolute, for click-to-open
     pub exists: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ReferenceItem {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ConfigDiagnosticInfo {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    pub field: Option<String>,
+    pub source: Option<String>,
+    pub related_source: Option<String>,
+    pub suggestion: String,
+}
+
+impl From<&ConfigDiagnostic> for ConfigDiagnosticInfo {
+    fn from(diagnostic: &ConfigDiagnostic) -> Self {
+        Self {
+            severity: format!("{:?}", diagnostic.severity).to_lowercase(),
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+            field: diagnostic.field.clone(),
+            source: diagnostic.source.as_ref().map(|source| source.label()),
+            related_source: diagnostic
+                .related_source
+                .as_ref()
+                .map(|source| source.label()),
+            suggestion: diagnostic.suggestion.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,16 +161,16 @@ pub fn nonoclaw_home() -> Option<PathBuf> {
 
 /// Gather the full project context. All local FS probes + a handful of git
 /// subprocess calls; bounded (commits ≤10, prompt_preview ≤400 chars).
+#[allow(clippy::too_many_arguments)]
 pub async fn gather(
     cwd: &Path,
     model: &str,
     registry: &ToolRegistry,
-    mcp_configs: &[(String, McpServerConfig)],
-    mcp_sources: &HashMap<String, String>,
-    context_window: Option<usize>,
-    compact_threshold: usize,
+    config: &ResolvedConfig,
     public_url: Option<String>,
     skills: &[Skill],
+    skill_extensions: &[ExtensionDescriptor],
+    skill_diagnostics: &[ExtensionDiagnostic],
 ) -> ProjectInfo {
     let tools: Vec<ToolInfo> = registry
         .all()
@@ -141,13 +190,15 @@ pub async fn gather(
                 mcp_server: mcp_server.clone(),
                 read_only: t.is_read_only(&serde_json::json!({})),
                 aliases: t.aliases().iter().map(|s| s.to_string()).collect(),
-                prompt_preview: truncate_chars(t.prompt(), 400),
+                prompt_preview: "[tool prompt hidden]".into(),
                 input_schema: t.input_schema(),
             }
         })
         .collect();
 
     // MCP servers: derive connected/tool_count from what actually registered.
+    let mcp_configs = config.mcp_configs();
+    let mcp_sources = config.mcp_source_labels();
     let mcp_servers = mcp_configs
         .iter()
         .map(|(name, cfg)| {
@@ -157,7 +208,7 @@ pub async fn gather(
                 .count();
             McpServerInfo {
                 name: name.clone(),
-                command: format!("{} {}", cfg.command, cfg.args.join(" ")),
+                command: command_source(&cfg.command, cfg.args.len()),
                 config_source: mcp_sources.get(name).cloned(),
                 connected: tool_count > 0,
                 tool_count,
@@ -171,22 +222,63 @@ pub async fn gather(
             name: s.name.clone(),
             description: s.description.clone(),
             source: s.source.clone(),
-            body: s.body.clone(),
+            body: "[skill content kept server-side]".into(),
         })
         .collect();
 
     let plugins = list_plugins(cwd);
+    let mut discovery = nonoclaw_engine::extensions::discover_profiles(cwd);
+    discovery.merge(nonoclaw_engine::extensions::discover_plugins(cwd));
+    discovery
+        .descriptors
+        .extend(skill_extensions.iter().cloned());
+    discovery
+        .descriptors
+        .extend(registry.extension_descriptors().iter().cloned());
+    discovery
+        .diagnostics
+        .extend(skill_diagnostics.iter().cloned());
+    discovery
+        .diagnostics
+        .extend(registry.extension_diagnostics().iter().cloned());
+    // MCP source labels come from the canonical resolved configuration rather
+    // than command strings, so Insight never needs to infer provenance.
+    for descriptor in &mut discovery.descriptors {
+        if descriptor.kind == ExtensionKind::Mcp {
+            if let Some(source) = mcp_sources.get(&descriptor.name) {
+                descriptor.source = source.clone();
+            }
+        }
+        descriptor.detail = descriptor.detail.as_deref().map(redact_text);
+    }
+    for diagnostic in &mut discovery.diagnostics {
+        diagnostic.message = redact_text(&diagnostic.message);
+        diagnostic.suggestion = redact_text(&diagnostic.suggestion);
+    }
+    discovery.descriptors.sort_by(|a, b| {
+        a.kind
+            .as_str()
+            .cmp(b.kind.as_str())
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| b.precedence.cmp(&a.precedence))
+    });
     let hooks = nonoclaw_engine::hooks::load_hooks(cwd)
         .into_iter()
         .map(|(t, d)| HookEntry {
             hook_type: t.to_string(),
             matcher: d.matcher.clone(),
-            command: format!("{} {}", d.command, d.args.join(" ")),
+            command: hook_source(&d),
         })
         .collect();
 
     let docs = collect_doc_layers(cwd);
     let settings = collect_settings_layers(cwd);
+    let config_diagnostics = config
+        .diagnostics
+        .iter()
+        .map(ConfigDiagnosticInfo::from)
+        .collect();
+    let (context_window, compact_threshold) = config.model_budget(model);
     let git = git_info(cwd).await;
 
     ProjectInfo {
@@ -196,14 +288,93 @@ pub async fn gather(
         mcp_servers,
         skills,
         plugins,
+        extensions: discovery.descriptors,
+        extension_diagnostics: discovery.diagnostics,
         hooks,
         docs,
         settings,
+        cli_reference: cli_reference(),
+        config_reference: nonoclaw_engine::config_reference().to_vec(),
+        config_diagnostics,
         git,
         context_window,
         compact_threshold,
         public_url,
     }
+}
+
+fn cli_reference() -> Vec<ReferenceItem> {
+    crate::Cli::command()
+        .get_arguments()
+        .filter(|argument| !argument.is_positional())
+        .filter_map(|argument| {
+            let long = argument.get_long()?;
+            let mut name = argument
+                .get_short()
+                .map(|short| format!("-{short}, --{long}"))
+                .unwrap_or_else(|| format!("--{long}"));
+            if argument.get_action().takes_values() {
+                let value_name = argument
+                    .get_value_names()
+                    .and_then(|names| names.first())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "VALUE".into());
+                name.push_str(&format!(" <{value_name}>"));
+            }
+            Some(ReferenceItem {
+                name,
+                description: argument
+                    .get_help()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn command_source(command: &str, argument_count: usize) -> String {
+    let executable = (!command.contains("://") && !command.contains('?') && !command.contains('#'))
+        .then(|| {
+            Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && name.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || "-_.".contains(character)
+                        })
+                })
+        })
+        .flatten()
+        .unwrap_or("configured command");
+    format!("{executable} ({argument_count} argument(s), values hidden)")
+}
+
+fn hook_source(definition: &nonoclaw_engine::hooks::HookDef) -> String {
+    if !definition.command.trim().is_empty() {
+        return format!(
+            "command · {}",
+            command_source(&definition.command, definition.args.len())
+        );
+    }
+    if let Some(prompt) = &definition.prompt {
+        return format!(
+            "prompt · {}",
+            prompt.model.as_deref().unwrap_or("default model")
+        );
+    }
+    if let Some(http) = &definition.http {
+        let origin = reqwest::Url::parse(&http.url)
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| format!("{}://{host}", url.scheme()))
+            })
+            .unwrap_or_else(|| "configured endpoint".into());
+        return format!("http · {origin} (path, query, and headers hidden)");
+    }
+    "invalid hook action".into()
 }
 
 /// Scan plugin directories for contributed skills.
@@ -226,7 +397,9 @@ fn list_plugins(cwd: &Path) -> Vec<PluginInfo> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() { continue; }
+            if !path.is_dir() {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             // Count <plugin>/skills/<skill>/SKILL.md
             let skill_count = std::fs::read_dir(path.join("skills"))
@@ -259,7 +432,11 @@ fn collect_doc_layers(cwd: &Path) -> Vec<PathLayer> {
         });
     };
 
-    push(&mut out, "Project · NONOCLAW.md", cwd.join(".nonoclaw/NONOCLAW.md"));
+    push(
+        &mut out,
+        "Project · NONOCLAW.md",
+        cwd.join(".nonoclaw/NONOCLAW.md"),
+    );
     push(
         &mut out,
         "Project · NONOCLAW.local.md",
@@ -305,10 +482,7 @@ fn extend_rules(out: &mut Vec<PathLayer>, prefix: &str, rules_dir: &Path) {
         .collect();
     paths.sort();
     for p in paths {
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("rule.md");
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("rule.md");
         out.push(PathLayer {
             label: format!("{prefix}/{name}"),
             exists: true,
@@ -367,14 +541,20 @@ async fn git_info(cwd: &Path) -> Option<GitInfo> {
         let user = (!user_raw.is_empty()).then_some(user_raw);
         return Some(GitInfo {
             branch: None,
-            ahead: 0, behind: 0,
-            staged: 0, modified: 0, untracked: 0, conflicts: 0,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            modified: 0,
+            untracked: 0,
+            conflicts: 0,
             is_empty: true,
             recent_commits: vec![],
             user,
         });
     }
-    let branch = (branch_raw == "HEAD").then(|| "HEAD (detached)".to_string()).or(Some(branch_raw));
+    let branch = (branch_raw == "HEAD")
+        .then(|| "HEAD (detached)".to_string())
+        .or(Some(branch_raw));
 
     let ahead = git_out(cwd, &["rev-list", "--count", "@{upstream}..HEAD"])
         .await
@@ -413,7 +593,12 @@ async fn git_info(cwd: &Path) -> Option<GitInfo> {
 
     let log = git_out(
         cwd,
-        &["log", "-40", "--date=short", "--format=%h%x09%an%x09%ad%x09%s"],
+        &[
+            "log",
+            "-40",
+            "--date=short",
+            "--format=%h%x09%an%x09%ad%x09%s",
+        ],
     )
     .await;
     let recent_commits: Vec<CommitInfo> = log.lines().filter_map(parse_commit_line).collect();
@@ -460,10 +645,7 @@ fn parse_commit_line(line: &str) -> Option<CommitInfo> {
 /// `git show` a commit's stat + patch, capped (large diffs truncate). `sha` is
 /// validated to hex 4-40 chars to keep it from being an arbitrary git arg.
 pub async fn git_show(cwd: &Path, sha: &str) -> Option<String> {
-    if sha.is_empty()
-        || sha.len() > 40
-        || !sha.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if sha.is_empty() || sha.len() > 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let out = git_out(cwd, &["show", "--stat", "--patch", "--no-color", sha]).await;
@@ -480,4 +662,63 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn command_and_hook_sources_hide_arguments_queries_and_headers() {
+        // **Validates: Requirements 9.8, 11.1, 11.2**
+        let command = command_source("/usr/local/bin/mcp-server", 3);
+        assert_eq!(command, "mcp-server (3 argument(s), values hidden)");
+        assert_eq!(
+            command_source("https://user:secret@example.test/run", 1),
+            "configured command (1 argument(s), values hidden)"
+        );
+
+        let hook = nonoclaw_engine::hooks::HookDef {
+            matcher: "*".into(),
+            command: String::new(),
+            args: vec![],
+            prompt: None,
+            http: Some(nonoclaw_engine::hooks::HttpHookConfig {
+                url: "https://hooks.example.test/private?token=top-secret".into(),
+                headers: [("Authorization".into(), "Bearer secret".into())]
+                    .into_iter()
+                    .collect(),
+            }),
+            timeout_secs: None,
+            failure_policy: nonoclaw_engine::hooks::HookFailurePolicy::Continue,
+        };
+        let source = hook_source(&hook);
+        assert_eq!(
+            source,
+            "http · https://hooks.example.test (path, query, and headers hidden)"
+        );
+        assert!(!source.contains("secret"));
+        assert!(!source.contains("private"));
+    }
+
+    #[test]
+    fn cli_reference_is_generated_from_the_clap_definition() {
+        // **Validates: Requirements 12.2**
+        let reference = cli_reference();
+        assert!(reference.iter().any(|item| item.name == "-p, --print"));
+        assert!(reference
+            .iter()
+            .any(|item| item.name == "--serve-http <ADDR>"));
+        assert!(reference.iter().any(|item| item.name == "--mcp-serve"));
+        assert!(!reference.iter().any(|item| item.name.contains("--bridge")));
+        assert!(reference.iter().all(|item| !item.description.is_empty()));
+    }
+
+    #[test]
+    fn public_metadata_placeholders_do_not_contain_raw_prompts() {
+        let tool_prompt = "[tool prompt hidden]";
+        let skill_body = "[skill content kept server-side]";
+        assert!(!tool_prompt.contains("Bearer"));
+        assert!(!skill_body.contains("sk-proj"));
+    }
 }

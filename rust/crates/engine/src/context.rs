@@ -154,10 +154,17 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
 
     // 0. Active beads + important facts (cross-session memory)
     let beads = nonoclaw_tools::memory::load_beads(cwd);
-    let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads).into_iter().take(5).collect();
+    let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads)
+        .into_iter()
+        .take(5)
+        .collect();
     let facts = nonoclaw_tools::memory::load_facts(cwd);
     let mut top_facts: Vec<&nonoclaw_tools::memory::Fact> = facts.iter().collect();
-    top_facts.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    top_facts.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     top_facts.truncate(10);
 
     if !active.is_empty() || !top_facts.is_empty() {
@@ -208,10 +215,7 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
             if let Some(content) = read_optional(p) {
                 let fact = strip_frontmatter(&content);
                 if !fact.trim().is_empty() {
-                    let name = p
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("fact");
+                    let name = p.file_stem().and_then(|n| n.to_str()).unwrap_or("fact");
                     buf.push_str(&format!("**{name}**: {fact}\n\n"));
                 }
             }

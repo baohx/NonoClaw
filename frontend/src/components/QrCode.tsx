@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import QRCode from "qrcode";
+import { getMobileAccessToken } from "../security";
 import { useStore } from "../store";
 
 /**
@@ -8,7 +9,7 @@ import { useStore } from "../store";
  */
 export default function QrCode() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const authToken = useStore((s) => s.authToken);
+  const authToken = getMobileAccessToken();
   const sessionId = useStore((s) => s.sessionId);
   const publicUrl = useStore((s) => s.projectInfo?.public_url ?? null);
   const origin = publicUrl || (typeof window !== "undefined" ? window.location.origin : "");

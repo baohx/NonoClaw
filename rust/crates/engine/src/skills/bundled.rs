@@ -15,12 +15,18 @@ pub fn register_bundled(skills: &mut Vec<Skill>) {
         (include_str!("bundled/remember.md"), "remember"),
         (include_str!("bundled/loop.md"), "loop"),
         (include_str!("bundled/update-config.md"), "update-config"),
-        (include_str!("bundled/keybindings-help.md"), "keybindings-help"),
+        (
+            include_str!("bundled/keybindings-help.md"),
+            "keybindings-help",
+        ),
         (include_str!("bundled/claude-api.md"), "claude-api"),
         (include_str!("bundled/code-review.md"), "code-review"),
         (include_str!("bundled/init.md"), "init"),
         (include_str!("bundled/review.md"), "review"),
-        (include_str!("bundled/security-review.md"), "security-review"),
+        (
+            include_str!("bundled/security-review.md"),
+            "security-review",
+        ),
     ];
 
     for (content, fallback) in defs {

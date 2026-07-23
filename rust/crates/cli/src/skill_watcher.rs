@@ -17,9 +17,7 @@ pub fn spawn_skill_watcher(
     cwd: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let mut watch_dirs: Vec<PathBuf> = vec![
-            cwd.join(".nonoclaw").join("skills"),
-        ];
+        let mut watch_dirs: Vec<PathBuf> = vec![cwd.join(".nonoclaw").join("skills")];
         if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
             watch_dirs.push(home.join("skills"));
         }
@@ -94,9 +92,7 @@ pub fn spawn_skill_watcher(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Flush pending changes after debounce period.
-                    if !pending_dirs.is_empty()
-                        && last_event.elapsed() >= debounce
-                    {
+                    if !pending_dirs.is_empty() && last_event.elapsed() >= debounce {
                         let dirs: Vec<PathBuf> = std::mem::take(&mut pending_dirs);
                         if let Ok(mut mgr) = skills_manager.write() {
                             for dir in &dirs {
