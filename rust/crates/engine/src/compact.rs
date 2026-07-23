@@ -14,22 +14,19 @@ const SUMMARY_SYSTEM: &str = "You are a summarization assistant. Produce a conci
 const MAX_SUMMARY_TOKENS: u32 = 4096;
 
 /// Compaction strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactMode {
     /// Summarize everything older than `keep_recent` messages (current behaviour).
     Summary,
     /// Keep the last N complete turns (user→assistant→tool→result) verbatim;
     /// summarize only the older prefix.  Each turn boundary is a plain user
     /// prompt (no pending tool results).
+    #[default]
     Segments,
 }
 
 /// Minimum number of complete turns kept verbatim in segments mode.
 pub const KEEP_RECENT_TURNS: usize = 3;
-
-impl Default for CompactMode {
-    fn default() -> Self { CompactMode::Segments }
-}
 
 /// Find a safe split point so the kept tail starts at a plain user prompt
 /// (not a tool_result), guaranteeing no `tool_use` is orphaned from its result.

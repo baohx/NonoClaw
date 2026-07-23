@@ -3,7 +3,6 @@
 //! positional prompt) or starts the web UI (`--serve-http`).
 
 mod attachments;
-mod commands;
 mod project_info;
 mod remote;
 mod serve_http;
@@ -16,9 +15,11 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
-use nonoclaw_api::{Client, ThinkingConfig};
-use nonoclaw_core::{Message, MessageContent, PermissionMode, Usage};
-use nonoclaw_engine::{EngineEvent, EngineOptions, QueryEngine, SkillsManager};
+use nonoclaw_core::{MessageContent, PermissionMode, Usage};
+use nonoclaw_engine::{
+    ClientPurpose, ConfigSource, EngineEvent, EventEnvelope, QueryEngine, RunConfigOverrides,
+    RunController, RunTerminalStatus, SessionService, SkillsManager,
+};
 use nonoclaw_tools::register_all;
 use serde_json::json;
 
@@ -39,7 +40,7 @@ struct Cli {
     /// The prompt. If omitted, read from stdin.
     prompt: Vec<String>,
 
-    /// Force headless / print mode (skip the interactive TUI).
+    /// Preserve the `-p`/`--print` compatibility entry for explicit headless mode.
     #[arg(short = 'p', long, default_value_t = false)]
     print: bool,
 
@@ -83,7 +84,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     output_format: OutputFormat,
 
-    /// MCP config path (parsed but not connected in Phase 0).
+    /// MCP config path. Servers are merged into the canonical resolved config.
     #[arg(long, value_name = "PATH")]
     mcp_config: Option<PathBuf>,
 
@@ -160,6 +161,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `--print` is a preserved explicit-headless compatibility flag. All
+    // non-server local invocations are headless, so reading it is sufficient.
+    let _explicit_headless = cli.print;
 
     // `--verbose` shows NonoClaw debug logs but keeps the noisy HTTP stack
     // (rustls/hyper/reqwest) at warn: these emit benign TLS teardown warnings
@@ -188,10 +192,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Remote session modes (Phase 6): serve or connect before any local setup.
-    if let Some(addr) = &cli.serve {
-        return remote::serve(addr).await;
-    }
+    // Remote client mode forwards the request without constructing a local run.
     if let Some(addr) = &cli.remote {
         let prompt = cli.prompt.join(" ");
         let trimmed = prompt.trim();
@@ -214,34 +215,26 @@ async fn main() -> Result<()> {
     }
 
     let cwd = std::env::current_dir().context("no current directory")?;
+    let session_service = SessionService::new();
 
     // --list-sessions prints and exits before any model call.
     if cli.list_sessions {
-        list_and_exit(&cwd);
+        list_and_exit(&session_service, &cwd);
     }
 
-    // Load layered settings + inject env BEFORE building the API client, so
-    // ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL from settings.json are available.
-    let settings = nonoclaw_engine::load_settings(&cwd, cli.settings.as_deref());
-    nonoclaw_engine::settings::apply_env(&settings);
+    // Resolve every file/environment/MCP layer once. The immutable snapshot is
+    // shared by headless, Web, remote server, compact, subagent, and doc-model
+    // paths; resolution itself does not mutate process environment.
+    let resolved = Arc::new(nonoclaw_engine::load_resolved_config(
+        &cwd,
+        cli.settings.as_deref(),
+        cli.mcp_config.as_deref(),
+    ));
+    resolved.log_diagnostics();
 
-    // Pass ALL model profiles to serve_http — per-model overrides
-    // (contextWindow, maxTokens, charsPerToken) are looked up at run time.
-    // The frontend dropdown filters to conversation models only.
-    let model_profiles: Vec<nonoclaw_engine::ModelProfile> =
-        settings.all_models();
-    for p in &model_profiles {
-        if p.default {
-            if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
-                std::env::set_var("ANTHROPIC_BASE_URL", &p.base_url);
-            }
-            if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
-                std::env::set_var("ANTHROPIC_API_KEY", &p.api_key);
-            }
-        }
+    if let Some(addr) = &cli.serve {
+        return remote::serve(addr, Arc::clone(&resolved)).await;
     }
-
-    let client = Client::from_env().context("failed to build API client")?;
 
     let permission_mode = if cli.dangerously_skip_permissions {
         PermissionMode::BypassPermissions
@@ -249,35 +242,14 @@ async fn main() -> Result<()> {
         PermissionMode::from_kebab(&cli.permission_mode)
             .ok_or_else(|| anyhow!("unknown --permission-mode `{}`", cli.permission_mode))?
     };
+    let model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| resolved.active_model.value.clone());
+    let client = resolved
+        .client_for(ClientPurpose::Conversation, Some(&model))
+        .context("failed to build API client from resolved configuration")?;
 
-    const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
-    const DEFAULT_MAX_TURNS: u32 = 200;
-    const DEFAULT_MAX_TOKENS: u32 = 8192;
-    const DEFAULT_COMPACT_THRESHOLD: usize = 150_000;
-    // Build options: CLI flags > settings > built-in defaults.
-    let max_tokens = cli
-        .max_tokens
-        .or(settings.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-    // Auto-compact threshold: an explicit --compact-threshold / compactThreshold
-    // wins; otherwise derive from the model's context window
-    // (window − maxTokens − safety margin) so compaction fires before overflow
-    // on smaller-window models (e.g. deepseek); otherwise the built-in default.
-    let context_window = cli.context_window.or(settings.context_window);
-    let compact_threshold_tokens = cli
-        .compact_threshold
-        .or(settings.compact_threshold)
-        .or_else(|| {
-            let cw = context_window?;
-            Some(cw.saturating_sub(max_tokens as usize + 2048))
-        })
-        .unwrap_or(DEFAULT_COMPACT_THRESHOLD);
-    tracing::info!(
-        context_window,
-        compact_threshold = compact_threshold_tokens,
-        max_tokens,
-        "resolved context budget"
-    );
     let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
     let background_registry = Arc::new(std::sync::Mutex::new(
         nonoclaw_tools::BackgroundTaskRegistry::new(),
@@ -286,159 +258,99 @@ async fn main() -> Result<()> {
     // Spawn file watcher for hot-reloading skills in headless mode.
     skill_watcher::spawn_skill_watcher(Arc::clone(&skills_manager), cwd.clone());
 
-    let mut options = EngineOptions {
-        model: cli
-            .model
-            .clone()
-            .or_else(|| settings.model.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL.into()),
-        max_tokens,
-        permission_mode,
-        allowed_tools: cli.allowed_tools.clone(),
-        disallowed_tools: cli.disallowed_tools.clone(),
-        add_dirs: cli.add_dir.clone(),
-        max_turns: cli
-            .max_turns
-            .or(settings.max_turns)
-            .unwrap_or(DEFAULT_MAX_TURNS),
-        append_system_prompt: cli.append_system_prompt.clone(),
-        thinking: if settings
-            .thinking
-            .as_ref()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            Some(ThinkingConfig::adaptive())
-        } else {
-            None
-        },
-        is_non_interactive: true,
-        permission_resolver: None,
-        question_resolver: None,
-        auto_compact: if cli.no_auto_compact {
-            false
-        } else {
-            settings.auto_compact.unwrap_or(true)
-        },
-        compact_threshold_tokens,
-        compact_model: settings.compact_model.clone(),
-        compact_model_creds: settings.compact_model.as_ref().and_then(|name| {
-            settings.all_models().iter().find(|p| &p.name == name).map(|p| {
-                (p.base_url.clone(), p.api_key.clone(), p.api_format.clone())
-            })
-        }),
-        chars_per_token: settings.chars_per_token,
-        context_window: None, // resolved at run time via apply_model_profile
-        skills_manager: Some(skills_manager),
-        arguments: None,
-        background_registry: Some(background_registry),
-    };
+    let mut options = resolved
+        .resolve_run(RunConfigOverrides {
+            source: ConfigSource::CommandLine {
+                field: "run options".into(),
+            },
+            model: cli.model.clone(),
+            max_turns: cli.max_turns,
+            max_tokens: cli.max_tokens,
+            context_window: cli.context_window,
+            compact_threshold: cli.compact_threshold,
+            auto_compact: cli.no_auto_compact.then_some(false),
+            permission_mode: Some(permission_mode),
+            allowed_tools: (!cli.allowed_tools.is_empty()).then(|| cli.allowed_tools.clone()),
+            disallowed_tools: (!cli.disallowed_tools.is_empty())
+                .then(|| cli.disallowed_tools.clone()),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            add_dirs: cli.add_dir.clone(),
+            arguments: None,
+            is_non_interactive: true,
+        })
+        .options;
+    options.skills_manager = Some(Arc::clone(&skills_manager));
+    options.background_registry = Some(background_registry);
 
-    // Resolve the session: resume by id, --continue the most recent, or fresh.
-    let (session_id, messages, session_file) = resolve_session(&cli, &cwd)?;
+    let (context_window, compact_threshold_tokens) = resolved.model_budget(&model);
+    tracing::info!(
+        context_window,
+        compact_threshold = compact_threshold_tokens,
+        max_tokens = options.max_tokens,
+        "resolved context budget"
+    );
 
-    // Build the tool registry once: builtins + MCP from settings + --mcp-config.
+    // Build the tool registry once: builtins + all resolved MCP sources.
     let (mut registry, todos) = register_all();
-
-    // Gather MCP server configs + their source labels (the web UI's Insight
-    // panel shows them). Sources: settings.json `mcpServers`, then --mcp-config.
-    let mut mcp_configs: Vec<(String, nonoclaw_tools::McpServerConfig)> = Vec::new();
-    let mut mcp_sources: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if let Some(ref servers) = settings.mcp_servers {
-        for (k, v) in servers.iter() {
-            mcp_configs.push((k.clone(), v.clone()));
-            mcp_sources.insert(k.clone(), "settings.json".to_string());
-        }
-    }
-    if let Some(path) = &cli.mcp_config {
-        match nonoclaw_tools::load_mcp_config(path) {
-            Ok(cfgs) => {
-                for (k, v) in &cfgs {
-                    mcp_configs.push((k.clone(), v.clone()));
-                    mcp_sources.insert(k.clone(), format!("--mcp-config {}", path.display()));
-                }
-            }
-            Err(e) => tracing::warn!("failed to load mcp-config: {e}"),
-        }
-    }
+    let mcp_configs = resolved.mcp_configs();
     nonoclaw_tools::register_mcp(&mut registry, &mcp_configs).await;
     // Register ToolSearch with a snapshot of all tools (including MCP).
     let tool_search = nonoclaw_tools::builtin::ToolSearchTool::new(registry.search_entries());
     registry.register(Arc::new(tool_search));
     let registry = Arc::new(registry);
 
-    // Resolve model: CLI flag > settings.model > model_profiles default > first
-    // profile > built-in fallback.
-    let model = cli
-        .model
-        .clone()
-        .or_else(|| settings.model.clone())
-        .or_else(|| {
-            let profiles = settings.conversation_models();
-            profiles
-                .iter()
-                .find(|p| p.default)
-                .or_else(|| profiles.first())
-                .map(|p| p.name.clone())
-        })
-        .unwrap_or_else(|| "claude-sonnet-4-5-20250929".into());
-
-    // Web UI server: HTTP + WebSocket.
+    // Web UI server: HTTP + WebSocket. All model, compact, document, media,
+    // permission, and MCP values are derived from this same resolved snapshot.
     if let Some(addr) = &cli.serve_http {
-        let doc_model = settings.resolved_doc_model().cloned();
-        let compact_model = settings.compact_model.clone();
-        let elevenlabs_api_key = settings.elevenlabs_api_key.clone();
         tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
             addr,
-            Arc::new(client),
             registry,
             todos,
             cwd,
             model,
-            mcp_configs,
-            mcp_sources,
-            context_window,
-            compact_threshold_tokens,
+            Arc::clone(&resolved),
             cli.public_url.clone(),
             cli.tunnel,
-            model_profiles,
-            doc_model,
-            compact_model,
-            elevenlabs_api_key,
         )
         .await?;
         return Ok(());
     }
 
     // --- Headless path ---
-    // Apply per-model overrides from the active model's profile.
-    if let Some(profile) = model_profiles.iter().find(|p| p.name == options.model) {
-        options.apply_model_profile(profile);
-        // Apply agent profile if this model has one.
-        if let Some(ref name) = profile.profile {
-            if let Some(ap) = nonoclaw_engine::agents::load_profile(&cwd, name) {
-                nonoclaw_engine::agents::apply_profile(&mut options, &ap);
-            }
-        }
-    }
     let prompt = read_prompt(&cli)?;
-    let mut engine = QueryEngine::with_session(
-        Arc::new(client),
-        registry,
-        todos,
-        options,
-        messages,
-        session_id,
-        session_file,
-    );
+    let session = resolve_session(&session_service, &cli, &cwd, &model).await?;
+    let engine = match session {
+        Some((session, snapshot)) => {
+            QueryEngine::with_session(client, registry, todos, options, session, snapshot)
+        }
+        None => QueryEngine::new(client, registry, todos, options),
+    };
 
     let json = matches!(cli.output_format, OutputFormat::Json);
-    let result = engine
-        .run(MessageContent::from_text(&prompt), &cwd, |ev| handle_event(json, ev))
-        .await
-        .context("agent run failed")?;
+    let controller = RunController::for_engine(&engine, cwd.clone());
+    let completion = controller
+        .start(
+            engine,
+            MessageContent::from_text(&prompt),
+            move |sequenced| async move {
+                handle_event(json, &sequenced);
+            },
+        )
+        .wait()
+        .await;
+    let result = match completion.terminal.status {
+        RunTerminalStatus::Done => completion
+            .terminal
+            .result
+            .context("run completed without a result")?,
+        RunTerminalStatus::Cancelled => {
+            anyhow::bail!("agent run cancelled: {:?}", completion.terminal.reason)
+        }
+        RunTerminalStatus::Error => {
+            anyhow::bail!("agent run failed: {:?}", completion.terminal.reason)
+        }
+    };
 
     if json {
         emit_json(&json!({
@@ -464,8 +376,8 @@ async fn main() -> Result<()> {
 }
 
 /// Print stored sessions for `cwd` and exit.
-fn list_and_exit(cwd: &std::path::Path) -> ! {
-    match nonoclaw_engine::list_sessions(cwd) {
+fn list_and_exit(service: &SessionService, cwd: &std::path::Path) -> ! {
+    match service.list_sessions(cwd) {
         Ok(list) if list.is_empty() => {
             println!("No sessions found for {}.", cwd.display());
         }
@@ -485,34 +397,35 @@ fn list_and_exit(cwd: &std::path::Path) -> ! {
     std::process::exit(0);
 }
 
-/// Resolve the session id, prior messages, and on-disk file for this run.
-fn resolve_session(
+/// Resolve the canonical session actor and its current snapshot for this run.
+async fn resolve_session(
+    service: &SessionService,
     cli: &Cli,
     cwd: &std::path::Path,
-) -> Result<(String, Vec<Message>, Option<std::path::PathBuf>)> {
+    model: &str,
+) -> Result<Option<(nonoclaw_engine::Session, nonoclaw_engine::SessionSnapshot)>> {
     if cli.no_session {
-        return Ok((nonoclaw_engine::new_session_id(), Vec::new(), None));
+        return Ok(None);
     }
-    if let Some(id) = &cli.resume {
-        let path = nonoclaw_engine::session_path(cwd, id)
-            .ok_or_else(|| anyhow!("cannot determine session path (set HOME or NONOCLAW_HOME)"))?;
-        let (_, _, messages) =
-            nonoclaw_engine::load_session(&path).with_context(|| format!("load session {id}"))?;
-        return Ok((id.clone(), messages, Some(path)));
-    }
-    if cli.continue_session {
-        if let Some(id) = nonoclaw_engine::most_recent_session(cwd)
+    let session = if let Some(id) = &cli.resume {
+        service
+            .resume(cwd, id)
+            .with_context(|| format!("load session {id}"))?
+    } else if cli.continue_session {
+        match service
+            .most_recent_session(cwd)
             .context("failed to look up most recent session")?
         {
-            let path = nonoclaw_engine::session_path(cwd, &id).unwrap();
-            let (_, _, messages) = nonoclaw_engine::load_session(&path)?;
-            return Ok((id, messages, Some(path)));
+            Some(id) => service
+                .resume(cwd, &id)
+                .with_context(|| format!("load session {id}"))?,
+            None => service.create(cwd, nonoclaw_engine::new_session_id(), model)?,
         }
-        // else: nothing to continue → start fresh.
-    }
-    let id = nonoclaw_engine::new_session_id();
-    let path = nonoclaw_engine::session_path(cwd, &id);
-    Ok((id, Vec::new(), path))
+    } else {
+        service.create(cwd, nonoclaw_engine::new_session_id(), model)?
+    };
+    let snapshot = session.snapshot().await?;
+    Ok(Some((session, snapshot)))
 }
 
 fn add_plugin(src: &str) -> Result<()> {
@@ -597,7 +510,8 @@ fn read_prompt(cli: &Cli) -> Result<String> {
     Ok(trimmed)
 }
 
-fn handle_event(json: bool, ev: &EngineEvent) {
+fn handle_event(json: bool, envelope: &EventEnvelope) {
+    let ev = &envelope.event;
     match ev {
         EngineEvent::TextDelta { text } => {
             if json {
@@ -648,6 +562,49 @@ fn handle_event(json: bool, ev: &EngineEvent) {
             // Only meaningful in JSON/SDK output; stay quiet in text mode.
             if json {
                 emit_json(&json!({"type":"model_info","model":model}));
+            }
+        }
+        EngineEvent::SkillActivated {
+            name,
+            reason,
+            source,
+            version,
+        } => {
+            if json {
+                emit_json(&json!({
+                    "type":"skill_activated",
+                    "name":name,
+                    "reason":reason,
+                    "source":source,
+                    "version":version,
+                }));
+            } else {
+                eprintln!("[skill: {name} ({reason}) from {source}]");
+            }
+        }
+        EngineEvent::SessionRepair { repair } => {
+            if json {
+                emit_json(&json!({"type":"session_repair","repair":repair}));
+            } else {
+                eprintln!("[session repair: {:?}: {}]", repair.kind, repair.detail);
+            }
+        }
+        EngineEvent::TaskChanged { change } => {
+            if json {
+                emit_json(&json!({"type":"task_changed","change":change}));
+            } else {
+                eprintln!(
+                    "[tasks: {:?} {:?}, scope={}, count={}]",
+                    change.source,
+                    change.change,
+                    change.scope,
+                    change.tasks.len()
+                );
+            }
+        }
+        _ => {
+            if json {
+                emit_json(&json!({"type":"run_event","envelope":envelope}));
             }
         }
     }

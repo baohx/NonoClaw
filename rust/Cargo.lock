@@ -1355,6 +1355,7 @@ name = "nonoclaw-engine"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "futures",
  "glob",
@@ -1362,6 +1363,7 @@ dependencies = [
  "nonoclaw-core",
  "nonoclaw-tools",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1378,6 +1380,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "glob",
  "nonoclaw-core",
  "regex",

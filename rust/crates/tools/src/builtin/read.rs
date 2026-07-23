@@ -139,6 +139,7 @@ mod tests {
             cwd,
             options: &opts,
             cancel: &cancel,
+            task_scope: Some("read-test"),
             subagent: None,
             question: None,
             background_registry: None,

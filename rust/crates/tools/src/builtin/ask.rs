@@ -1,6 +1,6 @@
 //! AskUserQuestion tool — surface a multiple-choice question to the user.
-//! Mirrors `src/tools/AskUserQuestionTool/`. The interactive resolver lives in
-//! the TUI (via [`ToolCtx::question`]); headless runs have none.
+//! The interactive resolver is supplied by the active UI adapter through
+//! [`ToolCtx::question`]; headless runs have none.
 
 use async_trait::async_trait;
 use nonoclaw_core::{Error, PermissionResult, Result};

@@ -50,9 +50,7 @@ impl Usage {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
     }
-
 }
-
 
 /// A streaming usage fragment as it appears in `message_start` / `message_delta`.
 /// All fields optional — only the relevant subset is present in each event.

@@ -89,8 +89,8 @@ impl ContentBlock {
     }
 }
 
-/// Image source. Phase 0 only needs base64 (images attached to reads); URL
-/// sources come with WebFetch (Phase 2).
+/// Base64 image source used for model attachments. URL retrieval remains the
+/// responsibility of WebFetch rather than the message wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]

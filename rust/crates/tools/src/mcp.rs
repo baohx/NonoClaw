@@ -17,7 +17,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nonoclaw_core::{Error, PermissionDecision, PermissionResult, Result};
+use nonoclaw_core::{
+    Error, ExtensionDescriptor, ExtensionDiagnostic, ExtensionDiagnosticSeverity, ExtensionKind,
+    ExtensionSourceKind, ExtensionStatus, PermissionDecision, PermissionResult, Result,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -192,12 +195,24 @@ impl McpClient {
     /// List available prompts from the MCP server (MCP `prompts/list`).
     pub async fn list_prompts(&self) -> Result<Vec<McpPromptDef>> {
         let result = self.request("prompts/list", json!({})).await?;
-        let prompts = result.get("prompts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let prompts = result
+            .get("prompts")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut out = Vec::new();
         for p in prompts {
             out.push(McpPromptDef {
-                name: p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                description: p.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                name: p
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                description: p
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             });
         }
         Ok(out)
@@ -425,6 +440,14 @@ impl Tool for McpTool {
 /// Per-server spawn/list failures are logged and skipped (non-fatal).
 pub async fn register(registry: &mut ToolRegistry, configs: &[(String, McpServerConfig)]) {
     for (name, cfg) in configs {
+        let source = format!("mcp-config:{name}");
+        let mut descriptor = ExtensionDescriptor::new(
+            ExtensionKind::Mcp,
+            name.clone(),
+            source.clone(),
+            ExtensionSourceKind::Explicit,
+            100,
+        );
         match McpClient::spawn(name, cfg).await {
             Ok(client) => match client.list_tools().await {
                 Ok(defs) => {
@@ -436,11 +459,66 @@ pub async fn register(registry: &mut ToolRegistry, configs: &[(String, McpServer
                             std::sync::Arc::clone(&client),
                         )));
                     }
+                    descriptor.detail = Some(format!("connected; {n} tool(s)"));
+                    registry.add_extension_descriptor(descriptor);
                     tracing::info!("MCP server `{name}`: registered {n} tool(s)");
                 }
-                Err(e) => tracing::warn!("MCP server `{name}` tools/list failed: {e}"),
+                Err(error) => {
+                    descriptor.status = ExtensionStatus::Failed;
+                    descriptor.detail = Some(error.to_string());
+                    registry.add_extension_descriptor(descriptor);
+                    registry.add_extension_diagnostic(mcp_failure(name, &source, &error));
+                    tracing::warn!("MCP server `{name}` tools/list failed: {error}");
+                }
             },
-            Err(e) => tracing::warn!("MCP server `{name}` spawn failed: {e}"),
+            Err(error) => {
+                descriptor.status = ExtensionStatus::Failed;
+                descriptor.detail = Some(error.to_string());
+                registry.add_extension_descriptor(descriptor);
+                registry.add_extension_diagnostic(mcp_failure(name, &source, &error));
+                tracing::warn!("MCP server `{name}` spawn failed: {error}");
+            }
         }
+    }
+}
+
+fn mcp_failure(name: &str, source: &str, error: &Error) -> ExtensionDiagnostic {
+    ExtensionDiagnostic {
+        severity: ExtensionDiagnosticSeverity::Error,
+        code: "mcp_load_failed".into(),
+        kind: ExtensionKind::Mcp,
+        name: Some(name.to_string()),
+        source: Some(source.to_string()),
+        message: format!("MCP server `{name}` failed: {error}"),
+        suggestion: "check the command and environment; other extensions remain available".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_mcp_is_isolated_from_core_registry() {
+        let (mut registry, _) = crate::register_all();
+        let core_count = registry.len();
+        let configs = vec![(
+            "broken".to_string(),
+            McpServerConfig {
+                kind: "stdio".into(),
+                command: "nonoclaw-command-that-does-not-exist".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        )];
+        register(&mut registry, &configs).await;
+        assert_eq!(registry.len(), core_count);
+        assert!(registry.find("Read").is_some());
+        assert!(registry
+            .extension_descriptors()
+            .iter()
+            .any(|descriptor| descriptor.name == "broken"
+                && descriptor.status == ExtensionStatus::Failed));
+        assert_eq!(registry.extension_diagnostics().len(), 1);
     }
 }

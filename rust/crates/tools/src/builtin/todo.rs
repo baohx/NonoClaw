@@ -1,66 +1,33 @@
-//! TodoWrite tool. Mirrors `src/tools/TodoWriteTool/`. Maintains a structured
-//! task list in a process-shared store so the engine/UI can render progress.
+//! TodoWrite compatibility adapter over the canonical scoped TaskStore.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use nonoclaw_core::{Error, PermissionResult, Result};
-use serde::{Deserialize, Serialize};
+use nonoclaw_core::{Error, PermissionResult, Result, TaskStatus};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::task_store::TaskStore;
+pub use crate::task_store::TodoItem;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const PROMPT: &str = "Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.\n\n## When to Use This Tool\nUse this tool proactively when a task requires 3+ distinct steps, is non-trivial, when the user explicitly requests a todo list, when the user provides multiple tasks, or after receiving new instructions.\n\n## When NOT to Use This Tool\nSkip when there is only a single straightforward task, the task is trivial, or it can be completed in fewer than 3 trivial steps.\n\nProvide the full updated todo list when calling this tool. Mark a task in_progress when starting it (ideally only one at a time) and completed when done.";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-impl TodoStatus {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "in_progress" => TodoStatus::InProgress,
-            "completed" => TodoStatus::Completed,
-            _ => TodoStatus::Pending,
-        }
-    }
-    #[allow(dead_code)]
-    fn label(self) -> &'static str {
-        match self {
-            TodoStatus::Pending => "pending",
-            TodoStatus::InProgress => "in_progress",
-            TodoStatus::Completed => "completed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
-    pub content: String,
-    pub status: TodoStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_form: Option<String>,
-}
-
-/// Shared todo list. `Arc<TodoStore>` is held by the tool and the engine.
-pub type TodoStore = Mutex<Vec<TodoItem>>;
+/// Compatibility names retained for existing Rust callers.
+pub type TodoStatus = TaskStatus;
+pub type TodoStore = TaskStore;
 
 pub fn new_store() -> Arc<TodoStore> {
-    Arc::new(Mutex::new(Vec::new()))
+    Arc::new(TaskStore::new())
 }
 
 pub struct TodoWriteTool {
-    store: Arc<TodoStore>,
+    store: Arc<TaskStore>,
 }
 
 impl TodoWriteTool {
-    pub fn new(store: Arc<TodoStore>) -> Self {
-        TodoWriteTool { store }
+    pub fn new(store: Arc<TaskStore>) -> Self {
+        Self { store }
     }
 }
 
@@ -104,117 +71,141 @@ impl Tool for TodoWriteTool {
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolCtx<'_>) -> PermissionResult {
-        // Updating the in-memory todo list is not destructive to the user's
-        // filesystem; auto-allow.
         PermissionResult::allow()
     }
 
     async fn call(
         &self,
         input: Value,
-        _ctx: &ToolCtx<'_>,
+        ctx: &ToolCtx<'_>,
         _cancel: CancellationToken,
     ) -> Result<ToolResult> {
-        let arr = input["todos"].as_array().ok_or_else(|| Error::Tool {
+        let array = input["todos"].as_array().ok_or_else(|| Error::Tool {
             tool: "TodoWrite".into(),
             message: "missing required array field `todos`".into(),
         })?;
-        let mut items: Vec<TodoItem> = Vec::with_capacity(arr.len());
-        for v in arr {
-            let content = v["content"]
+        let mut items = Vec::with_capacity(array.len());
+        for value in array {
+            let content = value["content"]
                 .as_str()
                 .ok_or_else(|| Error::Tool {
                     tool: "TodoWrite".into(),
                     message: "each todo requires `content`".into(),
                 })?
                 .to_string();
-            let status = TodoStatus::from_str(v["status"].as_str().unwrap_or("pending"));
-            let active_form = v["activeForm"].as_str().map(|s| s.to_string());
+            // Preserve TodoWrite's historical compatibility fallback. The
+            // model-facing schema still accepts only the three canonical values.
+            let status = value["status"]
+                .as_str()
+                .and_then(TaskStatus::parse)
+                .unwrap_or(TaskStatus::Pending);
             items.push(TodoItem {
                 content,
                 status,
-                active_form,
+                active_form: value["activeForm"].as_str().map(ToOwned::to_owned),
             });
         }
 
-        let summary = {
-            let mut store = self.store.lock().expect("todo store poisoned");
-            let total = items.len();
-            let done = items
-                .iter()
-                .filter(|t| t.status == TodoStatus::Completed)
-                .count();
-            let in_prog = items
-                .iter()
-                .filter(|t| t.status == TodoStatus::InProgress)
-                .count();
-            *store = items;
-            format!("Todos updated: {done}/{total} completed, {in_prog} in progress")
-        };
-        Ok(ToolResult::ok(summary))
+        let total = items.len();
+        let done = items
+            .iter()
+            .filter(|item| item.status == TaskStatus::Completed)
+            .count();
+        let in_progress = items
+            .iter()
+            .filter(|item| item.status == TaskStatus::InProgress)
+            .count();
+        let change = self.store.replace_todos(ctx.task_scope(), items);
+        Ok(ToolResult::ok(format!(
+            "Todos updated: {done}/{total} completed, {in_progress} in progress"
+        ))
+        .with_task_change(change))
     }
 }
 
-/// Render the current store as a numbered list (used by the engine for display).
-pub fn render(store: &TodoStore) -> String {
-    let store = store.lock().expect("todo store poisoned");
-    if store.is_empty() {
+/// Render one agent's current todo scope as a numbered list.
+pub fn render(store: &TodoStore, scope: &str) -> String {
+    let items = store.todos(scope);
+    if items.is_empty() {
         return String::new();
     }
-    let mut out = String::from("Task list:\n");
-    for (i, t) in store.iter().enumerate() {
-        let mark = match t.status {
-            TodoStatus::Completed => "[x]",
-            TodoStatus::InProgress => "[>]",
-            TodoStatus::Pending => "[ ]",
+    let mut output = String::from("Task list:\n");
+    for (index, item) in items.iter().enumerate() {
+        let mark = match item.status {
+            TaskStatus::Completed => "[x]",
+            TaskStatus::InProgress => "[>]",
+            TaskStatus::Pending => "[ ]",
         };
-        out.push_str(&format!("  {} {}. {}\n", mark, i + 1, t.content));
+        output.push_str(&format!("  {mark} {}. {}\n", index + 1, item.content));
     }
-    out
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fixture_store() -> Arc<TaskStore> {
+        Arc::new(TaskStore::with_dir(
+            std::env::temp_dir().join(format!("nonoclaw-todo-test-{}", uuid::Uuid::new_v4())),
+        ))
+    }
+
     #[tokio::test]
-    async fn replaces_store_contents() {
-        let store = new_store();
+    async fn replaces_only_the_callers_scope_and_emits_a_change() {
+        // **Validates: Requirements 1.4, 2.3, 2.5**
+        let store = fixture_store();
         let tool = TodoWriteTool::new(Arc::clone(&store));
-        let opts = crate::tool::ToolOptions {
+        let options = crate::tool::ToolOptions {
             model: "x".into(),
             permission_mode: nonoclaw_core::PermissionMode::Default,
             is_non_interactive: true,
             max_budget_usd: None,
         };
         let cancel = CancellationToken::new();
-        let cwd = std::path::Path::new("/tmp");
         let ctx = ToolCtx {
-            cwd,
-            options: &opts,
+            cwd: std::path::Path::new("/tmp"),
+            options: &options,
             cancel: &cancel,
+            task_scope: Some("parent"),
             subagent: None,
             question: None,
             background_registry: None,
         };
-        let input = json!({"todos":[
-            {"content":"a","status":"completed"},
-            {"content":"b","status":"in_progress"},
-            {"content":"c","status":"pending"}
-        ]});
-        tool.call(input, &ctx, CancellationToken::new())
+        let result = tool
+            .call(
+                json!({"todos":[
+                    {"content":"a","status":"completed"},
+                    {"content":"b","status":"in_progress"},
+                    {"content":"c","status":"pending"}
+                ]}),
+                &ctx,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
-        let s = store.lock().unwrap();
-        assert_eq!(s.len(), 3);
-        assert_eq!(s[0].status, TodoStatus::Completed);
-        assert_eq!(s[1].status, TodoStatus::InProgress);
-        assert_eq!(s[2].status, TodoStatus::Pending);
+        assert_eq!(store.todos("parent").len(), 3);
+        assert!(store.todos("child").is_empty());
+        assert_eq!(result.task_changes.len(), 1);
+        assert_eq!(result.task_changes[0].scope, "parent");
+        assert_eq!(result.task_changes[0].tasks.len(), 3);
     }
 
     #[test]
-    fn status_round_trip() {
-        assert_eq!(TodoStatus::from_str("in_progress"), TodoStatus::InProgress);
-        assert_eq!(TodoStatus::InProgress.label(), "in_progress");
+    fn status_and_render_use_the_shared_domain() {
+        let store = fixture_store();
+        assert_eq!(
+            TaskStatus::parse("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
+        store.replace_todos(
+            "agent",
+            vec![TodoItem {
+                content: "work".into(),
+                status: TaskStatus::InProgress,
+                active_form: None,
+            }],
+        );
+        assert!(render(&store, "agent").contains("[>] 1. work"));
     }
 }

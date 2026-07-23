@@ -6,33 +6,35 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use futures::stream::{FuturesUnordered, StreamExt};
 use nonoclaw_api::{Client, RequestParams, StreamEvent, ThinkingConfig, ToolSchema};
 use nonoclaw_core::{
     CacheControl, ContentBlock, Message, MessageContent, PermissionDecision, PermissionMode,
-    Result, StopReason, Usage, ValidationResult,
+    Result, RunEvent, SessionRepair, StopReason, StreamState, TechnicalStatus, Usage, UsagePart,
 };
 use nonoclaw_tools::permissions::PermissionGate;
-use nonoclaw_tools::tool::{QuestionResolver, SubagentRunner, ToolCtx};
-use nonoclaw_tools::{TodoStore, ToolOptions, ToolRegistry};
+use nonoclaw_tools::tool::{QuestionResolver, SubagentRunner};
+use nonoclaw_tools::{
+    PermissionResolverFuture, TodoStore, ToolCall, ToolExecutionContext, ToolExecutor,
+    ToolHookRunner, ToolOptions, ToolPermissionRequest, ToolPermissionResolver, ToolRegistry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agents::SubagentLifecycle;
 use crate::compact::{compact_messages, KEEP_RECENT_TURNS};
 use crate::context::{get_system_context, get_user_context, load_memory_prompt};
 use crate::prompt::build_system_blocks;
-use crate::session::{append_message, new_session_id, write_header};
+use crate::run::{RunContext, RunController, RunLimits, RunTerminalStatus};
+use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
 use crate::skills::SkillsManager;
 use crate::tokens::estimate_total;
 use nonoclaw_tools::BackgroundTaskRegistry;
 
-/// Minimum number of recent messages kept verbatim during auto-compaction.
-const KEEP_RECENT_MESSAGES: usize = 6;
-
-/// A request to the UI to resolve an interactive permission `Ask`. The resolver
-/// (supplied by the TUI) renders a prompt and returns the user's decision.
+/// A request to the active UI adapter to resolve an interactive permission
+/// `Ask` and return the user's decision.
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
     pub tool_use_id: String,
@@ -47,6 +49,48 @@ pub type ResolverFut = Pin<Box<dyn Future<Output = PermissionDecision> + Send>>;
 /// yields the user's decision. `None` (headless) means unresolved `Ask`s are
 /// auto-denied.
 pub type PermissionResolver = Arc<dyn Fn(PermissionRequest) -> ResolverFut + Send + Sync>;
+
+struct EnginePermissionResolver(PermissionResolver);
+
+impl ToolPermissionResolver for EnginePermissionResolver {
+    fn resolve(&self, request: ToolPermissionRequest) -> PermissionResolverFuture {
+        (self.0)(PermissionRequest {
+            tool_use_id: request.tool_use_id,
+            tool_name: request.tool_name,
+            input: request.input,
+            message: request.message,
+        })
+    }
+}
+
+struct EngineToolHooks {
+    runtime: crate::hooks::HookRuntime,
+}
+
+#[async_trait::async_trait]
+impl ToolHookRunner for EngineToolHooks {
+    async fn pre_tool_use(&self, tool_name: &str, input: &Value) -> PermissionDecision {
+        let context = crate::hooks::tool_context_for(
+            crate::hooks::HookType::PreToolUse,
+            tool_name,
+            input,
+            None,
+        );
+        self.runtime
+            .decide(crate::hooks::HookType::PreToolUse, tool_name, &context)
+            .await
+    }
+
+    async fn post_tool_use(&self, tool_name: &str, input: &Value, success: bool) {
+        let hook_type = if success {
+            crate::hooks::HookType::PostToolUse
+        } else {
+            crate::hooks::HookType::PostToolUseFailure
+        };
+        let context = crate::hooks::tool_context_for(hook_type, tool_name, input, None);
+        self.runtime.run(hook_type, tool_name, &context).await;
+    }
+}
 
 /// Configuration for a query run. Mirrors the CLI flags that reach the engine.
 //
@@ -70,12 +114,12 @@ pub struct EngineOptions {
     /// `true` for `--print` / SDK mode. Unresolved permission `Ask`s are
     /// auto-denied (no TTY to prompt).
     pub is_non_interactive: bool,
-    /// Interactive permission resolver (TUI). When set and the session is
+    /// Interactive permission resolver. When set and the session is
     /// interactive, `Ask` decisions are surfaced to the user; otherwise
     /// (headless) `Ask` is auto-denied.
     pub permission_resolver: Option<PermissionResolver>,
-    /// Interactive question resolver (TUI) for AskUserQuestion. When set and the
-    /// session is interactive, the tool can surface a multi-choice to the user;
+    /// Interactive question resolver for AskUserQuestion. When set and the
+    /// session is interactive, the tool can surface a multiple-choice prompt;
     /// otherwise it returns a default answer.
     pub question_resolver: Option<Arc<dyn QuestionResolver>>,
     /// When true, auto-compact the transcript once it exceeds
@@ -86,11 +130,11 @@ pub struct EngineOptions {
     /// Optional model override for compaction summarization. Falls back to
     /// `model` when unset. Set to a cheap model (e.g. haiku) to save costs.
     pub compact_model: Option<String>,
-    /// Credentials for the compact model (if different from main model).
-    /// Stored so we can build a separate client for cross-format compaction.
-    #[allow(clippy::type_complexity)]
-    pub compact_model_creds: Option<(String, String, Option<String>)>,
-    // (base_url, api_key, api_format)
+    /// Client selected by the canonical factory for compaction. Falls back to
+    /// the conversation client if construction failed during configuration.
+    pub compact_client: Option<Arc<Client>>,
+    /// Client selected by the canonical factory for child agents.
+    pub subagent_client: Option<Arc<Client>>,
     /// Chars-per-token divisor for the token estimator. Default 4 (Claude).
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
@@ -99,6 +143,11 @@ pub struct EngineOptions {
     /// ratio and auto-compact threshold. Falls back to the global
     /// `contextWindow` setting when the model profile doesn't specify one.
     pub context_window: Option<usize>,
+    /// Optional run budget propagated to tools and recorded in RunContext.
+    /// Existing entry points leave this unset until a budget is configured.
+    pub max_budget_usd: Option<f64>,
+    /// Safe diagnostics derived by canonical configuration/extension discovery.
+    pub startup_events: Vec<RunEvent>,
 }
 
 impl EngineOptions {
@@ -144,44 +193,44 @@ impl Default for EngineOptions {
             auto_compact: true,
             compact_threshold_tokens: 150_000,
             compact_model: None,
-            compact_model_creds: None,
+            compact_client: None,
+            subagent_client: None,
             chars_per_token: 4,
             context_window: None,
+            max_budget_usd: None,
+            startup_events: Vec::new(),
         }
     }
 }
 
-/// Events emitted during a run for live display (headless printing or, later,
-/// the TUI) and for the remote wire protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Backward-compatible name retained for existing CLI and library consumers.
+pub type EngineEvent = RunEvent;
+
+/// Explicit reason a run stopped. This is preserved in the final result and in
+/// the controller's exactly-once terminal commit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum EngineEvent {
-    TextDelta { text: String },
-    ToolUseStart {
-        id: String,
-        name: String,
-        input: Value,
+pub enum RunFinishReason {
+    Completed {
+        detail: String,
     },
-    ToolResult {
-        id: String,
-        ok: bool,
-        preview: String,
+    MaxTurns {
+        max_turns: u32,
+        suggestion: String,
     },
-    AssistantDone {
-        text: String,
+    BudgetExceeded {
+        max_budget_usd: f64,
+        suggestion: String,
     },
-    /// Fired when the transcript was auto-compacted.
-    Compacted {
-        removed: usize,
-        kept: usize,
-        tokens_before: usize,
-        tokens_after: usize,
+    ContextLimit {
+        context_window: usize,
+        suggestion: String,
     },
-    /// The real model the API reported in `message_start` (e.g. a configured
-    /// alias resolving to `deepseek-chat`). Emitted once per turn so the UI can
-    /// show what actually served the request.
-    ModelInfo {
-        model: String,
+    Cancelled {
+        reason: String,
+    },
+    Error {
+        message: String,
     },
 }
 
@@ -192,6 +241,17 @@ pub struct FinalResult {
     pub usage: Usage,
     pub turns: u32,
     pub stop_reason: Option<StopReason>,
+    pub finish_reason: RunFinishReason,
+}
+
+/// Cancels run-owned child work on every return path, including provider/tool
+/// errors that use `?` before the normal lifecycle epilogue.
+struct CancelChildrenOnDrop(CancellationToken);
+
+impl Drop for CancelChildrenOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 pub struct QueryEngine {
@@ -202,12 +262,16 @@ pub struct QueryEngine {
     messages: Vec<Message>,
     total_usage: Usage,
     session_id: String,
-    session_file: Option<PathBuf>,
+    session: Option<Session>,
+    session_revision: u64,
+    session_repairs: Vec<SessionRepair>,
     hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
     /// Background compaction task spawned when tokens reach 80% threshold.
     pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
     /// Message count when background compact was spawned (for correct delta).
     pending_compact_msg_count: usize,
+    /// Session revision the background compact was based on.
+    pending_compact_revision: u64,
 }
 
 impl QueryEngine {
@@ -225,37 +289,41 @@ impl QueryEngine {
             messages: Vec::new(),
             total_usage: Usage::default(),
             session_id: new_session_id(),
-            session_file: None,
+            session: None,
+            session_revision: 0,
+            session_repairs: Vec::new(),
             hooks: Vec::new(),
             pending_compact: None,
             pending_compact_msg_count: 0,
+            pending_compact_revision: 0,
         }
     }
 
-    /// Construct an engine with a preloaded transcript (resume) and a session
-    /// file to append new turns to. `messages` is the loaded history;
-    /// `session_id` / `session_file` identify the on-disk session.
+    /// Construct an engine from a canonical session snapshot. All subsequent
+    /// transcript mutations are committed through that session's writer actor.
     pub fn with_session(
         client: Arc<Client>,
         registry: Arc<ToolRegistry>,
         todos: Arc<TodoStore>,
         options: EngineOptions,
-        messages: Vec<Message>,
-        session_id: String,
-        session_file: Option<PathBuf>,
+        session: Session,
+        snapshot: SessionSnapshot,
     ) -> Self {
         QueryEngine {
             client,
             registry,
             todos,
             options,
-            messages,
+            messages: snapshot.messages,
             total_usage: Usage::default(),
-            session_id,
-            session_file,
+            session_id: session.id().to_string(),
+            session: Some(session),
+            session_revision: snapshot.revision,
+            session_repairs: snapshot.repairs,
             hooks: Vec::new(),
             pending_compact: None,
             pending_compact_msg_count: 0,
+            pending_compact_revision: 0,
         }
     }
 
@@ -269,59 +337,151 @@ impl QueryEngine {
         std::mem::take(&mut self.messages)
     }
 
-    /// Append a message to the session file (if persistence is enabled).
-    fn persist(&self, msg: &Message) {
-        if let Some(path) = &self.session_file {
-            if let Err(e) = append_message(path, msg) {
-                tracing::warn!("failed to persist session message: {e}");
+    /// Commit a transcript message through the canonical session actor.
+    async fn persist(&mut self, msg: Message) {
+        if let Some(session) = &self.session {
+            match session.append(msg).await {
+                Ok(revision) => self.session_revision = revision,
+                Err(error) => tracing::warn!(%error, "failed to persist session message"),
             }
         }
     }
 
-    /// Run the agent loop on a user prompt. `on_event` receives live updates.
+    /// Atomically replace the persisted transcript only if no intervening
+    /// session command has advanced the revision used by compaction.
+    async fn persist_compaction(&mut self, messages: Vec<Message>, expected_revision: u64) -> bool {
+        let Some(session) = &self.session else {
+            return true;
+        };
+        match session
+            .replace_after_compact(messages, expected_revision)
+            .await
+        {
+            Ok(revision) => {
+                self.session_revision = revision;
+                true
+            }
+            Err(SessionError::RevisionConflict { current, .. }) => {
+                self.session_revision = current;
+                tracing::debug!(
+                    expected_revision,
+                    current_revision = current,
+                    "discarding stale compact replacement"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist compact replacement");
+                false
+            }
+        }
+    }
+
+    pub fn run_context(&self, cwd: PathBuf) -> RunContext {
+        RunContext::new(
+            self.session_id.clone(),
+            cwd,
+            self.options.model.clone(),
+            RunLimits {
+                max_turns: self.options.max_turns,
+                max_budget_usd: self.options.max_budget_usd,
+                context_window: self.options.context_window,
+            },
+        )
+    }
+
+    pub fn child_run_context(&self, parent: &RunContext, cwd: PathBuf) -> RunContext {
+        parent.child(
+            self.session_id.clone(),
+            cwd,
+            self.options.model.clone(),
+            RunLimits {
+                max_turns: self.options.max_turns,
+                max_budget_usd: self.options.max_budget_usd,
+                context_window: self.options.context_window,
+            },
+        )
+    }
+
+    /// Backwards-compatible direct execution. Production entry points use
+    /// `RunController`; tests and library callers retain this convenience API.
     pub async fn run(
         &mut self,
         user_content: MessageContent,
         cwd: &Path,
+        on_event: impl FnMut(&EngineEvent),
+    ) -> Result<FinalResult> {
+        let context = self.run_context(cwd.to_path_buf());
+        self.run_with_context(user_content, &context, on_event)
+            .await
+    }
+
+    /// Run the agent loop inside the canonical run identity and token tree.
+    pub async fn run_with_context(
+        &mut self,
+        user_content: MessageContent,
+        context: &RunContext,
         mut on_event: impl FnMut(&EngineEvent),
     ) -> Result<FinalResult> {
+        let cwd = context.cwd.as_path();
+        if context.cancel.is_cancelled() {
+            return Err(nonoclaw_core::Error::Cancelled);
+        }
+        let run_started_at = Instant::now();
+        on_event(&RunEvent::RunStarted {
+            requested_model: self.options.model.clone(),
+            max_turns: self.options.max_turns,
+            max_budget_usd: self.options.max_budget_usd,
+        });
+        for diagnostic in self.options.startup_events.clone() {
+            on_event(&diagnostic);
+        }
         // Extract a plain-text preview for hooks / logging.
         let user_text = match &user_content {
             MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(bs) => bs.iter()
-                .filter_map(|b| match b { ContentBlock::Text { text, .. } => Some(text.as_str()), _ => None })
+            MessageContent::Blocks(bs) => bs
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
                 .join(""),
         };
 
         self.hooks = crate::hooks::load_hooks(cwd);
-        // SessionStart + UserPromptSubmit hooks
-        crate::hooks::run_hooks(
-            &self.hooks,
-            crate::hooks::HookType::SessionStart,
-            "*",
-            &crate::hooks::lifecycle_context("SessionStart"),
-        )
-        .await;
-        crate::hooks::run_hooks(
-            &self.hooks,
-            crate::hooks::HookType::UserPromptSubmit,
-            "*",
-            &crate::hooks::prompt_context(&user_text),
-        )
-        .await;
-        // Begin persistence: write the session header once, then each message
-        // as it's appended below.
-        if let Some(path) = &self.session_file {
-            let started = chrono::Local::now().to_rfc3339();
-            if let Err(e) = write_header(path, &self.session_id, cwd, &self.options.model, &started)
-            {
-                tracing::warn!("failed to write session header: {e}");
-            }
+        let hook_runtime = crate::hooks::HookRuntime::new(
+            self.hooks.clone(),
+            Some(Arc::clone(&self.client)),
+            self.options.model.clone(),
+            context.cancel.child_token(),
+        );
+        // SessionStart + UserPromptSubmit hooks.
+        hook_runtime
+            .run(
+                crate::hooks::HookType::SessionStart,
+                "*",
+                &crate::hooks::lifecycle_context("SessionStart"),
+            )
+            .await;
+        hook_runtime
+            .run(
+                crate::hooks::HookType::UserPromptSubmit,
+                "*",
+                &crate::hooks::prompt_context(&user_text),
+            )
+            .await;
+        for event in hook_runtime.drain_events() {
+            on_event(&event);
+        }
+        // Surface recoverable legacy-session damage through the normal engine
+        // event stream before new output is produced.
+        for repair in std::mem::take(&mut self.session_repairs) {
+            on_event(&EngineEvent::SessionRepair { repair });
         }
         let user_msg = Message::user(user_content.clone());
         self.messages.push(user_msg.clone());
-        self.persist(&user_msg);
+        self.persist(user_msg).await;
 
         // Assemble system prompt + tool definitions once (stable for the run).
         let system_ctx = get_system_context(cwd).await;
@@ -370,6 +530,52 @@ impl QueryEngine {
             .map(|d| serde_json::to_string(d).map(|s| s.len()).unwrap_or(0))
             .sum();
         let system_chars: usize = system_blocks.iter().map(|b| b.text.chars().count()).sum();
+        let skill_count = self
+            .options
+            .skills_manager
+            .as_ref()
+            .map(|manager| manager.read().unwrap().all_active().len())
+            .unwrap_or(0);
+        on_event(&RunEvent::ContextPrepared {
+            estimated_tokens: estimate_total(
+                &self.messages,
+                system_chars,
+                tools_chars,
+                self.options.chars_per_token,
+            ),
+            context_window: self.options.context_window,
+            tool_count: tool_defs.len(),
+            skill_count,
+        });
+        if let Some(manager) = &self.options.skills_manager {
+            for diagnostic in manager.read().unwrap().diagnostics() {
+                on_event(&RunEvent::ExtensionDiagnostic { diagnostic });
+            }
+        }
+        for descriptor in self.registry.extension_descriptors() {
+            if descriptor.kind == nonoclaw_core::ExtensionKind::Mcp {
+                on_event(&RunEvent::McpDiagnostic {
+                    server: descriptor.name.clone(),
+                    status: match descriptor.status {
+                        nonoclaw_core::ExtensionStatus::Active => TechnicalStatus::Succeeded,
+                        nonoclaw_core::ExtensionStatus::Pending => TechnicalStatus::Pending,
+                        nonoclaw_core::ExtensionStatus::Shadowed
+                        | nonoclaw_core::ExtensionStatus::Failed
+                        | nonoclaw_core::ExtensionStatus::Disconnected => TechnicalStatus::Failed,
+                    },
+                    source: Some(descriptor.source.clone()),
+                    detail: descriptor
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| "MCP extension state resolved".into()),
+                });
+            }
+        }
+        for diagnostic in self.registry.extension_diagnostics() {
+            on_event(&RunEvent::ExtensionDiagnostic {
+                diagnostic: diagnostic.clone(),
+            });
+        }
         let gate = PermissionGate::new(
             self.options.permission_mode,
             self.options.allowed_tools.clone(),
@@ -379,14 +585,34 @@ impl QueryEngine {
         // Subagent runner: shares the client + toolset; children exclude Agent
         // (no recursion) and TodoWrite (avoid clobbering the parent's list).
         let spawner = EngineSubagent {
-            client: Arc::clone(&self.client),
+            client: self
+                .options
+                .subagent_client
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.client)),
             registry: Arc::clone(&self.registry),
             options: self.options.clone(),
             cwd: cwd.to_path_buf(),
-            hooks: self.hooks.clone(),
+            hook_runtime: hook_runtime.clone(),
+            run_context: context.clone(),
+            task_store: Arc::clone(&self.todos),
+            lifecycle: SubagentLifecycle::new(context.cancel.clone()),
         };
+        let permission_resolver = self.options.permission_resolver.clone().map(|resolver| {
+            Arc::new(EnginePermissionResolver(resolver)) as Arc<dyn ToolPermissionResolver>
+        });
+        let tool_executor = ToolExecutor::from_env(
+            Arc::clone(&self.registry),
+            gate,
+            Arc::new(EngineToolHooks {
+                runtime: hook_runtime.clone(),
+            }),
+            permission_resolver,
+        );
+        let tool_options = self.tool_options();
 
-        let cancel = CancellationToken::new();
+        let cancel = context.cancel.child_token();
+        let _cancel_children_on_drop = CancelChildrenOnDrop(cancel.clone());
         let mut turns_made = 0u32;
         let mut last_text = String::new();
         let mut last_stop: Option<StopReason> = None;
@@ -396,23 +622,72 @@ impl QueryEngine {
         let mut last_skills_version: u64 = 0;
         if let Some(ref mgr) = self.options.skills_manager {
             let mut guard = mgr.write().unwrap();
+            if let Some(skill_name) = user_text
+                .strip_prefix('/')
+                .and_then(|rest| rest.split_whitespace().next())
+                .filter(|name| !name.is_empty())
+            {
+                guard.activate_slash_command(skill_name);
+            }
             let triggered = guard.match_triggers(&user_text);
             if !triggered.is_empty() {
                 tracing::info!(?triggered, "skills triggered by user input");
             }
+            for activation in guard.take_activation_events() {
+                on_event(&EngineEvent::SkillActivated {
+                    name: activation.name,
+                    reason: activation.reason,
+                    source: activation.source,
+                    version: activation.version,
+                });
+            }
             last_skills_version = guard.version();
         }
 
-        loop {
+        let finish_reason = loop {
+            if cancel.is_cancelled() {
+                return Err(nonoclaw_core::Error::Cancelled);
+            }
+
             // Inject background task completion notifications.
             if let Some(ref reg) = self.options.background_registry {
                 let notifications = reg.lock().unwrap().drain_notifications();
                 for task in &notifications {
+                    on_event(&RunEvent::BackgroundTaskChanged {
+                        task_id: task.id.clone(),
+                        status: match task.status {
+                            nonoclaw_tools::BackgroundTaskStatus::Completed => {
+                                TechnicalStatus::Succeeded
+                            }
+                            nonoclaw_tools::BackgroundTaskStatus::Failed => TechnicalStatus::Failed,
+                            nonoclaw_tools::BackgroundTaskStatus::Killed => {
+                                TechnicalStatus::Cancelled
+                            }
+                            nonoclaw_tools::BackgroundTaskStatus::Running
+                            | nonoclaw_tools::BackgroundTaskStatus::Backgrounded => {
+                                TechnicalStatus::Running
+                            }
+                        },
+                        exit_code: task.exit_code,
+                    });
                     let msg = format!(
                         "<task_notification>\n<task_id>{}</task_id>\n<status>{:?}</status>\n<command>{}</command>\n</task_notification>",
                         task.id, task.status, task.command
                     );
-                    self.messages.push(Message::user(MessageContent::from_text(&msg)));
+                    self.messages
+                        .push(Message::user(MessageContent::from_text(&msg)));
+                    hook_runtime
+                        .run(
+                            crate::hooks::HookType::Notification,
+                            "*",
+                            &serde_json::json!({
+                                "hook_event_name": "Notification",
+                                "task_id": task.id,
+                                "status": format!("{:?}", task.status),
+                                "command": task.command,
+                            }),
+                        )
+                        .await;
                 }
             }
 
@@ -446,7 +721,10 @@ impl QueryEngine {
             }
 
             if turns_made >= self.options.max_turns {
-                break;
+                break RunFinishReason::MaxTurns {
+                    max_turns: self.options.max_turns,
+                    suggestion: "continue the session or increase max_turns".into(),
+                };
             }
 
             // Two-pass auto-compact: check for completed background compact first.
@@ -458,25 +736,41 @@ impl QueryEngine {
             if compact_done {
                 let handle = self.pending_compact.take().unwrap();
                 let msg_count_at_spawn = self.pending_compact_msg_count;
+                let revision_at_spawn = self.pending_compact_revision;
                 match handle.await {
                     Ok(Ok(compacted)) => {
                         let kept = compacted.len();
-                        // Use the message count from when the compact was
-                        // spawned, NOT the current count (which may have grown).
                         let removed = msg_count_at_spawn.saturating_sub(kept);
-                        if removed > 0 && compacted.len() < self.messages.len() {
-                            // Only swap if the compacted result is actually
-                            // smaller than the current transcript.
-                            // Persist the first (summary) message.
-                            if let Some(first) = compacted.first() {
-                                self.persist(first);
-                            }
+                        if removed > 0
+                            && msg_count_at_spawn == self.messages.len()
+                            && self
+                                .persist_compaction(compacted.clone(), revision_at_spawn)
+                                .await
+                        {
                             self.messages = compacted;
                             on_event(&EngineEvent::Compacted {
-                                removed, kept, tokens_before: 0, tokens_after: 0,
+                                removed,
+                                kept,
+                                tokens_before: 0,
+                                tokens_after: 0,
                             });
+                            hook_runtime
+                                .run(
+                                    crate::hooks::HookType::PostCompact,
+                                    "*",
+                                    &crate::hooks::compact_context_for(
+                                        crate::hooks::HookType::PostCompact,
+                                        removed,
+                                        kept,
+                                        0,
+                                        0,
+                                    ),
+                                )
+                                .await;
                         } else {
-                            tracing::debug!("background compact stale — messages have grown since spawn, discarding");
+                            tracing::debug!(
+                                "background compact stale — transcript or revision changed since spawn"
+                            );
                         }
                     }
                     Ok(Err(e)) => tracing::warn!("background compact failed: {e}"),
@@ -487,22 +781,62 @@ impl QueryEngine {
             // Auto-compact: if the estimated prompt exceeds the threshold,
             // summarize the older transcript before the next turn.
             if self.options.auto_compact {
-                let est = estimate_total(&self.messages, system_chars, tools_chars, self.options.chars_per_token);
+                let est = estimate_total(
+                    &self.messages,
+                    system_chars,
+                    tools_chars,
+                    self.options.chars_per_token,
+                );
                 // Pre-fire: spawn background compact at 80% of threshold.
                 if est > self.options.compact_threshold_tokens * 8 / 10
                     && self.pending_compact.is_none()
                 {
-                    let model = self.options.compact_model.clone()
+                    let model = self
+                        .options
+                        .compact_model
+                        .clone()
                         .unwrap_or_else(|| self.options.model.clone());
-                    let compact_client = resolve_compact_client(
-                        &self.client, &self.options, &model,
-                    );
+                    let compact_client = self
+                        .options
+                        .compact_client
+                        .clone()
+                        .unwrap_or_else(|| Arc::clone(&self.client));
                     let messages = self.messages.clone();
                     let keep = KEEP_RECENT_TURNS;
                     let m = model.clone();
                     self.pending_compact_msg_count = messages.len();
+                    self.pending_compact_revision = self.session_revision;
+                    on_event(&RunEvent::CompactionStarted {
+                        automatic: true,
+                        tokens_before: est,
+                        messages_before: messages.len(),
+                    });
+                    hook_runtime
+                        .run(
+                            crate::hooks::HookType::PreCompact,
+                            "*",
+                            &crate::hooks::compact_context_for(
+                                crate::hooks::HookType::PreCompact,
+                                messages.len(),
+                                0,
+                                est,
+                                0,
+                            ),
+                        )
+                        .await;
+                    let compact_cancel = cancel.child_token();
                     let handle = tokio::spawn(async move {
-                        compact_messages(compact_client.as_ref(), &m, &messages, keep, crate::compact::CompactMode::Segments).await
+                        tokio::select! {
+                            biased;
+                            _ = compact_cancel.cancelled() => Err(nonoclaw_core::Error::Cancelled),
+                            result = compact_messages(
+                                compact_client.as_ref(),
+                                &m,
+                                &messages,
+                                keep,
+                                crate::compact::CompactMode::Segments,
+                            ) => result,
+                        }
                     });
                     self.pending_compact = Some(handle);
                 }
@@ -510,41 +844,60 @@ impl QueryEngine {
                 if est > self.options.compact_threshold_tokens {
                     let before = self.messages.len();
                     let tokens_before = est;
+                    let compact_revision = self.session_revision;
+                    on_event(&RunEvent::CompactionStarted {
+                        automatic: true,
+                        tokens_before,
+                        messages_before: before,
+                    });
                     // PreCompact hook
-                    crate::hooks::run_hooks(
-                        &self.hooks,
-                        crate::hooks::HookType::PreCompact,
-                        "*",
-                        &crate::hooks::compact_context(before, 0, est, 0),
-                    )
-                    .await;
+                    hook_runtime
+                        .run(
+                            crate::hooks::HookType::PreCompact,
+                            "*",
+                            &crate::hooks::compact_context_for(
+                                crate::hooks::HookType::PreCompact,
+                                before,
+                                0,
+                                est,
+                                0,
+                            ),
+                        )
+                        .await;
                     let compact_model = self
                         .options
                         .compact_model
                         .as_deref()
                         .unwrap_or(&self.options.model);
-                    // Build a client for the compact model if it uses a
-                    // different API format/provider than the main model.
-                    let compact_client = resolve_compact_client(
-                        &self.client, &self.options, compact_model,
+                    let compact_client = self
+                        .options
+                        .compact_client
+                        .clone()
+                        .unwrap_or_else(|| Arc::clone(&self.client));
+                    let compacted = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(nonoclaw_core::Error::Cancelled),
+                        result = compact_messages(
+                            compact_client.as_ref(),
+                            compact_model,
+                            &self.messages,
+                            KEEP_RECENT_TURNS,
+                            crate::compact::CompactMode::Segments,
+                        ) => result?,
+                    };
+                    let tokens_after = estimate_total(
+                        &compacted,
+                        system_chars,
+                        tools_chars,
+                        self.options.chars_per_token,
                     );
-                    let compacted = compact_messages(
-                        compact_client.as_ref(),
-                        compact_model,
-                        &self.messages,
-                        KEEP_RECENT_TURNS,
-                        crate::compact::CompactMode::Segments,
-                    )
-                    .await?;
-                    let tokens_after = estimate_total(&compacted, system_chars, tools_chars, self.options.chars_per_token);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
-                    if removed > 0 {
-                        // Persist the new summary message (first of the compacted
-                        // transcript) so the session file records the compaction.
-                        if let Some(first) = compacted.first() {
-                            self.persist(first);
-                        }
+                    if removed > 0
+                        && self
+                            .persist_compaction(compacted.clone(), compact_revision)
+                            .await
+                    {
                         self.messages = compacted;
                         on_event(&EngineEvent::Compacted {
                             removed,
@@ -553,13 +906,19 @@ impl QueryEngine {
                             tokens_after,
                         });
                         // PostCompact hook
-                        crate::hooks::run_hooks(
-                            &self.hooks,
-                            crate::hooks::HookType::PostCompact,
-                            "*",
-                            &crate::hooks::compact_context(removed, kept, est, tokens_after),
-                        )
-                        .await;
+                        hook_runtime
+                            .run(
+                                crate::hooks::HookType::PostCompact,
+                                "*",
+                                &crate::hooks::compact_context_for(
+                                    crate::hooks::HookType::PostCompact,
+                                    removed,
+                                    kept,
+                                    est,
+                                    tokens_after,
+                                ),
+                            )
+                            .await;
                     }
                 }
             }
@@ -576,20 +935,44 @@ impl QueryEngine {
                 thinking: self.options.thinking.clone(),
                 temperature: None,
                 betas: Vec::new(),
-                trace_label: Some(format!("{}:turn-{}", &self.session_id[..8.min(self.session_id.len())], turns_made)),
+                trace_label: Some(format!(
+                    "{}:turn-{}",
+                    &self.session_id[..8.min(self.session_id.len())],
+                    turns_made
+                )),
             };
 
-            let turn = match self.client.run_turn(&params, |ev| match ev {
-                StreamEvent::TextDelta { text } => {
-                    on_event(&EngineEvent::TextDelta { text: text.clone() });
-                }
-                StreamEvent::MessageStart { model, .. } => {
-                    if !model.is_empty() {
-                        on_event(&EngineEvent::ModelInfo { model: model.clone() });
-                    }
-                }
-                _ => {}
-            }).await {
+            let provider = format!("{:?}", self.client.api_format()).to_lowercase();
+            on_event(&RunEvent::ModelRequestStarted {
+                requested_model: self.options.model.clone(),
+                provider: provider.clone(),
+                turn: turns_made,
+            });
+            on_event(&RunEvent::StreamStateChanged {
+                state: StreamState::Connecting,
+                turn: turns_made,
+            });
+            let requested_model = self.options.model.clone();
+            let usage_before_turn = self.total_usage;
+            let turn = match self
+                .client
+                .run_turn_with_cancel(
+                    &params,
+                    |ev| {
+                        forward_stream_event(
+                            ev,
+                            &requested_model,
+                            &provider,
+                            turns_made,
+                            usage_before_turn,
+                            &mut on_event,
+                        )
+                    },
+                    cancel.child_token(),
+                )
+                .await
+                .map_err(|failure| failure.into_core())
+            {
                 Ok(t) => t,
                 Err(e) => {
                     // If the API rejects messages because of orphaned tool_use
@@ -604,22 +987,37 @@ impl QueryEngine {
                                 after = self.messages.len(),
                                 "repaired orphaned tool_use/tool_result pairs, retrying"
                             );
+                            on_event(&RunEvent::RecoveryApplied {
+                                category: "tool_pairing".into(),
+                                detail: "removed orphaned tool-use/result blocks before one retry"
+                                    .into(),
+                                items_affected: before.saturating_sub(self.messages.len()),
+                            });
                             let params2 = RequestParams {
                                 messages: strip_thinking(&self.messages),
-                                trace_label: Some(format!("{}:retry", &self.session_id[..8.min(self.session_id.len())])),
+                                trace_label: Some(format!(
+                                    "{}:retry",
+                                    &self.session_id[..8.min(self.session_id.len())]
+                                )),
                                 ..params.clone()
                             };
-                            self.client.run_turn(&params2, |ev| match ev {
-                                StreamEvent::TextDelta { text } => {
-                                    on_event(&EngineEvent::TextDelta { text: text.clone() });
-                                }
-                                StreamEvent::MessageStart { model, .. } => {
-                                    if !model.is_empty() {
-                                        on_event(&EngineEvent::ModelInfo { model: model.clone() });
-                                    }
-                                }
-                                _ => {}
-                            }).await?
+                            self.client
+                                .run_turn_with_cancel(
+                                    &params2,
+                                    |ev| {
+                                        forward_stream_event(
+                                            ev,
+                                            &requested_model,
+                                            &provider,
+                                            turns_made,
+                                            usage_before_turn,
+                                            &mut on_event,
+                                        )
+                                    },
+                                    cancel.child_token(),
+                                )
+                                .await
+                                .map_err(|failure| failure.into_core())?
                         } else {
                             return Err(e);
                         }
@@ -630,6 +1028,17 @@ impl QueryEngine {
             };
 
             self.total_usage.accumulate(&turn.usage);
+            on_event(&RunEvent::UsageUpdated {
+                turn: turns_made,
+                turn_usage: UsagePart {
+                    input_tokens: Some(turn.usage.input_tokens),
+                    output_tokens: Some(turn.usage.output_tokens),
+                    cache_creation_input_tokens: Some(turn.usage.cache_creation_input_tokens),
+                    cache_read_input_tokens: Some(turn.usage.cache_read_input_tokens),
+                },
+                total: self.total_usage,
+                max_budget_usd: self.options.max_budget_usd,
+            });
             last_stop = turn.stop_reason.clone();
 
             // Collect assistant text for display + the transcript message.
@@ -649,7 +1058,7 @@ impl QueryEngine {
             }
             let asst_msg = Message::assistant(MessageContent::from_blocks(turn.content.clone()));
             self.messages.push(asst_msg.clone());
-            self.persist(&asst_msg);
+            self.persist(asst_msg).await;
 
             let tool_uses: Vec<(String, String, Value)> = turn
                 .content
@@ -663,14 +1072,131 @@ impl QueryEngine {
                 .collect();
 
             if tool_uses.is_empty() || turn.stop_reason != Some(StopReason::ToolUse) {
-                break;
+                break RunFinishReason::Completed {
+                    detail: turn
+                        .stop_reason
+                        .as_ref()
+                        .map(|reason| format!("model stop reason: {}", reason.as_str()))
+                        .unwrap_or_else(|| "model returned no further tool calls".into()),
+                };
             }
 
-            // TODO(Phase 1+): run concurrency-safe tools concurrently. Phase 0
-            // executes tool_uses sequentially in order for simplicity.
-            let results = self
-                .execute_tools(&tool_uses, cwd, &gate, &cancel, &spawner, &mut on_event)
-                .await;
+            for (index, (id, name, input)) in tool_uses.iter().enumerate() {
+                on_event(&EngineEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: nonoclaw_core::redact_value(input.clone()),
+                });
+                on_event(&RunEvent::ToolQueued {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    index,
+                });
+                on_event(&RunEvent::ToolExecutionStarted {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    read_only: None,
+                    destructive: None,
+                });
+            }
+            let calls = tool_uses
+                .iter()
+                .map(|(id, name, input)| ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                })
+                .collect::<Vec<_>>();
+            let execution_context = ToolExecutionContext {
+                cwd,
+                options: &tool_options,
+                cancel: &cancel,
+                task_scope: Some(&context.session_id),
+                subagent: Some(&spawner),
+                question: self.options.question_resolver.as_deref(),
+                background_registry: self.options.background_registry.clone(),
+                is_non_interactive: self.options.is_non_interactive,
+            };
+            let executions = tool_executor.execute(&calls, &execution_context).await;
+            for execution in &executions {
+                on_event(&EngineEvent::ToolResult {
+                    id: execution.id.clone(),
+                    ok: !execution.is_error,
+                    preview: preview(&execution.content),
+                });
+                for change in &execution.task_changes {
+                    on_event(&EngineEvent::TaskChanged {
+                        change: change.clone(),
+                    });
+                }
+                for record in &execution.trace {
+                    match record.stage {
+                        nonoclaw_tools::ToolTraceStage::Validate
+                        | nonoclaw_tools::ToolTraceStage::Lookup => {
+                            on_event(&RunEvent::ToolValidation {
+                                tool_use_id: execution.id.clone(),
+                                tool_name: execution.name.clone(),
+                                ok: record.ok,
+                                detail: record.detail.clone(),
+                            });
+                        }
+                        nonoclaw_tools::ToolTraceStage::PermissionRequest => {
+                            on_event(&RunEvent::PermissionRequested {
+                                tool_use_id: execution.id.clone(),
+                                tool_name: execution.name.clone(),
+                                waiting_on: record.detail.clone(),
+                            });
+                        }
+                        nonoclaw_tools::ToolTraceStage::Permission => {
+                            on_event(&RunEvent::PermissionResolved {
+                                tool_use_id: execution.id.clone(),
+                                tool_name: execution.name.clone(),
+                                decision: if record.ok {
+                                    TechnicalStatus::Allowed
+                                } else {
+                                    TechnicalStatus::Denied
+                                },
+                                elapsed_ms: record.elapsed_ms,
+                            });
+                        }
+                        nonoclaw_tools::ToolTraceStage::Call => {
+                            on_event(&RunEvent::ToolExecutionFinished {
+                                tool_use_id: execution.id.clone(),
+                                tool_name: execution.name.clone(),
+                                status: if record.ok {
+                                    TechnicalStatus::Succeeded
+                                } else if context.cancel.is_cancelled() {
+                                    TechnicalStatus::Cancelled
+                                } else {
+                                    TechnicalStatus::Failed
+                                },
+                                elapsed_ms: record.elapsed_ms,
+                            });
+                        }
+                        nonoclaw_tools::ToolTraceStage::Normalize => {
+                            on_event(&RunEvent::ToolResultNormalized {
+                                tool_use_id: execution.id.clone(),
+                                original_chars: execution.original_chars,
+                                visible_chars: execution.content.chars().count(),
+                                truncated: execution.local_reference.is_some(),
+                                local_reference: execution
+                                    .local_reference
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().to_string()),
+                            });
+                        }
+                        nonoclaw_tools::ToolTraceStage::PreHook
+                        | nonoclaw_tools::ToolTraceStage::PostHook => {}
+                    }
+                }
+            }
+            for event in hook_runtime.drain_events() {
+                on_event(&event);
+            }
+            let results = executions
+                .into_iter()
+                .map(|result| (result.id, result.content, result.is_error))
+                .collect::<Vec<_>>();
 
             // Dynamic skill activation: extract file paths from Read/Write/Edit
             // tool uses and check against conditional skills + discover new skill
@@ -678,9 +1204,7 @@ impl QueryEngine {
             if let Some(ref mgr) = self.options.skills_manager {
                 let file_paths: Vec<PathBuf> = tool_uses
                     .iter()
-                    .filter(|(_, name, _)| {
-                        matches!(name.as_str(), "Read" | "Write" | "Edit")
-                    })
+                    .filter(|(_, name, _)| matches!(name.as_str(), "Read" | "Write" | "Edit"))
                     .filter_map(|(_, _, input)| {
                         input.get("file_path").and_then(|v| v.as_str()).map(|fp| {
                             if Path::new(fp).is_absolute() {
@@ -702,6 +1226,14 @@ impl QueryEngine {
                             "skills dynamically activated/discovered"
                         );
                     }
+                    for activation in guard.take_activation_events() {
+                        on_event(&EngineEvent::SkillActivated {
+                            name: activation.name,
+                            reason: activation.reason,
+                            source: activation.source,
+                            version: activation.version,
+                        });
+                    }
                 }
             }
 
@@ -711,212 +1243,48 @@ impl QueryEngine {
                 .collect();
             let tr_msg = Message::user(MessageContent::from_blocks(blocks));
             self.messages.push(tr_msg.clone());
-            self.persist(&tr_msg);
+            self.persist(tr_msg).await;
+        };
+
+        // Stop is the main-agent completion boundary; SessionEnd follows it.
+        hook_runtime
+            .run(
+                crate::hooks::HookType::Stop,
+                "*",
+                &crate::hooks::lifecycle_context("Stop"),
+            )
+            .await;
+        hook_runtime
+            .run(
+                crate::hooks::HookType::SessionEnd,
+                "*",
+                &crate::hooks::lifecycle_context("SessionEnd"),
+            )
+            .await;
+        for event in hook_runtime.drain_events() {
+            on_event(&event);
         }
 
-        // SessionEnd hook
-        crate::hooks::run_hooks(
-            &self.hooks,
-            crate::hooks::HookType::SessionEnd,
-            "*",
-            &crate::hooks::lifecycle_context("SessionEnd"),
-        )
-        .await;
+        // No run-owned background compaction task may outlive the run.
+        cancel.cancel();
+        if let Some(handle) = self.pending_compact.take() {
+            let _ = handle.await;
+        }
 
+        on_event(&RunEvent::RunFinished {
+            status: TechnicalStatus::Succeeded,
+            reason: format!("{finish_reason:?}"),
+            duration_ms: run_started_at.elapsed().as_millis() as u64,
+            turns: turns_made,
+            usage: self.total_usage,
+        });
         Ok(FinalResult {
             text: last_text,
             usage: self.total_usage,
             turns: turns_made,
             stop_reason: last_stop,
+            finish_reason,
         })
-    }
-
-    /// Validate + permission-gate + execute each tool_use, returning the
-    /// `(tool_use_id, result_content, is_error)` tuples in order.
-    ///
-    /// Mirrors CC's `partitionToolCalls` + `runTools`: consecutive
-    /// concurrency-safe tools are grouped into batches for parallel execution
-    /// (capped by `NONOCLAW_MAX_TOOL_CONCURRENCY`, default 10). Non-safe tools
-    /// run solo and serialise the pipeline.
-    async fn execute_tools(
-        &self,
-        tool_uses: &[(String, String, Value)],
-        cwd: &Path,
-        gate: &PermissionGate,
-        cancel: &CancellationToken,
-        spawner: &EngineSubagent,
-        on_event: &mut impl FnMut(&EngineEvent),
-    ) -> Vec<(String, String, bool)> {
-        let opts = self.tool_options();
-
-        // Emit ToolUseStart for all tool_uses up front (in order).
-        for (id, name, input) in tool_uses {
-            on_event(&EngineEvent::ToolUseStart {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
-        }
-
-        // Partition into batches of consecutive concurrency-safe tools.
-        let batches = partition_tool_uses(tool_uses, &self.registry);
-        let concurrency_cap = max_tool_concurrency();
-
-        let mut runs: Vec<Option<(String, String, bool)>> = vec![None; tool_uses.len()];
-
-        for batch in &batches {
-            if batch.is_concurrency_safe && batch.indices.len() > 1 {
-                // Run concurrently with cap.
-                let mut futs: FuturesUnordered<_> = batch
-                    .indices
-                    .iter()
-                    .map(|&i| {
-                        let (id, name, input) = &tool_uses[i];
-                        let cancel = cancel.child_token();
-                        let opts = opts.clone();
-                        async move {
-                            (i, self.run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel).await)
-                        }
-                    })
-                    .collect();
-
-                let mut inflight = 0usize;
-                while let Some((i, result)) = futs.next().await {
-                    runs[i] = Some(result);
-                    inflight += 1;
-                    // Feed more work if below cap (FuturesUnordered auto-manages
-                    // concurrency for queued futures; we just need to limit initial
-                    // spawn). Actually FuturesUnordered doesn't have a cap — it
-                    // eagerly spawns all. We handle this by limiting batch size
-                    // below.
-                    let _ = inflight; // all spawned, just collect
-                }
-            } else {
-                // Run sequentially.
-                for &i in &batch.indices {
-                    let (id, name, input) = &tool_uses[i];
-                    let cancel = cancel.child_token();
-                    let r = self
-                        .run_tool_pipeline(id, name, input.clone(), cwd, gate, spawner, &opts, cancel)
-                        .await;
-                    runs[i] = Some(r);
-                }
-            }
-        }
-
-        let runs: Vec<(String, String, bool)> = runs.into_iter().map(|r| r.unwrap()).collect();
-
-        // Emit ToolResult for each in order.
-        for (id, content, is_error) in &runs {
-            on_event(&EngineEvent::ToolResult {
-                id: id.clone(),
-                ok: !*is_error,
-                preview: preview(content),
-            });
-        }
-        runs
-    }
-
-    /// One tool_use's pipeline (validate → permission → call), no event side
-    /// effects — so callers can run many concurrently and emit events in order.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_tool_pipeline(
-        &self,
-        id: &str,
-        name: &str,
-        input: Value,
-        cwd: &Path,
-        gate: &PermissionGate,
-        spawner: &EngineSubagent,
-        opts: &ToolOptions,
-        cancel: CancellationToken,
-    ) -> (String, String, bool) {
-        let Some(tool) = self.registry.find(name) else {
-            return (id.into(), format!("Unknown tool: {name}"), true);
-        };
-
-        let ctx = ToolCtx {
-            cwd,
-            options: opts,
-            cancel: &cancel,
-            subagent: Some(spawner),
-            question: self.options.question_resolver.as_deref(),
-            background_registry: self.options.background_registry.clone(),
-        };
-
-        match tool.validate_input(&input, &ctx).await {
-            ValidationResult::Ok => {}
-            ValidationResult::Invalid { message, .. } => {
-                return (id.into(), format!("Validation error: {message}"), true);
-            }
-        }
-
-        // permission gate
-        let tool_decision = tool.check_permissions(&input, &ctx).await;
-        let is_read_only = tool.is_read_only(&input);
-        let mut decision = gate.decide(name, is_read_only, &tool_decision);
-        // Resolve an `Ask`: interactively via the resolver (TUI), or auto-deny
-        // in headless mode. `Allow`/`Deny` pass through unchanged.
-        if matches!(decision, PermissionDecision::Ask { .. }) {
-            if !self.options.is_non_interactive {
-                if let Some(resolver) = &self.options.permission_resolver {
-                    let req = PermissionRequest {
-                        tool_use_id: id.into(),
-                        tool_name: name.into(),
-                        input: input.clone(),
-                        message: match &decision {
-                            PermissionDecision::Ask { message } => message.clone(),
-                            _ => String::new(),
-                        },
-                    };
-                    decision = resolver(req).await;
-                }
-            } else {
-                decision = gate.headless_resolve(decision);
-            }
-        }
-
-        let (content, is_error) = match decision {
-            nonoclaw_core::PermissionDecision::Allow { updated_input } => {
-                // PreToolUse hooks
-                let pre_ctx = crate::hooks::tool_context(name, &input);
-                let pre = crate::hooks::run_pre_hooks(&self.hooks, name, &pre_ctx).await;
-                if !pre.is_allow() {
-                    ("Permission denied by PreToolUse hook".to_string(), true)
-                } else {
-                    let effective = updated_input.unwrap_or_else(|| input.clone());
-                    let r = tool.call(effective, &ctx, cancel.child_token()).await;
-                    // PostToolUse hooks (fire-and-forget after call)
-                    tokio::spawn({
-                        let hooks = self.hooks.clone();
-                        let name = name.to_string();
-                        let input = input.clone();
-                        async move {
-                            let ctx = crate::hooks::tool_context(&name, &input);
-                            crate::hooks::run_hooks(
-                                &hooks,
-                                crate::hooks::HookType::PostToolUse,
-                                &name,
-                                &ctx,
-                            )
-                            .await;
-                        }
-                    });
-                    match r {
-                        Ok(r) => (r.data, false),
-                        Err(e) => (format!("Error: {e}"), true),
-                    }
-                }
-            }
-            nonoclaw_core::PermissionDecision::Deny { reason } => {
-                (format!("Permission denied: {reason}"), true)
-            }
-            nonoclaw_core::PermissionDecision::Ask { message } => (
-                format!("Permission required (not granted): {message}"),
-                true,
-            ),
-        };
-        (id.into(), content, is_error)
     }
 
     fn tool_options(&self) -> ToolOptions {
@@ -924,7 +1292,7 @@ impl QueryEngine {
             model: self.options.model.clone(),
             permission_mode: self.options.permission_mode,
             is_non_interactive: self.options.is_non_interactive,
-            max_budget_usd: None,
+            max_budget_usd: self.options.max_budget_usd,
         }
     }
 
@@ -947,23 +1315,53 @@ impl QueryEngine {
             .collect()
     }
 
-    /// Clear the conversation history (for `/clear`).
-    pub fn clear(&mut self) {
+    /// Clear the conversation history through the same atomic session command
+    /// stream used by append and compact replacement.
+    pub async fn clear(&mut self) -> Result<()> {
+        if let Some(session) = &self.session {
+            self.session_revision = session
+                .clear()
+                .await
+                .map_err(|error| nonoclaw_core::Error::Other(error.to_string()))?;
+        }
         self.messages.clear();
+        Ok(())
     }
 
     /// Force a compaction now (regardless of threshold) if a safe split exists.
     /// Returns (removed, kept) message counts, or `None` if nothing compacted.
     pub async fn compact_now(&mut self) -> Result<Option<(usize, usize)>> {
         let before = self.messages.len();
+        let compact_revision = self.session_revision;
+        let runtime = crate::hooks::HookRuntime::new(
+            self.hooks.clone(),
+            Some(Arc::clone(&self.client)),
+            self.options.model.clone(),
+            CancellationToken::new(),
+        );
+        runtime
+            .run(
+                crate::hooks::HookType::PreCompact,
+                "*",
+                &crate::hooks::compact_context_for(
+                    crate::hooks::HookType::PreCompact,
+                    before,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+            .await;
         let compact_model = self
             .options
             .compact_model
             .as_deref()
             .unwrap_or(&self.options.model);
-        let compact_client = resolve_compact_client(
-            &self.client, &self.options, compact_model,
-        );
+        let compact_client = self
+            .options
+            .compact_client
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.client));
         let compacted = compact_messages(
             compact_client.as_ref(),
             compact_model,
@@ -973,24 +1371,142 @@ impl QueryEngine {
         )
         .await?;
         let kept = compacted.len();
-        if kept < before {
-            if let Some(first) = compacted.first() {
-                self.persist(first);
-            }
+        if kept < before
+            && self
+                .persist_compaction(compacted.clone(), compact_revision)
+                .await
+        {
             self.messages = compacted;
-            Ok(Some((before - kept, kept)))
+            let removed = before - kept;
+            runtime
+                .run(
+                    crate::hooks::HookType::PostCompact,
+                    "*",
+                    &crate::hooks::compact_context_for(
+                        crate::hooks::HookType::PostCompact,
+                        removed,
+                        kept,
+                        0,
+                        0,
+                    ),
+                )
+                .await;
+            Ok(Some((removed, kept)))
         } else {
             Ok(None)
         }
     }
 }
 
-/// Tool-result preview for display. Returns the content verbatim (tools
-/// already cap their own output, e.g. Bash ~30k chars) so the UI can show the
-/// full text with a scroll bar instead of a truncated one-liner. Only an
-/// extreme safety cap is applied to avoid pathological payloads.
+fn forward_stream_event(
+    event: &StreamEvent,
+    requested_model: &str,
+    provider: &str,
+    turn: u32,
+    total_before_turn: Usage,
+    on_event: &mut impl FnMut(&EngineEvent),
+) {
+    match event {
+        StreamEvent::MessageStart { model, usage, .. } => {
+            if !model.is_empty() {
+                on_event(&RunEvent::ModelInfo {
+                    model: model.clone(),
+                });
+                on_event(&RunEvent::ModelResolved {
+                    requested_model: requested_model.to_string(),
+                    actual_model: model.clone(),
+                    provider: provider.to_string(),
+                    turn,
+                });
+            }
+            let mut total = total_before_turn;
+            total.update_from_part(usage);
+            on_event(&RunEvent::UsageUpdated {
+                turn,
+                turn_usage: usage.clone(),
+                total,
+                max_budget_usd: None,
+            });
+        }
+        StreamEvent::TextDelta { text } => {
+            on_event(&RunEvent::StreamStateChanged {
+                state: StreamState::Streaming,
+                turn,
+            });
+            on_event(&RunEvent::TextDelta { text: text.clone() });
+        }
+        StreamEvent::ThinkingDelta { .. } => {
+            on_event(&RunEvent::ThinkingState { active: true, turn });
+        }
+        StreamEvent::MessageDelta { usage, .. } => {
+            let mut total = total_before_turn;
+            total.update_from_part(usage);
+            on_event(&RunEvent::UsageUpdated {
+                turn,
+                turn_usage: usage.clone(),
+                total,
+                max_budget_usd: None,
+            });
+        }
+        StreamEvent::MessageStop => {
+            on_event(&RunEvent::ThinkingState {
+                active: false,
+                turn,
+            });
+            on_event(&RunEvent::StreamStateChanged {
+                state: StreamState::Completed,
+                turn,
+            });
+        }
+        StreamEvent::CapabilityStatus { feature, status } => {
+            on_event(&RunEvent::ProviderDiagnostic {
+                provider: provider.to_string(),
+                category: format!("capability_{feature:?}").to_lowercase(),
+                status: if status.is_supported() {
+                    TechnicalStatus::Succeeded
+                } else {
+                    TechnicalStatus::Failed
+                },
+                detail: match status {
+                    nonoclaw_api::CapabilityStatus::Supported => "supported".into(),
+                    nonoclaw_api::CapabilityStatus::Unsupported { reason } => reason.to_string(),
+                },
+            });
+        }
+        StreamEvent::RetryScheduled {
+            attempt,
+            delay_ms,
+            error,
+        } => {
+            on_event(&RunEvent::RetryScheduled {
+                attempt: *attempt,
+                delay_ms: *delay_ms,
+                category: format!("{:?}", error.code).to_lowercase(),
+                operation: error.operation.into(),
+            });
+        }
+        StreamEvent::StreamError { error, .. } => {
+            on_event(&RunEvent::StreamStateChanged {
+                state: StreamState::Interrupted,
+                turn,
+            });
+            on_event(&RunEvent::RunError {
+                code: format!("{:?}", error.code).to_lowercase(),
+                operation: error.operation.into(),
+                retryable: error.retryable,
+                message: error.message.clone(),
+            });
+        }
+        StreamEvent::ToolUseStart { .. }
+        | StreamEvent::ToolUseInputDelta { .. }
+        | StreamEvent::BlockStop { .. } => {}
+    }
+}
+
+/// Tool-result preview for display. The canonical executor has already
+/// normalized oversized payloads, so this is only a final pathological guard.
 fn preview(s: &str) -> String {
-    const MAX: usize = 500_000;
+    const MAX: usize = 4_096;
     if s.chars().count() <= MAX {
         return s.to_string();
     }
@@ -999,74 +1515,18 @@ fn preview(s: &str) -> String {
     p
 }
 
-// ── Tool execution helpers ───────────────────────────────────────────────────
-
-/// A batch of tool uses for execution. Consecutive concurrency-safe tools
-/// are grouped; non-safe tools each get their own batch.
-struct Batch {
-    is_concurrency_safe: bool,
-    indices: Vec<usize>,
-}
-
-/// Partition tool_uses into batches. Consecutive concurrency-safe tools
-/// group together; a non-safe tool ends the current batch and starts a new
-/// single-element batch. Mirrors CC's `partitionToolCalls`.
-fn partition_tool_uses(
-    tool_uses: &[(String, String, Value)],
-    registry: &ToolRegistry,
-) -> Vec<Batch> {
-    let mut batches: Vec<Batch> = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    let mut current_safe = true;
-
-    for (i, (_, name, input)) in tool_uses.iter().enumerate() {
-        let is_safe = registry
-            .find(name)
-            .map(|t| t.is_concurrency_safe(input))
-            .unwrap_or(false);
-
-        if current.is_empty() {
-            current.push(i);
-            current_safe = is_safe;
-        } else if current_safe && is_safe {
-            current.push(i);
-        } else {
-            batches.push(Batch {
-                is_concurrency_safe: current_safe,
-                indices: std::mem::take(&mut current),
-            });
-            current.push(i);
-            current_safe = is_safe;
-        }
-    }
-    if !current.is_empty() {
-        batches.push(Batch {
-            is_concurrency_safe: current_safe,
-            indices: current,
-        });
-    }
-    batches
-}
-
-/// Maximum concurrent tool executions, from env var or default 10.
-fn max_tool_concurrency() -> usize {
-    std::env::var("NONOCLAW_MAX_TOOL_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10)
-        .max(1)
-}
-
-/// Engine-side subagent spawner. Holds clones of the shared client + toolset
-/// so a child [`QueryEngine`] can run a self-contained sub-query. Children
-/// exclude `Agent` (no recursion) and `TodoWrite` (don't clobber the parent's
-/// task list) and run headless with a capped turn budget.
+/// Engine-side subagent spawner. Holds clones of the shared client, toolset,
+/// and TaskStore so child todos are scope-isolated while the task graph remains
+/// available. Children exclude Agent/Coordinator to prevent recursion.
 pub(crate) struct EngineSubagent {
     client: Arc<Client>,
     registry: Arc<ToolRegistry>,
     options: EngineOptions,
     cwd: PathBuf,
-    hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
+    hook_runtime: crate::hooks::HookRuntime,
+    run_context: RunContext,
+    task_store: Arc<TodoStore>,
+    lifecycle: SubagentLifecycle,
 }
 
 impl SubagentRunner for EngineSubagent {
@@ -1076,35 +1536,93 @@ impl SubagentRunner for EngineSubagent {
         description: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
-            let child_registry = Arc::new(self.registry.filtered(&["Agent", "TodoWrite"]));
-            let mut child_opts = self.options.clone();
-            child_opts.is_non_interactive = true;
-            child_opts.permission_resolver = None;
-            child_opts.max_turns = child_opts.max_turns.min(10);
-            child_opts.append_system_prompt = Some(format!(
-                "You are a subagent (task: {description}). Run autonomously with the available \
-                 tools and report ONLY your final answer to the caller. Do not ask the user \
-                 questions."
-            ));
-            // Fresh, isolated todo store (unused since TodoWrite is excluded).
-            let child_todos = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut engine = QueryEngine::new(
-                Arc::clone(&self.client),
-                child_registry,
-                child_todos,
-                child_opts,
-            );
-            let result = engine.run(MessageContent::from_text(prompt), &self.cwd, |_| {}).await?;
-            // SubagentStop hook (fire-and-forget)
-            let text = result.text.clone();
-            let hooks = self.hooks.clone();
-            let desc = description.to_string();
-            tokio::spawn(async move {
-                let ctx = crate::hooks::subagent_context(&desc, &text);
-                crate::hooks::run_hooks(&hooks, crate::hooks::HookType::SubagentStop, "*", &ctx)
+            self.lifecycle
+                .run(async move {
+                    let subagent_started = Instant::now();
+                    self.hook_runtime.record_event(RunEvent::SubagentStarted {
+                        description: description.to_string(),
+                    });
+                    self.hook_runtime
+                        .run(
+                            crate::hooks::HookType::SubagentStart,
+                            "*",
+                            &crate::hooks::subagent_context_for(
+                                crate::hooks::HookType::SubagentStart,
+                                description,
+                                None,
+                            ),
+                        )
+                        .await;
+                    let outcome: Result<String> = async {
+                        let child_registry =
+                            Arc::new(self.lifecycle.child_registry(&self.registry)?);
+                        let mut child_opts = self.options.clone();
+                        child_opts.is_non_interactive = true;
+                        child_opts.permission_resolver = None;
+                        child_opts.max_turns = child_opts.max_turns.min(10);
+                        child_opts.append_system_prompt = Some(format!(
+                            "You are a subagent (task: {description}). Run autonomously with the available \
+                             tools and report ONLY your final answer to the caller. Do not ask the user \
+                             questions."
+                        ));
+                        let engine = QueryEngine::new(
+                            Arc::clone(&self.client),
+                            child_registry,
+                            Arc::clone(&self.task_store),
+                            child_opts,
+                        );
+                        let child_context =
+                            engine.child_run_context(&self.run_context, self.cwd.clone());
+                        let controller = RunController::new(child_context);
+                        let completion = controller
+                            .start(engine, MessageContent::from_text(prompt), |_| async {})
+                            .wait()
+                            .await;
+                        let result = match completion.terminal.status {
+                            RunTerminalStatus::Done => completion.terminal.result.ok_or_else(|| {
+                                nonoclaw_core::Error::Other(
+                                    "subagent completed without a result".into(),
+                                )
+                            })?,
+                            RunTerminalStatus::Cancelled => {
+                                return Err(nonoclaw_core::Error::Cancelled)
+                            }
+                            RunTerminalStatus::Error => {
+                                return Err(nonoclaw_core::Error::Other(format!(
+                                    "subagent failed: {:?}",
+                                    completion.terminal.reason
+                                )))
+                            }
+                        };
+                        Ok(result.text)
+                    }
                     .await;
-            });
-            Ok(result.text)
+                    let visible_result = outcome
+                        .as_deref()
+                        .unwrap_or("subagent ended without a result");
+                    self.hook_runtime
+                        .run(
+                            crate::hooks::HookType::SubagentStop,
+                            "*",
+                            &crate::hooks::subagent_context_for(
+                                crate::hooks::HookType::SubagentStop,
+                                description,
+                                Some(visible_result),
+                            ),
+                        )
+                        .await;
+                    self.hook_runtime.record_event(RunEvent::SubagentFinished {
+                        description: description.to_string(),
+                        status: if outcome.is_ok() {
+                            TechnicalStatus::Succeeded
+                        } else {
+                            TechnicalStatus::Failed
+                        },
+                        elapsed_ms: subagent_started.elapsed().as_millis() as u64,
+                    });
+                    outcome
+                })
+                .await
         })
     }
 
@@ -1152,39 +1670,6 @@ pub fn strip_thinking(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-/// Build a client for the compact model if it has different credentials
-/// than the main model. Returns a ref to the main client if they match.
-fn resolve_compact_client(
-    main_client: &Arc<nonoclaw_api::Client>,
-    options: &EngineOptions,
-    compact_model: &str,
-) -> Arc<nonoclaw_api::Client> {
-    if let Some((ref base_url, ref api_key, ref api_format)) = options.compact_model_creds {
-        let format = match api_format.as_deref() {
-            Some("openai") => nonoclaw_api::ApiFormat::OpenAI,
-            _ => nonoclaw_api::ApiFormat::Anthropic,
-        };
-        // Only build a new client if credentials or format differ.
-        if base_url != main_client.base_url()
-            || api_key.as_str() != main_client.api_key().unwrap_or_default()
-            || format != main_client.api_format()
-        {
-            match nonoclaw_api::Client::new(
-                Some(api_key.clone()), None, base_url.clone(),
-            ).map(|c| c.with_format(format)) {
-                Ok(c) => {
-                    tracing::debug!(%compact_model, %base_url, ?format, "compaction client rebuilt");
-                    return Arc::new(c);
-                }
-                Err(e) => {
-                    tracing::warn!("failed to build compact client: {e} — using main client");
-                }
-            }
-        }
-    }
-    Arc::clone(main_client)
-}
-
 /// Repair orphaned `tool_use` blocks in a message sequence. The Anthropic API
 /// requires that every `tool_use` in an assistant message be immediately followed
 /// by a matching `tool_result` in the next user message. If any are missing
@@ -1222,7 +1707,9 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
 
         // Check the next message (must be user) for matching tool_result blocks.
         let next_idx = i + 1;
-        let orphans = if next_idx < messages.len() && messages[next_idx].role == nonoclaw_core::Role::User {
+        let orphans = if next_idx < messages.len()
+            && messages[next_idx].role == nonoclaw_core::Role::User
+        {
             let result_ids: Vec<String> = match &messages[next_idx].content {
                 MessageContent::Blocks(blocks) => blocks
                     .iter()
@@ -1263,9 +1750,9 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
             });
             // If the assistant message now has only Thinking blocks left (no
             // Text or ToolUse), remove the entire assistant+user pair.
-            let has_substance = blocks.iter().any(|b| {
-                matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. })
-            });
+            let has_substance = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::ToolUse { .. }));
             if !has_substance {
                 need_cleanup = true;
             }
@@ -1278,14 +1765,12 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
             // it exists and has only tool_result blocks matching our orphans.
             if i < messages.len() && messages[i].role == nonoclaw_core::Role::User {
                 let all_orphaned_results = match &messages[i].content {
-                    MessageContent::Blocks(blocks) => blocks
-                        .iter()
-                        .all(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                orphans.contains(tool_use_id)
-                            }
-                            _ => false,
-                        }),
+                    MessageContent::Blocks(blocks) => blocks.iter().all(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            orphans.contains(tool_use_id)
+                        }
+                        _ => false,
+                    }),
                     _ => false,
                 };
                 if all_orphaned_results {
@@ -1321,6 +1806,33 @@ mod tests {
     }
 
     #[test]
+    fn task_changes_are_structured_engine_events() {
+        // **Validates: Requirements 2.3, 2.5**
+        let event = EngineEvent::TaskChanged {
+            change: nonoclaw_core::TaskChange {
+                scope: "parent".into(),
+                source: nonoclaw_core::TaskChangeSource::TodoWrite,
+                change: nonoclaw_core::TaskChangeKind::Replaced,
+                tasks: vec![nonoclaw_core::TaskSnapshot {
+                    id: "todo:parent:1".into(),
+                    subject: "work".into(),
+                    status: nonoclaw_core::TaskStatus::InProgress,
+                    active_form: Some("Working".into()),
+                    owner: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                }],
+            },
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["kind"], "task_changed");
+        assert_eq!(value["change"]["scope"], "parent");
+        assert_eq!(value["change"]["tasks"][0]["status"], "in_progress");
+        let decoded: EngineEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(decoded, EngineEvent::TaskChanged { .. }));
+    }
+
+    #[test]
     fn repair_removes_orphaned_tool_use() {
         let mut msgs = vec![
             Message::user(MessageContent::from_text("hi")),
@@ -1339,8 +1851,12 @@ mod tests {
         // The orphaned tool_use should be removed; the assistant message keeps its text.
         assert_eq!(msgs.len(), 3);
         if let MessageContent::Blocks(ref blocks) = msgs[1].content {
-            assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })));
-            assert!(!blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. })));
+            assert!(!blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         } else {
             panic!("expected blocks");
         }
@@ -1351,13 +1867,11 @@ mod tests {
         let mut msgs = vec![
             Message::user(MessageContent::from_text("hi")),
             // Assistant with ONLY a tool_use — no text.
-            Message::assistant(MessageContent::from_blocks(vec![
-                ContentBlock::ToolUse {
-                    id: "tu_2".into(),
-                    name: "Read".into(),
-                    input: serde_json::json!({"file_path": "/tmp/b"}),
-                },
-            ])),
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
+                id: "tu_2".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/b"}),
+            }])),
             // User message with only tool_result blocks that are ALSO orphans.
             Message::user(MessageContent::from_blocks(vec![
                 ContentBlock::ToolResult {
@@ -1378,13 +1892,11 @@ mod tests {
     fn repair_keeps_valid_pairing() {
         let mut msgs = vec![
             Message::user(MessageContent::from_text("read /tmp/x")),
-            Message::assistant(MessageContent::from_blocks(vec![
-                ContentBlock::ToolUse {
-                    id: "tu_3".into(),
-                    name: "Read".into(),
-                    input: serde_json::json!({"file_path": "/tmp/x"}),
-                },
-            ])),
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
+                id: "tu_3".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/x"}),
+            }])),
             Message::user(MessageContent::from_blocks(vec![
                 ContentBlock::ToolResult {
                     tool_use_id: "tu_3".into(),
@@ -1397,7 +1909,282 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         // tu_3 remains because its result is present.
         if let MessageContent::Blocks(ref blocks) = msgs[1].content {
-            assert!(blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         }
+    }
+
+    async fn spawn_provider_fixture(
+        answers: Vec<&'static str>,
+    ) -> (
+        Arc<Client>,
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(answers.len().max(1));
+        let task = tokio::spawn(async move {
+            for answer in answers {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "provider fixture request ended before headers");
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "provider fixture request body was truncated");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body =
+                    String::from_utf8(request[header_end..header_end + content_length].to_vec())
+                        .unwrap();
+                request_tx.send(body).await.unwrap();
+
+                let answer_json = serde_json::to_string(answer).unwrap();
+                let sse = format!(
+                    "event: message_start\ndata: {{\"message\":{{\"id\":\"msg_fixture\",\"model\":\"fixture-model\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":0}}}}}}\n\n\
+                     event: content_block_start\ndata: {{\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                     event: content_block_delta\ndata: {{\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{answer_json}}}}}\n\n\
+                     event: content_block_stop\ndata: {{\"index\":0}}\n\n\
+                     event: message_delta\ndata: {{\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":2}}}}\n\n\
+                     event: message_stop\ndata: {{}}\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client =
+            Client::new(Some("fixture-key".into()), None, format!("http://{addr}")).unwrap();
+        (Arc::new(client), request_rx, task)
+    }
+
+    fn fixture_engine(client: Arc<Client>) -> QueryEngine {
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = EngineOptions {
+            model: "fixture-requested-model".into(),
+            max_turns: 1,
+            auto_compact: false,
+            ..EngineOptions::default()
+        };
+        QueryEngine::new(client, Arc::new(registry), todos, options)
+    }
+
+    /// Full non-interactive engine success through a local Anthropic SSE
+    /// Provider fixture; no external API is contacted. Feature Matrix: §2.2 headless.
+    #[tokio::test]
+    async fn headless_minimal_success_path_uses_provider_fixture() {
+        let (client, mut requests, fixture_task) =
+            spawn_provider_fixture(vec!["fixture answer"]).await;
+        let mut engine = fixture_engine(client);
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-headless-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut events = Vec::new();
+        let result = engine
+            .run(MessageContent::from_text("fixture prompt"), &cwd, |event| {
+                events.push(event.clone())
+            })
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+
+        assert_eq!(result.text, "fixture answer");
+        assert_eq!(result.turns, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ModelInfo { model } if model == "fixture-model"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::AssistantDone { text } if text == "fixture answer"
+        )));
+        let request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+        assert_eq!(request["model"], "fixture-requested-model");
+        assert!(request["messages"].to_string().contains("fixture prompt"));
+    }
+
+    #[tokio::test]
+    async fn stop_and_session_end_hooks_run_in_lifecycle_order() {
+        // **Validates: Requirements 7.4**
+        let (client, _requests, fixture_task) = spawn_provider_fixture(vec!["done"]).await;
+        let mut engine = fixture_engine(client);
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-hooks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(cwd.join(".nonoclaw")).unwrap();
+        let events = cwd.join("events.txt");
+        let config = serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "command": "sh",
+                    "args": ["-c", format!("printf 'Stop\\n' >> '{}'", events.display())]
+                }],
+                "SessionEnd": [{
+                    "command": "sh",
+                    "args": ["-c", format!("printf 'SessionEnd\\n' >> '{}'", events.display())]
+                }]
+            }
+        });
+        std::fs::write(
+            cwd.join(".nonoclaw/hooks.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        engine
+            .run(MessageContent::from_text("finish"), &cwd, |_| {})
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(events).unwrap(),
+            "Stop\nSessionEnd\n"
+        );
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn subagent_start_and_stop_hooks_wrap_child_execution() {
+        // **Validates: Requirements 7.4**
+        let (client, _requests, fixture_task) = spawn_provider_fixture(vec!["child done"]).await;
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-sub-hooks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let events = cwd.join("events.txt");
+        let make_hook = |label: &str| crate::hooks::HookDef {
+            matcher: String::new(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("printf '{label}\\n' >> '{}'", events.display()),
+            ],
+            prompt: None,
+            http: None,
+            timeout_secs: Some(2),
+            failure_policy: crate::hooks::HookFailurePolicy::Deny,
+        };
+        let cancel = CancellationToken::new();
+        let hook_runtime = crate::hooks::HookRuntime::new(
+            vec![
+                (
+                    crate::hooks::HookType::SubagentStart,
+                    make_hook("SubagentStart"),
+                ),
+                (
+                    crate::hooks::HookType::SubagentStop,
+                    make_hook("SubagentStop"),
+                ),
+            ],
+            Some(Arc::clone(&client)),
+            "fixture-requested-model",
+            cancel.child_token(),
+        );
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = EngineOptions {
+            model: "fixture-requested-model".into(),
+            max_turns: 1,
+            auto_compact: false,
+            ..EngineOptions::default()
+        };
+        let parent = RunContext::new(
+            "parent-session",
+            cwd.clone(),
+            "fixture-requested-model",
+            RunLimits::default(),
+        );
+        let spawner = EngineSubagent {
+            client,
+            registry: Arc::new(registry),
+            options,
+            cwd: cwd.clone(),
+            hook_runtime,
+            run_context: parent,
+            task_store: todos,
+            lifecycle: SubagentLifecycle::new(cancel),
+        };
+        let result = spawner
+            .run_subagent("do child work", "child fixture")
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+        assert_eq!(result, "child done");
+        assert_eq!(
+            std::fs::read_to_string(events).unwrap(),
+            "SubagentStart\nSubagentStop\n"
+        );
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    /// Resume loads old JSONL history, sends it to the fixture Provider, and
+    /// appends the new turn to the same session. Feature Matrix: §2.2/§5 session resume.
+    #[tokio::test]
+    async fn session_resume_minimal_success_path_preserves_history() {
+        let (client, mut requests, fixture_task) =
+            spawn_provider_fixture(vec!["resumed answer"]).await;
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session_file = cwd.join("resume.jsonl");
+        let session = crate::session::SessionService::new()
+            .open_path(session_file, "resume-id", &cwd, "fixture-requested-model")
+            .unwrap();
+        session
+            .append(Message::user(MessageContent::from_text("first question")))
+            .await
+            .unwrap();
+        session
+            .append(Message::assistant(MessageContent::from_text(
+                "first answer",
+            )))
+            .await
+            .unwrap();
+        let snapshot = session.snapshot().await.unwrap();
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = EngineOptions {
+            model: "fixture-requested-model".into(),
+            max_turns: 1,
+            auto_compact: false,
+            ..EngineOptions::default()
+        };
+        let mut engine = QueryEngine::with_session(
+            client,
+            Arc::new(registry),
+            todos,
+            options,
+            session.clone(),
+            snapshot,
+        );
+        let result = engine
+            .run(MessageContent::from_text("second question"), &cwd, |_| {})
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+
+        assert_eq!(result.text, "resumed answer");
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains("first question"));
+        assert!(request.contains("first answer"));
+        assert!(request.contains("second question"));
+        let persisted = session.snapshot().await.unwrap();
+        assert_eq!(persisted.messages.len(), 4);
     }
 }

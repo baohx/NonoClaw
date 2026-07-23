@@ -8,7 +8,7 @@
 //! Facts and beads are plain markdown files under `.nonoclaw/memory/facts/` and
 //! `.nonoclaw/memory/beads/`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +61,9 @@ pub enum FactType {
     Bug,
 }
 
-fn default_half() -> f64 { 0.5 }
+fn default_half() -> f64 {
+    0.5
+}
 
 impl Fact {
     /// Write this fact to `memory/facts/{name}.md`.
@@ -105,7 +107,9 @@ fn sanitize_filename(name: &str) -> String {
 /// Extract raw YAML frontmatter text (between `---` delimiters).
 fn extract_frontmatter_raw(raw: &str) -> Option<String> {
     let s = raw.trim();
-    if !s.starts_with("---") { return None; }
+    if !s.starts_with("---") {
+        return None;
+    }
     let after = &s[3..];
     let end = after.find("\n---")?;
     Some(after[..end].to_string())
@@ -154,7 +158,7 @@ impl Bead {
     pub fn save(&self, cwd: &Path) -> std::io::Result<()> {
         let dir = cwd.join(".nonoclaw/memory/beads");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.md", &self.id));
+        let path = dir.join(format!("{}.md", self.id));
         let mut out = String::new();
         let fm = serde_yaml::to_string(&serde_json::to_value(self).unwrap_or_default())
             .unwrap_or_default();
@@ -162,7 +166,9 @@ impl Bead {
         out.push_str(&fm);
         out.push_str("---\n\n");
         out.push_str(&self.content);
-        if !out.ends_with('\n') { out.push('\n'); }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         std::fs::write(&path, out)
     }
 
@@ -190,21 +196,15 @@ pub fn load_beads(cwd: &Path) -> Vec<Bead> {
 }
 
 fn scan_dir<T>(dir: &Path, parser: fn(&Path) -> Option<T>) -> Vec<T> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
-    let mut out: Vec<T> = entries
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
         .filter_map(|p| parser(&p))
-        .collect();
-    out.sort_by(|a, b| {
-        // Sort by recency — newer first based on file mtime
-        // (we don't have access to the path here, so we rely on the
-        // `updated` field which is parsed from frontmatter).
-        // Default: keep insertion order.
-        std::cmp::Ordering::Equal
-    });
-    out
+        .collect()
 }
 
 /// Active (non-done) beads, sorted by priority descending.
@@ -213,7 +213,7 @@ pub fn active_beads(beads: &[Bead]) -> Vec<&Bead> {
         .iter()
         .filter(|b| b.status != BeadStatus::Done)
         .collect();
-    active.sort_by(|a, b| b.priority.cmp(&a.priority));
+    active.sort_by_key(|bead| std::cmp::Reverse(bead.priority));
     active
 }
 
@@ -237,14 +237,8 @@ pub fn search_facts<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a
     let mut scored: Vec<(f64, &Fact)> = facts
         .iter()
         .map(|f| {
-            let text = format!(
-                "{} {} {} {}",
-                f.name,
-                f.title,
-                f.content,
-                f.tags.join(" ")
-            )
-            .to_lowercase();
+            let text =
+                format!("{} {} {} {}", f.name, f.title, f.content, f.tags.join(" ")).to_lowercase();
             let mut score = 0.0f64;
             for term in &terms {
                 // Count occurrences of term in text (simple TF).
@@ -255,7 +249,10 @@ pub fn search_facts<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a
                     .filter(|f2| {
                         let t2 = format!(
                             "{} {} {} {}",
-                            f2.name, f2.title, f2.content, f2.tags.join(" ")
+                            f2.name,
+                            f2.title,
+                            f2.content,
+                            f2.tags.join(" ")
                         )
                         .to_lowercase();
                         t2.contains(term.as_str())
@@ -354,7 +351,7 @@ impl Goal {
     pub fn save(&self, cwd: &Path) -> std::io::Result<()> {
         let dir = cwd.join(".nonoclaw/memory/goals");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.md", &self.id));
+        let path = dir.join(format!("{}.md", self.id));
         let mut out = String::new();
         let fm = serde_yaml::to_string(&serde_json::to_value(self).unwrap_or_default())
             .unwrap_or_default();
@@ -362,7 +359,9 @@ impl Goal {
         out.push_str(&fm);
         out.push_str("---\n\n");
         out.push_str(&self.content);
-        if !out.ends_with('\n') { out.push('\n'); }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         std::fs::write(&path, out)
     }
 }
@@ -370,7 +369,9 @@ impl Goal {
 /// Load all goals from `memory/goals/*.md`.
 pub fn load_goals(cwd: &Path) -> Vec<Goal> {
     let dir = cwd.join(".nonoclaw/memory/goals");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
     entries
         .flatten()
         .map(|e| e.path())
@@ -405,7 +406,9 @@ pub fn beads_from_session() -> Vec<Bead> {
 /// Strip YAML frontmatter (`---\n...\n---\n`) from a string, returning body.
 pub fn strip_frontmatter(s: &str) -> String {
     let s = s.trim();
-    if !s.starts_with("---") { return s.to_string(); }
+    if !s.starts_with("---") {
+        return s.to_string();
+    }
     let after = &s[3..];
     if let Some(pos) = after.find("\n---") {
         after[pos + 4..].trim().to_string()
@@ -497,7 +500,9 @@ impl WikiPage {
         out.push_str(&fm);
         out.push_str("---\n\n");
         out.push_str(&self.content);
-        if !out.ends_with('\n') { out.push('\n'); }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         std::fs::write(&path, out)
     }
 }
@@ -509,7 +514,9 @@ pub fn load_wiki_pages(cwd: &Path) -> Vec<WikiPage> {
 }
 
 fn walk_wiki(dir: &Path) -> Vec<WikiPage> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -529,7 +536,11 @@ pub fn load_wiki_index(cwd: &Path) -> Option<String> {
     let path = cwd.join(".nonoclaw/wiki/index.md");
     let raw = std::fs::read_to_string(&path).ok()?;
     let body = strip_frontmatter(&raw);
-    if body.trim().is_empty() { None } else { Some(body) }
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(body)
+    }
 }
 
 /// BM25 search over wiki pages.
@@ -551,18 +562,31 @@ pub fn search_wiki<'a>(pages: &'a [WikiPage], query: &str, limit: usize) -> Vec<
         .map(|p| {
             let text = format!(
                 "{} {} {} {} {}",
-                p.name, p.title, p.summary, p.content, p.tags.join(" ")
-            ).to_lowercase();
+                p.name,
+                p.title,
+                p.summary,
+                p.content,
+                p.tags.join(" ")
+            )
+            .to_lowercase();
             let mut score = 0.0f64;
             for term in &terms {
                 let count = text.matches(term.as_str()).count() as f64;
-                let df = pages.iter().filter(|p2| {
-                    let t2 = format!(
-                        "{} {} {} {} {}",
-                        p2.name, p2.title, p2.summary, p2.content, p2.tags.join(" ")
-                    ).to_lowercase();
-                    t2.contains(term.as_str())
-                }).count() as f64;
+                let df = pages
+                    .iter()
+                    .filter(|p2| {
+                        let t2 = format!(
+                            "{} {} {} {} {}",
+                            p2.name,
+                            p2.title,
+                            p2.summary,
+                            p2.content,
+                            p2.tags.join(" ")
+                        )
+                        .to_lowercase();
+                        t2.contains(term.as_str())
+                    })
+                    .count() as f64;
                 let idf = ((pages.len() as f64 + 1.0) / (df + 0.5)).ln();
                 score += count * idf;
             }
@@ -609,7 +633,9 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
                 ctx = truncate_words(&b.content, 50),
             );
             chars += line.len();
-            if chars > max_chars { break; }
+            if chars > max_chars {
+                break;
+            }
             out.push_str(&line);
         }
     }
@@ -626,7 +652,9 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
         out.push_str(header);
         chars += header.len();
         for (i, f) in sorted_facts.iter().enumerate() {
-            if i >= 10 || chars >= max_chars { break; }
+            if i >= 10 || chars >= max_chars {
+                break;
+            }
             let line = format!(
                 "- **{title}** ({t:?}): {body}\n",
                 title = f.title,
@@ -634,7 +662,9 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
                 body = truncate_words(&f.content, 30),
             );
             chars += line.len();
-            if chars > max_chars { break; }
+            if chars > max_chars {
+                break;
+            }
             out.push_str(&line);
         }
     }
@@ -647,8 +677,12 @@ fn truncate_words(s: &str, max_words: usize) -> String {
     if words.len() <= max_words {
         s.to_string()
     } else {
-        let mut t: String = words.into_iter().take(max_words).collect::<Vec<_>>().join(" ");
-        t.push_str("…");
+        let mut t: String = words
+            .into_iter()
+            .take(max_words)
+            .collect::<Vec<_>>()
+            .join(" ");
+        t.push('…');
         t
     }
 }
@@ -656,6 +690,7 @@ fn truncate_words(s: &str, max_words: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("nonoclaw-memory-{}", uuid::Uuid::new_v4()));
@@ -758,7 +793,7 @@ mod tests {
             session: "s1".into(),
             content: "Investigating login timeout in production.".into(),
         }];
-        let facts = vec![Fact {
+        let facts = [Fact {
             name: "pip-mirror".into(),
             title: "pip use tsinghua".into(),
             content: "Always use tsinghua mirror.".into(),

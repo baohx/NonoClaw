@@ -276,6 +276,79 @@
         .app-body.rail-collapsed { grid-template-columns: 0px 1fr 0px; }
       }
 
+      /* ── Technical trace ───────────────────────────────────────────────── */
+      .trace {
+        flex: none;
+        max-height: 56%;
+        min-height: 148px;
+        display: flex;
+        flex-direction: column;
+        border-bottom: 1px solid var(--border);
+        background: var(--accent-softer);
+      }
+      .trace__summary {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 1px;
+        padding: 8px 8px 4px;
+      }
+      .trace__summary > div { min-width: 0; padding: 5px 6px; border-radius: 7px; background: var(--glass); }
+      .trace__summary span { display: block; font-family: var(--font-mono); font-size: 8px; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+      .trace__summary b { display: block; margin-top: 2px; color: var(--text); font-family: var(--font-mono); font-size: 9.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .trace__controls, .trace__filters { display: flex; align-items: center; gap: 4px; padding: 3px 8px; }
+      .trace__controls select, .trace__filters select, .trace__filters input {
+        min-width: 0; height: 25px; border: 1px solid var(--border); border-radius: 7px;
+        background: var(--glass); color: var(--text); font-family: var(--font-mono); font-size: 9.5px; outline: none;
+      }
+      .trace__controls select { flex: 1; padding: 0 5px; }
+      .trace__controls button {
+        appearance: none; height: 25px; padding: 0 7px; border: 1px solid var(--border); border-radius: 7px;
+        background: var(--glass); color: var(--muted); cursor: pointer; font-family: var(--font-mono); font-size: 9px;
+      }
+      .trace__controls button:hover:not(:disabled) { color: var(--accent); border-color: var(--accent-strong); }
+      .trace__controls button:disabled { opacity: .35; cursor: default; }
+      .trace__filters { flex-wrap: wrap; }
+      .trace__filters input { flex: 1 1 100%; padding: 0 7px; }
+      .trace__filters select { flex: 1; padding: 0 4px; }
+      .trace__developer { display: inline-flex; align-items: center; gap: 4px; color: var(--faint); font: 9px var(--font-mono); white-space: nowrap; }
+      .trace__developer input { width: 12px; height: 12px; accent-color: var(--accent); }
+      .trace__notice, .trace__window-note { padding: 2px 10px; color: var(--accent); font: 9px var(--font-mono); }
+      .trace__timeline { flex: 1; min-height: 56px; overflow: auto; padding: 3px 8px 8px; contain: strict; }
+      .trace__empty { padding: 14px 8px; color: var(--faint); font: 10px/1.5 var(--font-mono); }
+      .trace-run { margin: 2px 0 7px; }
+      .trace-run__head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 6px; padding: 4px 5px; color: var(--muted); background: var(--glass-2); border-radius: 6px; font: 9px var(--font-mono); }
+      .trace-run__head span:nth-child(2) { flex: 1; color: var(--text); font-weight: 600; }
+      .trace-row {
+        appearance: none; width: 100%; display: grid; grid-template-columns: 51px 7px minmax(0, 1fr); gap: 5px;
+        padding: 5px; border: none; border-left: 2px solid transparent; border-radius: 6px; background: transparent;
+        color: var(--text); text-align: left; cursor: default; font-family: var(--font-mono);
+      }
+      .trace-row[aria-expanded] { cursor: pointer; }
+      .trace-row:hover { background: var(--glass); }
+      .trace-row:focus-visible, .trace__controls button:focus-visible, .trace select:focus-visible, .trace input:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+      .trace-row--failure { border-left-color: var(--rose); }
+      .trace-row--cancel { border-left-color: var(--faint); }
+      .trace-row__time { padding-top: 1px; color: var(--faint); font-size: 8.5px; }
+      .trace-row__body { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+      .trace-row__summary { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; font: 10px/1.25 var(--font-sans); }
+      .trace-row__meta { color: var(--faint); font-size: 8.5px; }
+      .trace-row__details { display: flex; flex-direction: column; gap: 2px; margin: 5px 0 1px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 6px; background: rgba(0,0,0,.025); overflow: hidden; }
+      [data-theme="frost"] .trace-row__details { background: rgba(0,0,0,.18); }
+      .trace-row__details > span { display: grid; grid-template-columns: 78px minmax(0,1fr); gap: 5px; }
+      .trace-row__details i { color: var(--faint); font-size: 8.5px; font-style: normal; }
+      .trace-row__details code { overflow-wrap: anywhere; color: var(--muted); font-size: 8.5px; white-space: normal; }
+      .trace-pip { width: 6px; height: 6px; margin-top: 2px; border-radius: 50%; background: var(--faint); flex: none; }
+      .trace-pip--active { background: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+      .trace-pip--waiting { background: var(--amber); }
+      .trace-pip--success { background: var(--green); }
+      .trace-pip--warning { background: var(--amber); }
+      .trace-pip--failure { background: var(--rose); }
+      .trace-pip--cancel { background: var(--faint); }
+      .trace-status--active { color: var(--accent) !important; }
+      .trace-status--success { color: var(--green) !important; }
+      .trace-status--failure { color: var(--rose) !important; }
+      .trace-status--cancel { color: var(--faint) !important; }
+
       /* ── Insight accordion + rows ───────────────────────────────────────── */
       .acc { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 26px; }
       .acc-section { border-bottom: 1px solid var(--border); }
@@ -753,6 +826,18 @@
       }
       .breath-dot.connecting { background: var(--amber); }
       .breath-dot.off { background: var(--rose); animation: none; }
+      .breath-dot[data-phase="thinking"],
+      .breath-dot[data-phase="streaming"],
+      .breath-dot[data-phase="tool"],
+      .breath-dot[data-phase="subagent"] { background: var(--accent); }
+      .breath-status {
+        max-width: 132px;
+        overflow: hidden;
+        color: var(--muted);
+        font: 10.5px var(--font-mono);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .theme-dot {
         width: 18px; height: 18px; border-radius: 50%;
         cursor: pointer;
@@ -1269,7 +1354,7 @@
 
         .statusbar { padding: 0 8px; min-height: 44px; }
         .statusbar__model, .statusbar__divider, .statusbar__tokens,
-        .tag-compact, .session-pill { display: none; }
+        .tag-compact, .session-pill, .breath-status { display: none; }
         .statusbar__brand { font-size: 15px; }
         .statusbar__side { gap: 5px; }
         .mode-select { font-size: 10px; padding: 2px 7px; height: 24px; }
@@ -1347,6 +1432,14 @@
         box-shadow: var(--shadow-sm);
       }
       .svg-container svg { max-width: 100%; height: auto; }
+      @media (prefers-reduced-motion: reduce) {
+        .breath-dot, .connect-orb, .stream-caret, .toolcard__status.run {
+          animation: none;
+        }
+        .app-body, .chat-refresh, .theme-dot, .composer__send {
+          transition-duration: 0.01ms;
+        }
+      }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>

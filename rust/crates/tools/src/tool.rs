@@ -57,7 +57,8 @@ pub struct QuestionRequest {
 }
 
 /// Asks the user a multiple-choice question and returns the chosen option text
-/// (or `None` if dismissed). Provided by the TUI; headless runs have none.
+/// (or `None` if dismissed). Provided by an interactive UI adapter; headless
+/// runs have none.
 pub trait QuestionResolver: Send + Sync {
     fn ask<'a>(
         &'a self,
@@ -65,8 +66,7 @@ pub trait QuestionResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 }
 
-/// Session-wide options shared by every tool invocation. Mirrors the subset of
-/// `ToolUseContext.options` needed for Phase 0.
+/// Session-wide options shared by every tool invocation.
 #[derive(Debug, Clone)]
 pub struct ToolOptions {
     pub model: String,
@@ -81,6 +81,9 @@ pub struct ToolCtx<'a> {
     pub cwd: &'a Path,
     pub options: &'a ToolOptions,
     pub cancel: &'a CancellationToken,
+    /// Stable agent/session scope used by scoped in-memory tools such as
+    /// TodoWrite. Child agents receive a distinct scope.
+    pub task_scope: Option<&'a str>,
     /// Subagent runner (set by the engine). `None` in tests / when subagents
     /// are unavailable; the Agent tool errors if it's missing.
     pub subagent: Option<&'a dyn SubagentRunner>,
@@ -94,16 +97,24 @@ impl<'a> ToolCtx<'a> {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
+
+    pub fn task_scope(&self) -> &str {
+        self.task_scope.unwrap_or("default")
+    }
 }
 
 /// What a tool returns from [`Tool::call`]. Mirrors `ToolResult` (`src/Tool.ts:321`).
 /// `data` is the primary string result sent back to the model; `new_messages`
-/// lets a tool inject extra transcript messages (rare in Phase 0).
+/// lets a tool inject extra transcript messages.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolResult {
     pub data: String,
     #[serde(default)]
     pub new_messages: Vec<Message>,
+    /// Internal structured mutations for the engine event stream. Omitted from
+    /// the legacy serialized shape when no task tool was involved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_changes: Vec<nonoclaw_core::TaskChange>,
 }
 
 impl ToolResult {
@@ -111,13 +122,20 @@ impl ToolResult {
         ToolResult {
             data: data.into(),
             new_messages: Vec::new(),
+            task_changes: Vec::new(),
         }
     }
     pub fn error<S: Into<String>>(message: S) -> Self {
         ToolResult {
             data: message.into(),
             new_messages: Vec::new(),
+            task_changes: Vec::new(),
         }
+    }
+
+    pub fn with_task_change(mut self, change: nonoclaw_core::TaskChange) -> Self {
+        self.task_changes.push(change);
+        self
     }
 }
 
@@ -173,7 +191,7 @@ pub trait Tool: Send + Sync {
         true
     }
 
-    /// Deferred tools require ToolSearch before use. Always false in Phase 0.
+    /// Deferred tools remain discoverable through ToolSearch.
     fn should_defer(&self) -> bool {
         false
     }

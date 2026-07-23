@@ -1,3 +1,4 @@
+import { getMobileAccessToken } from "../security";
 import { useStore } from "../store";
 import QrCode from "./QrCode";
 
@@ -6,7 +7,7 @@ interface Props {
 }
 
 export default function QrDialog({ onClose }: Props) {
-  const authToken = useStore((s) => s.authToken);
+  const authToken = getMobileAccessToken();
   const publicUrl = useStore((s) => s.projectInfo?.public_url ?? null);
   const origin = publicUrl || (typeof window !== "undefined" ? window.location.origin : "");
   const url = authToken ? `${origin}/?token=${encodeURIComponent(authToken)}` : "";

@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from "react";
+import { breathController } from "./breath";
 import { useStore } from "./store";
-import { useWebSocket, markClearing } from "./websocket";
+import { useWebSocket } from "./websocket";
 import BreathField from "./components/BreathField";
 import ChatView from "./components/ChatView";
 import CommitDialog from "./components/CommitDialog";
@@ -43,9 +44,14 @@ export default function App() {
   const toggleLeftRail = useStore((s) => s.toggleLeftRail);
   const toggleInsight = useStore((s) => s.toggleInsight);
   const theme = useStore((s) => s.theme);
+  const setBreathState = useStore((s) => s.setBreathState);
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
+
+  useEffect(() => breathController.subscribe(({ phase, label }) => {
+    setBreathState(phase, label);
+  }), [setBreathState]);
 
   useEffect(() => {
     if (connectionStatus === "connected") setEverConnected(true);
@@ -92,15 +98,33 @@ export default function App() {
 
   const setAgentRunning = useStore((s) => s.setAgentRunning);
   const agentRunning = useStore((s) => s.agentRunning);
+  const multiRun = useStore((s) => s.multiRun);
+
+  // Multi-model sequencing is owned by the run slice. The timer is scoped to
+  // this mounted app and is cancelled on unmount or any session boundary.
+  useEffect(() => {
+    const nextModel = multiRun?.nextModel;
+    if (!nextModel) return;
+    const timer = window.setTimeout(() => {
+      const state = useStore.getState();
+      if (state.multiRun?.nextModel !== nextModel) return;
+      const label = state.availableModels.find((item) => item.name === nextModel)?.label || nextModel;
+      state.addMessage({
+        id: `multi-${nextModel}-${Date.now()}`,
+        role: "system",
+        content: `🟢 running ${label}…`,
+      });
+      const prompt = state.multiRun.prompt;
+      state.consumeMultiModel(nextModel);
+      send({ type: "run", prompt, model: nextModel });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [multiRun?.nextModel, send]);
 
   const handleSubmit = useCallback(
     (prompt: string, attachments: AttachmentRef[]) => {
       const cmd = prompt.trim();
       if (cmd === "/clear") {
-        // Block incoming tool events until the server responds with
-        // MessagesLoaded — prevents buffered events from resurrecting
-        // tool cards after the clear.
-        markClearing();
         useStore.getState().setAgentRunning(false);
         clearMessages();
         send({ type: "clear" });
@@ -111,6 +135,7 @@ export default function App() {
           useStore.getState().setAgentRunning(false);
           send({ type: "cancel" });
         }
+        useStore.getState().setCompacting(true);
         addMessage({
           id: `sys-${Date.now()}`,
           role: "system",
@@ -153,37 +178,29 @@ export default function App() {
         });
         userScrolledUp.current = false;
         // Label the first model before sending it (subsequent models are
-        // labelled in the websocket Done handler).
+        // labelled by the owned multi-run effect).
         addMessage({
           id: `sys-${Date.now()}`,
           role: "system",
           content: `🟢 running ${label(models[0])}…`,
         });
-        // Send the first model now; the websocket Done handler will chain the
-        // rest via window.__nonoclaw_pending_multi (hacky but zero-new-infra).
-        (window as any).__nonoclaw_pending_multi = {
-          models: models.slice(1),
-          prompt: realPrompt,
-          send,
-          addMessage,
-          label,
-        };
-        const activeModel = useStore.getState().availableModels.length > 0
-          ? useStore.getState().model : undefined;
+        // Queue ownership and sequencing live in the run slice; the mounted
+        // effect above advances one model only after an accepted terminal.
+        useStore.getState().startMultiRun(models.slice(1), realPrompt);
+        useStore.getState().setAgentRunning(true);
         send({ type: "run", prompt: realPrompt, model: models[0] });
         return;
       }
-      // /skill-name — inject the skill body into the system prompt.
-      let append: string | undefined;
+      // /skill-name — the server activates and injects the skill body. The
+      // browser receives metadata only and never retains raw skill prompts.
       const slashMatch = cmd.match(/^\/(\S+)/);
       if (slashMatch) {
         const skillName = slashMatch[1];
         const skills = useStore.getState().projectInfo?.skills ?? [];
         const found = skillName === "compact" || skillName === "clear"
-          ? undefined // those are built-in commands, not skills
+          ? undefined
           : skills.find((s) => s.name === skillName);
         if (found) {
-          append = found.body || `# Skill: ${found.name}\n${found.description}`;
           addMessage({
             id: `sys-${Date.now()}`,
             role: "system",
@@ -196,13 +213,13 @@ export default function App() {
       useStore.getState().setAgentRunning(true);
       const activeModel = useStore.getState().availableModels.length > 0
         ? useStore.getState().model : undefined;
-      send({ type: "run", prompt, model: activeModel, append_system_prompt: append, attachments: attachments.length ? attachments : undefined });
+      send({ type: "run", prompt, model: activeModel, attachments: attachments.length ? attachments : undefined });
     },
     [send, clearMessages, addMessage]
   );
 
-  const setPendingPermission = useStore((s) => s.setPendingPermission);
-  const setPendingQuestion = useStore((s) => s.setPendingQuestion);
+  const resolvePermission = useStore((s) => s.resolvePermission);
+  const resolveQuestion = useStore((s) => s.resolveQuestion);
 
   const handlePermission = useCallback(
     (decision: "allow" | "deny") => {
@@ -212,9 +229,10 @@ export default function App() {
         request_id: pendingPermission.request_id,
         decision,
       });
-      setPendingPermission(null);
+      resolvePermission(pendingPermission.request_id);
+      breathController.consumePrompt("permission", false);
     },
-    [send, pendingPermission, setPendingPermission]
+    [send, pendingPermission, resolvePermission]
   );
 
   const handleQuestion = useCallback(
@@ -225,13 +243,15 @@ export default function App() {
         request_id: pendingQuestion.request_id,
         answer,
       });
-      setPendingQuestion(null);
+      resolveQuestion(pendingQuestion.request_id);
+      breathController.consumePrompt("question", false);
     },
-    [send, pendingQuestion, setPendingQuestion]
+    [send, pendingQuestion, resolveQuestion]
   );
 
   const handleResume = useCallback(
     (id: string) => {
+      useStore.getState().prepareSessionSwitch(id);
       send({ type: "resume_session", id });
       setShowSessionPicker(false);
     },
@@ -239,6 +259,7 @@ export default function App() {
   );
 
   const handleNew = useCallback(() => {
+    useStore.getState().prepareSessionSwitch("");
     send({ type: "new_session" });
     setShowSessionPicker(false);
   }, [send, setShowSessionPicker]);
@@ -283,7 +304,12 @@ export default function App() {
           onSetModel={(name) => {
             send({ type: "set_model", name });
             const models = useStore.getState().availableModels;
-            useStore.getState().setInfo(name, useStore.getState().sessionId, useStore.getState().authToken, models);
+            useStore.getState().setInfo(
+              name,
+              useStore.getState().sessionId,
+              useStore.getState().hasMobileAccessToken,
+              models,
+            );
           }}
         />
         <div className={bodyClass}>

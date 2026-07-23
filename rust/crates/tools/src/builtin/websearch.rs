@@ -27,7 +27,9 @@ impl Tool for WebSearchTool {
     fn search_hint(&self) -> Option<&'static str> {
         Some("search the web internet lookup")
     }
-    fn should_defer(&self) -> bool { true }
+    fn should_defer(&self) -> bool {
+        true
+    }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]})
     }

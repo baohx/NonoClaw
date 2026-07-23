@@ -59,10 +59,16 @@ impl Tool for MemoryTool {
     fn is_read_only(&self, input: &Value) -> bool {
         matches!(
             input["action"].as_str(),
-            Some("search") | Some("beads") | Some("wiki_search") | Some("wiki_lint") | Some("goal_list")
+            Some("search")
+                | Some("beads")
+                | Some("wiki_search")
+                | Some("wiki_lint")
+                | Some("goal_list")
         )
     }
-    fn is_concurrency_safe(&self, _: &Value) -> bool { true }
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
     async fn check_permissions(&self, _: &Value, _: &ToolCtx<'_>) -> PermissionResult {
         PermissionResult::allow()
     }
@@ -73,12 +79,10 @@ impl Tool for MemoryTool {
         ctx: &ToolCtx<'_>,
         _cancel: CancellationToken,
     ) -> Result<ToolResult> {
-        let action = input["action"]
-            .as_str()
-            .ok_or_else(|| Error::Tool {
-                tool: "Memory".into(),
-                message: "missing required 'action' field".into(),
-            })?;
+        let action = input["action"].as_str().ok_or_else(|| Error::Tool {
+            tool: "Memory".into(),
+            message: "missing required 'action' field".into(),
+        })?;
 
         match action {
             "search" => search_facts(ctx.cwd, &input),
@@ -137,7 +141,11 @@ fn save_fact_impl(cwd: &Path, input: &Value) -> Result<ToolResult> {
         supersedes: None,
         tags: input["tags"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
     };
     fact.save(cwd).map_err(|e| Error::Tool {
@@ -160,9 +168,7 @@ fn forget_fact(cwd: &Path, input: &Value) -> Result<ToolResult> {
 fn list_beads(cwd: &Path) -> Result<ToolResult> {
     let beads = crate::memory::load_beads(cwd);
     let active: Vec<&crate::memory::Bead> =
-        crate::memory::active_beads(&beads)
-            .into_iter()
-            .collect();
+        crate::memory::active_beads(&beads).into_iter().collect();
     if active.is_empty() {
         return Ok(ToolResult::ok("No active beads."));
     }
@@ -179,7 +185,7 @@ fn list_beads(cwd: &Path) -> Result<ToolResult> {
             title = b.title,
             prio = b.priority,
             id = b.id,
-            ctx = &b.content.chars().take(200).collect::<String>(),
+            ctx = b.content.chars().take(200).collect::<String>(),
         ));
     }
     Ok(ToolResult::ok(out))
@@ -204,7 +210,10 @@ fn save_bead_impl(cwd: &Path, input: &Value) -> Result<ToolResult> {
         tool: "Memory".into(),
         message: format!("failed to save bead: {e}"),
     })?;
-    Ok(ToolResult::ok(format!("Bead `{}` ({}) saved.", bead.title, bead.id)))
+    Ok(ToolResult::ok(format!(
+        "Bead `{}` ({}) saved.",
+        bead.title, bead.id
+    )))
 }
 
 fn mark_bead_done(cwd: &Path, input: &Value) -> Result<ToolResult> {
@@ -239,7 +248,9 @@ fn wiki_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
     let pages = crate::memory::load_wiki_pages(cwd);
     let results = crate::memory::search_wiki(&pages, query, limit);
     if results.is_empty() {
-        return Ok(ToolResult::ok("No matching wiki pages found. The wiki may be empty — try ingesting a source first."));
+        return Ok(ToolResult::ok(
+            "No matching wiki pages found. The wiki may be empty — try ingesting a source first.",
+        ));
     }
     let mut out = String::new();
     for p in &results {
@@ -255,7 +266,7 @@ fn wiki_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
     Ok(ToolResult::ok(out))
 }
 
-fn wiki_ingest(cwd: &Path, input: &Value) -> Result<ToolResult> {
+fn wiki_ingest(_cwd: &Path, input: &Value) -> Result<ToolResult> {
     let source_path = require_str(input, "source_path")?;
     let path = Path::new(source_path);
     if !path.exists() {
@@ -271,16 +282,16 @@ fn wiki_ingest(cwd: &Path, input: &Value) -> Result<ToolResult> {
         message: format!("failed to read source: {e}"),
     })?;
     let preview: String = raw.chars().take(2000).collect();
-    let mut out = String::from(
-        "# Wiki Ingest Guide\n\n"
-    );
+    let mut out = String::from("# Wiki Ingest Guide\n\n");
     out.push_str("Read this source and create/update wiki pages in `.nonoclaw/wiki/`.\n\n");
     out.push_str("## Source content (first 2000 chars)\n\n");
     out.push_str(&preview);
     out.push_str("\n\n## Instructions\n\n");
     out.push_str("1. Read `wiki/WIKI.md` for the schema and writing conventions\n");
     out.push_str("2. Read `wiki/index.md` for the current wiki catalog\n");
-    out.push_str("3. Create or update pages in `wiki/concepts/`, `wiki/entities/`, `wiki/sources/`, etc.\n");
+    out.push_str(
+        "3. Create or update pages in `wiki/concepts/`, `wiki/entities/`, `wiki/sources/`, etc.\n",
+    );
     out.push_str("4. Update `wiki/index.md` with new page entries\n");
     out.push_str("5. Append an entry to `wiki/log.md`\n");
     out.push_str("6. Use `[[wikilinks]]` to cross-reference pages\n");
@@ -318,7 +329,9 @@ fn wiki_lint(cwd: &Path) -> Result<ToolResult> {
 
     let total = pages.len();
     if issues.is_empty() {
-        Ok(ToolResult::ok(format!("Wiki lint passed. {total} pages, 0 issues.")))
+        Ok(ToolResult::ok(format!(
+            "Wiki lint passed. {total} pages, 0 issues."
+        )))
     } else {
         let mut out = format!("Wiki lint: {total} pages, {} issues:\n\n", issues.len());
         for (i, issue) in issues.iter().enumerate().take(20) {
@@ -337,7 +350,11 @@ fn goal_create(cwd: &Path, input: &Value) -> Result<ToolResult> {
         status: crate::memory::GoalStatus::InProgress,
         steps: input["steps"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         verification: input["verification"].as_str().unwrap_or("").to_string(),
         created: chrono_now(),
@@ -348,7 +365,10 @@ fn goal_create(cwd: &Path, input: &Value) -> Result<ToolResult> {
         tool: "Memory".into(),
         message: format!("failed to save goal: {e}"),
     })?;
-    Ok(ToolResult::ok(format!("Goal `{}` created (id: {id}).", goal.title)))
+    Ok(ToolResult::ok(format!(
+        "Goal `{}` created (id: {id}).",
+        goal.title
+    )))
 }
 
 fn goal_update(cwd: &Path, input: &Value) -> Result<ToolResult> {
@@ -364,7 +384,10 @@ fn goal_update(cwd: &Path, input: &Value) -> Result<ToolResult> {
             };
         }
         if let Some(steps) = input["steps"].as_array() {
-            g.steps = steps.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            g.steps = steps
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
         }
         g.updated = chrono_now();
         g.save(cwd).map_err(|e| Error::Tool {
@@ -373,7 +396,10 @@ fn goal_update(cwd: &Path, input: &Value) -> Result<ToolResult> {
         })?;
         Ok(ToolResult::ok(format!("Goal `{id}` updated.")))
     } else {
-        Err(Error::Tool { tool: "Memory".into(), message: format!("no goal with id `{id}`") })
+        Err(Error::Tool {
+            tool: "Memory".into(),
+            message: format!("no goal with id `{id}`"),
+        })
     }
 }
 
@@ -390,10 +416,17 @@ fn goal_list(cwd: &Path) -> Result<ToolResult> {
             crate::memory::GoalStatus::Blocked => "🚫",
             crate::memory::GoalStatus::Abandoned => "❌",
         };
-        out.push_str(&format!("{icon} **{title}** [{status:?}]\n", title = g.title, status = g.status));
+        out.push_str(&format!(
+            "{icon} **{title}** [{status:?}]\n",
+            title = g.title,
+            status = g.status
+        ));
         out.push_str(&format!("  id: {}\n", g.id));
         let done = g.steps.iter().filter(|s| s.starts_with("[x]")).count();
-        out.push_str(&format!("  steps: {done}/{total}\n\n", total = g.steps.len()));
+        out.push_str(&format!(
+            "  steps: {done}/{total}\n\n",
+            total = g.steps.len()
+        ));
     }
     Ok(ToolResult::ok(out))
 }

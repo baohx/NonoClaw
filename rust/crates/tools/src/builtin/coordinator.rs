@@ -77,13 +77,20 @@ impl Tool for CoordinatorTool {
             r = runner.run_subagents(&tasks) => r,
         };
         let mut out = String::new();
-        for (i, (t, r)) in tasks.iter().zip(results.iter()).enumerate() {
-            out.push_str(&format!(
-                "--- Subtask {}: {}\n{}\n\n",
-                i + 1,
-                t.1,
-                r.as_deref().unwrap_or("(error)")
-            ));
+        for (i, (task, result)) in tasks.iter().zip(results.iter()).enumerate() {
+            let body = match result {
+                Ok(answer) => answer.as_str(),
+                Err(error) => {
+                    out.push_str(&format!(
+                        "--- Subtask {}: {}\nError: {}\n\n",
+                        i + 1,
+                        task.1,
+                        error
+                    ));
+                    continue;
+                }
+            };
+            out.push_str(&format!("--- Subtask {}: {}\n{}\n\n", i + 1, task.1, body));
         }
         Ok(ToolResult::ok(out))
     }

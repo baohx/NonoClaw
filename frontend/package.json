@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:breath": "node --experimental-strip-types src/breath.test.ts",
+    "test:transitions": "node --experimental-strip-types src/store/transitions.test.ts",
+    "test:security": "node --experimental-strip-types src/security.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -1,335 +1,340 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import { breathController } from "./breath";
+import { clearMobileAccessToken, sanitizeBrowserText, setMobileAccessToken } from "./security";
 import { useStore } from "./store";
-import { breathMeter } from "./breath";
-import type { ServerMsg, ClientMsg } from "./types";
+import { traceEntryFromEvent, traceTerminalEntry } from "./trace";
+import type { ClientMsg, ServerMsg } from "./types";
 
 const RECONNECT_DELAY_MS = 500;
 const MAX_RECONNECT_DELAY_MS = 10_000;
-// A connection is treated as half-dead if no data frame has arrived in this
-// window. The server heartbeat is 8s, so 12s leaves margin without false
-// positives on healthy idle connections.
 const STALE_AFTER_MS = 12_000;
+const FOREGROUND_STALE_AFTER_MS = 8_000;
+const SUPPORTED_PROTOCOL_VERSION = 1;
 
-// Messages sent while disconnected/stale are queued here and flushed on
-// reconnect, so a just-typed prompt is resent after reconnect succeeds.
-const pending: ClientMsg[] = [];
+interface SocketRuntime {
+  socket: WebSocket | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  reconnectDelay: number;
+  mounted: boolean;
+  lastMessageAt: number;
+  firstConnect: boolean;
+}
 
-// After a force-reconnect, skip exactly ONE MessagesLoaded (the handshake
-// replay) so it doesn't wipe the optimistic user message we just flushed.
-// Subsequent MessagesLoaded from peer sync broadcasts pass through normally.
-let skipOneLoad = false;
-
-// After /clear, ignore all engine events until MessagesLoaded arrives.
-// The server abort may leave buffered tool_use_start events in the channel
-// that would otherwise resurrect tool cards after the clear.
-let ignoreUntilLoad = false;
-
-/** Signal that a /clear is in flight — drop incoming tool events until the
- *  server responds with MessagesLoaded. */
-export function markClearing() {
-  ignoreUntilLoad = true;
+function websocketUrl(url: string): string {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token");
+  const session = params.get("session");
+  if (!token && !session) return url;
+  const query = new URLSearchParams();
+  if (token) query.set("token", token);
+  if (session) query.set("session", session);
+  return `${url}?${query.toString()}`;
 }
 
 export function useWebSocket(url: string) {
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
-  const reconnectDelay = useRef(RECONNECT_DELAY_MS);
-  const mounted = useRef(true);
-  // Generation counter: stale handlers (from a closed socket) bail out so a
-  // reconnecting connection's onclose doesn't clobber the fresh one.
-  const genRef = useRef(0);
-  const lastMsgAt = useRef(0);
-  // Don't run the visibility reconnect handler until the first connection
-  // succeeds — mobile browsers sometimes fire visibilitychange during page
-  // load, which would force-reconnect and set skipLoadUntil, breaking the
-  // initial MessagesLoaded.
-  const firstConnect = useRef(false);
-
-  const store = useStore;
+  const runtimeRef = useRef<SocketRuntime>({
+    socket: null,
+    reconnectTimer: null,
+    reconnectDelay: RECONNECT_DELAY_MS,
+    mounted: false,
+    lastMessageAt: 0,
+    firstConnect: false,
+  });
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    const myGen = ++genRef.current;
-
-    store.getState().setConnectionStatus("connecting");
-    // Inject auth token + session from URL params (QR-code mobile access).
-    let wsUrl = url;
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get("token");
-    const session = params.get("session");
-    if (token || session) {
-      wsUrl = `${url}?`;
-      if (token) wsUrl += `token=${encodeURIComponent(token)}`;
-      if (session) wsUrl += `${wsUrl.endsWith("?") ? "" : "&"}session=${encodeURIComponent(session)}`;
+    const runtime = runtimeRef.current;
+    if (!runtime.mounted) return;
+    if (runtime.socket?.readyState === WebSocket.OPEN
+      || runtime.socket?.readyState === WebSocket.CONNECTING) return;
+    if (runtime.reconnectTimer) {
+      clearTimeout(runtime.reconnectTimer);
+      runtime.reconnectTimer = null;
     }
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-    lastMsgAt.current = Date.now();
 
-    ws.onopen = () => {
-      if (!mounted.current || myGen !== genRef.current) return;
-      firstConnect.current = true;
-      lastMsgAt.current = Date.now();
-      store.getState().setConnectionStatus("connected");
-      reconnectDelay.current = RECONNECT_DELAY_MS;
-      // Flush anything queued while we were down (send-while-broken).
-      while (pending.length) {
-        const m = pending.shift()!;
-        try { ws.send(JSON.stringify(m)); } catch {}
+    const generation = useStore.getState().beginConnection();
+    breathController.consumeConnection("connecting");
+    const socket = new WebSocket(websocketUrl(url));
+    runtime.socket = socket;
+    runtime.lastMessageAt = Date.now();
+
+    socket.onopen = () => {
+      const current = runtimeRef.current;
+      if (!current.mounted || current.socket !== socket
+        || !useStore.getState().markConnected(generation)) {
+        try { socket.close(); } catch {}
+        return;
       }
-    };
+      current.firstConnect = true;
+      current.lastMessageAt = Date.now();
+      current.reconnectDelay = RECONNECT_DELAY_MS;
+      breathController.consumeConnection("connected");
 
-    ws.onmessage = (e) => {
-      if (!mounted.current || myGen !== genRef.current) return;
-      lastMsgAt.current = Date.now();
-      try {
-        const msg: ServerMsg = JSON.parse(e.data as string);
-        console.debug("[ws]", msg.type, msg);
-        handleServerMsg(msg);
-      } catch (err) {
-        console.error("[ws] parse error:", err, e.data);
-      }
-    };
-
-    ws.onclose = () => {
-      if (!mounted.current || myGen !== genRef.current) return;
-      store.getState().setConnectionStatus("disconnected");
-      wsRef.current = null;
-      // Silent exponential backoff reconnect (no overlay — surfacing is gone
-      // for reconnects; the UI stays usable and send/refresh recover lazily).
-      reconnectTimer.current = setTimeout(() => {
-        if (mounted.current) {
-          reconnectDelay.current = Math.min(reconnectDelay.current * 1.5, MAX_RECONNECT_DELAY_MS);
-          connect();
+      // Remove a queued command only after this generation successfully sends
+      // it. A failed send remains queued for the next generation.
+      for (const entry of [...useStore.getState().outboundQueue]) {
+        try {
+          socket.send(JSON.stringify(entry.message));
+          useStore.getState().acknowledgeOutbound(entry.id);
+        } catch {
+          try { socket.close(); } catch {}
+          break;
         }
-      }, reconnectDelay.current);
+      }
     };
 
-    ws.onerror = () => {
-      if (myGen !== genRef.current) return;
-      try { ws.close(); } catch {}
+    socket.onmessage = (event) => {
+      const current = runtimeRef.current;
+      if (!current.mounted || current.socket !== socket
+        || generation !== useStore.getState().connectionGeneration) return;
+      current.lastMessageAt = Date.now();
+      try {
+        dispatchServerMessage(JSON.parse(event.data as string) as ServerMsg);
+      } catch {
+        // Never echo malformed frames: they may contain prompts, credentials,
+        // attachment data, or unsafe upstream errors.
+        console.error("[ws] message rejected");
+      }
     };
-  }, [url, store]);
 
-  /** Force a fresh connection right now (used by the refresh button + send). */
+    socket.onclose = () => {
+      const current = runtimeRef.current;
+      if (!current.mounted || current.socket !== socket
+        || !useStore.getState().markDisconnected(generation)) return;
+      current.socket = null;
+      breathController.consumeConnection("disconnected");
+      if (current.reconnectTimer) return;
+      const delay = current.reconnectDelay;
+      current.reconnectTimer = setTimeout(() => {
+        const latest = runtimeRef.current;
+        latest.reconnectTimer = null;
+        latest.reconnectDelay = Math.min(latest.reconnectDelay * 1.5, MAX_RECONNECT_DELAY_MS);
+        connect();
+      }, delay);
+    };
+
+    socket.onerror = () => {
+      if (runtimeRef.current.socket !== socket) return;
+      try { socket.close(); } catch {}
+    };
+  }, [url]);
+
+  /** Restart at most once: a generation already CONNECTING owns recovery. */
   const forceReconnect = useCallback(() => {
-    // Skip the handshake MessagesLoaded so it doesn't overwrite the
-    // optimistic user message we just flushed on open.  Only skip ONE —
-    // subsequent broadcast MessagesLoaded from peer sync pass through.
-    skipOneLoad = true;
-    reconnectDelay.current = RECONNECT_DELAY_MS;
-    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-    try { wsRef.current?.close(); } catch {}
-    wsRef.current = null;
+    const runtime = runtimeRef.current;
+    runtime.reconnectDelay = RECONNECT_DELAY_MS;
+    if (runtime.reconnectTimer) {
+      clearTimeout(runtime.reconnectTimer);
+      runtime.reconnectTimer = null;
+    }
+    if (runtime.socket?.readyState === WebSocket.CONNECTING) return;
+    const previous = runtime.socket;
+    runtime.socket = null;
+    try { previous?.close(); } catch {}
     connect();
   }, [connect]);
 
-  /**
-   * Send a message. If the socket is healthy (OPEN + recently received a
-   * heartbeat), send immediately. Otherwise queue + force reconnect — the
-   * message flushes on open. This makes "send while broken" reconnect
-   * transparently and deliver, catching the mobile half-dead-socket case
-   * (readyState OPEN but data frozen) where ws.send() would silently buffer.
-   */
-  const send = useCallback((msg: ClientMsg) => {
-    const ws = wsRef.current;
-    const healthy =
-      !!ws &&
-      ws.readyState === WebSocket.OPEN &&
-      Date.now() - lastMsgAt.current < STALE_AFTER_MS;
+  const send = useCallback((message: ClientMsg) => {
+    const runtime = runtimeRef.current;
+    const socket = runtime.socket;
+    const healthy = !!socket
+      && socket.readyState === WebSocket.OPEN
+      && Date.now() - runtime.lastMessageAt < STALE_AFTER_MS;
     if (healthy) {
-      try { ws.send(JSON.stringify(msg)); return; } catch {}
+      try {
+        socket.send(JSON.stringify(message));
+        return;
+      } catch {}
     }
-    // Stale or closed — queue + reconnect; flush on open.
-    pending.push(msg);
+    useStore.getState().enqueueOutbound(message);
     forceReconnect();
   }, [forceReconnect]);
 
   useEffect(() => {
-    mounted.current = true;
+    const runtime = runtimeRef.current;
+    runtime.mounted = true;
     connect();
 
-    // Mobile browsers freeze background tabs; on returning to the foreground,
-    // silently reconnect if the socket looks stale. No overlay.
-    // Guard: only run AFTER the first-ever connection succeeded, so we don't
     const onVisibility = () => {
-      if (document.visibilityState !== "visible") return;
-      if (!mounted.current || !firstConnect.current) return;
-      const ws = wsRef.current;
-      const stale = !ws || ws.readyState !== WebSocket.OPEN ||
-        Date.now() - lastMsgAt.current > 8000;
-      if (stale) {
-        console.debug("[ws] foregrounded + stale — silent reconnect");
-        forceReconnect();
-      }
+      const current = runtimeRef.current;
+      if (document.visibilityState !== "visible" || !current.mounted || !current.firstConnect) return;
+      const stale = !current.socket
+        || current.socket.readyState !== WebSocket.OPEN
+        || Date.now() - current.lastMessageAt > FOREGROUND_STALE_AFTER_MS;
+      if (stale) forceReconnect();
     };
     document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
-      mounted.current = false;
+      const current = runtimeRef.current;
+      current.mounted = false;
       document.removeEventListener("visibilitychange", onVisibility);
-      wsRef.current?.close();
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (current.reconnectTimer) clearTimeout(current.reconnectTimer);
+      current.reconnectTimer = null;
+      const socket = current.socket;
+      current.socket = null;
+      try { socket?.close(); } catch {}
+      const state = useStore.getState();
+      state.cleanupConnection();
+      state.cancelMultiRun();
+      state.setPendingPermission(null);
+      state.setPendingQuestion(null);
+      clearMobileAccessToken();
+      breathController.consumeConnection("closed");
     };
   }, [connect, forceReconnect]);
 
   return { send, forceReconnect };
 }
 
-// ── Message dispatcher ─────────────────────────────────────────────────────
+export function supportsProtocol(version: number | undefined): boolean {
+  return version === undefined || version <= SUPPORTED_PROTOCOL_VERSION;
+}
 
-function handleServerMsg(msg: ServerMsg) {
-  const s = useStore.getState();
+function acceptRunMessage(
+  message: {
+    protocol_version?: number;
+    run_id?: string;
+    session_id?: string;
+    session_revision?: number;
+    sequence?: number;
+  },
+  terminal: boolean,
+): boolean {
+  if (!supportsProtocol(message.protocol_version)) return false;
+  if (message.run_id === undefined
+    || message.session_id === undefined
+    || message.session_revision === undefined
+    || message.sequence === undefined) return true;
+  return useStore.getState().acceptRunMessage({
+    runId: message.run_id,
+    sessionId: message.session_id,
+    sessionRevision: message.session_revision,
+    sequence: message.sequence,
+  }, terminal);
+}
 
-  switch (msg.type) {
-    case "info": {
-      s.setInfo(msg.model, msg.session_id, msg.auth_token, msg.available_models);
+/** Deterministic protocol dispatcher; ordering decisions are delegated to pure store transitions. */
+export function dispatchServerMessage(message: ServerMsg): void {
+  const state = useStore.getState();
+  switch (message.type) {
+    case "info":
+      state.setInfo(
+        message.model,
+        message.session_id,
+        setMobileAccessToken(message.auth_token),
+        message.available_models,
+      );
       break;
-    }
-
-    case "session_list": {
-      s.setSessions(msg.sessions);
+    case "session_list":
+      state.setSessions(message.sessions);
       break;
-    }
-
     case "messages_loaded": {
-      // Skip exactly one load after reconnect (the handshake replay) so
-      // optimistic user messages aren't wiped.
-      if (skipOneLoad) { skipOneLoad = false; break; }
-      if (pending.length > 0) break;
-      ignoreUntilLoad = false; // /clear completed — resume accepting events
-      s.loadMessages(msg.messages);
+      if (!supportsProtocol(message.protocol_version)) break;
+      const accepted = message.session_id !== undefined && message.revision !== undefined
+        ? state.acceptSnapshot(message.session_id, message.revision)
+        : state.acceptLegacySnapshot();
+      if (accepted) state.loadMessages(message.messages);
       break;
     }
-
-    case "file_tree": {
-      s.setFileTree(msg.root, msg.entries);
+    case "file_tree":
+      state.setFileTree(message.root, message.entries);
       break;
-    }
-
-    case "project_info": {
-      s.setProjectInfo(msg.info);
+    case "project_info":
+      state.setProjectInfo(message.info);
       break;
-    }
-
-    case "git_show": {
-      s.setPendingCommit({ sha: msg.sha, output: msg.output });
+    case "git_show":
+      state.setPendingCommit({ sha: message.sha, output: message.output });
       break;
-    }
-
     case "event": {
-      // Drop events during a /clear flush — they are tool cards from
-      // the aborted run that haven't been drained yet.
-      if (ignoreUntilLoad) break;
-      const ev = msg.event;
-      switch (ev.kind) {
-        case "text_delta": {
-          s.ensureStreaming();
-          s.appendStreaming(ev.text || "");
-          // Drive the breathing background from the token-stream rhythm.
-          breathMeter.pulse((ev.text || "").length);
+      if (!acceptRunMessage(message, false)) break;
+      const event = message.event;
+      const traceEntry = traceEntryFromEvent(message);
+      if (traceEntry) state.addTraceEntry(traceEntry);
+      breathController.consume(event);
+      switch (event.kind) {
+        case "text_delta":
+          state.ensureStreaming();
+          state.appendStreaming(event.text || "");
           break;
-        }
-        case "tool_use_start": {
-          const toolId = ev.id || "";
-          s.addToolCard(toolId, ev.name || "unknown", ev.input);
-          breathMeter.flare(0.45);
+        case "tool_use_start":
+          state.addToolCard(event.id || "", event.name || "unknown", event.input);
           break;
-        }
-        case "tool_result": {
-          const id = `tool-${ev.id}`;
-          s.updateToolResult(id, ev.ok ?? false, ev.preview || "");
-          breathMeter.flare(0.35);
+        case "tool_result":
+          state.updateToolResult(`tool-${event.id}`, event.ok ?? false, event.preview || "");
           break;
-        }
-        case "assistant_done": {
-          s.finishStreaming();
-          breathMeter.settle();
+        case "assistant_done":
+          state.finishStreaming();
           break;
-        }
-        case "model_info": {
-          if (ev.model) s.setModel(ev.model);
+        case "model_info":
+          if (event.model) state.setModel(event.model);
           break;
-        }
-        case "compacting": {
-          s.setCompacting(true);
+        case "task_changed":
+          if (event.change) state.addTaskChange(event.change);
           break;
-        }
-        case "compacted": {
-          s.setCompacting(false);
-          s.addMessage({
-            id: `compacted-${Date.now()}`,
+        case "compacting":
+        case "compaction_started":
+          state.setCompacting(true);
+          break;
+        case "compacted":
+          state.setCompacting(false);
+          state.addMessage({
+            id: message.event_id || `compacted-${message.timestamp_ms ?? Date.now()}`,
             role: "system",
-            content: `compacted: removed ${ev.removed ?? 0}, kept ${ev.kept ?? 0} messages`,
+            content: `compacted: removed ${event.removed ?? 0}, kept ${event.kept ?? 0} messages`,
           });
           break;
-        }
       }
       break;
     }
-
-    case "permission_required": {
-      s.setPendingPermission(msg);
+    case "permission_required":
+      state.setPendingPermission(message);
+      breathController.consumePrompt("permission", true);
       break;
-    }
-
-    case "question_required": {
-      s.setPendingQuestion(msg);
+    case "question_required":
+      state.setPendingQuestion(message);
+      breathController.consumePrompt("question", true);
       break;
-    }
-
     case "done": {
-      s.setAgentRunning(false);
-
-      // Chain the next /multi model if there's a pending multi-run queue.
-      const multi = (window as any).__nonoclaw_pending_multi;
-      if (multi?.models?.length) {
-        const nextModel = multi.models.shift();
-        setTimeout(() => {
-          multi.addMessage({
-            id: `sys-${Date.now()}`,
-            role: "system",
-            content: `\u{1F7E2} running ${multi.label(nextModel)}…`,
-          });
-          multi.send({ type: "run", prompt: multi.prompt, model: nextModel });
-        }, 600);
-      } else {
-        delete (window as any).__nonoclaw_pending_multi;
-      }
-
-      const { usage } = msg;
-      const inTok = usage.input_tokens ?? 0;
-      const outTok = usage.output_tokens ?? 0;
-      const cacheRead = usage.cache_read_input_tokens ?? 0;
-      const cacheWrite = usage.cache_creation_input_tokens ?? 0;
-      // Accumulate into the running totals (drives the StatusBar display).
-      s.addUsage({
-        input: inTok,
-        output: outTok,
-        cacheRead,
-        cacheWrite,
-      });
-      // Append a compact usage line under the answer.
-      const parts: string[] = [
-        `in ${inTok.toLocaleString()}`,
-        `out ${outTok.toLocaleString()}`,
-      ];
+      if (!acceptRunMessage(message, true)) break;
+      state.finishStreaming();
+      breathController.consumeTerminal("success", message.stop_reason ?? undefined);
+      state.addTraceEntry(traceTerminalEntry(message, "done", {
+        usage: message.usage,
+        turns: message.turns,
+        stop_reason: message.stop_reason,
+      }));
+      state.completeRun();
+      const input = message.usage.input_tokens ?? 0;
+      const output = message.usage.output_tokens ?? 0;
+      const cacheRead = message.usage.cache_read_input_tokens ?? 0;
+      const cacheWrite = message.usage.cache_creation_input_tokens ?? 0;
+      state.addUsage({ input, output, cacheRead, cacheWrite });
+      const parts = [`in ${input.toLocaleString()}`, `out ${output.toLocaleString()}`];
       if (cacheRead) parts.push(`cache read ${cacheRead.toLocaleString()}`);
       if (cacheWrite) parts.push(`cache write ${cacheWrite.toLocaleString()}`);
-      s.addMessage({
-        id: `usage-${Date.now()}`,
+      state.addMessage({
+        id: `usage-${message.run_id ?? message.timestamp_ms ?? Date.now()}`,
         role: "system",
-        content: `${msg.turns ?? 1} turn${(msg.turns ?? 1) > 1 ? "s" : ""} · ${parts.join(", ")}`,
+        content: `${message.turns ?? 1} turn${(message.turns ?? 1) > 1 ? "s" : ""} · ${parts.join(", ")}`,
       });
       break;
     }
-
     case "error": {
-      s.setAgentRunning(false);
-      s.addMessage({
-        id: `err-${Date.now()}`,
+      const safeMessage = sanitizeBrowserText(message.message || "operation failed");
+      if (!acceptRunMessage(message, message.run_id !== undefined)) break;
+      if (message.run_id !== undefined) {
+        state.addTraceEntry(traceTerminalEntry(message, "wire_error", { message: safeMessage }));
+        breathController.consumeTerminal("error", safeMessage);
+      } else {
+        breathController.signalError(safeMessage);
+      }
+      state.finishStreaming();
+      state.setAgentRunning(false);
+      state.cancelMultiRun();
+      state.addMessage({
+        id: `err-${message.run_id ?? message.timestamp_ms ?? Date.now()}`,
         role: "system",
-        content: `Error: ${msg.message}`,
+        content: `Error: ${safeMessage}`,
       });
       break;
     }

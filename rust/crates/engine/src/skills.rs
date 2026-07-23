@@ -10,10 +10,14 @@
 //! The [`SkillsManager`] is the thread-safe state container shared between the
 //! engine loop and the HTTP server.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nonoclaw_core::{
+    resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic, ExtensionKind,
+    ExtensionSourceKind, ExtensionStatus,
+};
 use serde::{Deserialize, Serialize};
 
 mod bundled;
@@ -225,6 +229,15 @@ impl Skill {
 
 // ── SkillsManager ────────────────────────────────────────────────────────────
 
+/// Structured fact emitted whenever a skill is selected or becomes active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillActivation {
+    pub name: String,
+    pub reason: String,
+    pub source: String,
+    pub version: Option<String>,
+}
+
 /// Thread-safe container for skill state. Shared between the engine loop and
 /// the HTTP/WS server via `Arc<RwLock<SkillsManager>>`.
 ///
@@ -238,6 +251,9 @@ pub struct SkillsManager {
     dynamic_skills: HashMap<String, Skill>,
     dynamic_skill_dirs: HashSet<PathBuf>,
     activated_conditional_names: HashSet<String>,
+    descriptors: Vec<ExtensionDescriptor>,
+    diagnostics: Vec<ExtensionDiagnostic>,
+    activation_events: VecDeque<SkillActivation>,
     /// Monotonic counter incremented on any state change; consumers poll this
     /// to know when to rebuild the system prompt.
     version: AtomicU64,
@@ -249,14 +265,31 @@ impl SkillsManager {
     // ── Construction ──────────────────────────────────────────────────────
 
     /// Discover all skills under `cwd` and separate into static vs conditional.
+    /// Precedence is explicit and stable: dynamic > project plugin > user plugin
+    /// > user skill > project skill > bundled.
     pub fn new(cwd: &Path) -> Self {
         let mut all = discover(cwd);
-        // Register bundled (built-in) skills first — disk skills can override them.
         bundled::register_bundled(&mut all);
+
+        let raw_descriptors = all.iter().map(skill_descriptor).collect();
+        let (descriptors, diagnostics) = resolve_extension_conflicts(raw_descriptors);
+        let active_sources: HashSet<String> = descriptors
+            .iter()
+            .filter(|descriptor| {
+                !matches!(
+                    descriptor.status,
+                    ExtensionStatus::Shadowed | ExtensionStatus::Failed
+                )
+            })
+            .map(|descriptor| descriptor.source.clone())
+            .collect();
+
         let mut static_skills = Vec::new();
         let mut conditional_skills = HashMap::new();
-
         for mut skill in all {
+            if !active_sources.contains(&skill.source) {
+                continue;
+            }
             // Normalize paths: strip `**` (match-all) and trailing `/`.
             let paths: Vec<String> = skill
                 .paths
@@ -280,6 +313,9 @@ impl SkillsManager {
             dynamic_skills: HashMap::new(),
             dynamic_skill_dirs: HashSet::new(),
             activated_conditional_names: HashSet::new(),
+            descriptors,
+            diagnostics,
+            activation_events: VecDeque::new(),
             version: AtomicU64::new(0),
             usage: SkillUsageTracker::load(),
         }
@@ -310,6 +346,30 @@ impl SkillsManager {
     /// Current monotonic version — changes whenever skill state changes.
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
+    }
+
+    /// Shared discovery data, including shadowed candidates.
+    pub fn descriptors(&self) -> Vec<ExtensionDescriptor> {
+        self.descriptors.clone()
+    }
+
+    /// Non-fatal discovery and conflict diagnostics for ProjectInfo/Insight.
+    pub fn diagnostics(&self) -> Vec<ExtensionDiagnostic> {
+        self.diagnostics.clone()
+    }
+
+    /// Drain activation facts after a trigger, slash, path, or dynamic discovery.
+    pub fn take_activation_events(&mut self) -> Vec<SkillActivation> {
+        self.activation_events.drain(..).collect()
+    }
+
+    fn record_activation(&mut self, skill: &Skill, reason: &str) {
+        self.activation_events.push_back(SkillActivation {
+            name: skill.name.clone(),
+            reason: reason.to_string(),
+            source: skill.source.clone(),
+            version: skill.version.clone(),
+        });
     }
 
     /// Save usage data to disk (called on graceful shutdown).
@@ -371,10 +431,7 @@ impl SkillsManager {
                 out.push_str(&format!("**Description**: {}\n", skill.description));
             }
             if let Some(ref wtu) = skill.when_to_use {
-                out.push_str(&format!(
-                    "**When to use**: {}\n",
-                    wtu.trim()
-                ));
+                out.push_str(&format!("**When to use**: {}\n", wtu.trim()));
             }
             if !skill.argument_names.is_empty() {
                 out.push_str(&format!(
@@ -456,13 +513,16 @@ impl SkillsManager {
         self.usage.record(name);
         if let Some(skill) = self.conditional_skills.remove(name) {
             tracing::info!(name, "slash-command activated conditional skill");
+            self.record_activation(&skill, "slash_command");
             self.activated_conditional_names.insert(name.to_string());
-            self.dynamic_skills
-                .insert(skill.name.clone(), skill);
+            self.dynamic_skills.insert(skill.name.clone(), skill);
             self.bump();
             true
         } else {
-            // Already active (static or dynamic) — still count as usage.
+            // Already active (static or dynamic) — still record the invocation.
+            if let Some(skill) = self.get_skill(name) {
+                self.record_activation(&skill, "slash_command");
+            }
             false
         }
     }
@@ -499,10 +559,8 @@ impl SkillsManager {
 
         for name in &to_activate {
             if let Some(skill) = self.conditional_skills.remove(name) {
-                tracing::info!(
-                    name,
-                    "conditionally activated skill (matched file path)"
-                );
+                tracing::info!(name, "conditionally activated skill (matched file path)");
+                self.record_activation(&skill, "path_match");
                 self.activated_conditional_names.insert(name.clone());
                 self.dynamic_skills.insert(skill.name.clone(), skill);
                 self.usage.record(name);
@@ -519,11 +577,7 @@ impl SkillsManager {
     /// Walk up from each file path (stopping below `cwd`) to discover
     /// `.nonoclaw/skills/` directories. Load any new ones into dynamic skills.
     /// Returns newly discovered directory paths.
-    pub fn discover_for_file_paths(
-        &mut self,
-        file_paths: &[PathBuf],
-        cwd: &Path,
-    ) -> Vec<PathBuf> {
+    pub fn discover_for_file_paths(&mut self, file_paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
         let resolved_cwd = canonical(cwd);
         let mut new_dirs: Vec<PathBuf> = Vec::new();
 
@@ -531,7 +585,9 @@ impl SkillsManager {
             let mut current = if fp.is_dir() {
                 fp.clone()
             } else {
-                fp.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fp.clone())
+                fp.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| fp.clone())
             };
 
             // Walk up to cwd's parent (NOT including cwd itself — cwd-level
@@ -554,9 +610,7 @@ impl SkillsManager {
         }
 
         // Sort deepest-first so skills closer to the file take precedence.
-        new_dirs.sort_by(|a, b| {
-            b.as_os_str().len().cmp(&a.as_os_str().len())
-        });
+        new_dirs.sort_by_key(|dir| std::cmp::Reverse(dir.as_os_str().len()));
 
         if !new_dirs.is_empty() {
             for dir in &new_dirs {
@@ -568,18 +622,51 @@ impl SkillsManager {
         new_dirs
     }
 
-    /// Scan a single skills directory, parse all `SKILL.md` files, and insert
-    /// them into `dynamic_skills` (later loads override earlier by name).
+    /// Scan a skills directory (or one skill root), parse valid `SKILL.md`
+    /// files, and insert them into `dynamic_skills`. A malformed neighbor is
+    /// recorded but never prevents healthy skills from loading.
     pub fn load_from_dir(&mut self, dir: &Path) {
-        let loaded = scan_skill_dir(dir);
+        let mut loaded = if dir.join("SKILL.md").is_file() {
+            parse_skill(&dir.join("SKILL.md")).into_iter().collect()
+        } else {
+            scan_skill_dir(dir)
+        };
+        if loaded.is_empty() && dir.join("SKILL.md").exists() {
+            let name = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            self.diagnostics.push(ExtensionDiagnostic {
+                severity: nonoclaw_core::ExtensionDiagnosticSeverity::Error,
+                code: "skill_load_failed".into(),
+                kind: ExtensionKind::Skill,
+                name: Some(name),
+                source: Some(dir.display().to_string()),
+                message: "failed to parse SKILL.md".into(),
+                suggestion: "fix the YAML frontmatter or make the file readable".into(),
+            });
+            return;
+        }
+        loaded.sort_by(|a, b| a.source.cmp(&b.source));
         for skill in loaded {
-            tracing::debug!(
-                name = skill.name,
-                dir = %dir.display(),
-                "dynamically loaded skill"
-            );
+            tracing::debug!(name = skill.name, dir = %dir.display(), "dynamically loaded skill");
+            let mut descriptor = skill_descriptor(&skill);
+            descriptor.source_kind = ExtensionSourceKind::Dynamic;
+            descriptor.precedence = 500;
+            self.descriptors.retain(|existing| {
+                !(existing.kind == ExtensionKind::Skill && existing.source == descriptor.source)
+            });
+            self.descriptors.push(descriptor);
+            self.record_activation(&skill, "dynamic_discovery");
             self.dynamic_skills.insert(skill.name.clone(), skill);
         }
+        let (descriptors, diagnostics) = resolve_extension_conflicts(self.descriptors.clone());
+        self.descriptors = descriptors;
+        self.diagnostics
+            .retain(|diagnostic| diagnostic.code != "extension_name_conflict");
+        self.diagnostics.extend(diagnostics);
+        self.bump();
     }
 
     /// Check all skills (static + conditional + dynamic) for `triggers` regex
@@ -590,78 +677,111 @@ impl SkillsManager {
             return Vec::new();
         }
 
-        let mut matched = Vec::new();
+        let mut matched_skills: Vec<Skill> = self
+            .static_skills
+            .iter()
+            .chain(self.dynamic_skills.values())
+            .filter(|skill| triggers_match(&skill.triggers, user_input))
+            .cloned()
+            .collect();
+        let mut to_activate: Vec<String> = self
+            .conditional_skills
+            .iter()
+            .filter(|(_, skill)| triggers_match(&skill.triggers, user_input))
+            .map(|(name, _)| name.clone())
+            .collect();
+        to_activate.sort();
 
-        // Check static skills
-        for s in &self.static_skills {
-            if triggers_match(&s.triggers, user_input) {
-                matched.push(s.name.clone());
-            }
-        }
-        // Check dynamic skills
-        for s in self.dynamic_skills.values() {
-            if triggers_match(&s.triggers, user_input)
-                && !matched.contains(&s.name)
-            {
-                matched.push(s.name.clone());
-            }
-        }
-        // Check conditional skills — auto-activate if triggered
-        let mut to_activate: Vec<String> = Vec::new();
-        for (name, s) in &self.conditional_skills {
-            if triggers_match(&s.triggers, user_input) {
-                if !matched.contains(name) {
-                    matched.push(name.clone());
-                }
-                to_activate.push(name.clone());
-            }
-        }
         for name in &to_activate {
             if let Some(skill) = self.conditional_skills.remove(name) {
                 tracing::info!(name, "trigger-activated conditional skill");
+                matched_skills.push(skill.clone());
                 self.activated_conditional_names.insert(name.clone());
                 self.dynamic_skills.insert(skill.name.clone(), skill);
                 self.usage.record(name);
             }
         }
+        matched_skills.sort_by(|a, b| a.name.cmp(&b.name));
+        matched_skills.dedup_by(|a, b| a.name == b.name);
+        for skill in &matched_skills {
+            self.record_activation(skill, "trigger");
+        }
 
         if !to_activate.is_empty() {
             self.bump();
         }
-        matched
+        matched_skills.into_iter().map(|skill| skill.name).collect()
     }
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
 
 /// Discover skills for `cwd`: project `.nonoclaw/skills`, user
-/// `~/.nonoclaw/skills`, and plugin-contributed skills. Later sources override
-/// earlier ones by name.
+/// `~/.nonoclaw/skills`, and user/project plugin-contributed skills. Duplicate
+/// candidates are retained so the shared resolver can expose every conflict.
 fn discover(cwd: &Path) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
 
-    let mut bases: Vec<PathBuf> = vec![cwd.join(".nonoclaw").join("skills")];
-    if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
-        bases.push(home.join("skills"));
+    for skill in scan_skill_dir(&cwd.join(".nonoclaw").join("skills")) {
+        skills.push(skill);
     }
-    for base in &bases {
-        for skill in scan_skill_dir(base) {
+    if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
+        for skill in scan_skill_dir(&home.join("skills")) {
             skills.push(skill);
         }
+        load_plugin_skills(&home.join("plugins"), &mut skills);
     }
+    load_plugin_skills(&cwd.join(".nonoclaw").join("plugins"), &mut skills);
+    skills
+}
 
-    // Plugin-contributed skills
-    let plugins_dir = cwd.join(".nonoclaw").join("plugins");
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        for entry in entries.flatten() {
-            let plugin_skills = entry.path().join("skills");
-            for skill in scan_skill_dir(&plugin_skills) {
-                skills.push(skill);
-            }
-        }
+fn load_plugin_skills(plugins_dir: &Path, skills: &mut Vec<Skill>) {
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return;
+    };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        skills.extend(scan_skill_dir(&entry.path().join("skills")));
     }
+}
 
-    dedup_by_name(skills)
+fn skill_descriptor(skill: &Skill) -> ExtensionDescriptor {
+    let data_dir = nonoclaw_core::nonoclaw_data_dir();
+    let source_path = Path::new(&skill.source);
+    let (source_kind, precedence) = if skill.source.starts_with("bundled:") {
+        (ExtensionSourceKind::Bundled, 0)
+    } else if skill.source.contains("/.nonoclaw/plugins/") {
+        (ExtensionSourceKind::Plugin, 400)
+    } else if data_dir
+        .as_ref()
+        .map(|home| source_path.starts_with(home.join("plugins")))
+        .unwrap_or(false)
+    {
+        (ExtensionSourceKind::Plugin, 300)
+    } else if data_dir
+        .as_ref()
+        .map(|home| source_path.starts_with(home.join("skills")))
+        .unwrap_or(false)
+    {
+        (ExtensionSourceKind::User, 200)
+    } else {
+        (ExtensionSourceKind::Project, 100)
+    };
+    let mut descriptor = ExtensionDescriptor::new(
+        ExtensionKind::Skill,
+        skill.name.clone(),
+        skill.source.clone(),
+        source_kind,
+        precedence,
+    );
+    descriptor.version = skill.version.clone();
+    descriptor.status = if skill.is_conditional() {
+        ExtensionStatus::Pending
+    } else {
+        ExtensionStatus::Active
+    };
+    descriptor
 }
 
 fn scan_skill_dir(base: &Path) -> Vec<Skill> {
@@ -722,11 +842,7 @@ pub fn parse_skill(path: &Path) -> Option<Skill> {
 /// embedded via `include_str!()`). `fallback_name` is the directory name
 /// (used when frontmatter omits `name`). `source` is a human-readable label
 /// like `"bundled:code-review"`.
-pub fn parse_skill_str(
-    text: &str,
-    fallback_name: Option<&str>,
-    source: &str,
-) -> Option<Skill> {
+pub fn parse_skill_str(text: &str, fallback_name: Option<&str>, source: &str) -> Option<Skill> {
     let (front, body) = parse_frontmatter(text);
 
     let name = front
@@ -806,9 +922,7 @@ fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
         .to_string();
 
     // Try serde_yaml first.
-    let map = if let Ok(value) =
-        serde_yaml::from_str::<serde_yaml::Value>(yaml_str)
-    {
+    let map = if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str) {
         yaml_value_to_map(&value)
     } else {
         // Fallback: line-by-line key: value.
@@ -890,10 +1004,10 @@ fn parse_string_list(raw: Option<&String>) -> Vec<String> {
 }
 
 fn parse_bool(raw: Option<&String>) -> bool {
-    match raw.map(|s| s.to_lowercase()).as_deref() {
-        Some("true") | Some("1") | Some("yes") => true,
-        _ => false,
-    }
+    matches!(
+        raw.map(|s| s.to_lowercase()).as_deref(),
+        Some("true") | Some("1") | Some("yes")
+    )
 }
 
 // ── Glob matching ────────────────────────────────────────────────────────────
@@ -908,8 +1022,7 @@ fn matches_pattern(pattern: &str, relative_path: &str) -> bool {
 
     // If pattern has no glob metacharacters, match as prefix.
     if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
-        return relative_path == pattern
-            || relative_path.starts_with(&format!("{pattern}/"));
+        return relative_path == pattern || relative_path.starts_with(&format!("{pattern}/"));
     }
 
     // For `**` patterns, use the glob crate (handles cross-directory matching).
@@ -919,8 +1032,7 @@ fn matches_pattern(pattern: &str, relative_path: &str) -> bool {
         }
         // Fallback: prefix match on the part before `/**`.
         let prefix = pattern.trim_end_matches("/**");
-        return relative_path == prefix
-            || relative_path.starts_with(&format!("{prefix}/"));
+        return relative_path == prefix || relative_path.starts_with(&format!("{prefix}/"));
     }
 
     // For single-level `*` / `?` / `[abc]` patterns, use a custom matcher that
@@ -1046,19 +1158,6 @@ fn walk_ref_dir(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn dedup_by_name(skills: Vec<Skill>) -> Vec<Skill> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<Skill> = Vec::new();
-    // Reverse iteration → first occurrence wins; we reverse back at the end.
-    for s in skills.into_iter().rev() {
-        if seen.insert(s.name.clone()) {
-            out.push(s);
-        }
-    }
-    out.reverse();
-    out
-}
-
 /// Substitute argument placeholders in a skill body. Mirrors CC's
 /// `argumentSubstitution.ts`.
 ///
@@ -1102,13 +1201,17 @@ pub fn substitute_arguments(
             .to_string();
     }
 
-    let re_dollar_n = regex::Regex::new(r"\$(\d+)(?!\w)").unwrap();
+    let re_dollar_n = regex::Regex::new(r"\$(\d+)([^A-Za-z0-9_]|$)").unwrap();
     if re_dollar_n.is_match(&result) {
         has_placeholder = true;
         result = re_dollar_n
             .replace_all(&result, |caps: &regex::Captures| {
                 let idx: usize = caps[1].parse().unwrap_or(0);
-                parsed.get(idx).cloned().unwrap_or_default()
+                format!(
+                    "{}{}",
+                    parsed.get(idx).cloned().unwrap_or_default(),
+                    &caps[2]
+                )
             })
             .to_string();
     }
@@ -1200,7 +1303,9 @@ fn parse_args(args: &str) -> Vec<String> {
 
 /// Truncate a string to `max` chars, appending `…` if clipped.
 pub fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { return s.to_string(); }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out
@@ -1211,10 +1316,7 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "nonoclaw-skills-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let d = std::env::temp_dir().join(format!("nonoclaw-skills-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1249,7 +1351,8 @@ mod tests {
 
     #[test]
     fn parses_boolean_fields() {
-        let text = "---\nname: s\ndisable-model-invocation: true\nuser-invocable: false\n---\nbody\n";
+        let text =
+            "---\nname: s\ndisable-model-invocation: true\nuser-invocable: false\n---\nbody\n";
         let (front, _) = parse_frontmatter(text);
         assert_eq!(front.get("disable-model-invocation").unwrap(), "true");
         assert_eq!(front.get("user-invocable").unwrap(), "false");
@@ -1296,9 +1399,13 @@ mod tests {
 
     #[test]
     fn parses_triggers() {
-        let text = "---\nname: s\ntriggers:\n  - \"deploy|ship|release\"\n  - \"prod\"\n---\nbody\n";
+        let text =
+            "---\nname: s\ntriggers:\n  - \"deploy|ship|release\"\n  - \"prod\"\n---\nbody\n";
         let (front, _) = parse_frontmatter(text);
-        assert!(front.get("triggers").unwrap().contains("deploy|ship|release"));
+        assert!(front
+            .get("triggers")
+            .unwrap()
+            .contains("deploy|ship|release"));
         assert!(front.get("triggers").unwrap().contains("prod"));
     }
 
@@ -1383,18 +1490,12 @@ mod tests {
         assert!(mgr.conditional_skills.contains_key("rust-helper"));
 
         // No match — wrong file type.
-        let activated = mgr.activate_conditional_for_paths(
-            &[PathBuf::from("src/readme.md")],
-            &dir,
-        );
+        let activated = mgr.activate_conditional_for_paths(&[PathBuf::from("src/readme.md")], &dir);
         assert!(activated.is_empty());
         assert_eq!(mgr.conditional_count(), cond_before);
 
         // Match — .rs file activates the skill.
-        let activated = mgr.activate_conditional_for_paths(
-            &[PathBuf::from("src/main.rs")],
-            &dir,
-        );
+        let activated = mgr.activate_conditional_for_paths(&[PathBuf::from("src/main.rs")], &dir);
         assert!(activated.contains(&"rust-helper".to_string()));
         assert!(mgr.dynamic_skills.contains_key("rust-helper"));
     }
@@ -1478,14 +1579,8 @@ mod tests {
             &["deploy|ship|release".to_string()],
             "please deploy to prod"
         ));
-        assert!(triggers_match(
-            &["ship".to_string()],
-            "can you ship this"
-        ));
-        assert!(!triggers_match(
-            &["deploy".to_string()],
-            "hello world"
-        ));
+        assert!(triggers_match(&["ship".to_string()], "can you ship this"));
+        assert!(!triggers_match(&["deploy".to_string()], "hello world"));
         assert!(!triggers_match(&[], "deploy"));
     }
 
@@ -1510,6 +1605,58 @@ mod tests {
     }
 
     #[test]
+    fn extension_discovery_precedence_is_characterized() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempdir();
+        let home = dir.join("home");
+        let project_skills = dir.join(".nonoclaw/skills");
+        let user_skills = home.join("skills");
+        let plugin_skills = dir.join(".nonoclaw/plugins/p1/skills");
+        write_skill(
+            &project_skills,
+            "shared",
+            "---\nname: shared\n---\nproject body",
+        );
+        write_skill(&user_skills, "shared", "---\nname: shared\n---\nuser body");
+        write_skill(
+            &plugin_skills,
+            "shared",
+            "---\nname: shared\n---\nplugin body",
+        );
+        // This deliberately captures the current bundled-vs-disk behavior
+        // called out as Q-14 in the Feature Preservation Matrix.
+        write_skill(
+            &project_skills,
+            "verify",
+            "---\nname: verify\n---\nproject verify body",
+        );
+
+        std::env::set_var("NONOCLAW_HOME", &home);
+        let manager = SkillsManager::new(&dir);
+        std::env::remove_var("NONOCLAW_HOME");
+
+        let shared = manager.get_skill("shared").unwrap();
+        assert!(shared.body.contains("plugin body"));
+        assert!(shared.source.contains("plugins/p1/skills/shared"));
+        let verify_lookup = manager.get_skill("verify").unwrap();
+        assert!(verify_lookup.source.contains(".nonoclaw/skills/verify"));
+        assert!(verify_lookup.body.contains("project verify body"));
+        let verify_active = manager
+            .all_active()
+            .into_iter()
+            .find(|skill| skill.name == "verify")
+            .unwrap();
+        assert!(verify_active.source.contains(".nonoclaw/skills/verify"));
+        assert!(verify_active.body.contains("project verify body"));
+        let conflict = manager
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.name.as_deref() == Some("verify"))
+            .unwrap();
+        assert_eq!(conflict.code, "extension_name_conflict");
+    }
+
+    #[test]
     fn dynamic_discovery_from_subdir() {
         let dir = tempdir();
         // Create a nested .nonoclaw/skills in a subdirectory.
@@ -1528,12 +1675,53 @@ mod tests {
         assert!(mgr.dynamic_skills.is_empty());
 
         // Simulate reading a file in the subdirectory.
-        let discovered = mgr.discover_for_file_paths(
-            &[sub.join("src").join("main.rs")],
-            &dir,
-        );
+        let discovered = mgr.discover_for_file_paths(&[sub.join("src").join("main.rs")], &dir);
         assert!(!discovered.is_empty());
         assert!(mgr.dynamic_skills.contains_key("api-tools"));
+    }
+
+    #[test]
+    fn hot_reload_replaces_body_and_emits_dynamic_activation() {
+        let dir = tempdir();
+        let skill_root = dir.join("reloadable");
+        write_skill(
+            &dir,
+            "reloadable",
+            "---\nname: reloadable\nversion: 1\n---\nold",
+        );
+        let mut manager = SkillsManager::new(&tempdir());
+        manager.load_from_dir(&skill_root);
+        assert_eq!(manager.get_skill("reloadable").unwrap().body, "old");
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: reloadable\nversion: 2\n---\nnew",
+        )
+        .unwrap();
+        manager.load_from_dir(&skill_root);
+        let reloaded = manager.get_skill("reloadable").unwrap();
+        assert_eq!(reloaded.body, "new");
+        assert_eq!(reloaded.version.as_deref(), Some("2"));
+        assert!(manager
+            .take_activation_events()
+            .iter()
+            .any(|event| event.reason == "dynamic_discovery"
+                && event.version.as_deref() == Some("2")));
+    }
+
+    #[test]
+    fn trigger_activation_records_reason_source_and_version() {
+        let dir = tempdir();
+        write_skill(
+            &dir.join(".nonoclaw/skills"),
+            "deploy",
+            "---\nname: deploy\nversion: 3\ntriggers: [deploy]\n---\nbody",
+        );
+        let mut manager = SkillsManager::new(&dir);
+        assert_eq!(manager.match_triggers("deploy now"), vec!["deploy"]);
+        let event = manager.take_activation_events().pop().unwrap();
+        assert_eq!(event.reason, "trigger");
+        assert_eq!(event.version.as_deref(), Some("3"));
+        assert!(event.source.contains("deploy"));
     }
 
     #[test]
@@ -1565,5 +1753,4 @@ mod tests {
         let dup = active.iter().find(|s| s.name == "dup").unwrap();
         assert_eq!(dup.description, "dynamic version");
     }
-
 }

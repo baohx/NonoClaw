@@ -4,16 +4,28 @@
 //! usage in `src/Tool.ts`, `src/query.ts`, `src/services/api/claude.ts`).
 
 pub mod error;
+pub mod extension;
 pub mod message;
 pub mod permissions;
+pub mod run_event;
+pub mod task;
 pub mod usage;
 
-pub use error::{ApiErrorKind, Error, Result};
+pub use error::{ApiErrorKind, AppError, Error, ErrorCode, Result};
+pub use extension::{
+    resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic,
+    ExtensionDiagnosticSeverity, ExtensionKind, ExtensionSourceKind, ExtensionStatus,
+};
 pub use message::{
     CacheControl, CacheControlKind, ContentBlock, ImageSource, Message, MessageContent, Role,
     StopReason, ToolResultContent,
 };
 pub use permissions::{PermissionDecision, PermissionMode, PermissionResult, ValidationResult};
+pub use run_event::{
+    redact_text, redact_value, timestamp_ms, EventEnvelope, RunEvent, RunId, SessionRepair,
+    SessionRepairKind, StreamState, TechnicalStatus, EVENT_PROTOCOL_VERSION,
+};
+pub use task::{TaskChange, TaskChangeKind, TaskChangeSource, TaskSnapshot, TaskStatus};
 pub use usage::{Usage, UsagePart};
 
 /// The user's home directory (platform-aware).

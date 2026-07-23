@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useStore } from "../store";
 import type { ProjectInfo, ToolInfo } from "../types";
+import TechnicalTrace from "./TechnicalTrace";
 
 interface Props {
   info: ProjectInfo | null;
@@ -37,6 +38,7 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
           </button>
         </span>
       </div>
+      <TechnicalTrace />
       <div className="acc">
         <Section
           id="tools"
@@ -153,6 +155,35 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         </Section>
 
         <Section
+          id="extension-diagnostics"
+          label="Extension diagnostics"
+          count={info?.extension_diagnostics.length ?? 0}
+          open={open.has("extension-diagnostics")}
+          onToggle={toggle}
+        >
+          {(info?.extension_diagnostics.length ?? 0) === 0 ? (
+            <div className="acc-empty">no extension conflicts or load failures</div>
+          ) : (
+            info?.extension_diagnostics.map((diagnostic, index) => (
+              <div className="insight-row" key={`${diagnostic.code}-${diagnostic.source}-${index}`}>
+                <div className="insight-row__top">
+                  <span className={`dot ${diagnostic.severity === "error" ? "bad" : "off"}`} />
+                  <span className="tag">{diagnostic.kind}</span>
+                  <span className="insight-row__name">{diagnostic.name ?? diagnostic.code}</span>
+                </div>
+                <div className="insight-row__meta">{diagnostic.message}</div>
+                <div className="insight-row__meta">fix: {diagnostic.suggestion}</div>
+              </div>
+            ))
+          )}
+          {(info?.extensions.length ?? 0) > 0 && (
+            <div className="acc-empty" style={{ marginTop: 8 }}>
+              higher precedence wins; shadowed and failed sources remain visible for diagnosis
+            </div>
+          )}
+        </Section>
+
+        <Section
           id="hooks"
           label="Hooks"
           count={info?.hooks.length ?? 0}
@@ -171,14 +202,15 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         >
           <PathRows label="docs" layers={info?.docs ?? []} onOpen={onOpen} />
           <PathRows label="config" layers={info?.settings ?? []} onOpen={onOpen} />
+          <ConfigRef items={info?.config_reference ?? []} />
         </Section>
 
         <Section id="slash" label="Slash commands" count={3} open={open.has("slash")} onToggle={toggle}>
           <SlashRef />
         </Section>
 
-        <Section id="cli" label="CLI reference" count={null} open={open.has("cli")} onToggle={toggle}>
-          <CliRef />
+        <Section id="cli" label="CLI reference" count={info?.cli_reference.length ?? 0} open={open.has("cli")} onToggle={toggle}>
+          <CliRef items={info?.cli_reference ?? []} />
         </Section>
 
         <Section
@@ -340,18 +372,21 @@ function PathRows({
   );
 }
 
-// ── Hooks: configured list + static reference ───────────────────────────────
+// ── Hooks: configured list + lifecycle reference ───────────────────────────
 
 const HOOK_TYPES: { name: string; when: string; deny: boolean; match: boolean }[] = [
   { name: "PreToolUse", when: "before a tool runs", deny: true, match: true },
-  { name: "PostToolUse", when: "after a tool finishes", deny: false, match: true },
+  { name: "PostToolUse", when: "after a tool succeeds", deny: false, match: true },
+  { name: "PostToolUseFailure", when: "after a tool fails", deny: false, match: true },
+  { name: "Notification", when: "runtime notification", deny: false, match: false },
   { name: "UserPromptSubmit", when: "user sends a prompt", deny: false, match: false },
   { name: "SessionStart", when: "session begins", deny: false, match: false },
   { name: "SessionEnd", when: "session ends", deny: false, match: false },
-  { name: "Stop", when: "main loop stops (turn done)", deny: false, match: false },
+  { name: "Stop", when: "main run stops", deny: false, match: false },
+  { name: "SubagentStart", when: "a subagent begins", deny: false, match: false },
   { name: "SubagentStop", when: "a subagent finishes", deny: false, match: false },
-  { name: "PreCompact", when: "before auto-compaction", deny: false, match: false },
-  { name: "PostCompact", when: "after auto-compaction", deny: false, match: false },
+  { name: "PreCompact", when: "before compaction", deny: false, match: false },
+  { name: "PostCompact", when: "after compaction", deny: false, match: false },
 ];
 
 function HooksSection({ configured }: { configured: { hook_type: string; matcher: string; command: string }[] }) {
@@ -374,7 +409,7 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
         <div className="acc-empty">none configured — create .nonoclaw/hooks.json (clickable in Docs & config)</div>
       )}
 
-      <div className="schema__label" style={{ marginTop: 10 }}>hook types · 9</div>
+      <div className="schema__label" style={{ marginTop: 10 }}>hook types · {HOOK_TYPES.length}</div>
       {HOOK_TYPES.map((t) => (
         <div className="cli-ref__flag" key={t.name}>
           <span className="cli-ref__name">{t.name}</span>
@@ -388,7 +423,7 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
 
       <div className="schema__label" style={{ marginTop: 10 }}>config</div>
       <div className="cli-ref__ex">
-{`// <cwd>/.nonoclaw/hooks.json  (project-level only)
+{`// ~/.nonoclaw/hooks.json or <cwd>/.nonoclaw/hooks.json
 {
   "hooks": {
     "PreToolUse": [
@@ -461,34 +496,16 @@ function SlashRef() {
           <span className="insight-row__name">Multi-model compare</span>
         </div>
         <div className="insight-row__meta">
-          Syntax: /multi deepseek-chat,glm-4-plus {"<prompt>"} — answers from multiple models side by side (Phase 2)
+          Syntax: /multi deepseek-chat,glm-4-plus {"<prompt>"} — compare model answers sequentially
         </div>
       </div>
     </div>
   );
 }
 
-// ── Static CLI reference ────────────────────────────────────────────────────
+// ── Generated CLI/config references ────────────────────────────────────────
 
-const CLI_FLAGS: { name: string; desc: string }[] = [
-  { name: "-p, --print", desc: "headless single-shot mode (no TUI)" },
-  { name: "--model <ID>", desc: "override the model (e.g. deepseek-chat)" },
-  { name: "--serve-http <ADDR>", desc: "start the web UI server" },
-  { name: "--permission-mode", desc: "default | acceptEdits | auto | plan | bypass" },
-  { name: "--allowed-tools", desc: "comma-separated tool allowlist" },
-  { name: "--disallowed-tools", desc: "comma-separated tool denylist" },
-  { name: "--mcp-config <PATH>", desc: "MCP servers JSON config file" },
-  { name: "--max-turns <N>", desc: "cap agent turns (default 10)" },
-  { name: "--resume <ID>", desc: "resume a session by id" },
-  { name: "--continue", desc: "resume the most recent session" },
-  { name: "--list-sessions", desc: "list sessions for cwd, then exit" },
-  { name: "--add-dir <PATH>", desc: "extra NONOCLAW.md search dir" },
-  { name: "--plugin-add <SRC>", desc: "install a plugin (dir or git URL)" },
-  { name: "--mcp-serve", desc: "run as an MCP server over stdio" },
-  { name: "--no-auto-compact", desc: "disable auto-compaction" },
-];
-
-function CliRef() {
+function CliRef({ items }: { items: { name: string; description: string }[] }) {
   return (
     <div className="cli-ref">
       <div className="cli-ref__ex">
@@ -503,13 +520,28 @@ echo "fix the bug" | nonoclaw -p --allowed-tools Read,Edit,Bash
 nonoclaw --continue "keep going"
 nonoclaw --list-sessions`}
       </div>
-      {CLI_FLAGS.map((f) => (
-        <div key={f.name} className="cli-ref__flag">
-          <span className="cli-ref__name">{f.name}</span>
-          <span className="cli-ref__desc">{f.desc}</span>
+      {items.map((item) => (
+        <div key={item.name} className="cli-ref__flag">
+          <span className="cli-ref__name">{item.name}</span>
+          <span className="cli-ref__desc">{item.description}</span>
         </div>
       ))}
+      {items.length === 0 && <div className="acc-empty">CLI metadata unavailable</div>}
     </div>
+  );
+}
+
+function ConfigRef({ items }: { items: { name: string; description: string }[] }) {
+  return (
+    <>
+      <div className="acc-empty" style={{ marginTop: 8 }}>settings fields</div>
+      {items.map((item) => (
+        <div key={item.name} className="cli-ref__flag">
+          <span className="cli-ref__name">{item.name}</span>
+          <span className="cli-ref__desc">{item.description}</span>
+        </div>
+      ))}
+    </>
   );
 }
 

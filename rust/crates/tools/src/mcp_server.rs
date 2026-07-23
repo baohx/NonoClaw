@@ -8,12 +8,11 @@
 //! trusts its client and runs tools under `BypassPermissions` (the client owns
 //! gating). `Agent` is excluded (no engine/client available to spawn subagents).
 
-use std::io::Write;
 use std::path::Path;
 
 use nonoclaw_core::{PermissionMode, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::tool::{ToolCtx, ToolOptions};
 
@@ -24,11 +23,25 @@ fn rpc_error(code: i64, message: &str) -> Value {
 
 /// Run the MCP server loop on stdin/stdout until EOF.
 pub async fn serve_stdin(registry: &crate::ToolRegistry, cwd: &Path) -> Result<()> {
+    serve_io(registry, cwd, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Transport-generic MCP loop. Keeping framing here makes stdio behavior
+/// characterizable with in-memory streams and no external process.
+async fn serve_io<R, W>(
+    registry: &crate::ToolRegistry,
+    cwd: &Path,
+    reader: R,
+    mut writer: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     // Agent can't run here (no engine/client), so don't advertise it.
     let served = registry.filtered(&["Agent"]);
 
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    let mut reader = BufReader::new(reader);
     let mut line = String::new();
     loop {
         line.clear();
@@ -81,9 +94,8 @@ pub async fn serve_stdin(registry: &crate::ToolRegistry, cwd: &Path) -> Result<(
                 Ok(r) => json!({"jsonrpc":"2.0","id":id,"result":r}),
                 Err(e) => json!({"jsonrpc":"2.0","id":id,"error":e}),
             };
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{resp}");
-            let _ = out.flush();
+            writer.write_all(format!("{resp}\n").as_bytes()).await?;
+            writer.flush().await?;
         }
     }
     Ok(())
@@ -119,6 +131,7 @@ async fn call_tool(
         cwd,
         options: &opts,
         cancel: &cancel,
+        task_scope: Some("mcp"),
         subagent: None,
         question: None,
         background_registry: None,
@@ -135,4 +148,79 @@ async fn call_tool(
             "isError": true,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Minimal initialize → list → call flow over the real JSONL MCP adapter.
+    /// Feature Preservation Matrix: §2.2 MCP server and §3.2; Requirements 1.3-1.4.
+    #[tokio::test]
+    async fn mcp_server_minimal_success_path() {
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let file = cwd.join("fixture.txt");
+        std::fs::write(&file, "fixture body\n").unwrap();
+
+        let (registry, _) = crate::builtin::register_all();
+        let (client, server) = tokio::io::duplex(128 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let server_cwd = cwd.clone();
+        let task = tokio::spawn(async move {
+            serve_io(&registry, &server_cwd, server_read, server_write).await
+        });
+
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut responses = BufReader::new(client_read).lines();
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let initialized: Value =
+            serde_json::from_str(&responses.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let listed: Value =
+            serde_json::from_str(&responses.next_line().await.unwrap().unwrap()).unwrap();
+        let names: Vec<_> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 19);
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"TaskOutput"));
+        assert!(names.contains(&"TaskStop"));
+        assert!(!names.contains(&"Agent"));
+
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {"file_path": file}}
+        });
+        client_write
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        let called: Value =
+            serde_json::from_str(&responses.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(called["result"]["isError"], false);
+        assert!(called["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fixture body"));
+
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        task.abort();
+        let _ = task.await;
+    }
 }
