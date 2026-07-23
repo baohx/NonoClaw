@@ -104,7 +104,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX, **tool card auto-collapse + command preview**, **attachment chips with upload state**, **"Nono" assistant label** |
 | **PWA** | Add to Home Screen, offline SW cache, installable on Android/iOS |
 | **Mobile Sync** | QR code → shared session → revisioned `MessagesLoaded` snapshots and sequenced run events; stale generations/revisions are rejected and peer snapshots are synchronized after Run/Clear/completion. |
-| **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access with terminal ASCII QR code |
+| **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access; the connected Web UI provides the authenticated mobile URL and QR code |
 | **LSP Code Intelligence** | goToDefinition, findReferences, documentSymbol, workspaceSymbol via ripgrep. No language server required. |
 | **Export** | Markdown copy + `.md` file download from assistant responses |
 
@@ -477,8 +477,7 @@ nonoclaw --serve-http 127.0.0.1:8765 --tunnel
 What happens:
 1. NonoClaw auto-spawns `cloudflared tunnel --url http://127.0.0.1:8765`
 2. Captures the `*.trycloudflare.com` URL from cloudflared's output
-3. Prints an **ASCII QR code** to the terminal (scannable immediately)
-4. Sets `public_url` auto-matically — the web UI QR button uses the tunnel URL
+3. Sets `public_url` automatically — the connected Web UI provides the authenticated tunnel URL and QR code
 
 Phone can access NonoClaw from any network (4G/5G, different WiFi, abroad) — no port forwarding, no public IP needed.
 
@@ -897,7 +896,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Web 界面** | 生物发光暗色主题，呼吸式 aurora 背景，文件树，Git 面板，Insight 手风琴，Markdown+KaTeX，**工具卡片自动折叠 + 命令预览**，**附件 chips 上传状态**，**"Nono" 助手标签** |
 | **PWA** | 添加到主屏幕，离线 SW 缓存，可在 Android/iOS 上安装 |
 | **手机同步** | 二维码 → 共享 session → 带 revision 的 `MessagesLoaded` 快照与有序运行事件；客户端拒绝旧连接代次/旧 revision，并在 Run/Clear/完成后同步 peer。 |
-| **隧道** | `--tunnel` 自动启动 Cloudflare Tunnel，终端打印 ASCII 二维码，实现公网 HTTPS 访问 |
+| **隧道** | `--tunnel` 自动启动 Cloudflare Tunnel，实现公网 HTTPS 访问；已连接的 Web UI 提供移动端认证 URL 和二维码 |
 | **LSP 代码智能** | goToDefinition、findReferences、documentSymbol、workspaceSymbol，基于 ripgrep。无需安装语言服务器。 |
 | **导出** | 助手回复支持复制 Markdown 与下载 `.md` 文件 |
 
@@ -1240,8 +1239,7 @@ nonoclaw --serve-http 127.0.0.1:8765 --tunnel
 流程：
 1. NonoClaw 自动启动 `cloudflared tunnel --url http://127.0.0.1:8765`
 2. 捕获 cloudflared 输出中的 `*.trycloudflare.com` URL
-3. 在终端打印 **ASCII 二维码**（可立即扫码）
-4. 自动设置 `public_url`——Web 界面的 QR 按钮使用隧道 URL
+3. 自动设置 `public_url`——已连接的 Web UI 通过 QR 按钮提供隧道认证 URL 和二维码
 
 手机可以从任何网络访问 NonoClaw（4G/5G、不同 WiFi、海外）——无需端口转发，无需公网 IP。
 
