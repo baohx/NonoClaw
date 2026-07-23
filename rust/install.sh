@@ -42,6 +42,10 @@ if [ ! -f "$FRONTEND_DIR/package.json" ]; then
   echo "错误: 未找到 $FRONTEND_DIR/package.json。" >&2
   exit 1
 fi
+if [ ! -f "$FRONTEND_DIR/package-lock.json" ]; then
+  echo "错误: 未找到 $FRONTEND_DIR/package-lock.json，无法执行可复现的 npm ci。" >&2
+  exit 1
+fi
 
 printf '%s\n' "=== NonoClaw 安装 / Install ==="
 printf '项目目录 / Project: %s\n' "$PROJECT_DIR"
@@ -50,11 +54,7 @@ printf '前端 / Frontend:     %s\n\n' "$FRONTEND_DST"
 
 echo "[1/4] 安装前端依赖并构建 / Install frontend dependencies and build"
 cd "$FRONTEND_DIR"
-if [ -f package-lock.json ]; then
-  npm ci
-else
-  npm install
-fi
+npm ci
 npm run build
 if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
   echo "错误: 前端构建未生成 $FRONTEND_DIR/dist/index.html。" >&2
@@ -71,10 +71,16 @@ fi
 
 echo "[3/4] 复制可执行文件 / Copy executable"
 mkdir -p "$BIN_DIR"
+# The temporary file is on the destination filesystem, so mv performs an
+# atomic replacement rather than leaving a source-tree symlink behind.
 BIN_TMP="$(mktemp "$BIN_DIR/.nonoclaw.tmp.XXXXXX")"
 install -m 0755 "$BIN_SRC" "$BIN_TMP"
 mv -f "$BIN_TMP" "$BIN_DST"
 BIN_TMP=""
+if [ ! -x "$BIN_DST" ] || [ -L "$BIN_DST" ]; then
+  echo "错误: 安装后的二进制无效或仍为符号链接: $BIN_DST。" >&2
+  exit 1
+fi
 
 echo "[4/4] 复制前端资源 / Copy frontend assets"
 mkdir -p "$DATA_DIR/frontend"
@@ -83,6 +89,10 @@ cp -R "$FRONTEND_DIR/dist/." "$FRONTEND_TMP/"
 rm -rf "$FRONTEND_DST"
 mv "$FRONTEND_TMP" "$FRONTEND_DST"
 FRONTEND_TMP=""
+if [ ! -f "$FRONTEND_DST/index.html" ]; then
+  echo "错误: 安装后的前端缺少 $FRONTEND_DST/index.html。" >&2
+  exit 1
+fi
 
 if printf '%s' "$PATH" | tr ':' '\n' | grep -qxF "$BIN_DIR"; then
   printf '✓ %s 已在 PATH 中 / is already on PATH\n' "$BIN_DIR"
