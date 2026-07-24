@@ -10,13 +10,14 @@
 //! server restart can resume them.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     response::IntoResponse,
     routing::get,
     Router,
@@ -90,6 +91,63 @@ impl AppState {
     pub(super) fn authorized(&self, supplied_token: Option<&str>) -> bool {
         token_is_authorized(self.require_auth, &self.auth_token, supplied_token)
     }
+
+    fn websocket_authorized(
+        &self,
+        supplied_token: Option<&str>,
+        peer_ip: IpAddr,
+        headers: &HeaderMap,
+    ) -> bool {
+        let forwarded = headers.contains_key("forwarded")
+            || headers.contains_key("x-forwarded-for")
+            || headers.contains_key("x-real-ip")
+            || headers.contains_key("cf-connecting-ip");
+        let require_auth = request_requires_auth(self.require_auth, peer_ip, forwarded);
+        token_is_authorized(require_auth, &self.auth_token, supplied_token)
+    }
+}
+
+fn request_requires_auth(configured: bool, peer_ip: IpAddr, forwarded: bool) -> bool {
+    configured && (!peer_ip.is_loopback() || forwarded)
+}
+
+#[cfg(test)]
+pub(super) fn upload_exploration_state(
+    cwd: PathBuf,
+    config: Arc<ResolvedConfig>,
+    upload_dir: PathBuf,
+) -> Arc<AppState> {
+    let (registry, todos) = nonoclaw_tools::register_all();
+    let registry = Arc::new(registry);
+    let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
+    let project_service = Arc::new(ProjectService::new(
+        cwd.clone(),
+        Arc::clone(&registry),
+        Arc::clone(&config),
+        None,
+        Arc::clone(&skills_manager),
+    ));
+    Arc::new(AppState {
+        registry,
+        todos,
+        cwd,
+        config: Arc::clone(&config),
+        auth_token: "exploration-token".into(),
+        require_auth: false,
+        public_url: None,
+        active_model: Arc::new(Mutex::new(config.active_model.value.clone())),
+        session_service: SessionService::new(),
+        session_hub: SessionHub::new(),
+        pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+        pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
+        skills_manager,
+        project_service,
+        background_registry: Arc::new(std::sync::Mutex::new(
+            nonoclaw_tools::BackgroundTaskRegistry::new(),
+        )),
+        upload_dir,
+    })
 }
 
 fn token_is_authorized(require_auth: bool, expected: &str, supplied: Option<&str>) -> bool {
@@ -265,18 +323,24 @@ pub async fn serve(
         app
     };
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
 // ── WebSocket handler ───────────────────────────────────────────────────────
 
 async fn ws_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.websocket_authorized(params.get("token").map(String::as_str), peer.ip(), &headers) {
         return super::http_error::error_response(
             StatusCode::UNAUTHORIZED,
             AppError::new(
@@ -1513,6 +1577,24 @@ mod characterization_tests {
             Some("https://public.example")
         ));
         assert!(listener_requires_auth("not-an-address", false, None));
+    }
+
+    #[test]
+    fn websocket_auth_policy_allows_only_direct_loopback_bootstrap_without_token() {
+        let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        let remote: IpAddr = "192.0.2.10".parse().unwrap();
+
+        assert!(!request_requires_auth(true, loopback_v4, false));
+        assert!(!request_requires_auth(true, loopback_v6, false));
+        assert!(request_requires_auth(true, loopback_v4, true));
+        assert!(request_requires_auth(true, remote, false));
+        assert!(!request_requires_auth(false, remote, true));
+
+        assert!(token_is_authorized(false, "secret", None));
+        assert!(!token_is_authorized(false, "secret", Some("wrong")));
+        assert!(!token_is_authorized(true, "secret", None));
+        assert!(token_is_authorized(true, "secret", Some("secret")));
     }
 
     fn client_kind(message: ClientMsg) -> &'static str {

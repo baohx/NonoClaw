@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { breathController } from "./breath";
-import { clearMobileAccessToken, sanitizeBrowserText, setMobileAccessToken } from "./security";
+import { clearMobileAccessToken, getBrowserAccessToken, sanitizeBrowserText, setMobileAccessToken } from "./security";
 import { useStore } from "./store";
 import { traceEntryFromEvent, traceTerminalEntry } from "./trace";
 import type { ClientMsg, ServerMsg } from "./types";
@@ -22,7 +22,7 @@ interface SocketRuntime {
 
 function websocketUrl(url: string): string {
   const params = new URLSearchParams(window.location.search);
-  const token = params.get("token");
+  const token = getBrowserAccessToken(window.location.search);
   const session = params.get("session");
   if (!token && !session) return url;
   const query = new URLSearchParams();

@@ -49,7 +49,7 @@ let mobileAccessToken = "";
 
 /** Keep the QR/mobile credential out of Zustand, localStorage, traces, and
  * serializable browser state. The token remains process-memory-only and is
- * exposed solely to the QR components that intentionally encode it. */
+ * exposed solely to authenticated networking and QR URL construction. */
 export function setMobileAccessToken(value: unknown): boolean {
   mobileAccessToken = typeof value === "string"
     && value.length >= 16
@@ -62,6 +62,13 @@ export function setMobileAccessToken(value: unknown): boolean {
 
 export function getMobileAccessToken(): string {
   return mobileAccessToken;
+}
+
+/** Prefer the credential explicitly present in the launch URL. After a direct
+ * loopback bootstrap, reuse the token delivered by the authenticated info
+ * frame so reconnects and HTTP APIs do not lose credentials. */
+export function getBrowserAccessToken(search: string): string {
+  return new URLSearchParams(search).get("token") || mobileAccessToken;
 }
 
 export function clearMobileAccessToken(): void {

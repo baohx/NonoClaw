@@ -1,6 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import { useStore } from "../store";
-import { sanitizeBrowserText } from "../security";
+import { getBrowserAccessToken, sanitizeBrowserText } from "../security";
 import type { MediaAttachment } from "../store/slices";
 import type { AttachmentRef, UploadResponse } from "../types";
 
@@ -12,7 +12,7 @@ interface Props {
 const ALLOWED_EXT = ".pdf,.docx,.doc,.txt,.md,.markdown,.png,.jpg,.jpeg";
 
 function authenticatedApiUrl(path: string): string {
-  const token = new URLSearchParams(window.location.search).get("token");
+  const token = getBrowserAccessToken(window.location.search);
   return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 }
 

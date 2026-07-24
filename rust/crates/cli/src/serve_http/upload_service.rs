@@ -361,6 +361,206 @@ fn upload_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use image::{DynamicImage, ImageFormat};
+    use nonoclaw_engine::load_resolved_config;
+    use reqwest::multipart::{Form, Part};
+
+    const EXPLORATION_SEED: u64 = 0xA77A_C4E1_2025_0001;
+
+    fn text_pdf_fixture() -> Vec<u8> {
+        let text = "Deterministic attachment upload exploration text with enough non whitespace characters for direct PDF extraction.";
+        let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn png_fixture() -> Vec<u8> {
+        let image = DynamicImage::new_rgb8(2, 2);
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    async fn spawn_mock_ocr() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "synthetic OCR fixture"}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn spawn_upload_server(
+        state: Arc<AppState>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/api/upload", post(upload_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/api/upload"), task)
+    }
+
+    #[tokio::test]
+    async fn property_1_unfixed_persisted_upload_settles_as_matching_wire_success() {
+        // **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.8**
+        let temp = tempfile::tempdir().unwrap();
+        let upload_dir = temp.path().join("uploads");
+        let (ocr_base_url, ocr_task) = spawn_mock_ocr().await;
+        let settings_path = temp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_vec(&serde_json::json!({
+                "docModel": {
+                    "provider": "deepseek_ocr",
+                    "model": "fixture-doc-model",
+                    "baseUrl": ocr_base_url,
+                    "apiKey": "synthetic-test-key"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = Arc::new(load_resolved_config(
+            temp.path(),
+            Some(&settings_path),
+            None,
+        ));
+        let state = super::super::connection::upload_exploration_state(
+            temp.path().to_path_buf(),
+            config,
+            upload_dir.clone(),
+        );
+        let (upload_url, upload_task) = spawn_upload_server(state).await;
+        let client = reqwest::Client::new();
+        let fixtures = [
+            (
+                "markdown",
+                "fixture.md",
+                "text/markdown",
+                "# Synthetic fixture\n\nUTF-8 text: deterministic café."
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            ("png", "fixture.png", "image/png", png_fixture()),
+            (
+                "pdf",
+                "fixture.pdf",
+                "application/pdf",
+                text_pdf_fixture(),
+            ),
+        ];
+
+        eprintln!("upload_exploration seed={EXPLORATION_SEED:#018x}");
+        for (category, filename, media_type, bytes) in fixtures {
+            let started = Instant::now();
+            let part = Part::bytes(bytes)
+                .file_name(filename.to_string())
+                .mime_str(media_type)
+                .unwrap();
+            let response = client
+                .post(&upload_url)
+                .multipart(Form::new().part("file", part))
+                .send()
+                .await
+                .unwrap_or_else(|_| panic!("category={category} boundary=transport"));
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body = response
+                .bytes()
+                .await
+                .unwrap_or_else(|_| panic!("category={category} boundary=transport_body"));
+            assert!(
+                status.is_success(),
+                "category={category} boundary=response_build status={}",
+                status.as_u16()
+            );
+            assert!(
+                content_type.starts_with("application/json"),
+                "category={category} boundary=response_headers status={}",
+                status.as_u16()
+            );
+            let payload: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| panic!("category={category} boundary=wire_parse"));
+            let id = payload["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("category={category} boundary=wire_schema"));
+            assert!(
+                valid_upload_id(id),
+                "category={category} boundary=wire_schema field=id"
+            );
+            assert!(
+                payload["filename"].is_string()
+                    && payload["extracted_text"].as_str() == Some("")
+                    && payload["image_count"].as_u64().is_some()
+                    && payload["error"].is_null(),
+                "category={category} boundary=wire_schema fields=success"
+            );
+            let stored = load_stored_attachment(&upload_dir, id)
+                .unwrap_or_else(|| panic!("category={category} boundary=metadata_persistence"));
+            assert_eq!(
+                stored.id, id,
+                "category={category} boundary=response_correlation"
+            );
+            eprintln!(
+                "category={category} upload_id={id} phase=loopback_complete status={} body_bytes={} elapsed_ms={}",
+                status.as_u16(),
+                body.len(),
+                started.elapsed().as_millis()
+            );
+        }
+        upload_task.abort();
+        ocr_task.abort();
+    }
 
     #[test]
     fn upload_ids_and_storage_paths_are_canonical_and_private() {

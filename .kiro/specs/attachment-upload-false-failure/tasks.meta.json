@@ -1,0 +1,107 @@
+{
+  "pbtResults": {
+    "1. 编写并运行未修复链路的最小反例探索测试": {
+      "status": "unexpected_pass",
+      "failingExample": "The fixed-seed loopback exploration completed all markdown, PNG, and PDF synthetic response cases successfully (HTTP 200, application/json, matching server ID, one terminal transition, no error), so it did not reproduce the expected unfixed-code bug condition.",
+      "lastRunTimestamp": 1784795714945
+    }
+  },
+  "executionHistory": {
+    "1. 编写并运行未修复链路的最小反例探索测试": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789677205
+      },
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789821728
+      }
+    ],
+    "2. 编写并运行未修复行为的 preservation 性质测试": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789678921
+      }
+    ],
+    "3.1 实现 Rust 上传成功/错误契约与 request correlation": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789680670
+      }
+    ],
+    "3.2 建立 Rust/TypeScript 共用 upload wire fixture": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789683249
+      }
+    ],
+    "3.3 实现唯一 TypeScript runtime response parser": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789684534
+      }
+    ],
+    "3.4 实现 requestId/localId/serverId 模型和纯单终态 reducer": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789685663
+      }
+    ],
+    "3.5 将 InputBox 限定为可测试的 fetch/timeout/session 编排层": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789686807
+      }
+    ],
+    "3.6 实现结构化前端错误、安全诊断与 UI 终态": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789688412
+      }
+    ],
+    "3.7 编写 PNG、Markdown、PDF 跨边界 E2E 与消息注入回归": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789689327
+      }
+    ],
+    "3.8 验证真实失败、安全边界与 session preservation": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789690357
+      }
+    ],
+    "3.9 重新运行同一 bug condition 探索性质并验证修复": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789691391
+      }
+    ],
+    "3.10 重新运行同一 preservation 性质并验证无回归": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789693963
+      }
+    ],
+    "4. Checkpoint - 运行 focused 与 full validation": [
+      {
+        "executionId": "a6cbcc32-cfe7-450d-9a2e-bb8b3eb8ed3e",
+        "chatSessionId": "sess_aad5497f-c65f-4819-8103-0311b9222ad2",
+        "timestamp": 1784789695260
+      }
+    ]
+  }
+}

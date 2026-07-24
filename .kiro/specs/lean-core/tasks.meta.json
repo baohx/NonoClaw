@@ -1,0 +1,177 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. 建立 Feature Preservation Matrix 和工程基线": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700696109
+      },
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700784574
+      },
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784703694281
+      }
+    ],
+    "2. 为关键现有行为建立 characterization tests": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700696646
+      },
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784703823360
+      },
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784710509072
+      }
+    ],
+    "3. 引入统一 `ResolvedConfig` 和配置来源诊断": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700697218
+      },
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784710556130
+      }
+    ],
+    "4. 建立统一 `ClientFactory`": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700697670
+      }
+    ],
+    "5. 完善 Anthropic/OpenAI Provider adapter": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700698396
+      }
+    ],
+    "6. 建立 `RunContext`、`RunController` 和统一终态": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700699316
+      }
+    ],
+    "7. 提取并统一 `ToolExecutor`": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700700510
+      }
+    ],
+    "8. 完善后台任务和子 Agent 生命周期": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700701718
+      }
+    ],
+    "9. 统一 TodoWrite 与 Task 系列底层状态": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700703477
+      }
+    ],
+    "10. 补齐 Hook action 和生命周期": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700704483
+      }
+    ],
+    "11. 统一 Extensions 发现、来源和冲突诊断": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700705495
+      }
+    ],
+    "12. 将会话读写集中到 `SessionService`": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700706494
+      }
+    ],
+    "13. 为 WebSocket 增加 revision、sequence 和协议一致性": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700707774
+      }
+    ],
+    "14. 按职责拆分 `serve_http`，保持全部路由": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700708603
+      }
+    ],
+    "15. 建立结构化技术透明事件流": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700709490
+      }
+    ],
+    "16. 将 InsightRail 演进为 Technical Trace": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700710298
+      }
+    ],
+    "17. 重构前端状态与重连逻辑": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700711114
+      }
+    ],
+    "18. 建立统一 BreathController 和呼吸状态机": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700712291
+      }
+    ],
+    "19. 加固安全、日志和错误模型": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700713126
+      }
+    ],
+    "20. 清理已迁移的重复实现和过时说明": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700714019
+      }
+    ],
+    "21. 完成功能保留、质量和体验验收": [
+      {
+        "executionId": "38b070c7-23c0-477b-9ed9-20dbd16ef832",
+        "chatSessionId": "sess_09cddaf9-b591-4528-839b-9d245115d711",
+        "timestamp": 1784700714804
+      }
+    ]
+  }
+}

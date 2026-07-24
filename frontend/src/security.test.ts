@@ -1,5 +1,6 @@
 import {
   clearMobileAccessToken,
+  getBrowserAccessToken,
   getMobileAccessToken,
   sanitizeBrowserText,
   sanitizeBrowserValue,
@@ -59,6 +60,14 @@ check(storedProject.includes("[skill content kept server-side]"), "skill metadat
 
 check(setMobileAccessToken("0123456789abcdef0123456789abcdef"), "valid mobile token must be available to QR components");
 check(getMobileAccessToken() === "0123456789abcdef0123456789abcdef", "mobile token vault must round-trip in memory");
+check(
+  getBrowserAccessToken("") === "0123456789abcdef0123456789abcdef",
+  "direct loopback bootstrap must reuse the info-frame token",
+);
+check(
+  getBrowserAccessToken("?token=launch-token") === "launch-token",
+  "an explicit launch token must take precedence over the runtime token",
+);
 check(!setMobileAccessToken("Bearer unsafe token"), "unsafe mobile token format must be rejected");
 check(getMobileAccessToken() === "", "rejected credentials must clear the vault");
 clearMobileAccessToken();
