@@ -1627,6 +1627,60 @@ mod tests {
         assert!(source.render_skill_body("nope", "", "test-session").is_none());
     }
 
+    /// Regression for the core cache-stability invariant: activating a
+    /// conditional skill must NOT change the static skill metadata that lives
+    /// in the cached system Block 1. If it did, the prompt cache would be
+    /// invalidated on every skill activation. Activated metadata must surface
+    /// only in the uncached dynamic block, and bodies must appear in neither.
+    #[test]
+    fn cached_static_metadata_is_stable_across_activation() {
+        let dir = tempdir();
+        let skills_dir = dir.join(".nonoclaw").join("skills");
+        std::fs::create_dir_all(skills_dir.join("alpha")).unwrap();
+        std::fs::write(
+            skills_dir.join("alpha").join("SKILL.md"),
+            "---\nname: alpha\ndescription: static one\n---\nalpha body",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills_dir.join("cond")).unwrap();
+        std::fs::write(
+            skills_dir.join("cond").join("SKILL.md"),
+            "---\nname: cond\ndescription: conditional\npaths: [\"*.rs\"]\n---\ncond body",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills_dir.join("docs")).unwrap();
+        std::fs::write(
+            skills_dir.join("docs").join("SKILL.md"),
+            "---\nname: docs\ndescription: docs helper\npaths: [\"*.md\"]\n---\ndocs body",
+        )
+        .unwrap();
+
+        let mut mgr = SkillsManager::new(&dir);
+
+        // Baseline: static metadata lists the static skill only.
+        let static_before = mgr.render_static_skill_metadata();
+        assert!(static_before.contains("## alpha"));
+        assert!(!static_before.contains("## cond"));
+        assert!(!static_before.contains("alpha body"));
+
+        // Activating the conditional skill must leave static metadata byte-identical.
+        assert!(mgr.activate_slash_command("cond"));
+        assert_eq!(static_before, mgr.render_static_skill_metadata());
+
+        // The activated skill surfaces in the dynamic (uncached) metadata,
+        // without its body.
+        let dyn_md = mgr.render_dynamic_skill_metadata();
+        assert!(dyn_md.contains("## cond"));
+        assert!(!dyn_md.contains("cond body"));
+
+        // A path-based activation (a different activation path) also leaves
+        // static metadata untouched.
+        let more =
+            mgr.activate_conditional_for_paths(&[PathBuf::from("notes.md")], dir.as_path());
+        assert!(more.contains(&"docs".to_string()));
+        assert_eq!(static_before, mgr.render_static_skill_metadata());
+    }
+
     #[test]
     fn empty_render_prompt() {
         let dir = tempdir();
