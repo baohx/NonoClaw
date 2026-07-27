@@ -16,7 +16,8 @@
 //!   those with any signal, capped at `top_k`. If nothing matches, include all.
 //! - Excluded MCP tools remain discoverable via `ToolSearch`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{OnceLock, RwLock};
 
 use nonoclaw_tools::builtin::tool_search::ToolSearchEntry;
 
@@ -97,6 +98,55 @@ pub fn select_mcp_tools(
     )
 }
 
+// ── Session pinning ──────────────────────────────────────────────────────────
+//
+// The HTTP path creates a fresh `QueryEngine` per user message, so per-run
+// selection could differ across messages and break the tools-array prompt
+// cache. Pinning the selection to the session (compute once, reuse for all
+// later runs) makes the tools array byte-identical across runs → cross-run
+// cache hits. State is keyed by session id in a process-global map; it is
+// ephemeral (cache-only) and not persisted.
+
+/// Soft cap on tracked sessions, to bound memory in long-running servers. On
+/// overflow the cache is cleared wholesale (pinning restarts for live sessions).
+const MAX_PINNED_SESSIONS: usize = 64;
+
+type PinnedStore = RwLock<HashMap<String, HashSet<String>>>;
+
+fn pinned_store() -> &'static PinnedStore {
+    static STORE: OnceLock<PinnedStore> = OnceLock::new();
+    STORE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Session-pinned MCP selection: compute once (on the first message that
+/// produces a narrowing) and reuse for the rest of the session, so the tools
+/// array is byte-identical across runs and the prompt cache holds cross-run.
+///
+/// Generic opening messages that produce no narrowing are NOT pinned, so a
+/// later, specific message can still drive the selection. Once a narrowing is
+/// pinned it stays fixed for the session (stability over adaptivity); tools
+/// excluded by the pinning remain reachable via `ToolSearch`.
+pub fn pinned_mcp_selection(
+    session_id: &str,
+    user_text: &str,
+    all_entries: &[ToolSearchEntry],
+    top_k: usize,
+) -> Option<HashSet<String>> {
+    // Fast path: already pinned for this session.
+    if let Some(sel) = pinned_store().read().unwrap().get(session_id) {
+        return Some(sel.clone());
+    }
+    let sel = select_mcp_tools(user_text, all_entries, top_k);
+    if let Some(set) = &sel {
+        let mut store = pinned_store().write().unwrap();
+        if store.len() >= MAX_PINNED_SESSIONS {
+            store.clear();
+        }
+        store.insert(session_id.to_string(), set.clone());
+    }
+    sel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +214,43 @@ mod tests {
         }
         // No MCP tool matched "deploy" → keep all (None).
         assert_eq!(select_mcp_tools("deploy please", &entries, 5), None);
+    }
+
+    #[test]
+    fn pins_first_narrowing_and_reuses_across_messages() {
+        let mut entries = vec![entry("Read", "read files", "")];
+        entries.push(entry("mcp__ci__deploy", "deploy the service", "deploy"));
+        for i in 0..15 {
+            entries.push(entry(&format!("mcp__fill__t{i}"), "zzz noop filler", ""));
+        }
+        let sid = "sess-pin-1";
+        // First message: generic → no narrowing, not pinned.
+        assert_eq!(pinned_mcp_selection(sid, "hello there", &entries, 5), None);
+        // Second message: narrows → pinned.
+        let sel = pinned_mcp_selection(sid, "please deploy the service", &entries, 5)
+            .expect("second message narrows");
+        assert!(sel.contains("mcp__ci__deploy"));
+        // Third message: different intent, but selection is pinned → same set.
+        let sel3 = pinned_mcp_selection(sid, "totally different docs task", &entries, 5);
+        assert_eq!(sel3, Some(sel));
+    }
+
+    #[test]
+    fn sessions_are_isolated() {
+        let mut entries = vec![entry("Read", "read files", "")];
+        entries.push(entry("mcp__ci__deploy", "continuous integration ship artifact", "deploy"));
+        entries.push(entry("mcp__db__query", "structured query language lookup", "query"));
+        for i in 0..14 {
+            entries.push(entry(&format!("mcp__fill__t{i}"), "zzz noop filler", ""));
+        }
+        let a = pinned_mcp_selection("sess-iso-a", "deploy artifact", &entries, 5);
+        let b = pinned_mcp_selection("sess-iso-b", "query language", &entries, 5);
+        assert_ne!(a, b);
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert!(a.contains("mcp__ci__deploy"));
+        assert!(!a.contains("mcp__db__query"));
+        assert!(b.contains("mcp__db__query"));
+        assert!(!b.contains("mcp__ci__deploy"));
     }
 }

@@ -530,7 +530,8 @@ impl QueryEngine {
         // the run. Built-in tools are always kept; excluded MCP tools remain
         // discoverable via ToolSearch. `None` = include all (no narrowing).
         let mcp_keep: Option<std::collections::HashSet<String>> = if self.options.auto_select_mcp {
-            crate::tool_selector::select_mcp_tools(
+            crate::tool_selector::pinned_mcp_selection(
+                self.session_id(),
                 &user_text,
                 &self.registry.search_entries(),
                 self.options.auto_select_mcp_top_k,
