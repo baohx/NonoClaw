@@ -13,6 +13,7 @@ pub mod session;
 pub mod settings;
 pub mod skills;
 pub mod tokens;
+pub mod tool_selector;
 pub mod toolchain;
 pub mod trace;
 

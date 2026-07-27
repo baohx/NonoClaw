@@ -1137,6 +1137,8 @@ impl ResolvedConfig {
             permission_mode,
             allowed_tools,
             disallowed_tools,
+            auto_select_mcp: true,
+            auto_select_mcp_top_k: crate::tool_selector::DEFAULT_TOP_K,
             add_dirs: overrides.add_dirs,
             max_turns: overrides
                 .max_turns

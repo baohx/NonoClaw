@@ -105,6 +105,14 @@ pub struct EngineOptions {
     pub permission_mode: PermissionMode,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+    /// Narrow the advertised MCP tools to a keyword-relevant subset computed
+    /// once per run from the user's message (see `tool_selector`). Built-in
+    /// tools are always kept; excluded MCP tools stay discoverable via
+    /// ToolSearch. Conservative: only narrows when MCP tools exceed
+    /// `auto_select_mcp_top_k` and the message has keyword signal.
+    pub auto_select_mcp: bool,
+    /// Cap on advertised MCP tools once narrowing applies.
+    pub auto_select_mcp_top_k: usize,
     pub add_dirs: Vec<PathBuf>,
     pub max_turns: u32,
     /// Permit one tools-disabled synthesis turn after the normal turn budget.
@@ -187,6 +195,8 @@ impl Default for EngineOptions {
             permission_mode: PermissionMode::Default,
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
+            auto_select_mcp: true,
+            auto_select_mcp_top_k: crate::tool_selector::DEFAULT_TOP_K,
             add_dirs: Vec::new(),
             max_turns: 10,
             finalize_on_max_turns: false,
@@ -515,10 +525,27 @@ impl QueryEngine {
         } else {
             Some(self.options.allowed_tools.as_slice())
         };
+        // Session MCP selection: narrow the advertised MCP subset once from the
+        // user's message so the tools array stays small and cache-stable for
+        // the run. Built-in tools are always kept; excluded MCP tools remain
+        // discoverable via ToolSearch. `None` = include all (no narrowing).
+        let mcp_keep: Option<std::collections::HashSet<String>> = if self.options.auto_select_mcp {
+            crate::tool_selector::select_mcp_tools(
+                &user_text,
+                &self.registry.search_entries(),
+                self.options.auto_select_mcp_top_k,
+            )
+        } else {
+            None
+        };
         let mut tool_defs: Vec<ToolSchema> = self
             .registry
             .active_definitions(allow_filter)
             .into_iter()
+            .filter(|d| match &mcp_keep {
+                Some(keep) => !d.name.starts_with("mcp__") || keep.contains(&d.name),
+                None => true,
+            })
             .map(|d| ToolSchema {
                 name: d.name,
                 description: d.description,
