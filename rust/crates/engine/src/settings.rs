@@ -64,6 +64,14 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Enable automatic transcript compaction.",
     },
     ConfigFieldReference {
+        name: "autoSelectMcp",
+        description: "Narrow advertised MCP tools to a keyword-relevant subset per run.",
+    },
+    ConfigFieldReference {
+        name: "autoSelectMcpTopK",
+        description: "Cap on advertised MCP tools once narrowing applies.",
+    },
+    ConfigFieldReference {
         name: "compactThreshold",
         description: "Estimated-token threshold for automatic compaction.",
     },
@@ -134,6 +142,13 @@ pub struct SettingsFile {
     pub auto_compact: Option<bool>,
     #[serde(rename = "compactThreshold")]
     pub compact_threshold: Option<usize>,
+    /// Narrow advertised MCP tools to a keyword-relevant subset per run.
+    /// Defaults to true when unset.
+    #[serde(rename = "autoSelectMcp", default)]
+    pub auto_select_mcp: Option<bool>,
+    /// Cap on advertised MCP tools once narrowing applies.
+    #[serde(rename = "autoSelectMcpTopK", default)]
+    pub auto_select_mcp_top_k: Option<usize>,
     #[serde(rename = "contextWindow")]
     pub context_window: Option<usize>,
     pub thinking: Option<Value>,
@@ -259,6 +274,8 @@ impl fmt::Debug for SettingsFile {
             .field("max_tokens", &self.max_tokens)
             .field("auto_compact", &self.auto_compact)
             .field("compact_threshold", &self.compact_threshold)
+            .field("auto_select_mcp", &self.auto_select_mcp)
+            .field("auto_select_mcp_top_k", &self.auto_select_mcp_top_k)
             .field("context_window", &self.context_window)
             .field("thinking", &self.thinking.as_ref().map(|_| "[configured]"))
             .field("permissions", &self.permissions)
@@ -312,6 +329,8 @@ impl Default for SettingsFile {
             max_tokens: None,
             auto_compact: None,
             compact_threshold: None,
+            auto_select_mcp: None,
+            auto_select_mcp_top_k: None,
             context_window: None,
             thinking: None,
             permissions: None,
@@ -1137,8 +1156,14 @@ impl ResolvedConfig {
             permission_mode,
             allowed_tools,
             disallowed_tools,
-            auto_select_mcp: true,
-            auto_select_mcp_top_k: crate::tool_selector::DEFAULT_TOP_K,
+            auto_select_mcp: self
+                .settings
+                .auto_select_mcp
+                .unwrap_or(true),
+            auto_select_mcp_top_k: self
+                .settings
+                .auto_select_mcp_top_k
+                .unwrap_or(crate::tool_selector::DEFAULT_TOP_K),
             add_dirs: overrides.add_dirs,
             max_turns: overrides
                 .max_turns
@@ -1344,6 +1369,12 @@ fn merge_settings_value(
     }
     if present("compactThreshold", overlay.compact_threshold.is_some()) {
         base.compact_threshold = overlay.compact_threshold;
+    }
+    if present("autoSelectMcp", overlay.auto_select_mcp.is_some()) {
+        base.auto_select_mcp = overlay.auto_select_mcp;
+    }
+    if present("autoSelectMcpTopK", overlay.auto_select_mcp_top_k.is_some()) {
+        base.auto_select_mcp_top_k = overlay.auto_select_mcp_top_k;
     }
     if present("contextWindow", overlay.context_window.is_some()) {
         base.context_window = overlay.context_window;
