@@ -167,6 +167,7 @@ mod tests {
             cwd: std::path::Path::new("/tmp"),
             options: &options,
             cancel: &cancel,
+            tool_use_id: "todo-test-call",
             task_scope: Some("parent"),
             subagent: None,
             question: None,

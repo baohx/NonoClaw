@@ -1,7 +1,8 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, SubagentRun, SubagentTool } from "../types";
+import { useStore } from "../store";
 import Markdown from "./Markdown";
+import { createRenderedExportArtifact, type ExportFormat } from "../export";
 
 interface Props {
   messages: ChatMessage[];
@@ -9,23 +10,14 @@ interface Props {
 }
 
 export default function ChatView({ messages }: Props) {
-  // Find the last non-streaming assistant message index for export buttons.
-  const lastAssistantIdx = (() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.role === "assistant" && !m.streaming && m.content.trim()) return i;
-    }
-    return -1;
-  })();
-
   return (
     <div>
       {messages.length === 0 && <WelcomeMessage />}
-      {messages.map((msg, i) => (
+      {messages.map((msg) => (
         <MessageCard
           key={msg.id}
           msg={msg}
-          isLastAssistant={i === lastAssistantIdx}
+          isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
         />
       ))}
     </div>
@@ -63,66 +55,18 @@ function copyText(text: string) {
 
 // ── Export helpers ──────────────────────────────────────────────────────────
 
-/** Render markdown to an HTML string using the same Markdown component. */
-function markdownToHtml(md: string): Promise<string> {
-  return new Promise((resolve) => {
-    const container = document.createElement("div");
-    container.style.position = "fixed"; container.style.opacity = "0";
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    root.render(
-      <Markdown content={md} />
-    );
-    // Wait one tick for React to flush.
-    setTimeout(() => {
-      const html = container.innerHTML;
-      root.unmount();
-      document.body.removeChild(container);
-      resolve(html);
-    }, 50);
-  });
-}
+// Export artifacts are generated locally and structurally validated before download.
 
-const EXPORT_CSS = `
-  body { font-family: -apple-system, "Segoe UI", sans-serif; color: #1a1a1a; max-width: 800px; margin: 40px auto; line-height: 1.7; }
-  pre { background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
-  code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
-  pre code { background: none; padding: 0; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; }
-  th { background: #f5f5f5; }
-  blockquote { border-left: 3px solid #ccc; padding-left: 12px; color: #666; margin: 8px 0; }
-  h1 { font-size: 1.6em; } h2 { font-size: 1.3em; } h3 { font-size: 1.1em; }
-  img { max-width: 100%; }
-`;
-
-async function exportMarkdown(content: string, format: "md" | "docx" | "pdf") {
+async function exportResponse(content: string, format: "md" | ExportFormat, renderedElement: HTMLElement | null) {
   if (format === "md") {
     const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
     downloadBlob(blob, "nonoclaw-export.md");
     return;
   }
-
-  const html = await markdownToHtml(content);
-  const fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>${EXPORT_CSS}</style></head><body>${html}</body></html>`;
-
-  if (format === "pdf") {
-    // Open in a new window and trigger print → user selects "Save as PDF".
-    const w = window.open("", "_blank");
-    if (!w) return;
-    w.document.write(fullHtml);
-    w.document.close();
-    setTimeout(() => w.print(), 300);
-    return;
-  }
-
-  if (format === "docx") {
-    // Word-compatible HTML — download as .doc (Word opens HTML with .doc ext).
-    const docxHtml = `<!DOCTYPE html><html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><style>${EXPORT_CSS}</style></head><body>${html}</body></html>`;
-    const blob = new Blob(["﻿", docxHtml], { type: "application/msword" });
-    downloadBlob(blob, "nonoclaw-export.doc");
-    return;
-  }
+  if (!renderedElement) throw new Error("The rendered response is not available for export");
+  const renderedContent = renderedElement.querySelector<HTMLElement>(".markdown-body") ?? renderedElement;
+  const artifact = await createRenderedExportArtifact(format, renderedContent);
+  downloadBlob(new Blob([artifact.bytes], { type: artifact.mime }), artifact.filename);
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -146,6 +90,8 @@ const MessageCard = memo(function MessageCard({
   isLastAssistant: boolean;
 }) {
   const [showExport, setShowExport] = useState(false);
+  const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  const renderedRef = useRef<HTMLDivElement>(null);
 
   if (msg.role === "system") {
     return (
@@ -181,27 +127,49 @@ const MessageCard = memo(function MessageCard({
         {/* Last assistant message: copy + export md */}
         {!isUser && isLastAssistant && (
           <>
-            <button
-              className="msg-action"
-              title="Copy markdown"
-              onClick={() => copyText(msg.content)}
-            >
-              ⧉
-            </button>
-            <button
-              className="msg-action"
-              title="Export as Markdown"
-              onClick={() => exportMarkdown(msg.content, "md")}
-            >
-              ↓
-            </button>
+            <button className="msg-action" title="Copy markdown" onClick={() => copyText(msg.content)}>⧉</button>
+            <button className="msg-action" title="Export this completed turn" aria-expanded={showExport} onClick={() => setShowExport((value) => !value)}>↓</button>
+            {showExport && (
+              <span className="msg-export-options" role="menu" aria-label="Export format">
+                {(["md", "docx", "pdf"] as const).map((format) => (
+                  <button key={format} role="menuitem" disabled={exporting !== null} onClick={async () => {
+                    const richFormat = format === "md" ? null : format;
+                    try {
+                      setExporting(richFormat);
+                      await exportResponse(msg.content, format, renderedRef.current);
+                      setShowExport(false);
+                    } catch (reason) {
+                      window.alert(reason instanceof Error ? reason.message : "Rendered export failed");
+                    } finally {
+                      setExporting(null);
+                    }
+                  }}>{exporting === format ? `${format.toUpperCase()}…` : format.toUpperCase()}</button>
+                ))}
+              </span>
+            )}
           </>
         )}
       </div>
       <div className="msg__inner">
-        <div className="msg__bubble">
+        <div ref={renderedRef} className="msg__bubble">
           {isUser ? (
-            msg.content
+            <>
+              {msg.attachments && msg.attachments.length > 0 && (
+                <div className="msg__attachments" aria-label="Attachments">
+                  {msg.attachments.map((attachment, index) => (
+                    <span
+                      key={`${attachment.filename}-${index}`}
+                      className="msg__attachment"
+                      title={attachment.filename}
+                    >
+                      <span className="msg__attachment-icon" aria-hidden="true">↗</span>
+                      <span className="msg__attachment-name">{attachment.filename}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <span className="msg__user-text">{msg.content}</span>
+            </>
           ) : msg.streaming ? (
             <StreamingText text={msg.content} />
           ) : (
@@ -240,37 +208,137 @@ function toolInputPreview(name: string, input: unknown): string {
   return val.length > max ? val.slice(0, max) + "…" : val;
 }
 
+const EMPTY_CHILD_IDS: string[] = [];
+
 const ToolCard = memo(function ToolCard({ msg }: { msg: ChatMessage }) {
+  const name = msg.toolName || "tool";
+  const supportsChildren = name === "Agent" || name === "Coordinator";
+  const parentToolId = msg.id.startsWith("tool-") ? msg.id.slice(5) : msg.id;
+  const childIds = useStore((state) => supportsChildren
+    ? state.childIdsByParentToolId[parentToolId] ?? EMPTY_CHILD_IDS
+    : EMPTY_CHILD_IDS);
+  const childRunsById = useStore((state) => state.subagentRunsById);
+  const children = childIds.map((id) => childRunsById[id]).filter((run): run is SubagentRun => !!run);
+  const childRunning = children.some((child) => child.status === "running" || child.status === "waiting_permission");
   const [collapsed, setCollapsed] = useState(true);
+  const manuallyToggled = useRef(false);
   const prevStreaming = useRef(msg.streaming);
 
-  // Auto-collapse when the tool result arrives (streaming → done).
+  // Child-bearing tools default open while active and fold after completion;
+  // once the user chooses a state, live events never override it.
   useEffect(() => {
-    if (prevStreaming.current && !msg.streaming) {
-      setCollapsed(true);
+    if (!manuallyToggled.current) {
+      if (supportsChildren && children.length > 0) setCollapsed(!childRunning);
+      else if (prevStreaming.current && !msg.streaming) setCollapsed(true);
     }
     prevStreaming.current = msg.streaming;
-  }, [msg.streaming]);
+  }, [childRunning, children.length, msg.streaming, supportsChildren]);
 
   const running = msg.streaming;
   const failed = msg.toolOk === false;
   const statusClass = running ? "run" : failed ? "err" : "ok";
-  const statusSym = running ? "◌" : failed ? "✕" : "✓";
-  const name = msg.toolName || "tool";
+  const statusSym = running ? "CHECKING" : failed ? "FAILURE" : "SUCCESS";
   const inputPreview = toolInputPreview(name, msg.toolInput);
+  const toggle = () => {
+    manuallyToggled.current = true;
+    setCollapsed((value) => !value);
+  };
 
   return (
     <div className="toolcard">
-      <div className="toolcard__head" onClick={() => setCollapsed((c) => !c)}>
+      <div className="toolcard__head" onClick={toggle}>
         <span className={`toolcard__status ${statusClass}`}>{statusSym}</span>
         <span className="toolcard__name">{name}</span>
-        {inputPreview && (
-          <code className="toolcard__cmd">{inputPreview}</code>
-        )}
+        {inputPreview && <code className="toolcard__cmd">{inputPreview}</code>}
+        {children.length > 0 && <span className="toolcard__child-count">{children.length} child{children.length === 1 ? "" : "ren"}</span>}
         <span className="toolcard__chev">{collapsed ? "▸" : "▾"}</span>
       </div>
       {!collapsed && (
-        <pre className="toolcard__pre">{restoreNewlines(msg.content)}</pre>
+        <div className="toolcard__details">
+          <strong>Command</strong>
+          <pre className="toolcard__pre">{JSON.stringify(msg.toolInput ?? {}, null, 2)}</pre>
+          <strong>Result</strong>
+          <pre className="toolcard__pre">{restoreNewlines(msg.content)}</pre>
+          {supportsChildren && children.length > 0 && (
+            <div className="subagents" aria-label="Subagent runs">
+              {children.map((child) => <SubagentRunCard key={child.id} run={child} />)}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const SubagentRunCard = memo(function SubagentRunCard({ run }: { run: SubagentRun }) {
+  const running = run.status === "running" || run.status === "waiting_permission";
+  const [collapsed, setCollapsed] = useState(!running);
+  const manual = useRef(false);
+  const wasRunning = useRef(running);
+
+  useEffect(() => {
+    if (!manual.current) {
+      if (running) setCollapsed(false);
+      else if (wasRunning.current) setCollapsed(true);
+    }
+    wasRunning.current = running;
+  }, [running]);
+
+  const failed = run.status === "failed" || run.status === "interrupted";
+  const statusClass = running ? "run" : failed ? "err" : "ok";
+  return (
+    <section className="subagent">
+      <button className="subagent__head" type="button" onClick={() => {
+        manual.current = true;
+        setCollapsed((value) => !value);
+      }}>
+        <span className={`subagent__dot ${statusClass}`} />
+        <span className="subagent__index">#{run.index + 1}</span>
+        <span className="subagent__description">{run.description}</span>
+        {run.profile && <span className="subagent__profile">{run.profile}</span>}
+        <span className={`subagent__status ${statusClass}`}>{run.status.replace("_", " ")}</span>
+        <span className="toolcard__chev">{collapsed ? "▸" : "▾"}</span>
+      </button>
+      {!collapsed && (
+        <div className="subagent__body">
+          {run.toolOrder.length > 0 && (
+            <div className="subagent__tools">
+              {run.toolOrder.map((id) => run.toolsById[id] && <SubagentToolCard key={id} tool={run.toolsById[id]} />)}
+            </div>
+          )}
+          {(run.output || run.outputTruncated) && (
+            <div className="subagent__output">
+              <strong>{running ? "Streaming output" : "Final output"}</strong>
+              {running ? <StreamingText text={run.output} /> : <Markdown content={run.output} />}
+              {run.outputTruncated && <div className="subagent__truncated">Output truncated in browser state.</div>}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+});
+
+const SubagentToolCard = memo(function SubagentToolCard({ tool }: { tool: SubagentTool }) {
+  // Child tool payloads/results are intentionally opt-in, even after success.
+  const [collapsed, setCollapsed] = useState(true);
+  const running = ["pending", "queued", "validated", "permission_allowed", "running"].includes(tool.status);
+  const failed = tool.ok === false || tool.status.includes("failed") || tool.status.includes("denied");
+  return (
+    <div className="subtool">
+      <button className="subtool__head" type="button" onClick={() => setCollapsed((value) => !value)}>
+        <span className={`subagent__dot ${running ? "run" : failed ? "err" : "ok"}`} />
+        <span className="subtool__name">{tool.name}</span>
+        <span className="subtool__status">{tool.status.replace("_", " ")}</span>
+        {tool.permission && <span className="subtool__permission">permission: {tool.permission}</span>}
+        <span className="toolcard__chev">{collapsed ? "▸" : "▾"}</span>
+      </button>
+      {!collapsed && (
+        <div className="subtool__details">
+          {tool.input !== undefined && <pre className="toolcard__pre">{JSON.stringify(tool.input, null, 2)}</pre>}
+          <pre className="toolcard__pre">{restoreNewlines(tool.result || (running ? "Waiting for result…" : "[no output]"))}</pre>
+          {tool.truncated && <div className="subagent__truncated">Tool result truncated.</div>}
+        </div>
       )}
     </div>
   );

@@ -1,4 +1,44 @@
-import type { ChatMessage, ClientMsg } from "../types";
+import type {
+  ChatMessage,
+  ClientMsg,
+  EngineEvent,
+  ScopedSubagentEvent,
+  SubagentRun,
+  SubagentRunStatus,
+  SubagentTool,
+} from "../types";
+import { sanitizeBrowserText } from "../security";
+
+/** Parent-envelope checks for scoped child events. This intentionally does not
+ * advance root ordering: child_sequence owns child idempotency, while these
+ * guards prevent late frames from crossing session/snapshot/terminal bounds. */
+export interface ScopedEnvelopeGateState {
+  sessionId: string;
+  sessionRevision: number;
+  snapshotRevision: number;
+  awaitingSnapshot: boolean;
+  terminalRuns: Record<string, true>;
+}
+
+export interface ScopedEnvelopeMeta {
+  runId?: string;
+  sessionId?: string;
+  sessionRevision?: number;
+  sequence?: number;
+}
+
+export function acceptScopedEnvelope(
+  state: ScopedEnvelopeGateState,
+  meta: ScopedEnvelopeMeta,
+): boolean {
+  if (!meta.runId || !meta.sessionId
+    || !Number.isSafeInteger(meta.sessionRevision)
+    || !Number.isSafeInteger(meta.sequence)) return false;
+  if (state.awaitingSnapshot || meta.sessionId !== state.sessionId) return false;
+  if ((meta.sessionRevision as number) < Math.max(state.snapshotRevision, state.sessionRevision)) return false;
+  if ((meta.sequence as number) < 0 || state.terminalRuns[meta.runId]) return false;
+  return true;
+}
 
 export const MAX_OUTBOUND_QUEUE = 64;
 export const MAX_TRACKED_RUNS = 128;
@@ -265,12 +305,13 @@ export function addToolCardTransition(
 ): ChatStreamState {
   const id = `tool-${toolId}`;
   if (state.messages.some((message) => message.id === id)) return state;
+  const settled = finishStreamingTransition(state);
   return {
-    ...state,
-    messages: [...state.messages, {
+    ...settled,
+    messages: [...settled.messages, {
       id,
       role: "tool",
-      content: `Running ${name}…`,
+      content: "Result unavailable",
       toolName: name,
       toolInput: input,
       streaming: true,
@@ -284,15 +325,231 @@ export function updateToolResultTransition(
   ok: boolean,
   preview: string,
 ): ChatStreamState {
-  const content = !preview && ok ? "[ok — no output]" : preview;
+  const id = `tool-${toolId}`;
+  const content = !preview ? (ok ? "[ok — no output]" : "Tool execution failed") : preview;
+
   let changed = false;
   const messages = state.messages.map((message) => {
-    if (message.id !== toolId) return message;
+    if (message.id !== id) return message;
     if (message.content === content && message.toolOk === ok && message.streaming === false) return message;
     changed = true;
     return { ...message, content, toolOk: ok, streaming: false };
   });
   return changed ? { ...state, messages } : state;
+}
+
+export const MAX_SUBAGENT_RUNS = 64;
+export const MAX_SUBAGENT_TOOLS = 64;
+export const MAX_SUBAGENT_OUTPUT_CHARS = 100_000;
+const MAX_SUBAGENT_RESULT_CHARS = 24_000;
+const MAX_SUBAGENT_EVENT_TEXT_CHARS = 4_000;
+const MAX_SUBAGENT_ID_CHARS = 160;
+
+export interface SubagentState {
+  subagentRunsById: Record<string, SubagentRun>;
+  childIdsByParentToolId: Record<string, string[]>;
+}
+
+export function emptySubagentState(): SubagentState {
+  return { subagentRunsById: {}, childIdsByParentToolId: {} };
+}
+
+function safeChildString(value: unknown, max = MAX_SUBAGENT_EVENT_TEXT_CHARS): string {
+  if (typeof value !== "string") return "";
+  return sanitizeBrowserText(value).replace(/\0/g, "").slice(0, max);
+}
+
+function safeChildId(value: unknown): string {
+  const safe = safeChildString(value, MAX_SUBAGENT_ID_CHARS).trim();
+  return safe && !/[\r\n]/.test(safe) ? safe : "";
+}
+
+/** A deliberately shallow/bounded input copy. Child wire data must never turn
+ * the browser store into an unbounded payload cache. */
+const SENSITIVE_CHILD_KEY = /(^|[_-])(api[_-]?key|authorization|credential|password|secret|token|prompt|attachment[_-]?data|extracted[_-]?text|images?|content|body)($|[_-])/i;
+
+function safeChildValue(value: unknown, depth = 0, key = ""): unknown {
+  if (SENSITIVE_CHILD_KEY.test(key)) return undefined;
+  if (depth > 4) return "[truncated]";
+  if (typeof value === "string") return safeChildString(value);
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "boolean" || value === null) return value;
+  if (Array.isArray(value)) return value.slice(0, 40)
+    .map((item) => safeChildValue(item, depth + 1))
+    .filter((item) => item !== undefined);
+  if (!value || typeof value !== "object") return undefined;
+  const safe: Record<string, unknown> = {};
+  let count = 0;
+  for (const rawKey in value as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(value, rawKey) || count >= 40) break;
+    const safeKey = safeChildString(rawKey, 120);
+    const child = safeChildValue((value as Record<string, unknown>)[rawKey], depth + 1, rawKey);
+    if (safeKey && child !== undefined) safe[safeKey] = child;
+    count += 1;
+  }
+  return safe;
+}
+
+function terminalChildStatus(value: unknown): SubagentRunStatus {
+  switch (value) {
+    case "succeeded": case "success": case "completed": return "succeeded";
+    case "cancelled": case "canceled": return "cancelled";
+    case "interrupted": return "interrupted";
+    default: return "failed";
+  }
+}
+
+function childToolId(event: EngineEvent): string {
+  return safeChildId(event.kind === "tool_use_start" || event.kind === "tool_result"
+    ? event.id
+    : event.tool_use_id);
+}
+
+function updateChildTool(run: SubagentRun, event: EngineEvent): SubagentRun {
+  const id = childToolId(event);
+  if (!id) return run;
+  const current = run.toolsById[id] ?? {
+    id,
+    name: safeChildString(event.name ?? event.tool_name, 160) || "tool",
+    result: "",
+    status: "pending",
+    truncated: false,
+  };
+  let tool: SubagentTool = { ...current };
+  if (event.name || event.tool_name) tool.name = safeChildString(event.name ?? event.tool_name, 160) || tool.name;
+
+  switch (event.kind) {
+    case "tool_use_start":
+      tool = { ...tool, input: safeChildValue(event.input), status: "running" };
+      break;
+    case "tool_result": {
+      const result = safeChildString(event.preview, MAX_SUBAGENT_RESULT_CHARS + 1);
+      tool = {
+        ...tool,
+        ok: event.ok === true,
+        result: result.slice(0, MAX_SUBAGENT_RESULT_CHARS),
+        truncated: result.length > MAX_SUBAGENT_RESULT_CHARS,
+        status: event.ok === true ? "succeeded" : "failed",
+      };
+      break;
+    }
+    case "tool_queued": tool.status = "queued"; break;
+    case "tool_validation":
+      tool.status = event.ok === false ? "validation_failed" : "validated";
+      break;
+    case "permission_requested":
+      tool.status = "waiting_permission";
+      tool.permission = safeChildString(event.waiting_on, 120) || "requested";
+      break;
+    case "permission_resolved":
+      tool.permission = safeChildString(event.decision, 120) || "resolved";
+      tool.status = event.decision === "denied" ? "permission_denied" : "permission_allowed";
+      break;
+    case "tool_execution_started": tool.status = "running"; break;
+    case "tool_execution_finished": tool.status = safeChildString(event.status, 120) || "finished"; break;
+    case "tool_result_normalized":
+      tool.truncated = tool.truncated || event.truncated === true;
+      break;
+  }
+
+  const isNew = run.toolsById[id] === undefined;
+  let toolOrder = isNew ? [...run.toolOrder, id] : run.toolOrder;
+  const toolsById = { ...run.toolsById, [id]: tool };
+  while (toolOrder.length > MAX_SUBAGENT_TOOLS) {
+    const removed = toolOrder[0];
+    toolOrder = toolOrder.slice(1);
+    delete toolsById[removed];
+  }
+  return { ...run, toolsById, toolOrder };
+}
+
+/** Apply one scoped event without consulting or mutating parent-run ordering.
+ * A child sequence is accepted only when it is newer than that child's last
+ * sequence; duplicates and late/out-of-order events are ignored. */
+export function applySubagentEventTransition(
+  state: SubagentState,
+  raw: ScopedSubagentEvent,
+  runLimit = MAX_SUBAGENT_RUNS,
+): { accepted: boolean; state: SubagentState } {
+  const id = safeChildId(raw.subagent_id);
+  const parentToolUseId = safeChildId(raw.parent_tool_use_id);
+  const sequence = raw.child_sequence;
+  const inner = raw.event;
+  if (!id || !parentToolUseId || !Number.isSafeInteger(sequence) || sequence < 0
+    || !inner || typeof inner !== "object" || inner.kind === "subagent_event") {
+    return { accepted: false, state };
+  }
+
+  const previous = state.subagentRunsById[id];
+  if ((previous && previous.parentToolUseId !== parentToolUseId)
+    || sequence <= (previous?.childSequence ?? -1)) {
+    return { accepted: false, state };
+  }
+
+  let run: SubagentRun = previous ? { ...previous, childSequence: sequence } : {
+    id,
+    parentToolUseId,
+    description: safeChildString(raw.description, 500) || "Delegated task",
+    profile: safeChildString(raw.profile, 160) || undefined,
+    index: typeof raw.index === "number" && Number.isSafeInteger(raw.index)
+      ? Math.max(0, Math.min(raw.index, 1_000_000)) : 0,
+    childSequence: sequence,
+    status: "running",
+    output: "",
+    outputTruncated: false,
+    segmentCount: 0,
+    toolsById: {},
+    toolOrder: [],
+  };
+
+  // Metadata may arrive before the child's first lifecycle event; retain safe
+  // updates while preserving the immutable parent scope.
+  run.description = safeChildString(raw.description, 500) || run.description;
+  run.profile = safeChildString(raw.profile, 160) || run.profile;
+
+  if (inner.kind === "text_delta") {
+    const delta = safeChildString(inner.text, MAX_SUBAGENT_EVENT_TEXT_CHARS);
+    const room = Math.max(0, MAX_SUBAGENT_OUTPUT_CHARS - run.output.length);
+    run.output = run.output + delta.slice(0, room);
+    run.outputTruncated = run.outputTruncated || delta.length > room;
+  } else if (inner.kind === "assistant_done") {
+    run.segmentCount += 1;
+  } else if (inner.kind === "run_finished") {
+    run.status = terminalChildStatus(inner.status);
+  } else if (inner.kind === "permission_requested") {
+    run.status = "waiting_permission";
+  } else if (inner.kind === "permission_resolved" && run.status === "waiting_permission") {
+    run.status = "running";
+  }
+
+  if ([
+    "tool_use_start", "tool_result", "tool_queued", "tool_validation",
+    "permission_requested", "permission_resolved", "tool_execution_started",
+    "tool_execution_finished", "tool_result_normalized",
+  ].includes(inner.kind)) run = updateChildTool(run, inner);
+
+  const subagentRunsById = { ...state.subagentRunsById, [id]: run };
+  const childIdsByParentToolId = { ...state.childIdsByParentToolId };
+  const parentIds = childIdsByParentToolId[parentToolUseId] ?? [];
+  if (!parentIds.includes(id)) childIdsByParentToolId[parentToolUseId] = [...parentIds, id];
+  childIdsByParentToolId[parentToolUseId] = [...childIdsByParentToolId[parentToolUseId]]
+    .sort((left, right) => subagentRunsById[left].index - subagentRunsById[right].index || left.localeCompare(right));
+
+  const boundedLimit = Math.max(1, runLimit);
+  const allIds = Object.keys(subagentRunsById);
+  if (allIds.length > boundedLimit) {
+    const retained = new Set(allIds
+      .sort((left, right) => subagentRunsById[right].childSequence - subagentRunsById[left].childSequence || left.localeCompare(right))
+      .slice(0, boundedLimit));
+    for (const childId of allIds) if (!retained.has(childId)) delete subagentRunsById[childId];
+    for (const [parentId, ids] of Object.entries(childIdsByParentToolId)) {
+      const kept = ids.filter((childId) => retained.has(childId));
+      if (kept.length) childIdsByParentToolId[parentId] = kept;
+      else delete childIdsByParentToolId[parentId];
+    }
+  }
+
+  return { accepted: true, state: { subagentRunsById, childIdsByParentToolId } };
 }
 
 export interface PromptDedupState {

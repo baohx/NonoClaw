@@ -13,6 +13,7 @@ pub mod session;
 pub mod settings;
 pub mod skills;
 pub mod tokens;
+pub mod toolchain;
 pub mod trace;
 
 pub use hooks::{
@@ -42,6 +43,9 @@ pub use settings::{
     ModelProfile, ResolvedConfig, RunConfigOverrides, SettingsFile,
 };
 pub use skills::{substitute_arguments, Skill, SkillActivation, SkillsManager};
+pub use toolchain::{
+    probe_runtime, probe_runtime_with_updates, ExecutableProbe, PythonVenvProbe, RuntimeProbeReport,
+};
 
 pub use trace::TraceCollector;
 

@@ -42,18 +42,106 @@ pub struct AgentProfile {
     pub body: String,
 }
 
-/// Load an agent profile by name from `<cwd>/.nonoclaw/agents/<name>.md`.
-pub fn load_profile(cwd: &Path, name: &str) -> Option<AgentProfile> {
+const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+const MAX_PROFILE_NAME_CHARS: usize = 128;
+
+/// Strictly load an agent profile by safe basename from
+/// `<cwd>/.nonoclaw/agents/<name>.md`.
+pub fn load_profile_checked(cwd: &Path, name: &str) -> Result<AgentProfile> {
+    validate_profile_name(name)?;
     let path = cwd.join(".nonoclaw/agents").join(format!("{name}.md"));
-    load_profile_file(&path)
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::Config(format!("agent profile `{name}` was not found"))
+        } else {
+            Error::Config(format!("failed to inspect agent profile `{name}`: {error}"))
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "agent profile `{name}` is not a regular file"
+        )));
+    }
+    if metadata.len() > MAX_PROFILE_BYTES {
+        return Err(Error::Config(format!(
+            "agent profile `{name}` exceeds the 64 KiB size limit"
+        )));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        Error::Config(format!("failed to read agent profile `{name}`: {error}"))
+    })?;
+    if bytes.len() as u64 > MAX_PROFILE_BYTES {
+        return Err(Error::Config(format!(
+            "agent profile `{name}` exceeds the 64 KiB size limit"
+        )));
+    }
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| Error::Config(format!("agent profile `{name}` is not valid UTF-8")))?;
+    let fm_text = extract_frontmatter(&raw).ok_or_else(|| {
+        Error::Config(format!(
+            "agent profile `{name}` must contain YAML frontmatter"
+        ))
+    })?;
+    let body = strip_frontmatter_text(&raw);
+    let mut profile: AgentProfile = serde_yaml::from_str(&fm_text).map_err(|error| {
+        Error::Config(format!(
+            "failed to parse agent profile `{name}` frontmatter: {error}"
+        ))
+    })?;
+    if profile.name.trim().is_empty() {
+        profile.name = name.to_string();
+    }
+    if let Some(mode) = profile.permission_mode.as_deref() {
+        if nonoclaw_core::PermissionMode::from_kebab(mode).is_none() {
+            return Err(Error::Config(format!(
+                "agent profile `{name}` has invalid permission mode `{mode}`"
+            )));
+        }
+    }
+    profile.body = body;
+    Ok(profile)
 }
 
-/// Load from an explicit path.
+fn validate_profile_name(name: &str) -> Result<()> {
+    let safe = !name.is_empty()
+        && name.chars().count() <= MAX_PROFILE_NAME_CHARS
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && !name.contains(['/', '\\'])
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if safe {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "invalid agent profile name `{name}`: expected a safe non-hidden basename"
+        )))
+    }
+}
+
+/// Backward-compatible optional loader used by extension discovery. Child
+/// Agent execution uses [`load_profile_checked`] so failures are never ignored.
+pub fn load_profile(cwd: &Path, name: &str) -> Option<AgentProfile> {
+    load_profile_checked(cwd, name).ok()
+}
+
+/// Load from an explicit path for best-effort profile listing.
 fn load_profile_file(path: &Path) -> Option<AgentProfile> {
     let raw = std::fs::read_to_string(path).ok()?;
+    if raw.len() as u64 > MAX_PROFILE_BYTES {
+        return None;
+    }
     let fm_text = extract_frontmatter(&raw)?;
     let body = strip_frontmatter_text(&raw);
     let mut profile: AgentProfile = serde_yaml::from_str(&fm_text).ok()?;
+    if profile
+        .permission_mode
+        .as_deref()
+        .is_some_and(|mode| nonoclaw_core::PermissionMode::from_kebab(mode).is_none())
+    {
+        return None;
+    }
     if profile.name.is_empty() {
         profile.name = path
             .file_stem()
@@ -84,7 +172,6 @@ pub fn list_profiles(cwd: &Path) -> Vec<AgentProfile> {
 /// Apply a profile's overrides to [`EngineOptions`].
 /// Called after building options but before engine run.
 pub fn apply_profile(options: &mut crate::EngineOptions, profile: &AgentProfile) {
-    // Merge system prompt appendage.
     if let Some(ref extra) = profile.system_prompt_append {
         let merged = match &options.append_system_prompt {
             Some(existing) => format!("{existing}\n\n{extra}"),
@@ -92,18 +179,62 @@ pub fn apply_profile(options: &mut crate::EngineOptions, profile: &AgentProfile)
         };
         options.append_system_prompt = Some(merged);
     }
-    // Override allowed/disallowed tools.
     if !profile.tools_allow.is_empty() {
         options.allowed_tools = profile.tools_allow.clone();
     }
     if !profile.tools_deny.is_empty() {
         options.disallowed_tools = profile.tools_deny.clone();
     }
-    // Override permission mode.
     if let Some(ref mode) = profile.permission_mode {
-        if let Some(m) = nonoclaw_core::PermissionMode::from_kebab(mode) {
-            options.permission_mode = m;
+        if let Some(mode) = nonoclaw_core::PermissionMode::from_kebab(mode) {
+            options.permission_mode = mode;
         }
+    }
+}
+
+/// Apply a profile to child options without ever broadening the parent's
+/// capabilities. The fixed autonomous-child prompt remains authoritative and
+/// is followed only by the profile's explicit prompt appendage.
+pub(crate) fn apply_subagent_profile(
+    options: &mut crate::EngineOptions,
+    profile: Option<&AgentProfile>,
+    fixed_prompt: String,
+) {
+    if let Some(profile) = profile {
+        // tools_allow is enforced as registry visibility by EngineSubagent.
+        // Keep the parent's explicit permission allow rules unchanged: adding
+        // a profile tool here would bypass Plan/default headless protections.
+        for denied in &profile.tools_deny {
+            if !options.disallowed_tools.contains(denied) {
+                options.disallowed_tools.push(denied.clone());
+            }
+        }
+        if let Some(mode) = profile
+            .permission_mode
+            .as_deref()
+            .and_then(nonoclaw_core::PermissionMode::from_kebab)
+        {
+            if permission_strictness(mode) <= permission_strictness(options.permission_mode) {
+                options.permission_mode = mode;
+            }
+        }
+    }
+
+    options.append_system_prompt = Some(
+        match profile.and_then(|p| p.system_prompt_append.as_deref()) {
+            Some(extra) if !extra.trim().is_empty() => format!("{fixed_prompt}\n\n{extra}"),
+            _ => fixed_prompt,
+        },
+    );
+}
+
+fn permission_strictness(mode: nonoclaw_core::PermissionMode) -> u8 {
+    match mode {
+        nonoclaw_core::PermissionMode::Plan => 0,
+        nonoclaw_core::PermissionMode::Default => 1,
+        nonoclaw_core::PermissionMode::AcceptEdits => 2,
+        nonoclaw_core::PermissionMode::Auto => 3,
+        nonoclaw_core::PermissionMode::BypassPermissions => 4,
     }
 }
 
@@ -270,6 +401,128 @@ Body text here."#;
             .contains("Extra instructions"));
         assert_eq!(opts.allowed_tools, vec!["Read", "Write"]);
         assert_eq!(opts.disallowed_tools, vec!["Bash"]);
+    }
+
+    fn profile_test_dir() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nonoclaw-agent-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".nonoclaw/agents")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn checked_profile_rejects_unsafe_missing_and_invalid_mode() {
+        let cwd = profile_test_dir();
+        for name in [
+            "",
+            ".hidden",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "white space",
+        ] {
+            assert!(
+                matches!(load_profile_checked(&cwd, name), Err(Error::Config(message)) if message.contains("invalid agent profile name"))
+            );
+        }
+        assert!(matches!(
+            load_profile_checked(&cwd, "missing"),
+            Err(Error::Config(message)) if message.contains("was not found")
+        ));
+        std::fs::write(
+            cwd.join(".nonoclaw/agents/bad-mode.md"),
+            "---\nname: bad-mode\npermission_mode: superuser\n---\nbody\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_profile_checked(&cwd, "bad-mode"),
+            Err(Error::Config(message)) if message.contains("invalid permission mode")
+        ));
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn subagent_profile_merges_prompt_and_only_tightens_permissions() {
+        let profile = AgentProfile {
+            name: "restricted".into(),
+            system_prompt_append: Some("Profile-only guidance.".into()),
+            tools_allow: vec!["Read".into(), "Bash".into()],
+            tools_deny: vec!["Bash".into(), "Write".into()],
+            permission_mode: Some("plan".into()),
+            ..Default::default()
+        };
+        let mut options = crate::EngineOptions {
+            append_system_prompt: Some("parent prompt must not replace child prompt".into()),
+            allowed_tools: vec!["Read".into(), "Write".into()],
+            disallowed_tools: vec!["Grep".into()],
+            permission_mode: nonoclaw_core::PermissionMode::Default,
+            ..Default::default()
+        };
+        apply_subagent_profile(&mut options, Some(&profile), "Fixed child prompt.".into());
+        assert_eq!(options.allowed_tools, vec!["Read", "Write"]);
+        assert_eq!(options.disallowed_tools, vec!["Grep", "Bash", "Write"]);
+        assert_eq!(options.permission_mode, nonoclaw_core::PermissionMode::Plan);
+        assert_eq!(
+            options.append_system_prompt.as_deref(),
+            Some("Fixed child prompt.\n\nProfile-only guidance.")
+        );
+
+        let less_strict = AgentProfile {
+            permission_mode: Some("auto".into()),
+            tools_allow: vec!["Bash".into()],
+            ..Default::default()
+        };
+        apply_subagent_profile(&mut options, Some(&less_strict), "Fixed.".into());
+        assert_eq!(options.permission_mode, nonoclaw_core::PermissionMode::Plan);
+        assert_eq!(options.allowed_tools, vec!["Read", "Write"]);
+    }
+
+    #[test]
+    fn subagent_profile_allow_is_visibility_only_and_never_grants_permission() {
+        let profile = AgentProfile {
+            name: "writer".into(),
+            tools_allow: vec!["Write".into(), "Bash".into()],
+            ..Default::default()
+        };
+
+        for mode in [
+            nonoclaw_core::PermissionMode::Plan,
+            nonoclaw_core::PermissionMode::Default,
+        ] {
+            let mut options = crate::EngineOptions {
+                permission_mode: mode,
+                allowed_tools: Vec::new(),
+                ..Default::default()
+            };
+            apply_subagent_profile(&mut options, Some(&profile), "Fixed.".into());
+            assert!(options.allowed_tools.is_empty());
+
+            let gate = nonoclaw_tools::PermissionGate::new(
+                options.permission_mode,
+                options.allowed_tools.clone(),
+                options.disallowed_tools.clone(),
+            );
+            let decision = gate.decide(
+                "Write",
+                false,
+                &nonoclaw_core::PermissionDecision::ask("write requires permission"),
+            );
+            let resolved = gate.headless_resolve(decision);
+            assert!(matches!(
+                resolved,
+                nonoclaw_core::PermissionDecision::Deny { .. }
+            ));
+        }
+
+        let (registry, _) = nonoclaw_tools::register_all();
+        let visible = registry
+            .filtered(&["Agent", "Coordinator"])
+            .restricted_to(&profile.tools_allow);
+        assert!(visible.find("Write").is_some());
+        assert!(visible.find("Bash").is_some());
+        assert!(visible.find("Read").is_none());
+        assert!(visible.find("Agent").is_none());
     }
 
     #[tokio::test]

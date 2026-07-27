@@ -4,6 +4,7 @@
 //! are owned by responsibility-focused submodules.
 
 mod connection;
+mod download_service;
 mod http_error;
 mod project_service;
 mod protocol;

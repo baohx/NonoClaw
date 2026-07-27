@@ -67,6 +67,7 @@ pub(super) fn enrich_prompt_with_attachments(
     prompt: &str,
     attachments: &Option<Vec<AttachmentRef>>,
     upload_dir: &std::path::Path,
+    include_images: bool,
 ) -> MessageContent {
     let attachments = match attachments {
         Some(attachments) if !attachments.is_empty() => attachments,
@@ -99,19 +100,21 @@ pub(super) fn enrich_prompt_with_attachments(
             .map(|value| value.extracted_text.as_str())
             .unwrap_or(attachment.extracted_text.as_str());
         blocks.push(ContentBlock::text(format!("## File: {filename}\n\n")));
-        for image in images.iter().take(MAX_IMAGES_PER_ATTACHMENT) {
-            if image.data.len() < 2_000_000 {
-                blocks.push(ContentBlock::Image {
-                    source: ImageSource {
-                        kind: "base64".into(),
-                        media_type: image.media_type.clone(),
-                        data: image.data.clone(),
-                    },
-                });
-                blocks.push(ContentBlock::text(format!(
-                    "(extracted image: {})\n",
-                    image.media_type
-                )));
+        if include_images {
+            for image in images.iter().take(MAX_IMAGES_PER_ATTACHMENT) {
+                if image.data.len() < 2_000_000 {
+                    blocks.push(ContentBlock::Image {
+                        source: ImageSource {
+                            kind: "base64".into(),
+                            media_type: image.media_type.clone(),
+                            data: image.data.clone(),
+                        },
+                    });
+                    blocks.push(ContentBlock::text(format!(
+                        "(extracted image: {})\n",
+                        image.media_type
+                    )));
+                }
             }
         }
         let display = if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
@@ -211,6 +214,7 @@ mod tests {
             "visible user request",
             &Some(attachments),
             std::path::Path::new("/nonexistent-upload-root"),
+            false,
         );
         let MessageContent::Blocks(blocks) = content else {
             panic!("attachments must produce block content");
@@ -226,5 +230,65 @@ mod tests {
         assert!(!text.contains("../"));
         assert!(text.contains("[... content truncated]"));
         assert!(text.ends_with("visible user request"));
+    }
+
+    fn attachment_with_image() -> AttachmentRef {
+        AttachmentRef {
+            id: "missing-upload".into(),
+            filename: "report.pdf".into(),
+            extracted_text: "Extracted PDF text".into(),
+            images: vec![super::super::protocol::ImageRef {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn text_only_attachment_enrichment_omits_images_but_keeps_extracted_text() {
+        let content = enrich_prompt_with_attachments(
+            "summarize",
+            &Some(vec![attachment_with_image()]),
+            std::path::Path::new("/nonexistent-upload-root"),
+            false,
+        );
+        let MessageContent::Blocks(blocks) = content else {
+            panic!("attachments must produce block content");
+        };
+        assert!(!blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })));
+        let text = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("Extracted PDF text"));
+        assert!(text.ends_with("summarize"));
+    }
+
+    #[test]
+    fn vision_attachment_enrichment_keeps_images_and_extracted_text() {
+        let content = enrich_prompt_with_attachments(
+            "summarize",
+            &Some(vec![attachment_with_image()]),
+            std::path::Path::new("/nonexistent-upload-root"),
+            true,
+        );
+        let MessageContent::Blocks(blocks) = content else {
+            panic!("attachments must produce block content");
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count(),
+            1
+        );
+        assert!(blocks.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text, .. } if text.contains("Extracted PDF text"))
+        }));
     }
 }

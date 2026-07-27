@@ -786,6 +786,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 | `XDG_DATA_HOME` | Standard data root; used as `$XDG_DATA_HOME/nonoclaw` when `NONOCLAW_DATA_DIR` is unset |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch backends |
 | `NONOCLAW_MAX_TOOL_CONCURRENCY` | Max parallel tool executions (default: 10) |
+| `NONOCLAW_SUBAGENT_MAX_TURNS` | Child-agent autonomous turn cap (default: 24, hard max: 200; never exceeds the parent run limit) |
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Disable `run_in_background` (default: enabled) |
 | `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
 
@@ -1528,6 +1529,7 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw -p "并行运行独立检查"
 | `XDG_DATA_HOME` | 标准数据根目录；未设置 `NONOCLAW_DATA_DIR` 时使用 `$XDG_DATA_HOME/nonoclaw` |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch 后端 |
 | `NONOCLAW_MAX_TOOL_CONCURRENCY` | 最大并行工具执行数（默认：10） |
+| `NONOCLAW_SUBAGENT_MAX_TURNS` | 子代理自主执行轮次上限（默认：24，硬上限：200，且不会超过父运行限制） |
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | 禁用 `run_in_background`（默认：启用） |
 | `RUST_LOG` | 日志级别（`debug`、`info`、`warn`） |
 

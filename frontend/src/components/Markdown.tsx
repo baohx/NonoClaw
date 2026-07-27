@@ -57,34 +57,104 @@ function SvgBlock({ source }: { source: string }) {
   );
 }
 
-/** Render an ECharts chart from a JSON option block. */
+/** Render an ECharts chart from inert JSON option data. */
 function EChartsBlock({ source }: { source: string }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [status, setStatus] = React.useState<"pending" | "active" | "chart unavailable" | "error">("pending");
+  const [error, setError] = React.useState("");
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const win = window as any;
-    if (!win.echarts) {
-      el.innerHTML = `<pre class="mermaid-raw">ECharts not loaded</pre>`;
-      return;
-    }
-    try {
-      const option = JSON.parse(source);
-      const chart = win.echarts.init(el, undefined, {
-        width: undefined,
-        height: 400,
+    let chart: any = null;
+    let observer: ResizeObserver | null = null;
+    let frame = 0;
+    let disposed = false;
+    let retried = false;
+    let retryTimer = 0;
+
+    const dispose = () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer?.disconnect();
+      observer = null;
+      if (chart) {
+        try { chart.dispose(); } catch {}
+        chart = null;
+      }
+    };
+    const scheduleResize = () => {
+      if (!chart || disposed || el.clientWidth <= 0 || el.clientHeight <= 0 || frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        if (chart && el.clientWidth > 0 && el.clientHeight > 0) chart.resize();
       });
-      chart.setOption(option);
-      const onResize = () => chart.resize();
-      window.addEventListener("resize", onResize);
-      return () => { window.removeEventListener("resize", onResize); chart.dispose(); };
-    } catch {
-      el.innerHTML = `<pre class="mermaid-raw">${source}</pre>`;
+    };
+    const initialize = (isRetry: boolean) => {
+      if (disposed || chart) return;
+      const win = window as any;
+      if (!win.echarts) {
+        if (isRetry) {
+          setStatus("chart unavailable");
+          setError("ECharts library is unavailable");
+        }
+        return;
+      }
+      try {
+        const option = JSON.parse(source);
+        if (!option || typeof option !== "object") throw new Error("Chart Source must be a JSON object or array");
+        chart = win.echarts.init(el);
+        chart.setOption(option);
+        if (typeof ResizeObserver !== "undefined") {
+          observer = new ResizeObserver(scheduleResize);
+          observer.observe(el);
+        }
+        scheduleResize();
+        setError("");
+        setStatus("active");
+      } catch (reason) {
+        dispose();
+        setStatus("error");
+        setError(reason instanceof Error ? reason.message : "ECharts rejected the option");
+      }
+    };
+    const retryOnce = () => {
+      if (retried || disposed || chart) return;
+      retried = true;
+      initialize(true);
+    };
+
+    setStatus("pending");
+    setError("");
+    initialize(false);
+    if (!chart) {
+      window.addEventListener("echarts-ready", retryOnce, { once: true });
+      retryTimer = window.setTimeout(retryOnce, 250);
     }
+    return () => {
+      disposed = true;
+      window.removeEventListener("echarts-ready", retryOnce);
+      if (retryTimer) window.clearTimeout(retryTimer);
+      dispose();
+    };
   }, [source]);
 
-  return <div ref={ref} style={{ width: "100%", minHeight: 320 }} />;
+  const copySource = async () => {
+    try { await navigator.clipboard.writeText(source); } catch {}
+  };
+
+  return (
+    <figure className="echarts-block" data-chart-status={status}>
+      <div ref={ref} style={{ width: "100%", minHeight: 320 }} />
+      <figcaption role="status">
+        <span>{status}{error ? ` · ${error}` : ""}</span>
+        <button type="button" onClick={copySource}>copy chart source</button>
+      </figcaption>
+      <details>
+        <summary>Chart Source</summary>
+        <pre><code>{source}</code></pre>
+      </details>
+    </figure>
+  );
 }
 
 const PIPE = ""; // private-use char as pipe placeholder inside math

@@ -10,9 +10,9 @@ use nonoclaw_core::{Error, PermissionDecision, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::tool::{Tool, ToolCtx, ToolResult};
+use crate::tool::{normalize_optional_profile, SubagentRequest, Tool, ToolCtx, ToolResult};
 
-const PROMPT: &str = "Launches a subagent to handle a self-contained subtask in the background and returns its final answer.\n\nUse this for:\n- Searches or investigations requiring multiple rounds of tool use you don't need to follow step-by-step\n- Independent, parallelizable work (you may call Agent several times in one turn)\n- Anything that would clutter the main conversation\n\nInput:\n- `prompt`: a complete, self-contained instruction (the subagent does NOT see this conversation — include all needed context, file paths, and the success criterion).\n- `description`: a short (3-5 word) label of what the subagent is doing.\n\nNotes:\n- The subagent runs with a restricted toolset (no nested Agent) and reports only its final result, not its steps.\n- Prefer specific over vague prompts; state exactly what a successful answer looks like.";
+const PROMPT: &str = "Launches a subagent to handle a self-contained subtask and returns its final answer. Child streaming status, tool activity, permissions, and terminal events are reported under this Agent call.\n\nUse this for:\n- Searches or investigations requiring multiple rounds of tool use\n- Independent, parallelizable work (you may call Agent several times in one turn)\n- Anything that would clutter the main conversation\n\nInput:\n- `prompt`: a complete, self-contained instruction (the subagent does NOT see this conversation — include all needed context, file paths, and the success criterion).\n- `description`: a short (3-5 word) label of what the subagent is doing.\n- `profile`: optional `.nonoclaw/agents/<profile>.md` profile; it may only tighten the parent permissions/tools.\n\nNotes:\n- The subagent runs non-interactively with a restricted toolset (no nested Agent/Coordinator).\n- Prefer specific over vague prompts; state exactly what a successful answer looks like.";
 
 pub struct AgentTool;
 
@@ -35,7 +35,8 @@ impl Tool for AgentTool {
             "type": "object",
             "properties": {
                 "description": {"type":"string","description":"A short (3-5 word) description of the task"},
-                "prompt": {"type":"string","description":"Fully self-contained instruction for the subagent"}
+                "prompt": {"type":"string","description":"Fully self-contained instruction for the subagent"},
+                "profile": {"type":"string","description":"Optional agent profile name from .nonoclaw/agents/<name>.md"}
             },
             "required": ["description", "prompt"]
         })
@@ -74,6 +75,12 @@ impl Tool for AgentTool {
             message: "missing required field `prompt`".into(),
         })?;
 
+        let profile =
+            normalize_optional_profile(input.get("profile")).map_err(|()| Error::Tool {
+                tool: "Agent".into(),
+                message: "optional field `profile` must be a string, null, or omitted".into(),
+            })?;
+
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -89,9 +96,31 @@ impl Tool for AgentTool {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            r = runner.run_subagent(prompt, description) => r,
+            r = runner.run_subagent(SubagentRequest {
+                prompt: prompt.to_owned(),
+                description: description.to_owned(),
+                profile,
+                parent_tool_use_id: ctx.tool_use_id.to_owned(),
+                index: None,
+            }) => r,
         }?;
 
         Ok(ToolResult::ok(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_exposes_optional_profile() {
+        let schema = AgentTool.input_schema();
+        assert_eq!(schema["properties"]["profile"]["type"], "string");
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "profile"));
     }
 }

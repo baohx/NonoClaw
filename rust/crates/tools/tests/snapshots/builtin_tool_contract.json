@@ -417,6 +417,10 @@
           "description": "A short (3-5 word) description of the task",
           "type": "string"
         },
+        "profile": {
+          "description": "Optional agent profile name from .nonoclaw/agents/<name>.md",
+          "type": "string"
+        },
         "prompt": {
           "description": "Fully self-contained instruction for the subagent",
           "type": "string"
@@ -464,6 +468,10 @@
               "description": {
                 "type": "string"
               },
+              "profile": {
+                "description": "Optional agent profile name from .nonoclaw/agents/<name>.md",
+                "type": "string"
+              },
               "prompt": {
                 "type": "string"
               }
@@ -474,6 +482,8 @@
             ],
             "type": "object"
           },
+          "maxItems": 16,
+          "minItems": 1,
           "type": "array"
         }
       },

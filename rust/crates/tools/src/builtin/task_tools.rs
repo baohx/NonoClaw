@@ -337,6 +337,7 @@ mod tests {
             cwd: std::path::Path::new("/tmp"),
             options: &options,
             cancel: &cancel,
+            tool_use_id: "task-test-call",
             task_scope: Some("coordinator"),
             subagent: None,
             question: None,

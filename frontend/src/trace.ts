@@ -81,6 +81,14 @@ function usageDetails(value: unknown, prefix: string): Record<string, TraceDetai
 }
 function compactNumber(value: unknown): string { return number(value).toLocaleString(); }
 
+/** Calculate context usage whenever a window is known, independently of UI visibility. */
+export function contextUsagePercent(estimated: unknown, window: unknown): number | null {
+  if (typeof window !== "number" || !Number.isFinite(window) || window < 0) return null;
+  if (window === 0) return 0;
+  const used = typeof estimated === "number" && Number.isFinite(estimated) ? Math.max(0, estimated) : 0;
+  return Math.round(Math.min(100, used / window * 100) * 10) / 10;
+}
+
 interface Fact {
   category: TraceCategory;
   status: TraceStatus;
@@ -175,7 +183,7 @@ export function traceTerminalEntry(meta: RunWireMeta, kind: "done" | "wire_error
 export function appendTraceEntry(entries: TraceEntry[], entry: TraceEntry): TraceEntry[] {
   if (entries.some((existing) => existing.id === entry.id)) return entries;
   return [...entries, entry]
-    .sort((a, b) => a.timestampMs - b.timestampMs || a.runId.localeCompare(b.runId) || a.sequence - b.sequence)
+    .sort((a, b) => a.sequence - b.sequence || a.timestampMs - b.timestampMs || a.id.localeCompare(b.id))
     .slice(-MAX_TRACE_EVENTS);
 }
 

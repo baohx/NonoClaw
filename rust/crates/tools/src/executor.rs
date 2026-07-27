@@ -234,6 +234,7 @@ impl ToolExecutor {
             cwd: context.cwd,
             options: context.options,
             cancel: context.cancel,
+            tool_use_id: &call.id,
             task_scope: context.task_scope,
             subagent: context.subagent,
             question: context.question,

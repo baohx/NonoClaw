@@ -1,17 +1,22 @@
-import type { ClientMsg } from "../types.ts";
+import type { ClientMsg, EngineEvent, ScopedSubagentEvent } from "../types.ts";
+import { engineMessagesToChat } from "./slices.ts";
 import { checkTraceStateInvariants } from "../trace.test.ts";
 import {
   MAX_OUTBOUND_QUEUE,
   MAX_RESOLVED_PROMPTS,
   MAX_TRACKED_RUNS,
   acceptRunTransition,
+  acceptScopedEnvelope,
   acceptSnapshotTransition,
   accumulateUsage,
   addToolCardTransition,
+  applySubagentEventTransition,
+  emptySubagentState,
   enqueueClientMessage,
   prepareSessionBoundary,
   resolvePromptTransition,
   transitionConnection,
+  updateToolResultTransition,
   type ChatStreamState,
   type ConnectionState,
   type SessionOrderingState,
@@ -125,6 +130,33 @@ function chatPromptAndUsageChecks(): void {
   const once = chat.messages.length;
   chat = addToolCardTransition(chat, "tool-a", "Read", { path: "a" });
   assert(chat.messages.length === once, "tool cards must be idempotent");
+  chat = updateToolResultTransition(chat, "tool-a", false, "permission denied");
+  const failedCard = chat.messages.find((message) => message.id === "tool-tool-a");
+  assert(failedCard?.toolOk === false && failedCard.content === "permission denied", "failed tool results must set FAILURE on the matching card");
+
+  const restored = engineMessagesToChat([
+    { role: "assistant", content: [
+      { type: "text", text: "before" },
+      { type: "tool_use", id: "Case-Sensitive", name: "Read", input: { path: "safe" } },
+      { type: "text", text: "after" },
+    ] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "Case-Sensitive", content: "failed", is_error: true }] },
+  ]);
+  assert(restored.map((message) => message.role).join(",") === "assistant,tool,assistant", "history must preserve text/tool/text block order");
+  assert(restored[1].id === "tool-Case-Sensitive" && restored[1].toolOk === false, "history must merge exact stable call ids and preserve failure");
+
+  const restoredAttachments = engineMessagesToChat([
+    { role: "user", attachments: [{ filename: "diagram.png" }, { filename: "notes.md" }], content: [
+      { type: "text", text: "explain these files" },
+    ] },
+    { role: "assistant", content: "first answer" },
+    { role: "user", content: "follow-up without files" },
+  ]);
+  assert(restoredAttachments[0].content === "explain these files", "attachment history must retain the original user prompt");
+  assert(restoredAttachments[0].attachments?.map((item) => item.filename).join(",") === "diagram.png,notes.md",
+    "attachment history must retain every filename on its user turn");
+  assert(restoredAttachments[2].attachments === undefined,
+    "attachment history must not leak filenames into a later user turn");
 
   let prompts = { resolvedPermissionIds: [] as string[], resolvedQuestionIds: [] as string[] };
   prompts = resolvePromptTransition(prompts, "permission", "permission-a");
@@ -143,8 +175,130 @@ function chatPromptAndUsageChecks(): void {
   "usage accumulation must be component-wise");
 }
 
+function scopedEvent(
+  childId: string,
+  sequence: number,
+  event: EngineEvent,
+  index: number | null = 0,
+): ScopedSubagentEvent {
+  return {
+    kind: "subagent_event",
+    subagent_id: childId,
+    parent_tool_use_id: "parent-agent",
+    description: `child ${childId}`,
+    profile: childId === "child-b" ? "reviewer" : undefined,
+    index,
+    child_sequence: sequence,
+    event,
+  };
+}
+
+// Validates scoped ordering/isolation: child events cannot mutate root-run state.
+function subagentTransitionChecks(): void {
+  const root = {
+    streamingIdx: 7,
+    model: "root-model",
+    sessionRevision: 12,
+    runSequences: { root: 42 },
+    breath: "streaming",
+  };
+  let children = emptySubagentState();
+
+  let next = applySubagentEventTransition(children, scopedEvent("child-a", 0, {
+    kind: "text_delta", text: "alpha ",
+  }, 2));
+  assert(next.accepted, "first child sequence zero must be accepted");
+  children = next.state;
+  next = applySubagentEventTransition(children, scopedEvent("child-b", 0, {
+    kind: "text_delta", text: "beta",
+  }, 1));
+  assert(next.accepted, "a second child under one parent must be independent");
+  children = next.state;
+  assert(children.childIdsByParentToolId["parent-agent"].join(",") === "child-b,child-a",
+    "siblings must be stable by index rather than arrival order");
+  assert(children.subagentRunsById["child-a"].output === "alpha "
+    && children.subagentRunsById["child-b"].output === "beta",
+  "sibling text buffers must remain isolated");
+  assert(children.subagentRunsById["child-b"].profile === "reviewer", "optional child profile must be retained");
+
+  const duplicateState = children;
+  assert(!applySubagentEventTransition(children, scopedEvent("child-a", 0, {
+    kind: "text_delta", text: "duplicate",
+  }, 2)).accepted, "duplicate child sequence must be rejected");
+  assert(!applySubagentEventTransition(children, scopedEvent("child-a", -1, {
+    kind: "text_delta", text: "late",
+  }, 2)).accepted, "out-of-order child sequence must be rejected");
+  assert(children === duplicateState && children.subagentRunsById["child-a"].output === "alpha ",
+    "rejected child events must be idempotent");
+
+  children = applySubagentEventTransition(children, scopedEvent("child-a", 1, {
+    kind: "tool_use_start", id: "shared-tool", name: "Read", input: { path: "a", api_key: "secret" },
+  }, 2)).state;
+  children = applySubagentEventTransition(children, scopedEvent("child-b", 1, {
+    kind: "tool_use_start", id: "shared-tool", name: "Bash", input: { command: "echo b" },
+  }, 1)).state;
+  children = applySubagentEventTransition(children, scopedEvent("child-a", 2, {
+    kind: "permission_requested", tool_use_id: "shared-tool", tool_name: "Read", waiting_on: "user",
+  }, 2)).state;
+  assert(children.subagentRunsById["child-a"].status === "waiting_permission"
+    && children.subagentRunsById["child-a"].toolsById["shared-tool"].permission === "user",
+  "child permission must update only its scoped run/tool");
+  assert(children.subagentRunsById["child-b"].toolsById["shared-tool"].name === "Bash",
+    "equal tool ids in sibling runs must not collide");
+  const safeInput = children.subagentRunsById["child-a"].toolsById["shared-tool"].input as Record<string, unknown>;
+  assert(!("api_key" in safeInput), "child tool input must be sanitized before browser storage");
+
+  children = applySubagentEventTransition(children, scopedEvent("child-a", 3, {
+    kind: "assistant_done",
+  }, 2)).state;
+  assert(children.subagentRunsById["child-a"].segmentCount === 1
+    && children.subagentRunsById["child-a"].status === "waiting_permission",
+  "assistant_done must close a segment without terminating the child");
+  children = applySubagentEventTransition(children, scopedEvent("child-a", 4, {
+    kind: "run_finished", status: "succeeded",
+  }, 2)).state;
+  assert(children.subagentRunsById["child-a"].status === "succeeded", "run_finished must terminate the child");
+
+  assert(root.streamingIdx === 7 && root.model === "root-model" && root.sessionRevision === 12
+    && root.runSequences.root === 42 && root.breath === "streaming",
+  "scoped transition must not update root streaming/model/revision/sequence/breath state");
+
+  children = emptySubagentState();
+  assert(Object.keys(children.subagentRunsById).length === 0
+    && Object.keys(children.childIdsByParentToolId).length === 0,
+  "session/messages_loaded/clear boundary state must remove all transient child runs");
+}
+
 connectionAndQueueChecks();
 snapshotAndRunOrderingChecks();
 chatPromptAndUsageChecks();
+subagentTransitionChecks();
+scopedEnvelopeGateChecks();
 checkTraceStateInvariants();
 console.log("frontend transition checks passed");
+
+function scopedEnvelopeGateChecks(): void {
+  const gate = {
+    sessionId: "session-current",
+    sessionRevision: 8,
+    snapshotRevision: 7,
+    awaitingSnapshot: false,
+    terminalRuns: {} as Record<string, true>,
+  };
+  const current = { runId: "parent-run", sessionId: "session-current", sessionRevision: 8, sequence: 12 };
+  assert(acceptScopedEnvelope(gate, current), "current-session child envelope should be accepted");
+  assert(!acceptScopedEnvelope(gate, { ...current, sessionId: "session-old" }),
+    "late child envelopes from an old session must be rejected");
+  assert(!acceptScopedEnvelope({ ...gate, awaitingSnapshot: true }, current),
+    "child envelopes must not cross a snapshot barrier");
+  assert(!acceptScopedEnvelope(gate, { ...current, sessionRevision: 6 }),
+    "child envelopes older than known session state must be rejected");
+  assert(!acceptScopedEnvelope({ ...gate, terminalRuns: { "parent-run": true } }, current),
+    "child envelopes arriving after parent terminal must be rejected");
+
+  const direct = applySubagentEventTransition(emptySubagentState(), scopedEvent("direct-agent", 0, {
+    kind: "run_started",
+  }, null));
+  assert(direct.accepted && direct.state.subagentRunsById["direct-agent"].index === 0,
+    "direct Agent index:null must normalize to zero");
+}

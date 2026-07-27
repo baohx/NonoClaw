@@ -1,4 +1,4 @@
-import { appendTraceEntry, eventToSafeFact, groupTraceRuns, MAX_TRACE_EVENTS, type TraceEntry } from "./trace.ts";
+import { appendTraceEntry, contextUsagePercent, eventToSafeFact, groupTraceRuns, MAX_TRACE_EVENTS, type TraceEntry } from "./trace.ts";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`trace invariant failed: ${message}`);
@@ -11,6 +11,11 @@ export function checkTraceStateInvariants(): void {
 
   const tool = eventToSafeFact({ kind: "tool_use_start", id: "tool-1", name: "Read", input: { password: "secret" } });
   check(tool !== null && !("input" in (tool.details ?? {})), "tool input must be omitted");
+
+  check(contextUsagePercent(50, 200) === 25, "context usage must be calculated independently of rendering");
+  check(contextUsagePercent(1, 3) === 33.3, "context usage must round to one decimal");
+  check(contextUsagePercent(50, 0) === 0, "zero context window must report 0.0 percent");
+  check(contextUsagePercent(300, 200) === 100, "context usage must be constrained to 100 percent");
 
   let entries: TraceEntry[] = [];
   for (let sequence = MAX_TRACE_EVENTS + 10; sequence >= 1; sequence -= 1) {

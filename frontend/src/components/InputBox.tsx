@@ -2,10 +2,12 @@ import { useRef, useCallback, useEffect, useState } from "react";
 import { useStore } from "../store";
 import { getBrowserAccessToken, sanitizeBrowserText } from "../security";
 import type { MediaAttachment } from "../store/slices";
-import type { AttachmentRef, UploadResponse } from "../types";
+import type { AttachmentRef, PermissionMode, UploadResponse } from "../types";
 
 interface Props {
   onSubmit: (text: string, attachments: AttachmentRef[]) => void;
+  onSetPermissionMode: (mode: PermissionMode) => void;
+  onSetModel: (name: string) => void;
   disabled?: boolean;
 }
 
@@ -16,7 +18,7 @@ function authenticatedApiUrl(path: string): string {
   return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 }
 
-export default function InputBox({ onSubmit, disabled }: Props) {
+export default function InputBox({ onSubmit, onSetPermissionMode, onSetModel, disabled }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyRef = useRef<string[]>([]);
@@ -32,6 +34,9 @@ export default function InputBox({ onSubmit, disabled }: Props) {
   const recording = useStore((state) => state.recording);
   const setRecording = useStore((state) => state.setRecording);
   const sessionId = useStore((state) => state.sessionId);
+  const model = useStore((state) => state.model);
+  const availableModels = useStore((state) => state.availableModels);
+  const permissionMode = useStore((state) => state.permissionMode);
   const [dragOver, setDragOver] = useState(false);
   const dragCounter = useRef(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -318,7 +323,7 @@ export default function InputBox({ onSubmit, disabled }: Props) {
           rows={1}
         />
         <div className="composer__hint">
-          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div className="composer__hint-main">
             <button
               className="composer__attach"
               onClick={() => fileInputRef.current?.click()}
@@ -348,8 +353,42 @@ export default function InputBox({ onSubmit, disabled }: Props) {
                 <line x1="8" y1="23" x2="16" y2="23"/>
               </svg>
             </button>
-            <kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> · /clear /compact
-          </span>
+            <span className="composer__shortcuts">
+              <span className="composer__shortcut-key"><kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> · </span>
+              <span className="composer__commands">/clear /compact</span>
+            </span>
+            <div className="composer__run-options" aria-label="Next run settings">
+              <label>
+                <span>model</span>
+                <select
+                  aria-label="Model for next run"
+                  value={model}
+                  disabled={disabled}
+                  onChange={(event) => onSetModel(event.target.value)}
+                  title={disabled ? "Model can be changed after this run finishes" : "Model for the next run"}
+                >
+                  {availableModels.map((item) => <option key={item.name} value={item.name}>{item.label || item.name}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>mode</span>
+                <select
+                  aria-label="Execution mode for next run"
+                  value={permissionMode}
+                  disabled={disabled}
+                  onChange={(event) => onSetPermissionMode(event.target.value as PermissionMode)}
+                  title={disabled ? "Execution mode can be changed after this run finishes" : "Permission policy for the next run"}
+                >
+                  <option value="default">Default</option>
+                  <option value="acceptEdits">Accept edits</option>
+                  <option value="auto">Auto</option>
+                  <option value="bypassPermissions">Bypass</option>
+                  <option value="plan">Plan</option>
+                </select>
+              </label>
+              {disabled && <span className="composer__run-status" role="status">Run settings are locked until the current run ends.</span>}
+            </div>
+          </div>
           <button
             className="composer__send"
             onClick={submit}

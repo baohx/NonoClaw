@@ -214,6 +214,16 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         </Section>
 
         <Section
+          id="system"
+          label="System"
+          count={info?.system.entries.length ?? 0}
+          open={open.has("system")}
+          onToggle={toggle}
+        >
+          <SystemSection info={info} />
+        </Section>
+
+        <Section
           id="project"
           label="Project"
           count={null}
@@ -546,6 +556,47 @@ function ConfigRef({ items }: { items: { name: string; description: string }[] }
 }
 
 // ── Project summary (reads live session/token state from the store) ──────────
+
+function SystemSection({ info }: { info: ProjectInfo | null }) {
+  const system = info?.system;
+  if (!system) return <div className="acc-empty">runtime probe has not completed</div>;
+  return (
+    <div>
+      <div className="acc-empty">
+        completed {new Date(system.completed_at_ms).toLocaleString()} · timeout {system.timeout_ms} ms · output limit {system.output_limit_bytes.toLocaleString()} bytes
+      </div>
+      {system.entries.map((entry) => {
+        const dot = entry.status === "available" ? "on" : entry.status === "missing" ? "off" : "bad";
+        return (
+          <div className="insight-row" key={entry.name}>
+            <div className="insight-row__top">
+              <span className={`dot ${dot}`} />
+              <span className="insight-row__name">{entry.name.split(".").pop()}</span>
+              <span className="tag">{entry.status}</span>
+            </div>
+            <div className="insight-row__meta">path: {entry.path ?? "—"}</div>
+            <div className="insight-row__meta">
+              version: {entry.version ?? "—"}
+              {entry.expected_version ? ` · expected ${entry.expected_version}` : ""}
+            </div>
+            <div className="insight-row__meta">source: {entry.resolution_source}</div>
+            {entry.suggestion && <div className="insight-row__meta">fix: {entry.suggestion}</div>}
+          </div>
+        );
+      })}
+      <div className="insight-row">
+        <div className="insight-row__top">
+          <span className={`dot ${system.python_venv.status === "available" ? "on" : system.python_venv.status === "invalid" ? "bad" : "off"}`} />
+          <span className="insight-row__name">Python virtual environment</span>
+          <span className="tag">{system.python_venv.status}</span>
+        </div>
+        <div className="insight-row__meta">python: {system.python_venv.python_path ?? "—"}</div>
+        <div className="insight-row__meta">required: {system.python_venv.required ? "yes" : "no"}</div>
+        {system.python_venv.suggestion && <div className="insight-row__meta">fix: {system.python_venv.suggestion}</div>}
+      </div>
+    </div>
+  );
+}
 
 function ProjectKv({ info }: { info: ProjectInfo | null }) {
   const sessionId = useStore((s) => s.sessionId);

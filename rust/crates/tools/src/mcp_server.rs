@@ -131,6 +131,7 @@ async fn call_tool(
         cwd,
         options: &opts,
         cancel: &cancel,
+        tool_use_id: "mcp-call",
         task_scope: Some("mcp"),
         subagent: None,
         question: None,

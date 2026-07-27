@@ -35,7 +35,8 @@ export interface EngineEvent {
     | "subagent_started" | "subagent_finished" | "background_task_changed"
     | "compaction_started" | "recovery_applied" | "extension_diagnostic"
     | "mcp_diagnostic" | "config_diagnostic" | "usage_updated"
-    | "cancellation_requested" | "run_error" | "run_finished";
+    | "cancellation_requested" | "run_error" | "run_finished"
+    | "subagent_event";
   text?: string;
   id?: string;
   name?: string;
@@ -74,7 +75,7 @@ export interface EngineEvent {
   operation?: string;
   tool_use_id?: string;
   tool_name?: string;
-  index?: number;
+  index?: number | null;
   waiting_on?: string;
   decision?: string;
   elapsed_ms?: number;
@@ -107,6 +108,60 @@ export interface EngineEvent {
   duration_ms?: number;
   turns?: number;
   retryable?: boolean;
+  /** Scoped child-run metadata (subagent_event only). The enclosing run wire
+   * metadata continues to belong exclusively to the parent run. */
+  subagent_id?: string;
+  parent_tool_use_id?: string;
+  profile?: string | null;
+  child_sequence?: number;
+  event?: EngineEvent;
+}
+
+/** A child EngineEvent scoped to one Agent/Coordinator tool invocation. */
+export interface ScopedSubagentEvent extends EngineEvent {
+  kind: "subagent_event";
+  subagent_id: string;
+  parent_tool_use_id: string;
+  description: string;
+  profile?: string | null;
+  /** Coordinator child position; null/absent for a direct Agent call. */
+  index?: number | null;
+  child_sequence: number;
+  event: EngineEvent;
+}
+
+export type SubagentRunStatus =
+  | "running"
+  | "waiting_permission"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface SubagentTool {
+  id: string;
+  name: string;
+  input?: unknown;
+  result: string;
+  ok?: boolean;
+  status: string;
+  permission?: string;
+  truncated: boolean;
+}
+
+export interface SubagentRun {
+  id: string;
+  parentToolUseId: string;
+  description: string;
+  profile?: string;
+  index: number;
+  childSequence: number;
+  status: SubagentRunStatus;
+  output: string;
+  outputTruncated: boolean;
+  segmentCount: number;
+  toolsById: Record<string, SubagentTool>;
+  toolOrder: string[];
 }
 
 /** Versioned ordering metadata added in protocol v1. Optional fields preserve
@@ -308,6 +363,29 @@ export interface GitInfo {
   recent_commits: CommitInfo[];
   user: string | null;
 }
+export interface RuntimeExecutableProbe {
+  name: string;
+  status: "checking" | "available" | "missing" | "invalid" | "version mismatch";
+  path: string | null;
+  version: string | null;
+  expected_version: string | null;
+  resolution_source: string;
+  diagnostic: string | null;
+  suggestion: string | null;
+}
+export interface RuntimeProbeReport {
+  fingerprint: string;
+  completed_at_ms: number;
+  timeout_ms: number;
+  output_limit_bytes: number;
+  entries: RuntimeExecutableProbe[];
+  python_venv: {
+    status: "available" | "missing" | "invalid";
+    python_path: string | null;
+    required: boolean;
+    suggestion: string | null;
+  };
+}
 export interface ProjectInfo {
   cwd: string;
   model: string;
@@ -325,6 +403,7 @@ export interface ProjectInfo {
   /** Shared top-level settings metadata used by server diagnostics. */
   config_reference: ConfigFieldReference[];
   config_diagnostics: ConfigDiagnosticInfo[];
+  system: RuntimeProbeReport;
   /** Configured model context window (tokens), if set. */
   context_window: number | null;
   /** Effective auto-compact threshold (tokens). */
@@ -336,6 +415,11 @@ export interface ProjectInfo {
 export interface ProjectInfoMsg {
   type: "project_info";
   info: ProjectInfo;
+}
+
+export interface SystemProbeMsg {
+  type: "system_probe";
+  system: RuntimeProbeReport;
 }
 
 export interface GitShowRequest {
@@ -372,6 +456,7 @@ export type ServerMsg =
   | MessagesLoadedMsg
   | FileTreeMsg
   | ProjectInfoMsg
+  | SystemProbeMsg
   | GitShowMsg;
 
 // ── Browser → Server messages ─────────────────────────────────────────────
@@ -473,10 +558,16 @@ export type ClientMsg =
 
 // ── Application types ─────────────────────────────────────────────────────
 
+export interface MessageAttachment {
+  filename: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
+  /** Attachment names associated with this user turn. */
+  attachments?: MessageAttachment[];
   /** Tool name (only for tool messages). */
   toolName?: string;
   /** Tool input JSON (only for tool messages). */

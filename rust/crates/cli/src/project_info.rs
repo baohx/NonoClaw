@@ -39,6 +39,8 @@ pub struct ProjectInfo {
     pub config_reference: Vec<ConfigFieldReference>,
     /// Safe field/file-level configuration diagnostics for the Insight rail.
     pub config_diagnostics: Vec<ConfigDiagnosticInfo>,
+    /// Per-executable runtime availability, version, path, and provenance.
+    pub system: nonoclaw_engine::RuntimeProbeReport,
     pub git: Option<GitInfo>,
     /// Configured model context window (tokens), if set.
     pub context_window: Option<usize>,
@@ -167,6 +169,7 @@ pub async fn gather(
     model: &str,
     registry: &ToolRegistry,
     config: &ResolvedConfig,
+    system: nonoclaw_engine::RuntimeProbeReport,
     public_url: Option<String>,
     skills: &[Skill],
     skill_extensions: &[ExtensionDescriptor],
@@ -296,6 +299,7 @@ pub async fn gather(
         cli_reference: cli_reference(),
         config_reference: nonoclaw_engine::config_reference().to_vec(),
         config_diagnostics,
+        system,
         git,
         context_window,
         compact_threshold,

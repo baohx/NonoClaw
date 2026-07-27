@@ -108,6 +108,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Global token-estimation divisor.",
     },
     ConfigFieldReference {
+        name: "executables",
+        description: "Explicit Rust, Node.js, and Python executable paths and versions.",
+    },
+    ConfigFieldReference {
         name: "docModel",
         description: "Document/OCR model name or inline configuration.",
     },
@@ -150,8 +154,100 @@ pub struct SettingsFile {
     pub chars_per_token: usize,
     #[serde(rename = "docModel", default)]
     pub doc_model: Option<DocModelSetting>,
+    #[serde(default)]
+    pub executables: Option<ExecutableSettings>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutableEntrySetting {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RustExecutableSettings {
+    #[serde(default)]
+    pub rustc: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub cargo: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub rustup: Option<ExecutableEntrySetting>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeExecutableSettings {
+    #[serde(default)]
+    pub node: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub npm: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub npx: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub corepack: Option<ExecutableEntrySetting>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PythonExecutableSettings {
+    #[serde(default)]
+    pub python: Option<ExecutableEntrySetting>,
+    #[serde(default)]
+    pub pip: Option<ExecutableEntrySetting>,
+    #[serde(rename = "requireVirtualEnv", default)]
+    pub require_virtual_env: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutableSettings {
+    #[serde(default)]
+    pub rust: Option<RustExecutableSettings>,
+    #[serde(default)]
+    pub node: Option<NodeExecutableSettings>,
+    #[serde(default)]
+    pub python: Option<PythonExecutableSettings>,
+}
+
+impl ExecutableSettings {
+    pub fn entries(&self) -> Vec<(&'static str, &ExecutableEntrySetting)> {
+        let mut entries = Vec::new();
+        if let Some(group) = &self.rust {
+            if let Some(entry) = &group.rustc {
+                entries.push(("rust.rustc", entry));
+            }
+            if let Some(entry) = &group.cargo {
+                entries.push(("rust.cargo", entry));
+            }
+            if let Some(entry) = &group.rustup {
+                entries.push(("rust.rustup", entry));
+            }
+        }
+        if let Some(group) = &self.node {
+            if let Some(entry) = &group.node {
+                entries.push(("node.node", entry));
+            }
+            if let Some(entry) = &group.npm {
+                entries.push(("node.npm", entry));
+            }
+            if let Some(entry) = &group.npx {
+                entries.push(("node.npx", entry));
+            }
+            if let Some(entry) = &group.corepack {
+                entries.push(("node.corepack", entry));
+            }
+        }
+        if let Some(group) = &self.python {
+            if let Some(entry) = &group.python {
+                entries.push(("python.python", entry));
+            }
+            if let Some(entry) = &group.pip {
+                entries.push(("python.pip", entry));
+            }
+        }
+        entries
+    }
 }
 
 impl fmt::Debug for SettingsFile {
@@ -200,6 +296,10 @@ impl fmt::Debug for SettingsFile {
                 "doc_model",
                 &self.doc_model.as_ref().map(|_| "[configured]"),
             )
+            .field(
+                "executables",
+                &self.executables.as_ref().map(|_| "[configured]"),
+            )
             .finish()
     }
 }
@@ -223,6 +323,7 @@ impl Default for SettingsFile {
             elevenlabs_api_key: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
+            executables: None,
             extra: HashMap::new(),
         }
     }
@@ -685,6 +786,31 @@ impl ResolvedConfig {
         &self.settings
     }
 
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn executable_settings(&self) -> Option<&ExecutableSettings> {
+        self.settings.executables.as_ref()
+    }
+
+    pub fn executable_source_label(&self, field: &str) -> String {
+        self.source_for(field)
+            .last()
+            .map(ConfigSource::label)
+            .unwrap_or_else(|| "PATH discovery".into())
+    }
+
+    pub fn executable_fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&self.settings.executables)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        self.cwd.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     pub fn all_models(&self) -> &[ModelProfile] {
         self.settings.models.as_deref().unwrap_or_default()
     }
@@ -1016,6 +1142,7 @@ impl ResolvedConfig {
                 .max_turns
                 .or(self.settings.max_turns)
                 .unwrap_or(DEFAULT_MAX_TURNS),
+            finalize_on_max_turns: false,
             append_system_prompt: overrides.append_system_prompt,
             skills_manager: None,
             arguments: overrides.arguments,
@@ -1264,6 +1391,18 @@ fn merge_settings_value(
     if present("docModel", overlay.doc_model.is_some()) {
         base.doc_model.clone_from(&overlay.doc_model);
     }
+    if let Some(executables) = &overlay.executables {
+        base.executables = Some(match &base.executables {
+            Some(existing) => {
+                let existing = serde_json::to_value(existing).unwrap_or_default();
+                let overlay =
+                    remove_null_values(serde_json::to_value(executables).unwrap_or_default());
+                serde_json::from_value(deep_merge_values(Some(&existing), &overlay))
+                    .unwrap_or_else(|_| executables.clone())
+            }
+            None => executables.clone(),
+        });
+    }
     base.extra.extend(overlay.extra.clone());
 }
 
@@ -1273,6 +1412,20 @@ fn merge_unique_strings(existing: Option<Vec<String>>, added: &[String]) -> Vec<
     merged.sort();
     merged.dedup();
     merged
+}
+
+fn remove_null_values(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, remove_null_values(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(remove_null_values).collect()),
+        other => other,
+    }
 }
 
 fn deep_merge_values(base: Option<&Value>, overlay: &Value) -> Value {
@@ -1835,6 +1988,65 @@ fn validate_settings(
             }
         }
     }
+    validate_executable_settings(settings, field_sources, diagnostics);
+}
+
+fn validate_executable_settings(
+    settings: &SettingsFile,
+    sources: &BTreeMap<String, Vec<ConfigSource>>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(executables) = &settings.executables else {
+        return;
+    };
+    for (entry_name, entry) in executables.entries() {
+        let base = format!("executables.{entry_name}");
+        let source = |suffix: &str| {
+            sources
+                .get(&format!("{base}.{suffix}"))
+                .or_else(|| sources.get(&base))
+                .and_then(|items| items.last())
+                .cloned()
+        };
+        if entry.path.is_none() && entry.version.is_none() {
+            diagnostics.push(ConfigDiagnostic::warning(
+                "executable_entry_empty",
+                format!("{base} defines neither path nor version"),
+                Some(base.clone()),
+                source("path"),
+                "Set path and/or exact version, or remove the empty entry.",
+            ));
+        }
+        if let Some(path) = entry.path.as_deref() {
+            let supported_prefix = path == "${HOME}"
+                || path.starts_with("${HOME}/")
+                || path == "${WORKSPACE}"
+                || path.starts_with("${WORKSPACE}/");
+            if path.is_empty()
+                || (!Path::new(path).is_absolute() && !supported_prefix)
+                || (path.starts_with("${") && !supported_prefix)
+            {
+                diagnostics.push(ConfigDiagnostic::error(
+                    "executable_path_invalid",
+                    format!(
+                        "{base}.path must be absolute or start with ${{HOME}} or ${{WORKSPACE}}"
+                    ),
+                    Some(format!("{base}.path")),
+                    source("path"),
+                    "Use one executable path without shell syntax or extra arguments.",
+                ));
+            }
+        }
+        if entry.version.as_deref().is_some_and(str::is_empty) {
+            diagnostics.push(ConfigDiagnostic::error(
+                "executable_version_empty",
+                format!("{base}.version cannot be empty"),
+                Some(format!("{base}.version")),
+                source("version"),
+                "Set an exact version or remove the version field.",
+            ));
+        }
+    }
 }
 
 fn diagnose_missing_env_reference(
@@ -2070,6 +2282,13 @@ fn record_layer_sources(layer: &ConfigLayer, sources: &mut BTreeMap<String, Vec<
             }
         }
     }
+    for field in layer
+        .present_fields
+        .iter()
+        .filter(|field| field.starts_with("executables."))
+    {
+        set_scalar_source(sources, field, layer.source.clone());
+    }
     for field in layer.settings.extra.keys() {
         set_scalar_source(sources, field, layer.source.clone());
     }
@@ -2263,7 +2482,53 @@ fn diagnose_unknown_fields(
             unknown_field(&format!("docModel.{key}"), source, diagnostics);
         }
     }
+    diagnose_executable_unknown_fields(value, source, diagnostics);
     diagnose_mcp_unknown_fields(value, source, diagnostics);
+}
+
+fn diagnose_executable_unknown_fields(
+    value: &Value,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(groups) = value.get("executables").and_then(Value::as_object) else {
+        return;
+    };
+    for (group, group_value) in groups {
+        let allowed: &[&str] = match group.as_str() {
+            "rust" => &["rustc", "cargo", "rustup"],
+            "node" => &["node", "npm", "npx", "corepack"],
+            "python" => &["python", "pip", "requireVirtualEnv"],
+            _ => {
+                unknown_field(&format!("executables.{group}"), source, diagnostics);
+                continue;
+            }
+        };
+        let Some(entries) = group_value.as_object() else {
+            continue;
+        };
+        for (entry, entry_value) in entries {
+            if !allowed.contains(&entry.as_str()) {
+                unknown_field(&format!("executables.{group}.{entry}"), source, diagnostics);
+                continue;
+            }
+            if group == "python" && entry == "requireVirtualEnv" {
+                continue;
+            }
+            if let Some(fields) = entry_value.as_object() {
+                for field in fields
+                    .keys()
+                    .filter(|field| !matches!(field.as_str(), "path" | "version"))
+                {
+                    unknown_field(
+                        &format!("executables.{group}.{entry}.{field}"),
+                        source,
+                        diagnostics,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn diagnose_mcp_unknown_fields(
@@ -2809,5 +3074,37 @@ mod tests {
             &[ConfigSource::ExplicitSettings { path: explicit }]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn executable_entries_merge_sibling_fields_with_field_sources() {
+        let low = layer(
+            "user.json",
+            serde_json::json!({"executables":{"node":{"node":{"path":"/opt/node"}}}}),
+        );
+        let high = layer(
+            "project.json",
+            serde_json::json!({"executables":{"node":{"node":{"version":"20.11.1"}}}}),
+        );
+        let resolved = resolve_layers(
+            &[low, high],
+            &ConfigEnvironment::default(),
+            Path::new("/workspace"),
+        );
+        let node = resolved
+            .executable_settings()
+            .and_then(|settings| settings.node.as_ref())
+            .and_then(|group| group.node.as_ref())
+            .unwrap();
+        assert_eq!(node.path.as_deref(), Some("/opt/node"));
+        assert_eq!(node.version.as_deref(), Some("20.11.1"));
+        assert_eq!(
+            resolved.source_for("executables.node.node.path")[0],
+            source("user.json")
+        );
+        assert_eq!(
+            resolved.source_for("executables.node.node.version")[0],
+            source("project.json")
+        );
     }
 }

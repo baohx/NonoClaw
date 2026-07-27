@@ -1,5 +1,7 @@
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import type { FileEntry } from "../types";
+import { getMobileAccessToken } from "../security";
 
 interface Props {
   root: string;
@@ -47,6 +49,66 @@ function fileGlyph(name: string): string {
 export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
   // ALL directories collapsed by default — user expands what they need.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>());
+  const [menu, setMenu] = useState<{ entry: FileEntry; x: number; y: number } | null>(null);
+  const menuOrigin = useRef<HTMLButtonElement | null>(null);
+
+  const closeMenu = useCallback(() => {
+    setMenu(null);
+    requestAnimationFrame(() => menuOrigin.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => closeMenu();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", keydown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", keydown);
+    };
+  }, [menu, closeMenu]);
+
+  const openMenu = useCallback((entry: FileEntry, element: HTMLButtonElement, x: number, y: number) => {
+    menuOrigin.current = element;
+    setMenu({ entry, x, y });
+  }, []);
+
+  const download = useCallback((entry: FileEntry) => {
+    if (entry.is_dir) return;
+    const token = getMobileAccessToken();
+    if (!token) {
+      window.alert("Download requires an active access token.");
+      closeMenu();
+      return;
+    }
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "/api/download";
+    form.target = "nonoclaw-download-target";
+    form.hidden = true;
+    for (const [name, value] of [["token", token], ["path", entry.path]]) {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+    closeMenu();
+  }, [closeMenu]);
+
+  const contextKey = useCallback((event: React.KeyboardEvent<HTMLButtonElement>, entry: FileEntry) => {
+    if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
+      event.preventDefault();
+      const rect = event.currentTarget.getBoundingClientRect();
+      openMenu(entry, event.currentTarget, rect.left + 24, rect.bottom);
+    }
+  }, [openMenu]);
 
   // When a fresh tree arrives, don't auto-expand anything.
   const seedKey = entries.map((e) => e.path).join("\n");
@@ -125,6 +187,11 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
                 className="tree-row tree-row--dir"
                 style={{ paddingLeft: 10 + e.depth * 13 }}
                 onClick={() => toggle(e.path)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  openMenu(e, event.currentTarget, event.clientX, event.clientY);
+                }}
+                onKeyDown={(event) => contextKey(event, e)}
                 title={e.path}
               >
                 <span className="tree-row__caret">{open ? "▾" : "▸"}</span>
@@ -139,6 +206,11 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
               className="tree-row tree-row--file"
               style={{ paddingLeft: 10 + e.depth * 13 + 13 }}
               onClick={(ev) => onOpen(e.path, ev.shiftKey)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                openMenu(e, event.currentTarget, event.clientX, event.clientY);
+              }}
+              onKeyDown={(event) => contextKey(event, e)}
               title={`${e.path} — click to open · shift+click for VS Code`}
             >
               <span className="tree-row__glyph">{fileGlyph(e.name)}</span>
@@ -147,6 +219,32 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
           );
         })}
       </div>
+      <iframe name="nonoclaw-download-target" className="download-target" title="Download target" />
+      {menu && createPortal(
+        <div
+          className="filetree-menu"
+          role="menu"
+          style={{
+            left: Math.max(4, Math.min(menu.x + 4, window.innerWidth - 140)),
+            top: Math.max(4, Math.min(menu.y + 4, window.innerHeight - (menu.entry.is_dir ? 76 : 44))),
+          }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            role="menuitem"
+            autoFocus
+            disabled={menu.entry.is_dir}
+            title={menu.entry.is_dir ? "Directory downloads are not supported." : `Download ${menu.entry.name}`}
+            onClick={() => download(menu.entry)}
+          >
+            Download
+          </button>
+          {menu.entry.is_dir && (
+            <div className="filetree-menu__hint">Directory downloads are not supported.</div>
+          )}
+        </div>,
+        document.body
+      )}
     </div>
   );
 }

@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -25,7 +25,7 @@ nonoclaw-tools = { path = "crates/tools" }
 nonoclaw-engine = { path = "crates/engine" }
 
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 futures = "0.3"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "multipart"] }

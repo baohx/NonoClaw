@@ -389,7 +389,9 @@ mod tests {
             pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
         }
         let xref = pdf.len();
-        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
         for offset in offsets {
             pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
@@ -419,9 +421,7 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -429,15 +429,11 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
-    async fn spawn_upload_server(
-        state: Arc<AppState>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_upload_server(state: Arc<AppState>) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new()
             .route("/api/upload", post(upload_handler))
             .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -487,12 +483,7 @@ mod tests {
                     .to_vec(),
             ),
             ("png", "fixture.png", "image/png", png_fixture()),
-            (
-                "pdf",
-                "fixture.pdf",
-                "application/pdf",
-                text_pdf_fixture(),
-            ),
+            ("pdf", "fixture.pdf", "application/pdf", text_pdf_fixture()),
         ];
 
         eprintln!("upload_exploration seed={EXPLORATION_SEED:#018x}");

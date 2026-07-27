@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test:breath": "node --experimental-strip-types src/breath.test.ts",
-    "test:transitions": "node --experimental-strip-types src/store/transitions.test.ts",
+    "test:transitions": "node --experimental-strip-types --loader ./src/ts-extension-loader.mjs src/store/transitions.test.ts",
     "test:security": "node --experimental-strip-types src/security.test.ts",
+    "test:export": "node --experimental-strip-types src/export.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "@codemirror/view": "^6.36.0",
     "@types/qrcode": "^1.5.6",
     "codemirror": "^6.0.1",
+    "html2canvas": "1.4.1",
     "katex": "^0.17.0",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",

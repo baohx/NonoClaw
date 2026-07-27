@@ -58,7 +58,7 @@ use super::session_hub::{create_new_session, resume_session, SessionHub, SharedH
 pub(super) struct AppState {
     registry: Arc<ToolRegistry>,
     todos: Arc<TodoStore>,
-    cwd: PathBuf,
+    pub(super) cwd: PathBuf,
     /// Canonical immutable configuration snapshot shared by all Web paths.
     pub(super) config: Arc<ResolvedConfig>,
     /// Auth token for remote (QR-code) mobile access.
@@ -90,6 +90,10 @@ pub(super) struct AppState {
 impl AppState {
     pub(super) fn authorized(&self, supplied_token: Option<&str>) -> bool {
         token_is_authorized(self.require_auth, &self.auth_token, supplied_token)
+    }
+
+    pub(super) fn download_authorized(&self, supplied_token: Option<&str>) -> bool {
+        supplied_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
     }
 
     fn websocket_authorized(
@@ -167,6 +171,22 @@ fn constant_time_token_eq(expected: &str, supplied: &str) -> bool {
             difference | (left ^ right)
         })
         == 0
+}
+
+fn authenticated_public_url(public_url: &str, auth_token: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(public_url).ok()?;
+    let retained: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "token")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    {
+        let mut query = url.query_pairs_mut();
+        query.clear();
+        query.extend_pairs(retained.iter().map(|(key, value)| (key, value)));
+        query.append_pair("token", auth_token);
+    }
+    Some(url.into())
 }
 
 fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) -> bool {
@@ -289,15 +309,25 @@ pub async fn serve(
     // Spawn file watcher for hot-reloading skills.
     crate::skill_watcher::spawn_skill_watcher(Arc::clone(&state.skills_manager), cwd.clone());
 
-    // Print only the public origin. The authenticated mobile URL remains
-    // available through the in-app QR flow and is never written to logs.
+    // This explicit operator-facing startup message is the only terminal output
+    // that includes the Web credential. Keep tracing and ProjectInfo limited to
+    // the token-free public origin so routine logs and browser metadata do not
+    // duplicate the secret.
     if let Some(ref url) = state.public_url {
-        eprintln!("\n  Tunnel ready: \x1b[1;33m{url}\x1b[0m\n");
+        if let Some(authenticated_url) = authenticated_public_url(url, &state.auth_token) {
+            eprintln!("\n  Tunnel ready: \x1b[1;33m{authenticated_url}\x1b[0m\n");
+        } else {
+            tracing::warn!("public URL is invalid; authenticated startup URL omitted");
+        }
     }
 
     // Always register the WebSocket route + PWA manifest + service worker.
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route(
+            "/api/download",
+            axum::routing::post(super::download_service::download_handler),
+        )
         .route(
             "/api/upload",
             axum::routing::post(super::upload_service::upload_handler),
@@ -678,7 +708,20 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             }
             ClientMsg::ProjectInfoRefresh => {
                 let current_model = state.active_model.lock().await.clone();
-                let info = state.project_service.refresh(&current_model).await;
+                let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+                let updates_socket = Arc::clone(&tx);
+                let forward_updates = tokio::spawn(async move {
+                    while let Some(system) = updates_rx.recv().await {
+                        send_msg(&updates_socket, ServerMsg::SystemProbe { system }).await;
+                    }
+                });
+                let info = state
+                    .project_service
+                    .refresh(&current_model, move |system| {
+                        let _ = updates_tx.send(system);
+                    })
+                    .await;
+                let _ = forward_updates.await;
                 send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
             }
             ClientMsg::GitShow { sha } => match state.project_service.git_show(&sha).await {
@@ -1057,6 +1100,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         }
                     };
 
+                    let include_attachment_images = run_client
+                        .capabilities_for_model(&model_used)
+                        .status(nonoclaw_api::ProviderFeature::Images)
+                        .is_supported();
                     let session_for_wire = session_for_run.clone();
                     let engine = QueryEngine::with_session(
                         run_client,
@@ -1067,9 +1114,14 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         session_snapshot,
                     );
 
-                    // Enrich the prompt with attachment content + images.
-                    let enriched =
-                        enrich_prompt_with_attachments(&prompt, &attachments, &s.upload_dir);
+                    // Text extraction/OCR is always included. Raw image blocks
+                    // are added only when the selected provider accepts them.
+                    let enriched = enrich_prompt_with_attachments(
+                        &prompt,
+                        &attachments,
+                        &s.upload_dir,
+                        include_attachment_images,
+                    );
                     let controller = RunController::for_engine(&engine, s.cwd.clone());
                     *active_for_run.lock().await = Some(controller.clone());
 
@@ -1564,6 +1616,24 @@ mod characterization_tests {
     }
 
     #[test]
+    fn authenticated_tunnel_url_includes_exactly_one_current_token() {
+        assert_eq!(
+            authenticated_public_url("https://example.trycloudflare.com", "current-token"),
+            Some("https://example.trycloudflare.com/?token=current-token".into())
+        );
+        assert_eq!(
+            authenticated_public_url(
+                "https://public.example/app?mode=mobile&token=stale#share",
+                "current-token"
+            ),
+            Some(
+                "https://public.example/app?mode=mobile&token=current-token#share".into()
+            )
+        );
+        assert_eq!(authenticated_public_url("not a URL", "current-token"), None);
+    }
+
+    #[test]
     fn listener_auth_policy_covers_loopback_public_tunnel_and_invalid_addresses() {
         // **Validates: Requirements 11.2**
         assert!(!listener_requires_auth("127.0.0.1:3000", false, None));
@@ -1724,11 +1794,25 @@ mod characterization_tests {
             cli_reference: vec![],
             config_reference: vec![],
             config_diagnostics: vec![],
+            system: nonoclaw_engine::RuntimeProbeReport {
+                fingerprint: "fixture".into(),
+                completed_at_ms: 0,
+                timeout_ms: 3_000,
+                output_limit_bytes: 65_536,
+                entries: vec![],
+                python_venv: nonoclaw_engine::PythonVenvProbe {
+                    status: "missing".into(),
+                    python_path: None,
+                    required: false,
+                    suggestion: None,
+                },
+            },
             git: None,
             context_window: None,
             compact_threshold: 80_000,
             public_url: None,
         };
+        let system_probe = project_info.system.clone();
         let messages = vec![
             ServerMsg::Event {
                 envelope: EventEnvelope::at(
@@ -1786,6 +1870,9 @@ mod characterization_tests {
                 root: "/fixture".into(),
                 entries: vec![],
             },
+            ServerMsg::SystemProbe {
+                system: system_probe,
+            },
             ServerMsg::ProjectInfo { info: project_info },
             ServerMsg::GitShow {
                 sha: "abc".into(),
@@ -1813,6 +1900,7 @@ mod characterization_tests {
                 "session_list",
                 "messages_loaded",
                 "file_tree",
+                "system_probe",
                 "project_info",
                 "git_show"
             ]

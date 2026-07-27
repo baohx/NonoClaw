@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useStore } from "../store";
 import {
+  contextUsagePercent,
   exportTraceRun,
   groupTraceRuns,
   MAX_RENDERED_TRACE_EVENTS,
@@ -83,20 +84,22 @@ export default function TechnicalTrace() {
     announce("redacted trace exported");
   };
 
-  const context = lastMatching(latest?.entries, (entry) => entry.category === "context");
-  const model = lastMatching(latest?.entries, (entry) => entry.kind === "model_resolved" || entry.kind === "model_info");
-  const usage = lastMatching(latest?.entries, (entry) => entry.category === "usage" || entry.kind === "run_finished" || entry.kind === "done");
-  const turnEntry = lastMatching(latest?.entries, (entry) => typeof entry.details.turn === "number");
-  const turn = turnEntry?.details.turn;
+  const summaryRun = selected;
+  const context = lastMatching(summaryRun?.entries, (entry) => entry.category === "context");
+  const model = lastMatching(summaryRun?.entries, (entry) => entry.kind === "model_resolved" || entry.kind === "model_info");
+  const usage = lastMatching(summaryRun?.entries, (entry) => entry.category === "usage" || entry.kind === "run_finished" || entry.kind === "done");
+  const turnEntry = lastMatching(summaryRun?.entries, (entry) => typeof entry.details.turn === "number" || typeof entry.details.turns === "number");
+  const turn = turnEntry?.details.turn ?? turnEntry?.details.turns;
+  const contextPercent = contextUsagePercent(context?.details.estimated_tokens, context?.details.context_window);
 
   return (
     <section className="trace" aria-label="Technical trace">
       <div className="trace__summary">
-        <div><span>run</span><b className={`trace-status trace-status--${latest?.status ?? "info"}`}>{latest ? latest.status : "idle"}</b></div>
-        <div title={model?.summary}><span>model</span><b>{model?.summary.replace(/^Actual model · |^.* → /, "") ?? "—"}</b></div>
-        <div><span>turn</span><b>{turn ?? "—"}</b></div>
-        <div title={context?.summary}><span>context</span><b>{context?.details.estimated_tokens?.toLocaleString?.() ?? "—"}</b></div>
-        <div><span>tokens</span><b>{usage?.details.total_out?.toLocaleString?.() ?? "—"}</b></div>
+        <div title={summaryRun ? summaryRun.runId : "尚无数据"}><span>run</span><b className={`trace-status trace-status--${summaryRun?.status ?? "info"}`}>{summaryRun ? `${summaryRun.runId.slice(0, 8)} · ${summaryRun.status}` : "— · idle"}</b></div>
+        <div title={model?.summary ?? "尚无数据"}><span>model</span><b>{model?.summary ?? "—"}</b></div>
+        <div title={turn === undefined ? "尚无数据" : undefined}><span>turn</span><b>{turn ?? "—"}</b></div>
+        <div title={context?.summary ?? "尚无数据"}><span>context</span><b>{context?.details.estimated_tokens?.toLocaleString?.() ?? "—"}{contextPercent !== null ? ` · ${contextPercent.toFixed(1)}%` : ""}</b></div>
+        <div title={usage ? undefined : "尚无数据"}><span>tokens</span><b>{usage ? `in ${usage.details.total_in ?? 0} · out ${usage.details.total_out ?? 0} · r ${usage.details.total_cache_read ?? 0} · w ${usage.details.total_cache_write ?? 0}` : "—"}</b></div>
       </div>
 
       <div className="trace__controls">

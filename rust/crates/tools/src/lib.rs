@@ -25,8 +25,8 @@ pub use permissions::{pattern_matches, wildcard_match, PermissionGate};
 pub use registry::ToolRegistry;
 pub use task_store::{TaskItem, TaskPatch, TaskStore, TodoItem};
 pub use tool::{
-    allow_if_read_only, matches_name, QuestionRequest, QuestionResolver, SubagentRunner, Tool,
-    ToolDefinition, ToolOptions, ToolResult,
+    allow_if_read_only, matches_name, QuestionRequest, QuestionResolver, SubagentRequest,
+    SubagentRunner, Tool, ToolDefinition, ToolOptions, ToolResult,
 };
 
 pub use background::{

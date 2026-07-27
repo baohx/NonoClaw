@@ -39,6 +39,8 @@ pub(super) struct ProjectService {
     public_url: Option<String>,
     skills_manager: Arc<RwLock<SkillsManager>>,
     refresh_gate: Mutex<()>,
+    system_cache: Mutex<Option<nonoclaw_engine::RuntimeProbeReport>>,
+    system_generation: std::sync::atomic::AtomicU64,
 }
 
 impl ProjectService {
@@ -56,6 +58,8 @@ impl ProjectService {
             public_url,
             skills_manager,
             refresh_gate: Mutex::new(()),
+            system_cache: Mutex::new(None),
+            system_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -65,18 +69,61 @@ impl ProjectService {
 
     pub(super) async fn snapshot(&self, model: &str) -> ProjectInfo {
         let _refresh = self.refresh_gate.lock().await;
-        self.gather_with(model, &self.config).await
+        self.gather_with(model, &self.config, false, None, &mut |_| {})
+            .await
     }
 
-    pub(super) async fn refresh(&self, model: &str) -> ProjectInfo {
+    pub(super) async fn refresh<F>(&self, model: &str, mut on_update: F) -> ProjectInfo
+    where
+        F: FnMut(nonoclaw_engine::RuntimeProbeReport) + Send,
+    {
+        let observed_generation = self
+            .system_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let _refresh = self.refresh_gate.lock().await;
         self.skills_manager.write().unwrap().rescan(&self.cwd);
         let config = self.config.reload();
         config.log_diagnostics();
-        self.gather_with(model, &config).await
+        self.gather_with(
+            model,
+            &config,
+            true,
+            Some(observed_generation),
+            &mut on_update,
+        )
+        .await
     }
 
-    async fn gather_with(&self, model: &str, config: &ResolvedConfig) -> ProjectInfo {
+    async fn gather_with(
+        &self,
+        model: &str,
+        config: &ResolvedConfig,
+        force_probe: bool,
+        observed_generation: Option<u64>,
+        on_update: &mut (dyn FnMut(nonoclaw_engine::RuntimeProbeReport) + Send),
+    ) -> ProjectInfo {
+        let fingerprint = config.executable_fingerprint();
+        let cached = self.system_cache.lock().await.clone();
+        let current_generation = self
+            .system_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let concurrent_refresh_completed = force_probe
+            && observed_generation.is_some_and(|observed| observed != current_generation);
+        let system = if cached
+            .as_ref()
+            .is_some_and(|report| report.fingerprint == fingerprint)
+            && (!force_probe || concurrent_refresh_completed)
+        {
+            cached.expect("matching cached report")
+        } else {
+            let report =
+                nonoclaw_engine::probe_runtime_with_updates(config, cached.as_ref(), on_update)
+                    .await;
+            *self.system_cache.lock().await = Some(report.clone());
+            self.system_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            report
+        };
         let (skills, extensions, diagnostics) = {
             let manager = self.skills_manager.read().unwrap();
             (
@@ -90,6 +137,7 @@ impl ProjectService {
             model,
             &self.registry,
             config,
+            system,
             self.public_url.clone(),
             &skills,
             &extensions,

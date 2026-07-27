@@ -1,5 +1,4 @@
 import { useStore } from "../store";
-import type { PermissionMode } from "../types";
 
 interface Props {
   model: string;
@@ -7,8 +6,6 @@ interface Props {
   connectionStatus: "connecting" | "connected" | "disconnected";
   onOpenSessions: () => void;
   onShowQr: () => void;
-  onSetPermissionMode: (mode: PermissionMode) => void;
-  onSetModel: (name: string) => void;
   compacting: boolean;
   leftRailCollapsed: boolean;
   insightCollapsed: boolean;
@@ -21,8 +18,6 @@ export default function StatusBar({
   sessionId,
   connectionStatus,
   onOpenSessions,
-  onSetPermissionMode,
-  onSetModel,
   compacting,
   leftRailCollapsed,
   insightCollapsed,
@@ -65,41 +60,14 @@ export default function StatusBar({
         <span className="statusbar__brand">
           Nono<i>Claw</i>
         </span>
-        {model && availableModels.length > 1 ? (
+        {model ? (
           <>
             <span className="statusbar__divider" />
-            <select
-              className="mode-select"
-              value={model}
-              onChange={(e) => onSetModel(e.target.value)}
-              title="Switch model"
-            >
-              {availableModels.map((m) => (
-                <option key={m.name} value={m.name}>
-                  {m.label || m.name}
-                </option>
-              ))}
-            </select>
-          </>
-        ) : model ? (
-          <>
-            <span className="statusbar__divider" />
-            <span className="statusbar__model">{model}</span>
+            <span className="statusbar__model" title="Current model (change the next run in the composer)">{availableModels.find((item) => item.name === model)?.label || model}</span>
           </>
         ) : null}
         {compacting && <span className="tag-compact">◌ compacting</span>}
-        <select
-          className="mode-select"
-          value={permissionMode}
-          onChange={(e) => onSetPermissionMode(e.target.value as PermissionMode)}
-          title="Permission mode"
-        >
-          <option value="default">default</option>
-          <option value="acceptEdits">acceptEdits</option>
-          <option value="auto">auto</option>
-          <option value="bypassPermissions">bypass</option>
-          <option value="plan">plan</option>
-        </select>
+        <span className="statusbar__model" title="Current execution mode (change the next run in the composer)">{permissionMode}</span>
       </div>
 
       <div className="statusbar__side">

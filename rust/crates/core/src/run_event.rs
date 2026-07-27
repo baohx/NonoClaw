@@ -204,6 +204,18 @@ pub enum RunEvent {
         status: TechnicalStatus,
         elapsed_ms: u64,
     },
+    /// A child run event scoped to the Agent/Coordinator tool call that spawned it.
+    /// The parent controller assigns the enclosing envelope sequence; the child's
+    /// original sequence is retained separately for ordering within this scope.
+    SubagentEvent {
+        subagent_id: String,
+        parent_tool_use_id: String,
+        description: String,
+        profile: Option<String>,
+        index: Option<u32>,
+        child_sequence: u64,
+        event: Box<RunEvent>,
+    },
     BackgroundTaskChanged {
         task_id: String,
         status: TechnicalStatus,
@@ -443,6 +455,34 @@ fn redact_string(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn subagent_event_preserves_scope_and_recursively_redacts_child() {
+        let event = RunEvent::SubagentEvent {
+            subagent_id: "child-run".into(),
+            parent_tool_use_id: "tool-parent".into(),
+            description: "inspect files".into(),
+            profile: Some("readonly".into()),
+            index: Some(2),
+            child_sequence: 9,
+            event: Box::new(RunEvent::ToolUseStart {
+                id: "child-tool".into(),
+                name: "Read".into(),
+                input: json!({"path":"src/lib.rs","api_key":"sk-ant-secret"}),
+            }),
+        }
+        .redacted();
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["kind"], "subagent_event");
+        assert_eq!(value["subagent_id"], "child-run");
+        assert_eq!(value["parent_tool_use_id"], "tool-parent");
+        assert_eq!(value["profile"], "readonly");
+        assert_eq!(value["index"], 2);
+        assert_eq!(value["child_sequence"], 9);
+        assert_eq!(value["event"]["kind"], "tool_use_start");
+        assert_eq!(value["event"]["input"]["path"], "src/lib.rs");
+        assert_eq!(value["event"]["input"]["api_key"], "[REDACTED]");
+    }
 
     #[test]
     fn envelope_serialization_has_stable_identity_and_order_metadata() {

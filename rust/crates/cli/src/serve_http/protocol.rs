@@ -183,6 +183,9 @@ pub(super) enum ServerMsg {
     ProjectInfo {
         info: ProjectInfo,
     },
+    SystemProbe {
+        system: nonoclaw_engine::RuntimeProbeReport,
+    },
     GitShow {
         sha: String,
         output: String,
@@ -236,10 +239,20 @@ pub(super) fn messages_loaded(session_id: &str, snapshot: SessionSnapshot) -> Se
 /// removing data that the UI never needs: provider thinking/signatures,
 /// attachment bytes/extracted bodies, and unsafe tool payload fields.
 fn message_for_wire(message: Message) -> serde_json::Value {
-    serde_json::json!({
+    let attachments = attachment_filenames(&message.content);
+    let mut wire = serde_json::json!({
         "role": message.role,
         "content": safe_message_content(message.content),
-    })
+    });
+    if !attachments.is_empty() {
+        wire["attachments"] = serde_json::Value::Array(
+            attachments
+                .into_iter()
+                .map(|filename| serde_json::json!({ "filename": filename }))
+                .collect(),
+        );
+    }
+    wire
 }
 
 fn safe_message_content(content: MessageContent) -> serde_json::Value {
@@ -249,12 +262,56 @@ fn safe_message_content(content: MessageContent) -> serde_json::Value {
             if let Some(prompt) = attached_user_prompt(&blocks) {
                 return serde_json::json!([{
                     "type": "text",
-                    "text": format!("[attachment content kept server-side]\n\n{prompt}")
+                    "text": prompt
                 }]);
             }
             serde_json::Value::Array(blocks.into_iter().filter_map(safe_block).collect())
         }
     }
+}
+
+fn attachment_filenames(content: &MessageContent) -> Vec<String> {
+    const FILE_HEADER: &str = "## File: ";
+    const USER_MESSAGE_HEADER: &str = "---\n\n## User message\n\n";
+    let MessageContent::Blocks(blocks) = content else {
+        return Vec::new();
+    };
+    if attached_user_prompt(blocks).is_none() {
+        return Vec::new();
+    }
+
+    let mut filenames = Vec::new();
+    let mut expect_heading = true;
+    let mut expect_image_label = false;
+    for block in blocks.iter().skip(1) {
+        let ContentBlock::Text { text, .. } = block else {
+            expect_image_label = matches!(block, ContentBlock::Image { .. });
+            continue;
+        };
+        if text.starts_with(USER_MESSAGE_HEADER) {
+            break;
+        }
+        if expect_image_label && text.starts_with("(extracted image: ") {
+            expect_image_label = false;
+            continue;
+        }
+        expect_image_label = false;
+        if expect_heading {
+            if let Some(filename) = text
+                .strip_prefix(FILE_HEADER)
+                .and_then(|value| value.strip_suffix("\n\n"))
+                .filter(|value| !value.is_empty() && !value.contains('\r') && !value.contains('\n'))
+            {
+                filenames.push(filename.chars().take(255).collect());
+                expect_heading = false;
+            }
+            continue;
+        }
+        // The text body following a file heading is always one block. The next
+        // text block is therefore either another file heading or the prompt.
+        expect_heading = true;
+    }
+    filenames
 }
 
 fn attached_user_prompt(blocks: &[ContentBlock]) -> Option<String> {
@@ -387,7 +444,7 @@ mod tests {
             ContentBlock::text(
                 "The user has attached the following files. Their content has already been extracted.",
             ),
-            ContentBlock::text("private attachment body sk-proj-attachment"),
+            ContentBlock::text("## File: architecture.png\n\n"),
             ContentBlock::Image {
                 source: ImageSource {
                     kind: "base64".into(),
@@ -395,6 +452,10 @@ mod tests {
                     data: "private-image-data".into(),
                 },
             },
+            ContentBlock::text("(extracted image: image/png)\n"),
+            ContentBlock::text("private attachment body sk-proj-attachment\n\n"),
+            ContentBlock::text("## File: requirements.md\n\n"),
+            ContentBlock::text("second private attachment body\n\n"),
             ContentBlock::text("---\n\n## User message\n\nplease summarize"),
         ]));
         let assistant = Message {
@@ -417,9 +478,19 @@ mod tests {
             ]),
         };
 
-        let encoded =
-            serde_json::json!([message_for_wire(attachment), message_for_wire(assistant)])
-                .to_string();
+        let attachment_wire = message_for_wire(attachment);
+        assert_eq!(
+            attachment_wire["attachments"],
+            serde_json::json!([
+                { "filename": "architecture.png" },
+                { "filename": "requirements.md" }
+            ])
+        );
+        assert_eq!(
+            attachment_wire["content"],
+            serde_json::json!([{ "type": "text", "text": "please summarize" }])
+        );
+        let encoded = serde_json::json!([attachment_wire, message_for_wire(assistant)]).to_string();
         for forbidden in [
             "private attachment body",
             "private-image-data",
@@ -430,7 +501,8 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden), "wire leaked {forbidden}");
         }
-        assert!(encoded.contains("attachment content kept server-side"));
+        assert!(encoded.contains("architecture.png"));
+        assert!(encoded.contains("requirements.md"));
         assert!(encoded.contains("please summarize"));
         assert!(encoded.contains("visible answer"));
         assert!(encoded.contains("src/main.rs"));

@@ -151,6 +151,29 @@ impl ToolRegistry {
         }
         out
     }
+
+    /// Clone a registry while retaining only tools named by `include`.
+    /// This is a visibility boundary, not a permission allowlist: retained
+    /// tools still pass through the caller's unchanged PermissionGate.
+    pub fn restricted_to(&self, include: &[String]) -> ToolRegistry {
+        let mut out = ToolRegistry::new();
+        out.extension_descriptors = self.extension_descriptors.clone();
+        out.extension_diagnostics = self.extension_diagnostics.clone();
+        for tool in &self.tools {
+            let included = include.iter().any(|name| {
+                matches_name(tool.name(), tool.aliases(), name)
+                    || name
+                        .split('(')
+                        .next()
+                        .map(|prefix| tool.name() == prefix.trim())
+                        .unwrap_or(false)
+            });
+            if included {
+                out.register(Arc::clone(tool));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

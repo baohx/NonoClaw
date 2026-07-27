@@ -249,14 +249,35 @@ impl Client {
     }
 
     pub fn capabilities(&self) -> ProviderCapabilities {
-        self.format.capabilities()
+        self.capabilities_for_model("")
+    }
+
+    /// Provider capabilities can be narrower than the wire format. DeepSeek's
+    /// Anthropic-compatible endpoint, for example, does not accept image
+    /// content blocks even though native Anthropic does.
+    pub fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        let mut capabilities = self.format.capabilities();
+        let deepseek_model = model.to_ascii_lowercase().contains("deepseek");
+        let deepseek_endpoint = reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("deepseek.com")
+                    || host.to_ascii_lowercase().ends_with(".deepseek.com")
+            });
+        if deepseek_model || deepseek_endpoint {
+            capabilities.images = CapabilityStatus::Unsupported {
+                reason: "DeepSeek APIs do not accept image content blocks",
+            };
+        }
+        capabilities
     }
 
     fn validate_capabilities(
         &self,
         params: &RequestParams,
     ) -> std::result::Result<(), ProviderError> {
-        let capabilities = self.capabilities();
+        let capabilities = self.capabilities_for_model(&params.model);
         if params.thinking.is_some() {
             capabilities.require(ProviderFeature::Thinking)?;
         }
@@ -1864,6 +1885,42 @@ mod tests {
         let error = client.validate_capabilities(&params).unwrap_err();
         assert_eq!(error.code, crate::ProviderErrorCode::Capability);
         assert_eq!(error.feature, Some(ProviderFeature::Thinking));
+    }
+
+    #[test]
+    fn deepseek_capabilities_disable_images_without_affecting_native_anthropic() {
+        let deepseek = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://api.deepseek.com/anthropic".into(),
+        )
+        .unwrap();
+        assert!(!deepseek
+            .capabilities_for_model("deepseek-v4-pro")
+            .images
+            .is_supported());
+
+        let proxied_deepseek = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://proxy.example.test/anthropic".into(),
+        )
+        .unwrap();
+        assert!(!proxied_deepseek
+            .capabilities_for_model("deepseek-v4-pro")
+            .images
+            .is_supported());
+
+        let anthropic = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://api.anthropic.com".into(),
+        )
+        .unwrap();
+        assert!(anthropic
+            .capabilities_for_model("claude-sonnet-4-5-20250929")
+            .images
+            .is_supported());
     }
 
     #[test]

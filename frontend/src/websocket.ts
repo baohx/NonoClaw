@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef } from "react";
 import { breathController } from "./breath";
 import { clearMobileAccessToken, getBrowserAccessToken, sanitizeBrowserText, setMobileAccessToken } from "./security";
 import { useStore } from "./store";
+import { acceptScopedEnvelope } from "./store/transitions";
 import { traceEntryFromEvent, traceTerminalEntry } from "./trace";
-import type { ClientMsg, ServerMsg } from "./types";
+import type { ClientMsg, ScopedSubagentEvent, ServerMsg } from "./types";
 
 const RECONNECT_DELAY_MS = 500;
 const MAX_RECONNECT_DELAY_MS = 10_000;
@@ -242,12 +243,38 @@ export function dispatchServerMessage(message: ServerMsg): void {
     case "project_info":
       state.setProjectInfo(message.info);
       break;
+    case "system_probe":
+      if (state.projectInfo) {
+        state.setProjectInfo({ ...state.projectInfo, system: message.system });
+      }
+      break;
     case "git_show":
       state.setPendingCommit({ sha: message.sha, output: message.output });
       break;
     case "event": {
-      if (!acceptRunMessage(message, false)) break;
       const event = message.event;
+      // Child ordering and lifecycle are entirely scoped to child_sequence.
+      // Never let child events advance parent run metadata, trace, breath,
+      // streaming/model/usage, or terminal state.
+      if (event.kind === "subagent_event") {
+        const current = useStore.getState();
+        if (supportsProtocol(message.protocol_version) && acceptScopedEnvelope({
+          sessionId: current.sessionId,
+          sessionRevision: current.sessionRevision,
+          snapshotRevision: current.snapshotRevision,
+          awaitingSnapshot: current.awaitingSnapshot,
+          terminalRuns: current.terminalRuns,
+        }, {
+          runId: message.run_id,
+          sessionId: message.session_id,
+          sessionRevision: message.session_revision,
+          sequence: message.sequence,
+        })) {
+          current.applySubagentEvent(event as ScopedSubagentEvent);
+        }
+        break;
+      }
+      if (!acceptRunMessage(message, false)) break;
       const traceEntry = traceEntryFromEvent(message);
       if (traceEntry) state.addTraceEntry(traceEntry);
       breathController.consume(event);
@@ -260,7 +287,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
           state.addToolCard(event.id || "", event.name || "unknown", event.input);
           break;
         case "tool_result":
-          state.updateToolResult(`tool-${event.id}`, event.ok ?? false, event.preview || "");
+          state.updateToolResult(event.id || "", event.ok ?? false, event.preview || "");
           break;
         case "assistant_done":
           state.finishStreaming();

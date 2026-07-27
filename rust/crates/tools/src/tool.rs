@@ -21,28 +21,62 @@ use tokio_util::sync::CancellationToken;
 
 pub use crate::background::BackgroundTaskRegistry;
 
+/// Owned description of one child run. Ownership keeps Coordinator fan-out
+/// independent from the model input value and preserves stable scope metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentRequest {
+    pub prompt: String,
+    pub description: String,
+    pub profile: Option<String>,
+    pub parent_tool_use_id: String,
+    pub index: Option<u32>,
+}
+
+/// Normalize the model-facing optional profile field before constructing a
+/// subagent request. Compatible providers commonly emit explicit null or an
+/// empty string for omitted optional fields; both mean "no profile". Non-empty
+/// names are trimmed here and still pass through the engine's strict safe-name
+/// validation before any profile file is accessed.
+pub(crate) fn normalize_optional_profile(
+    value: Option<&Value>,
+) -> std::result::Result<Option<String>, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => {
+            let name = name.trim();
+            if name.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(name.to_owned()))
+            }
+        }
+        Some(_) => Err(()),
+    }
+}
+
 /// Spawns a subagent (a recursive engine run with its own message history and a
 /// restricted toolset) and returns its final text answer. Provided by the
-/// engine; tools that need it (Agent) read it from [`ToolCtx::subagent`].
+/// engine; tools that need it (Agent/Coordinator) read it from
+/// [`ToolCtx::subagent`].
 ///
 /// The returned future borrows `self` for its lifetime (the engine owns the
 /// runner for the duration of the run).
 pub trait SubagentRunner: Send + Sync {
     fn run_subagent<'a>(
         &'a self,
-        prompt: &'a str,
-        description: &'a str,
+        request: SubagentRequest,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
-    /// Run multiple subagents concurrently; default falls back to sequential.
+    /// Run multiple subagents; default preserves request/result cardinality and
+    /// falls back to sequential execution.
     fn run_subagents<'a>(
         &'a self,
-        tasks: &'a [(String, String)],
+        requests: Vec<SubagentRequest>,
     ) -> Pin<Box<dyn Future<Output = Vec<Result<String>>> + Send + 'a>> {
         Box::pin(async move {
-            let mut out = Vec::new();
-            for (prompt, desc) in tasks {
-                out.push(self.run_subagent(prompt, desc).await);
+            let mut out = Vec::with_capacity(requests.len());
+            for request in requests {
+                out.push(self.run_subagent(request).await);
             }
             out
         })
@@ -81,6 +115,9 @@ pub struct ToolCtx<'a> {
     pub cwd: &'a Path,
     pub options: &'a ToolOptions,
     pub cancel: &'a CancellationToken,
+    /// Current model tool-use identifier. Agent/Coordinator propagate this as
+    /// the parent scope for all child events.
+    pub tool_use_id: &'a str,
     /// Stable agent/session scope used by scoped in-memory tools such as
     /// TodoWrite. Child agents receive a distinct scope.
     pub task_scope: Option<&'a str>,

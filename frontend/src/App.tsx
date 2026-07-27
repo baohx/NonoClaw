@@ -208,7 +208,12 @@ export default function App() {
           });
         }
       }
-      addMessage({ id: `user-${Date.now()}`, role: "user", content: prompt });
+      addMessage({
+        id: `user-${Date.now()}`,
+        role: "user",
+        content: prompt,
+        attachments: attachments.map(({ filename }) => ({ filename })),
+      });
       userScrolledUp.current = false;
       useStore.getState().setAgentRunning(true);
       const activeModel = useStore.getState().availableModels.length > 0
@@ -297,20 +302,6 @@ export default function App() {
           onToggleLeftRail={toggleLeftRail}
           onToggleInsight={toggleInsight}
           onShowQr={() => setShowQr(true)}
-          onSetPermissionMode={(mode) => {
-            useStore.getState().setPermissionMode(mode);
-            send({ type: "set_permission_mode", mode });
-          }}
-          onSetModel={(name) => {
-            send({ type: "set_model", name });
-            const models = useStore.getState().availableModels;
-            useStore.getState().setInfo(
-              name,
-              useStore.getState().sessionId,
-              useStore.getState().hasMobileAccessToken,
-              models,
-            );
-          }}
         />
         <div className={bodyClass}>
           <aside className="rail">
@@ -342,7 +333,19 @@ export default function App() {
             <div ref={chatRef} className="chat-scroll" onScroll={handleScroll}>
               <ChatView messages={messages} streamingIdx={streamingIdx} />
             </div>
-            <InputBox onSubmit={handleSubmit} disabled={compacting || agentRunning} />
+            <InputBox
+              onSubmit={handleSubmit}
+              disabled={compacting || agentRunning}
+              onSetPermissionMode={(mode) => {
+                useStore.getState().setPermissionMode(mode);
+                send({ type: "set_permission_mode", mode });
+              }}
+              onSetModel={(name) => {
+                send({ type: "set_model", name });
+                const state = useStore.getState();
+                state.setInfo(name, state.sessionId, state.hasMobileAccessToken, state.availableModels);
+              }}
+            />
           </main>
           <aside className="insight">
             <InsightRail

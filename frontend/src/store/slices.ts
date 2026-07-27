@@ -10,7 +10,9 @@ import type {
   PermissionRequired,
   ProjectInfo,
   QuestionRequired,
+  ScopedSubagentEvent,
   SessionInfoWire,
+  SubagentRun,
   TaskChange,
 } from "../types";
 import { sanitizeBrowserText, sanitizeBrowserValue, sanitizeMediaAttachment, sanitizeProjectInfo } from "../security";
@@ -20,6 +22,7 @@ import {
   acceptRunTransition,
   acceptSnapshotTransition,
   acknowledgeClientMessage,
+  applySubagentEventTransition,
   accumulateUsage,
   addToolCardTransition,
   appendStreamingTransition,
@@ -119,6 +122,13 @@ export interface ToolSlice {
   updateToolResult: (toolId: string, ok: boolean, preview: string) => void;
 }
 
+export interface SubagentSlice {
+  subagentRunsById: Record<string, SubagentRun>;
+  childIdsByParentToolId: Record<string, string[]>;
+  applySubagentEvent: (event: ScopedSubagentEvent) => boolean;
+  clearSubagentRuns: () => void;
+}
+
 export interface ProjectSlice {
   fileTreeRoot: string;
   fileTree: FileEntry[];
@@ -184,7 +194,7 @@ export interface UiSlice {
   setPermissionMode: (mode: PermissionMode) => void;
 }
 
-export type AppState = ConnectionSlice & SessionSlice & RunSlice & ToolSlice & ProjectSlice & DialogSlice & MediaSlice & BreathSlice & UiSlice;
+export type AppState = ConnectionSlice & SessionSlice & RunSlice & ToolSlice & SubagentSlice & ProjectSlice & DialogSlice & MediaSlice & BreathSlice & UiSlice;
 type Slice<T> = StateCreator<AppState, [], [], T>;
 
 function connectionState(state: AppState): ConnectionState {
@@ -225,6 +235,8 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     toolCards: {},
+    subagentRunsById: {},
+    childIdsByParentToolId: {},
     pendingPermission: null,
     pendingQuestion: null,
     pendingCommit: null,
@@ -348,7 +360,14 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
       return match ? Math.max(next, Number.parseInt(match[1], 10) + 1) : next;
     }, 1);
     const toolCards = Object.fromEntries(mapped.filter((message) => message.role === "tool").map((message) => [message.id, true as const]));
-    set({ messages: mapped, streamingIdx: null, nextMessageId, toolCards });
+    set({
+      messages: mapped,
+      streamingIdx: null,
+      nextMessageId,
+      toolCards,
+      subagentRunsById: {},
+      childIdsByParentToolId: {},
+    });
   },
   clearMessages: () => set((state) => ({
     ...prepareSessionBoundary(orderingState(state)),
@@ -356,6 +375,8 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     streamingIdx: null,
     nextMessageId: 1,
     toolCards: {},
+    subagentRunsById: {},
+    childIdsByParentToolId: {},
     activeRunId: null,
     agentRunning: false,
     compacting: false,
@@ -428,6 +449,24 @@ export const createToolSlice: Slice<ToolSlice> = (set, get) => ({
     return id;
   },
   updateToolResult: (toolId, ok, preview) => set((state) => updateToolResultTransition(state, toolId, ok, preview)),
+});
+
+export const createSubagentSlice: Slice<SubagentSlice> = (set) => ({
+  subagentRunsById: {},
+  childIdsByParentToolId: {},
+  applySubagentEvent: (event) => {
+    let accepted = false;
+    set((state) => {
+      const result = applySubagentEventTransition({
+        subagentRunsById: state.subagentRunsById,
+        childIdsByParentToolId: state.childIdsByParentToolId,
+      }, event);
+      accepted = result.accepted;
+      return accepted ? result.state : {};
+    });
+    return accepted;
+  },
+  clearSubagentRuns: () => set({ subagentRunsById: {}, childIdsByParentToolId: {} }),
 });
 
 export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
@@ -545,42 +584,93 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
 });
 
 export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
+  type Block = { type?: string; text?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean };
   const output: ChatMessage[] = [];
   let counter = 1;
   const nextId = () => `msg-${counter++}`;
-  const toolNameById = new Map<string, string>();
+  const firstUseById = new Map<string, Block>();
+  const lastResultById = new Map<string, Block>();
+  const duplicateUses = new Set<string>();
+  const duplicateResults = new Set<string>();
 
   for (const raw of messages) {
-    const message = raw as { role?: string; content?: unknown };
-    const text = extractText(message.content);
-    const blocks = Array.isArray(message.content) ? message.content : [];
-    if (message.role === "user") {
-      const toolResults = blocks.filter((block) => (block as { type?: string })?.type === "tool_result");
-      if (toolResults.length && !text) {
-        for (const result of toolResults) {
-          const block = result as { tool_use_id?: string; content?: unknown; is_error?: boolean };
-          output.push({
-            id: `tool-${block.tool_use_id ?? counter++}`,
-            role: "tool",
-            content: extractText(block.content) || "(tool result)",
-            toolName: block.tool_use_id ? toolNameById.get(block.tool_use_id) : undefined,
-            toolOk: !block.is_error,
-            streaming: false,
-          });
+    const blocks = Array.isArray((raw as { content?: unknown })?.content)
+      ? (raw as { content: Block[] }).content : [];
+    for (const block of blocks) {
+      if (block.type === "tool_use" && block.id) {
+        if (firstUseById.has(block.id)) duplicateUses.add(block.id);
+        else firstUseById.set(block.id, block);
+      } else if (block.type === "tool_result" && block.tool_use_id) {
+        if (lastResultById.has(block.tool_use_id)) duplicateResults.add(block.tool_use_id);
+        lastResultById.set(block.tool_use_id, block);
+      }
+    }
+  }
+
+  const emittedUses = new Set<string>();
+  const appendText = (
+    role: "user" | "assistant",
+    text: string,
+    attachments: ChatMessage["attachments"] = [],
+  ) => {
+    if (!text) return;
+    const previous = output[output.length - 1];
+    if (previous?.role === role && !previous.streaming && !previous.toolName
+      && !previous.attachments?.length && !attachments.length) previous.content += text;
+    else output.push({ id: nextId(), role, content: text, ...(attachments.length ? { attachments } : {}) });
+  };
+
+  for (const raw of messages) {
+    const message = raw as { role?: string; content?: unknown; attachments?: unknown };
+    const attachments = Array.isArray(message.attachments)
+      ? message.attachments.flatMap((value) => {
+        const filename = (value as { filename?: unknown })?.filename;
+        return typeof filename === "string" && filename.length > 0
+          ? [{ filename: sanitizeBrowserText(filename.slice(0, 255)) }]
+          : [];
+      })
+      : [];
+    const blocks: Block[] = Array.isArray(message.content) ? message.content as Block[] : [];
+    if (typeof message.content === "string") {
+      if (message.role === "user" || message.role === "assistant") appendText(message.role, message.content, attachments);
+      continue;
+    }
+    let pendingAttachments = attachments;
+    for (const block of blocks) {
+      if (block.type === "text") {
+        if (message.role === "user" || message.role === "assistant") {
+          appendText(message.role, block.text ?? "", pendingAttachments);
+          pendingAttachments = [];
         }
-      } else if (text) output.push({ id: nextId(), role: "user", content: text });
-    } else if (message.role === "assistant") {
-      const toolUses = blocks.filter((block) => (block as { type?: string })?.type === "tool_use") as { id?: string; name?: string; input?: unknown }[];
-      if (text) output.push({ id: nextId(), role: "assistant", content: text });
-      for (const tool of toolUses) {
-        if (tool.id && tool.name) toolNameById.set(tool.id, tool.name);
+        continue;
+      }
+      if (block.type === "tool_use") {
+        const callId = block.id;
+        if (!callId || firstUseById.get(callId) !== block || emittedUses.has(callId)) continue;
+        emittedUses.add(callId);
+        const result = lastResultById.get(callId);
         output.push({
-          id: `tool-${tool.id ?? counter++}`,
+          id: `tool-${callId}`,
           role: "tool",
-          content: `${tool.name ?? "tool"}(${JSON.stringify(tool.input ?? {}).slice(0, 80)})`,
-          toolName: tool.name,
-          toolInput: sanitizeBrowserValue(tool.input),
-          toolOk: true,
+          content: result ? (extractText(result.content) || (result.is_error ? "Tool execution failed" : "[ok — no output]")) : "Result unavailable",
+          toolName: block.name,
+          toolInput: sanitizeBrowserValue(block.input),
+          toolOk: result ? !result.is_error : undefined,
+          streaming: false,
+        });
+        if (duplicateUses.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool call ignored: ${callId}` });
+        if (duplicateResults.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool results resolved to the last result: ${callId}` });
+        continue;
+      }
+      if (block.type === "tool_result") {
+        const callId = block.tool_use_id;
+        if (!callId || firstUseById.has(callId) || lastResultById.get(callId) !== block) continue;
+        output.push({
+          id: `tool-${callId}`,
+          role: "tool",
+          content: extractText(block.content) || (block.is_error ? "Tool execution failed" : "[ok — no output]"),
+          toolName: "Command unavailable",
+          toolOk: !block.is_error,
           streaming: false,
         });
       }
