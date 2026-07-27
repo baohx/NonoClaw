@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.7.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, and multimodal document understanding.
+> **Version**: v0.10.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **progressive skill disclosure**, **session-pinned MCP tool selection**, and **high-fidelity DOCX/PDF export**.
 
 ---
 
@@ -91,14 +91,14 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts, tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
-| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge** |
+| **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge**, **session-pinned keyword selection** (advertise only the relevant MCP-tool subset per session so the tools array stays cache-stable; `autoSelectMcp`/`autoSelectMcpTopK`) |
 | **Unified Model Profiles** | All models in single `models[]` array with `role` tags (`main`/`doc`/`compact`); `docModel` and `compactModel` reference by name; **per-model contextWindow / maxTokens / charsPerToken**; **compactModel** independent summarization model |
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
-| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching**, **per-model token estimation** |
+| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session), **per-model token estimation** |
 | **Goal Tracking** | Multi-step task plans in `memory/goals/*.md`. Agent self-manages steps, verification criteria, and progress. `Memory goal_create/goal_update/goal_list` actions. |
-| **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload |
+| **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload, **progressive disclosure** (only metadata sits in the cached system prefix; the full body loads on demand via the `Skill` tool) |
 | **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP**, 12 event types) |
 | **Task System** | File-persisted task store, dependency graph, owner assignment, status lifecycle |
 | **Web UI** | Bioluminescent dark theme, breathing aurora, file tree, Git pane, Insight accordion, Markdown+KaTeX, **tool card auto-collapse + command preview**, **attachment chips with upload state**, **"Nono" assistant label** |
@@ -106,7 +106,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Mobile Sync** | QR code → shared session → revisioned `MessagesLoaded` snapshots and sequenced run events; stale generations/revisions are rejected and peer snapshots are synchronized after Run/Clear/completion. |
 | **Tunnel** | `--tunnel` auto-spawns Cloudflare Tunnel for public HTTPS access; the connected Web UI provides the authenticated mobile URL and QR code |
 | **LSP Code Intelligence** | goToDefinition, findReferences, documentSymbol, workspaceSymbol via ripgrep. No language server required. |
-| **Export** | Markdown copy + `.md` file download from assistant responses |
+| **Export** | Markdown copy + `.md` file download, plus **high-fidelity DOCX/PDF export** (paginated canvas render) from assistant responses |
 
 ## Technical Transparency & Breathing
 
@@ -516,6 +516,8 @@ context: fork
 Run `./deploy.sh --env=$1 --branch=$2`
 ```
 
+**Progressive disclosure:** only skill metadata (name + description + `when_to_use`) sits in the cached system prefix; the full body loads on demand when the model calls the `Skill` tool (or immediately on an explicit `/skill-name`). This keeps the cold prefix small and the prompt cache stable across turns and skill activations. The 12 bundled built-in skills (e.g. `code-review`, `init`, `security-review`) follow the same pattern.
+
 #### Supported Frontmatter Fields (v0.2.0)
 
 | Field | Description |
@@ -659,6 +661,8 @@ Full example at `~/.nonoclaw/settings.json`:
 | `permissions.deny` | Tool patterns to always deny |
 | `compactThreshold` | Auto-compact trigger (estimated tokens) |
 | `autoCompact` | Enable/disable auto-compaction |
+| `autoSelectMcp` | Narrow advertised MCP tools to a keyword-relevant subset, pinned per session for a cache-stable tools array (default `true`) |
+| `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `15`) |
 
 ---
 
@@ -796,7 +800,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.7.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆和多模态文档理解。
+> **版本**: v0.10.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**技能渐进式披露**、**MCP 会话级工具选择**和**高保真 DOCX/PDF 导出**。
 
 ---
 
@@ -884,14 +888,14 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。 |
 | **文件附件** | 通过纸夹按钮、拖拽或粘贴上传 PDF/DOCX/DOC/TXT/MD/PNG/JPG；通过可配置的 Mistral/DeepSeek 文档模型**自动 OCR**；**直接文本提取**（pdftotext + ZIP XML）尽可能跳过 OCR；**嵌入图片提取**（pdfimages + word/media）并为每张图片生成 OCR 描述；多模态模型的 **ContentBlock::Image 注入** |
 | **Bash 后台任务** | `run_in_background: true` 启动分离进程，输出持久化到磁盘，完成时注入 `<task_notification>` |
-| **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接** |
+| **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接**，**会话级关键词选择**（每会话仅展示相关 MCP 工具子集，使 tools 数组缓存稳定；`autoSelectMcp`/`autoSelectMcpTopK`） |
 | **统一模型配置** | 所有模型集中在单一 `models[]` 数组，通过 `role` 标签（`main`/`doc`/`compact`）区分；`docModel` 和 `compactModel` 通过名称引用；**每模型专属 contextWindow / maxTokens / charsPerToken**；**compactModel** 独立的摘要压缩模型 |
 | **多模型切换** | 通过 UI 下拉框或 `/multi` 斜杠命令切换模型；`/multi` 语法错误时显示帮助提示 |
 | **权限** | 5 种模式：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过 UI 下拉框切换 |
 | **会话** | 按工作目录的 JSONL 持久化，`--resume` / `--continue` / `--list-sessions`，**会话命名**，渐进式元数据 |
-| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**、**每模型 token 估算** |
+| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**（带**缓存稳定前缀**：技能正文按需经 `Skill` 工具加载；MCP 子集按会话固定）、**每模型 token 估算** |
 | **目标追踪** | `memory/goals/*.md` 中的多步骤任务计划。Agent 自主管理步骤、验证标准和进度。`Memory goal_create/goal_update/goal_list` 操作。 |
-| **技能** | `/skill-name` 注入，**12 个内置技能**，通过路径/触发器/文件发现**动态激活**，参数替换，fork 上下文，使用追踪，热重载 |
+| **技能** | `/skill-name` 注入，**12 个内置技能**，通过路径/触发器/文件发现**动态激活**，参数替换，fork 上下文，使用追踪，热重载，**渐进式披露**（缓存系统前缀仅放元数据；完整正文按需经 `Skill` 工具加载） |
 | **插件** | `--plugin-add`，通过 `.nonoclaw/hooks.json` 配置钩子（**shell + prompt + HTTP**，12 种事件类型） |
 | **任务系统** | 文件持久化任务存储，依赖图，owner 分配，状态生命周期 |
 | **Web 界面** | 生物发光暗色主题，呼吸式 aurora 背景，文件树，Git 面板，Insight 手风琴，Markdown+KaTeX，**工具卡片自动折叠 + 命令预览**，**附件 chips 上传状态**，**"Nono" 助手标签** |
@@ -899,7 +903,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **手机同步** | 二维码 → 共享 session → 带 revision 的 `MessagesLoaded` 快照与有序运行事件；客户端拒绝旧连接代次/旧 revision，并在 Run/Clear/完成后同步 peer。 |
 | **隧道** | `--tunnel` 自动启动 Cloudflare Tunnel，实现公网 HTTPS 访问；已连接的 Web UI 提供移动端认证 URL 和二维码 |
 | **LSP 代码智能** | goToDefinition、findReferences、documentSymbol、workspaceSymbol，基于 ripgrep。无需安装语言服务器。 |
-| **导出** | 助手回复支持复制 Markdown 与下载 `.md` 文件 |
+| **导出** | 助手回复支持复制 Markdown 与下载 `.md`，并支持**高保真 DOCX/PDF 导出**（分页画布渲染） |
 
 ## 技术透明与呼吸体验
 
@@ -1279,6 +1283,8 @@ context: fork
 运行 `./deploy.sh --env=$1 --branch=$2`
 ```
 
+**渐进式披露**：缓存的系统前缀只放技能元数据（名称 + 描述 + `when_to_use`）；完整正文在模型调用 `Skill` 工具时按需加载（或显式 `/技能名` 时立即注入）。这样冷前缀更小，且提示缓存能在多轮和技能激活间保持稳定。12 个内置技能（如 `code-review`、`init`、`security-review`）同样遵循该模式。
+
 #### 支持的 Frontmatter 字段
 
 | 字段 | 描述 |
@@ -1422,6 +1428,8 @@ nonoclaw --plugin-add https://github.com/... # Git URL
 | `permissions.deny` | 始终拒绝的工具模式 |
 | `compactThreshold` | 自动压缩触发阈值（估算 tokens） |
 | `autoCompact` | 启用/禁用自动压缩 |
+| `autoSelectMcp` | 将展示的 MCP 工具收窄为关键词相关子集，并按会话固定以保持 tools 数组缓存稳定（默认 `true`） |
+| `autoSelectMcpTopK` | 收窄时展示的 MCP 工具数量上限（默认 `15`） |
 
 ---
 
