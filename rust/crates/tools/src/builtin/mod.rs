@@ -13,6 +13,7 @@ pub mod grep;
 pub mod lsp;
 pub mod memory;
 pub mod read;
+pub mod skill;
 pub mod task_tools;
 pub mod todo;
 pub mod tool_search;
@@ -31,6 +32,7 @@ pub use grep::GrepTool;
 pub use lsp::LspTool;
 pub use memory::MemoryTool;
 pub use read::ReadTool;
+pub use skill::{SkillSource, SkillTool};
 pub use todo::{TodoStatus, TodoStore, TodoWriteTool};
 pub use tool_search::ToolSearchTool;
 pub use webfetch::WebFetchTool;
@@ -112,14 +114,28 @@ mod characterization_tests {
     use super::*;
     use serde_json::json;
 
+    /// In-test stub for `SkillSource` (the real impl lives in the engine crate,
+    /// which the `tools` crate cannot depend on).
+    struct StubSource;
+    impl crate::builtin::skill::SkillSource for StubSource {
+        fn render_skill_body(&self, _: &str, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn skill_description(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
     /// Characterization contract for the normal CLI/Web registry: the 18 core
-    /// tools plus ToolSearch, which main registers after MCP discovery.
-    /// Feature Preservation Matrix: sections 3.1 and 10; Requirements 1.4, 11.7.
+    /// tools plus ToolSearch and Skill, which main registers after MCP
+    /// discovery. Feature Preservation Matrix: sections 3.1 and 10;
+    /// Requirements 1.4, 11.7.
     #[test]
     fn tool_registration_names_and_schemas_match_snapshot() {
         let (mut registry, _) = register_all();
         let search_entries = registry.search_entries();
         registry.register(Arc::new(ToolSearchTool::new(search_entries)));
+        registry.register(Arc::new(SkillTool::new(Arc::new(StubSource))));
 
         let tools: Vec<_> = registry
             .definitions(None)

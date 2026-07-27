@@ -42,7 +42,7 @@ pub use settings::{
     config_reference, load_resolved_config, ConfigDiagnostic, ConfigFieldReference, ConfigSource,
     ModelProfile, ResolvedConfig, RunConfigOverrides, SettingsFile,
 };
-pub use skills::{substitute_arguments, Skill, SkillActivation, SkillsManager};
+pub use skills::{substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillsManager};
 pub use toolchain::{
     probe_runtime, probe_runtime_with_updates, ExecutableProbe, PythonVenvProbe, RuntimeProbeReport,
 };

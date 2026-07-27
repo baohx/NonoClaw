@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use nonoclaw_core::{
     resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic, ExtensionKind,
@@ -416,22 +417,60 @@ impl SkillsManager {
 
     // ── Prompt rendering ─────────────────────────────────────────────────
 
-    /// Format all active skills as a system-prompt block. Includes
-    /// `when_to_use` guidance so the model knows when to invoke each skill.
+    /// Metadata for all active skills (name + description + when-to-use + how
+    /// to load the body). Bodies are NOT included — load them on demand via the
+    /// `Skill` tool so they stay out of the cached system prefix.
     pub fn render_prompt(&self) -> String {
         let active = self.all_active();
-        if active.is_empty() {
+        self.render_metadata_for(&active)
+    }
+
+    /// Metadata for **static** skills only. Injected into the frozen, cached
+    /// system Block 1 — deterministic from `SkillsManager::new`, so it is
+    /// byte-stable for the entire session and never invalidates the prompt
+    /// cache on skill activation.
+    pub fn render_static_skill_metadata(&self) -> String {
+        self.render_metadata_for(&self.static_skills)
+    }
+
+    /// Metadata for **dynamically activated** skills. Injected into the
+    /// uncached system Block 2 (rebuilt every turn with fresh git anyway), so
+    /// activations surface without touching the cached prefix. Skills that
+    /// shadow a static skill by name are skipped to avoid duplicate headers.
+    pub fn render_dynamic_skill_metadata(&self) -> String {
+        let static_names: HashMap<&str, ()> = self
+            .static_skills
+            .iter()
+            .map(|s| (s.name.as_str(), ()))
+            .collect();
+        let skills: Vec<Skill> = self
+            .dynamic_skills
+            .values()
+            .filter(|s| !static_names.contains_key(s.name.as_str()))
+            .cloned()
+            .collect();
+        self.render_metadata_for(&skills)
+    }
+
+    /// Render metadata (no bodies) for a set of skills, sorted by name.
+    fn render_metadata_for(&self, skills: &[Skill]) -> String {
+        if skills.is_empty() {
             return String::new();
         }
+        let mut sorted: Vec<&Skill> = skills.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
         let mut out = String::from("# Available Skills\n\n");
-        for skill in &active {
+        for skill in &sorted {
             out.push_str(&format!("## {}\n", skill.name));
             if !skill.description.is_empty() {
                 out.push_str(&format!("**Description**: {}\n", skill.description));
             }
             if let Some(ref wtu) = skill.when_to_use {
-                out.push_str(&format!("**When to use**: {}\n", wtu.trim()));
+                let wtu = wtu.trim();
+                if !wtu.is_empty() {
+                    out.push_str(&format!("**When to use**: {}\n", wtu));
+                }
             }
             if !skill.argument_names.is_empty() {
                 out.push_str(&format!(
@@ -442,24 +481,13 @@ impl SkillsManager {
             if let Some(ref hint) = skill.argument_hint {
                 out.push_str(&format!("**Usage**: /{} {}\n", skill.name, hint));
             }
-            out.push('\n');
-            // Cap skill body to avoid bloating the system prompt (firecrawl
-            // skills can have 100+ KB of reference docs each).  The model
-            // can read the full skill via `/skill-name` or Read tool.
-            let body_short = crate::skills::truncate_str(&skill.body, 2000);
-            out.push_str(&body_short);
-            if body_short.len() < skill.body.len() {
-                out.push_str("\n*(body truncated — use /");
-                out.push_str(&skill.name);
-                out.push_str(" to load full skill)*\n");
-            }
-            if !skill.body.ends_with('\n') {
-                out.push('\n');
-            }
+            out.push_str(&format!(
+                "**Load**: call the `Skill` tool with {{\"name\":\"{}\"}} to read the full instructions.\n",
+                skill.name
+            ));
             out.push_str("\n---\n\n");
         }
-        // The engine will append this block to the system prompt; strip the
-        // trailing separator line to avoid an unnecessary blank section.
+        // Strip the trailing separator to avoid an unnecessary blank section.
         while out.ends_with("\n---\n\n") {
             let end = out.len().saturating_sub("\n---\n\n".len());
             out.truncate(end);
@@ -1311,9 +1339,41 @@ pub fn truncate_str(s: &str, max: usize) -> String {
     out
 }
 
+/// Engine-side adapter that gives the `tools` crate's `Skill` tool live access
+/// to skill bodies, without `tools` depending on `engine`. A newtype wrapper is
+/// used (rather than `impl SkillSource for RwLock<SkillsManager>`) to satisfy
+/// the orphan rule — `RwLock` is not a fundamental type.
+pub struct EngineSkillSource {
+    manager: Arc<RwLock<SkillsManager>>,
+}
+
+impl EngineSkillSource {
+    pub fn new(manager: Arc<RwLock<SkillsManager>>) -> Self {
+        EngineSkillSource { manager }
+    }
+}
+
+impl nonoclaw_tools::builtin::skill::SkillSource for EngineSkillSource {
+    fn render_skill_body(&self, name: &str, args: &str, session_id: &str) -> Option<String> {
+        self.manager
+            .read()
+            .unwrap()
+            .render_skill_with_args(name, args, session_id)
+    }
+
+    fn skill_description(&self, name: &str) -> Option<String> {
+        self.manager
+            .read()
+            .unwrap()
+            .get_skill(name)
+            .map(|s| s.description)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nonoclaw_tools::builtin::SkillSource;
 
     fn tempdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("nonoclaw-skills-{}", uuid::Uuid::new_v4()));
@@ -1536,7 +1596,35 @@ mod tests {
         assert!(prompt.contains("## alpha"));
         assert!(prompt.contains("first skill"));
         assert!(prompt.contains("when testing"));
-        assert!(prompt.contains("Alpha body here."));
+        // Metadata points to the Skill tool; the body is NOT in the prompt.
+        assert!(prompt.contains("`Skill` tool"));
+        assert!(!prompt.contains("Alpha body here."));
+    }
+
+    #[test]
+    fn skill_source_loads_full_body_on_demand() {
+        let dir = tempdir();
+        let skills_dir = dir.join(".nonoclaw").join("skills");
+        std::fs::create_dir_all(skills_dir.join("alpha")).unwrap();
+        std::fs::write(
+            skills_dir.join("alpha").join("SKILL.md"),
+            "---\nname: alpha\ndescription: first skill\n---\nAlpha body here.",
+        )
+        .unwrap();
+
+        let mgr = SkillsManager::new(&dir);
+        let source = EngineSkillSource::new(Arc::new(RwLock::new(mgr)));
+        // The Skill tool data path returns the full, untruncated body.
+        let body = source
+            .render_skill_body("alpha", "", "test-session")
+            .expect("alpha body");
+        assert!(body.contains("Alpha body here."));
+        assert_eq!(
+            source.skill_description("alpha").as_deref(),
+            Some("first skill")
+        );
+        // Unknown skill -> None.
+        assert!(source.render_skill_body("nope", "", "test-session").is_none());
     }
 
     #[test]

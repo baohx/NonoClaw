@@ -17,8 +17,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use nonoclaw_core::{MessageContent, PermissionMode, Usage};
 use nonoclaw_engine::{
-    ClientPurpose, ConfigSource, EngineEvent, EventEnvelope, QueryEngine, RunConfigOverrides,
-    RunController, RunTerminalStatus, SessionService, SkillsManager,
+    ClientPurpose, ConfigSource, EngineEvent, EngineSkillSource, EventEnvelope, QueryEngine,
+    RunConfigOverrides, RunController, RunTerminalStatus, SessionService, SkillsManager,
 };
 use nonoclaw_tools::register_all;
 use serde_json::json;
@@ -297,6 +297,12 @@ async fn main() -> Result<()> {
     // Register ToolSearch with a snapshot of all tools (including MCP).
     let tool_search = nonoclaw_tools::builtin::ToolSearchTool::new(registry.search_entries());
     registry.register(Arc::new(tool_search));
+    // Register the Skill tool (progressive disclosure): it loads skill bodies
+    // on demand via the shared skills manager, so bodies stay out of the cached
+    // system prefix. Like ToolSearch, registered after MCP discovery.
+    registry.register(Arc::new(nonoclaw_tools::builtin::SkillTool::new(
+        Arc::new(EngineSkillSource::new(Arc::clone(&skills_manager))),
+    )));
     let registry = Arc::new(registry);
 
     // Web UI server: HTTP + WebSocket. All model, compact, document, media,

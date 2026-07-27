@@ -599,5 +599,25 @@
       "type": "object"
     },
     "name": "ToolSearch"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "args": {
+          "default": "",
+          "description": "Optional arguments to substitute into the skill body.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Skill name exactly as listed under Available Skills.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "Skill"
   }
 ]

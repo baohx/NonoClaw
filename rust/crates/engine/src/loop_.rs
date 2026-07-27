@@ -634,7 +634,7 @@ impl QueryEngine {
 
         // Skill triggers: check user input against trigger patterns and
         // activate matching conditional skills before the first turn.
-        let mut last_skills_version: u64 = 0;
+        let mut slash_skill_body: Option<(String, String)> = None;
         if let Some(ref mgr) = self.options.skills_manager {
             let mut guard = mgr.write().unwrap();
             if let Some(skill_name) = user_text
@@ -643,6 +643,28 @@ impl QueryEngine {
                 .filter(|name| !name.is_empty())
             {
                 guard.activate_slash_command(skill_name);
+                // Explicit slash invocation: inject the full body into the
+                // uncached message tail so the skill applies immediately with
+                // zero round-trips. Fork-context skills are executed as
+                // sub-agents on the HTTP path and are skipped here.
+                let inline = guard
+                    .get_skill(skill_name)
+                    .map(|s| s.context.as_deref() != Some("fork"))
+                    .unwrap_or(true);
+                if inline {
+                    let args = user_text
+                        .strip_prefix('/')
+                        .unwrap_or(&user_text)
+                        .split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if let Some(body) =
+                        guard.render_skill_with_args(skill_name, &args, &self.session_id)
+                    {
+                        slash_skill_body = Some((skill_name.to_string(), body));
+                    }
+                }
             }
             let triggered = guard.match_triggers(&user_text);
             if !triggered.is_empty() {
@@ -656,7 +678,12 @@ impl QueryEngine {
                     version: activation.version,
                 });
             }
-            last_skills_version = guard.version();
+        }
+        // Inject the slash-invoked skill body after releasing the skills lock.
+        if let Some((name, body)) = slash_skill_body {
+            self.messages.push(Message::user(MessageContent::from_text(
+                format!("<skill name=\"{name}\">\n{body}\n</skill>"),
+            )));
         }
 
         let finish_reason = loop {
@@ -706,25 +733,14 @@ impl QueryEngine {
                 }
             }
 
-            // Rebuild system prompt if skills were dynamically activated.
-            if let Some(ref mgr) = self.options.skills_manager {
-                let v = mgr.read().unwrap().version();
-                if v > last_skills_version {
-                    system_blocks = build_system_blocks(
-                        cwd,
-                        &system_ctx,
-                        &user_ctx,
-                        &memory,
-                        &tool_prompts,
-                        &self.options.append_system_prompt,
-                        &self.options.skills_manager,
-                    );
-                    last_skills_version = v;
-                }
-            }
+            // Note: skill activations no longer rebuild the cached Block 1.
+            // Activated skill metadata flows through the uncached Block 2
+            // (refreshed below), so the cached prefix stays byte-stable.
 
             // Refresh the uncached context block with live git status
             // each turn so the model sees up-to-date working-tree state.
+            // Dynamic skill metadata is rendered into this uncached block, so
+            // skill activations surface without invalidating the cached Block 1.
             {
                 let live_git = get_system_context(cwd).await;
                 system_blocks = crate::prompt::refresh_context_block(
@@ -732,6 +748,7 @@ impl QueryEngine {
                     &live_git,
                     &user_ctx,
                     &memory,
+                    &self.options.skills_manager,
                 );
             }
 

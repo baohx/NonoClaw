@@ -70,9 +70,13 @@ pub fn build_system_blocks(
         tool_prompts.len(),
         tools_list.join("\n"),
     ));
-    // Inject active skills (static + dynamically activated/discovered).
+    // Inject STATIC skill metadata only. This keeps Block 1 byte-stable for the
+    // whole session — skill activations surface their metadata in the uncached
+    // Block 2 (see `refresh_context_block`) instead, so they never invalidate
+    // the cached prefix. Skill bodies are never embedded; they load on demand
+    // via the `Skill` tool.
     if let Some(mgr) = skills_manager {
-        let skill_prompt = mgr.read().unwrap().render_prompt();
+        let skill_prompt = mgr.read().unwrap().render_static_skill_metadata();
         if !skill_prompt.is_empty() {
             main.push_str(&format!("\n{skill_prompt}\n"));
         }
@@ -119,12 +123,15 @@ pub fn build_system_blocks(
 
 /// Rebuild only the uncached context block (Block 2) with fresh git status.
 /// Call this before each turn so the model sees up-to-date git info without
-/// invalidating the cached Block 1 (identity + tools + skills).
+/// invalidating the cached Block 1 (identity + tools + static skill metadata).
+/// Dynamically activated skill metadata is rendered into this uncached block,
+/// so activations are visible without touching the cached prefix.
 pub fn refresh_context_block(
     old_blocks: &[SystemBlock],
     system: &SystemContext,
     user: &UserContext,
     memory: &Option<String>,
+    skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
 ) -> Vec<SystemBlock> {
     let mut blocks = Vec::with_capacity(2);
     // Block 1: preserved as-is (cached).
@@ -145,6 +152,14 @@ pub fn refresh_context_block(
         context.push_str("# Memory\n\n");
         context.push_str(mem);
         context.push('\n');
+    }
+    // Dynamic skill metadata: surfaces activated skills without invalidating
+    // the cached Block 1. (Bodies still load on demand via the Skill tool.)
+    if let Some(mgr) = skills_manager {
+        let dyn_md = mgr.read().unwrap().render_dynamic_skill_metadata();
+        if !dyn_md.is_empty() {
+            context.push_str(&format!("\n{dyn_md}\n"));
+        }
     }
     if !context.is_empty() {
         blocks.push(SystemBlock {
