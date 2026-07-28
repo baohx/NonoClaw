@@ -34,6 +34,16 @@ impl Tool for BashTool {
     fn description(&self) -> &'static str {
         "Executes a bash command on the local machine."
     }
+    fn snippet(&self) -> String {
+        "Run shell commands (build, test, git, package managers)".to_string()
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[
+            "Use the Grep tool instead of `rg`/`grep` in Bash for file content searches — it's faster and respects .gitignore.",
+            "Use the Read tool instead of `cat`/`head`/`tail` in Bash for reading files.",
+            "Quote paths with spaces; prefer absolute paths over `cd` when running one-off commands.",
+        ]
+    }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

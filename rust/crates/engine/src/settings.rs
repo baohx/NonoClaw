@@ -149,6 +149,12 @@ pub struct SettingsFile {
     /// Cap on advertised MCP tools once narrowing applies.
     #[serde(rename = "autoSelectMcpTopK", default)]
     pub auto_select_mcp_top_k: Option<usize>,
+    /// System-prompt section profile: "full" (default) or "minimal".
+    /// `minimal` keeps only identity + safety + task-completion, dropping
+    /// ~60% of the BASE body for cost-sensitive or compact models. Tool
+    /// guidance / available-tools / skills / append are unaffected.
+    #[serde(rename = "promptProfile", default)]
+    pub prompt_profile: Option<String>,
     #[serde(rename = "contextWindow")]
     pub context_window: Option<usize>,
     pub thinking: Option<Value>,
@@ -163,6 +169,10 @@ pub struct SettingsFile {
     pub models: Option<Vec<ModelProfile>>,
     #[serde(rename = "compactModel", default)]
     pub compact_model: Option<String>,
+    /// Cap on the compaction summarizer's output length (tokens). Default
+    /// 4096. Increase (e.g. 8192) for long, dense conversations.
+    #[serde(rename = "compactMaxTokens", default)]
+    pub compact_max_tokens: Option<u32>,
     #[serde(rename = "elevenlabsApiKey", default)]
     pub elevenlabs_api_key: Option<String>,
     #[serde(rename = "charsPerToken", default = "default_chars_per_token")]
@@ -331,6 +341,7 @@ impl Default for SettingsFile {
             compact_threshold: None,
             auto_select_mcp: None,
             auto_select_mcp_top_k: None,
+            prompt_profile: None,
             context_window: None,
             thinking: None,
             permissions: None,
@@ -339,6 +350,7 @@ impl Default for SettingsFile {
             mcp_servers: None,
             models: None,
             compact_model: None,
+            compact_max_tokens: None,
             elevenlabs_api_key: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
@@ -1184,11 +1196,21 @@ impl ResolvedConfig {
                 .unwrap_or(true),
             compact_threshold_tokens,
             compact_model: Some(self.model_for(ClientPurpose::Compact, Some(&model))),
+            compact_max_tokens: self
+                .settings
+                .compact_max_tokens
+                .unwrap_or(crate::compact::DEFAULT_MAX_SUMMARY_TOKENS),
             compact_client: self.client_for(ClientPurpose::Compact, Some(&model)).ok(),
             subagent_client: self.client_for(ClientPurpose::Subagent, Some(&model)).ok(),
             chars_per_token,
             context_window,
             max_budget_usd: None,
+            prompt_profile: self
+                .settings
+                .prompt_profile
+                .as_deref()
+                .map(crate::prompt::PromptProfile::parse)
+                .unwrap_or_default(),
             startup_events: self
                 .diagnostics
                 .iter()
@@ -1375,6 +1397,12 @@ fn merge_settings_value(
     }
     if present("autoSelectMcpTopK", overlay.auto_select_mcp_top_k.is_some()) {
         base.auto_select_mcp_top_k = overlay.auto_select_mcp_top_k;
+    }
+    if present("promptProfile", overlay.prompt_profile.is_some()) {
+        base.prompt_profile = overlay.prompt_profile.clone();
+    }
+    if present("compactMaxTokens", overlay.compact_max_tokens.is_some()) {
+        base.compact_max_tokens = overlay.compact_max_tokens;
     }
     if present("contextWindow", overlay.context_window.is_some()) {
         base.context_window = overlay.context_window;

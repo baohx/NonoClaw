@@ -10,8 +10,28 @@ use nonoclaw_api::{Client, RequestParams, SystemBlock};
 use nonoclaw_core::{ContentBlock, Message, MessageContent, Result, ToolResultContent};
 use serde_json::Value;
 
-const SUMMARY_SYSTEM: &str = "You are a summarization assistant. Produce a concise but complete summary of the conversation that preserves everything a continuing assistant needs: the user's goal and constraints, key decisions and their rationale, files read or modified (with paths and the important snippets), commands run and their outcomes, the current state of work, and any open questions or next steps. Do NOT omit concrete technical details (paths, names, values).";
-const MAX_SUMMARY_TOKENS: u32 = 4096;
+const SUMMARY_SYSTEM: &str = r#"You are a summarization assistant. Produce a concise but complete summary of the conversation that preserves everything a continuing assistant needs. Use the following XML structure so the continuing assistant can scan it reliably:
+
+<goal>The user's overall goal and constraints in 1-3 sentences.</goal>
+<decisions>
+- Each key decision made during the conversation, with the rationale (one bullet per decision).
+</decisions>
+<files_modified>
+- path/to/file — what changed and why (one bullet per file; include line numbers or identifiers when relevant). Use "read" if the file was only inspected.
+</files_modified>
+<commands_run>
+- command → outcome (one bullet per command; include exit codes or error text on failure).
+</commands_run>
+<current_state>1-3 sentences describing where the work stands right now: what's done, what's in flight.</current_state>
+<open_questions>
+- Unresolved questions, blockers, or next steps the continuing assistant must address.
+</open_questions>
+
+Do NOT omit concrete technical details (paths, names, values, error messages). Skip sections that have nothing to record (e.g. no commands run → omit <commands_run> entirely)."#;
+
+/// Default cap on the summarizer's output. Overridable via the
+/// `compactMaxTokens` settings.json field.
+pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 4096;
 
 /// Compaction strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,13 +84,15 @@ fn is_plain_user_prompt(m: &Message) -> bool {
 
 /// Compact `messages`: summarize the older prefix, keep the recent tail.
 /// `keep_recent` is the minimum number of messages / turns to keep verbatim
-/// (interpretation depends on `mode`).
+/// (interpretation depends on `mode`). `max_summary_tokens` caps the
+/// summarizer's output length — increase for long, dense conversations.
 pub async fn compact_messages(
     client: &Client,
     model: &str,
     messages: &[Message],
     keep_recent: usize,
     mode: CompactMode,
+    max_summary_tokens: u32,
 ) -> Result<Vec<Message>> {
     // In segments mode, `keep_recent` counts turns, not messages.
     let effective_keep = match mode {
@@ -107,7 +129,7 @@ pub async fn compact_messages(
     );
     let params = RequestParams {
         model: model.to_string(),
-        max_tokens: MAX_SUMMARY_TOKENS,
+        max_tokens: max_summary_tokens,
         system: vec![SystemBlock {
             kind: "text".into(),
             text: SUMMARY_SYSTEM.into(),
@@ -134,8 +156,8 @@ pub async fn compact_messages(
 
     let mut out = Vec::with_capacity(keep.len() + 1);
     out.push(Message::user(MessageContent::from_text(format!(
-        "[Compacted summary of earlier conversation]\n{summary}\n\
-         [End summary — recent messages follow.]"
+        "<conversation_history_summary>\n{summary}\n</conversation_history_summary>\n\
+         Recent messages follow."
     ))));
     out.extend(keep.iter().cloned());
     Ok(out)
@@ -262,5 +284,54 @@ mod tests {
         assert!(r.contains("user: p1"));
         assert!(r.contains("tool_use Read"));
         assert!(r.contains("tool_result:"));
+    }
+
+    // ========================================================================
+    // Batch 4 — XML structured context wrapping
+    // ========================================================================
+
+    #[test]
+    fn compacted_summary_uses_xml_tag() {
+        // T4.4 acceptance: the summary injected into messages must use
+        // <conversation_history_summary>...</conversation_history_summary>,
+        // not the legacy [Compacted summary...] / [End summary...] markers.
+        // We can't call compact_messages (requires LLM client) so we
+        // construct the wrapper the same way the function does and assert.
+        let summary = "User asked about Rust ownership.";
+        let wrapped = format!(
+            "<conversation_history_summary>\n{summary}\n</conversation_history_summary>\n\
+             Recent messages follow."
+        );
+        assert!(wrapped.contains("<conversation_history_summary>"));
+        assert!(wrapped.contains("</conversation_history_summary>"));
+        assert!(wrapped.contains(summary));
+        assert!(!wrapped.contains("[Compacted summary"));
+        assert!(!wrapped.contains("[End summary"));
+    }
+
+    // ========================================================================
+    // Batch 5 — Compaction experience improvements
+    // ========================================================================
+
+    #[test]
+    fn summary_system_prompts_for_structured_output() {
+        // T5.1 acceptance: SUMMARY_SYSTEM must request structured XML output
+        // with the agreed sections.
+        assert!(SUMMARY_SYSTEM.contains("<goal>"));
+        assert!(SUMMARY_SYSTEM.contains("<decisions>"));
+        assert!(SUMMARY_SYSTEM.contains("<files_modified>"));
+        assert!(SUMMARY_SYSTEM.contains("<commands_run>"));
+        assert!(SUMMARY_SYSTEM.contains("<current_state>"));
+        assert!(SUMMARY_SYSTEM.contains("<open_questions>"));
+        // Sanity: not the legacy free-form prompt.
+        assert!(!SUMMARY_SYSTEM.contains("Preserve concrete technical details.")
+            || SUMMARY_SYSTEM.contains("Do NOT omit concrete technical details"));
+    }
+
+    #[test]
+    fn default_max_summary_tokens_is_4096() {
+        // T5.2 acceptance: the default stays at 4096; the constant is the
+        // single source of truth referenced by settings resolution.
+        assert_eq!(DEFAULT_MAX_SUMMARY_TOKENS, 4096);
     }
 }

@@ -15,17 +15,31 @@ pub struct SystemContext {
 pub struct UserContext {
     pub nonoclaw_md: String,
     pub date: String,
+    /// Content of `SYSTEM.md` if discovered. When present, it **completely
+    /// replaces** the default BASE prompt body (identity + guidelines) —
+    /// see pi's customPrompt pattern. Loaded from (in priority order):
+    ///   1. `<cwd>/.nonoclaw/SYSTEM.md`
+    ///   2. `~/.nonoclaw/SYSTEM.md`
+    pub system_md_override: Option<String>,
+    /// Content of `APPEND_SYSTEM.md` if discovered. Always appended to the
+    /// end of Block 1, regardless of whether `system_md_override` is set.
+    /// Loaded from the same locations as `SYSTEM.md`.
+    pub append_system_md: Option<String>,
 }
 
 const GIT_STATUS_MAX: usize = 2000;
 
 /// Collect a git snapshot for the system prompt. Runs git as a subprocess;
-/// fails quietly (returns empty) outside a repo.
+/// fails quietly (returns empty) outside a repo. The four git commands are
+/// spawned in parallel — they're independent and the latency win is real
+/// (4 × ~10ms sequential → ~10ms wall time).
 pub async fn get_system_context(cwd: &Path) -> SystemContext {
-    let branch = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-    let status = git_out(cwd, &["status"]).await;
-    let log = git_out(cwd, &["log", "--oneline", "-5"]).await;
-    let user = git_out(cwd, &["config", "user.name"]).await;
+    let (branch, status, log, user) = tokio::join!(
+        git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        git_out(cwd, &["status"]),
+        git_out(cwd, &["log", "--oneline", "-5"]),
+        git_out(cwd, &["config", "user.name"]),
+    );
 
     let mut s = String::new();
     if !branch.is_empty() {
@@ -105,7 +119,28 @@ pub fn get_user_context(cwd: &Path, add_dirs: &[PathBuf]) -> UserContext {
     }
 
     let date = chrono::Local::now().format("%Y/%m/%d").to_string();
-    UserContext { nonoclaw_md, date }
+    close_project_context(&mut nonoclaw_md);
+
+    // SYSTEM.md / APPEND_SYSTEM.md discovery. Project-local file wins over
+    // the user-global one; only the first found is used. These are loaded
+    // raw (no XML wrapping) — they're prompt-body content, not context.
+    let system_md_override = read_optional(&cwd.join(".nonoclaw/SYSTEM.md")).or_else(|| {
+        nonoclaw_core::nonoclaw_data_dir().and_then(|home| {
+            read_optional(&PathBuf::from(&home).join(".nonoclaw/SYSTEM.md"))
+        })
+    });
+    let append_system_md = read_optional(&cwd.join(".nonoclaw/APPEND_SYSTEM.md")).or_else(|| {
+        nonoclaw_core::nonoclaw_data_dir().and_then(|home| {
+            read_optional(&PathBuf::from(&home).join(".nonoclaw/APPEND_SYSTEM.md"))
+        })
+    });
+
+    UserContext {
+        nonoclaw_md,
+        date,
+        system_md_override,
+        append_system_md,
+    }
 }
 
 /// Scan `rules_dir/*.md`, sorted by filename, and append each to `buf`.
@@ -129,9 +164,21 @@ fn load_rules(rules_dir: &Path, buf: &mut String) {
 
 fn append_md(buf: &mut String, source: &str, content: String) {
     if buf.is_empty() {
-        buf.push_str("# Project context (NONOCLAW.md)\n\n");
+        buf.push_str("<project_context>\n");
     }
-    buf.push_str(&format!("## from {source}\n\n{content}\n\n"));
+    buf.push_str(&format!(
+        "<project_instructions path=\"{source}\">\n{content}\n</project_instructions>\n"
+    ));
+}
+
+/// Close the `<project_context>` wrapper opened by the first `append_md` call.
+/// Idempotent: only appends the closing tag when the buffer actually opened
+/// one. Must be called once after all `append_md`/`load_rules` calls, before
+/// returning the assembled NONOCLAW.md context.
+fn close_project_context(buf: &mut String) {
+    if buf.starts_with("<project_context>\n") && !buf.ends_with("</project_context>\n") {
+        buf.push_str("</project_context>\n");
+    }
 }
 
 /// Load the memory index + individual fact files from `.nonoclaw/memory/`.
@@ -280,5 +327,101 @@ mod tests {
     fn user_context_date_is_set() {
         let uc = get_user_context(Path::new("/nonexistent"), &[]);
         assert!(!uc.date.is_empty());
+    }
+
+    // ========================================================================
+    // Batch 4 — XML structured context wrapping
+    // ========================================================================
+
+    #[test]
+    fn nonoclaw_md_uses_project_context_xml() {
+        use std::io::Write;
+        // Set up a tempdir with a .nonoclaw/NONOCLAW.md
+        let tmp = std::env::temp_dir().join(format!("nc_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".nonoclaw")).unwrap();
+        let mut f = std::fs::File::create(tmp.join(".nonoclaw/NONOCLAW.md")).unwrap();
+        writeln!(f, "project rules here").unwrap();
+        drop(f);
+
+        let uc = get_user_context(&tmp, &[]);
+        assert!(uc.nonoclaw_md.contains("<project_context>"),
+                "must open <project_context>: got\n{}", uc.nonoclaw_md);
+        assert!(uc.nonoclaw_md.contains("</project_context>"),
+                "must close </project_context>: got\n{}", uc.nonoclaw_md);
+        assert!(uc.nonoclaw_md.contains("<project_instructions path=\".nonoclaw/NONOCLAW.md\">"),
+                "must use <project_instructions> with path attr: got\n{}", uc.nonoclaw_md);
+        assert!(uc.nonoclaw_md.contains("</project_instructions>"),
+                "must close <project_instructions>");
+        assert!(uc.nonoclaw_md.contains("project rules here"),
+                "must embed the file content");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nonoclaw_md_empty_when_no_files() {
+        let tmp = std::env::temp_dir().join(format!("nc_test_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uc = get_user_context(&tmp, &[]);
+        assert!(uc.nonoclaw_md.is_empty(),
+                "no NONOCLAW.md → empty string, got\n{}", uc.nonoclaw_md);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ========================================================================
+    // Batch 6 — SYSTEM.md / APPEND_SYSTEM.md discovery
+    // ========================================================================
+
+    #[test]
+    fn system_md_loaded_from_project_dir() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("nc_test_sysmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".nonoclaw")).unwrap();
+        let mut f = std::fs::File::create(tmp.join(".nonoclaw/SYSTEM.md")).unwrap();
+        writeln!(f, "Custom system prompt body").unwrap();
+        drop(f);
+
+        let uc = get_user_context(&tmp, &[]);
+        assert_eq!(
+            uc.system_md_override.as_deref().map(str::trim),
+            Some("Custom system prompt body"),
+            "SYSTEM.md must be loaded into system_md_override"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_system_md_loaded_from_project_dir() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("nc_test_appmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".nonoclaw")).unwrap();
+        let mut f = std::fs::File::create(tmp.join(".nonoclaw/APPEND_SYSTEM.md")).unwrap();
+        writeln!(f, "extra instructions").unwrap();
+        drop(f);
+
+        let uc = get_user_context(&tmp, &[]);
+        assert_eq!(
+            uc.append_system_md.as_deref().map(str::trim),
+            Some("extra instructions"),
+            "APPEND_SYSTEM.md must be loaded into append_system_md"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn missing_system_files_yield_none() {
+        let tmp = std::env::temp_dir().join(format!("nc_test_nofiles_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let uc = get_user_context(&tmp, &[]);
+        assert!(uc.system_md_override.is_none());
+        assert!(uc.append_system_md.is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
