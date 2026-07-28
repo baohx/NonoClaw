@@ -1113,64 +1113,93 @@ impl QueryEngine {
                     cancel.child_token(),
                 )
                 .await
-                .map_err(|failure| failure.into_core())
             {
                 Ok(t) => t,
-                Err(e) => {
-                    // If the API rejects messages because of orphaned tool_use
-                    // blocks (no matching tool_result), repair and retry once.
-                    let msg = e.to_string();
-                    if msg.contains("tool_use") && msg.contains("tool_result") {
-                        let before = self.messages.len();
-                        repair_tool_pairing(&mut self.messages);
-                        if self.messages.len() != before {
-                            tracing::warn!(
-                                before,
-                                after = self.messages.len(),
-                                "repaired orphaned tool_use/tool_result pairs, retrying"
-                            );
-                            on_event(&RunEvent::RecoveryApplied {
-                                category: "tool_pairing".into(),
-                                detail: "removed orphaned tool-use/result blocks before one retry"
-                                    .into(),
-                                items_affected: before.saturating_sub(self.messages.len()),
-                            });
-                            let params2 = RequestParams {
-                                messages: strip_unsupported_blocks(
-                                    &self.messages,
-                                    self.client
-                                        .capabilities_for_model(&self.options.model)
-                                        .status(ProviderFeature::Images)
-                                        .is_supported(),
-                                ),
-                                trace_label: Some(format!(
-                                    "{}:retry",
-                                    &self.session_id[..8.min(self.session_id.len())]
-                                )),
-                                ..params.clone()
-                            };
-                            self.client
-                                .run_turn_with_cancel(
-                                    &params2,
-                                    |ev| {
-                                        forward_stream_event(
-                                            ev,
-                                            &requested_model,
-                                            &provider,
-                                            turns_made,
-                                            usage_before_turn,
-                                            &mut on_event,
-                                        )
-                                    },
-                                    cancel.child_token(),
-                                )
-                                .await
-                                .map_err(|failure| failure.into_core())?
+                Err(failure) => {
+                    // Graceful truncation: when the provider stream produced
+                    // partial content before failing (e.g. output length limit,
+                    // connection reset mid-response), surface the usable
+                    // output with a truncation notice instead of a hard error.
+                    if !failure.partial.content.is_empty() {
+                        tracing::warn!(
+                            error = %failure.error.message,
+                            partial_blocks = failure.partial.content.len(),
+                            "stream interrupted mid-response, using partial output with truncation notice"
+                        );
+                        let notice = "\n\n---\n⚠️ 输出被截断（流式响应中断，可能已达到最大长度限制）\n[Output truncated — streaming response interrupted]";
+                        on_event(&RunEvent::TextDelta {
+                            text: notice.to_string(),
+                        });
+                        on_event(&RunEvent::RecoveryApplied {
+                            category: "stream_truncation".into(),
+                            detail: format!(
+                                "stream error: {}; partial output preserved with truncation notice",
+                                failure.error.message,
+                            ),
+                            items_affected: failure.partial.content.len(),
+                        });
+                        let mut turn = failure.partial;
+                        turn.content.push(ContentBlock::text(notice));
+                        turn.stop_reason =
+                            turn.stop_reason.or(Some(StopReason::MaxTokens));
+                        turn
+                    } else {
+                        let e = failure.into_core();
+                        // If the API rejects messages because of orphaned tool_use
+                        // blocks (no matching tool_result), repair and retry once.
+                        let msg = e.to_string();
+                        if msg.contains("tool_use") && msg.contains("tool_result") {
+                            let before = self.messages.len();
+                            repair_tool_pairing(&mut self.messages);
+                            if self.messages.len() != before {
+                                tracing::warn!(
+                                    before,
+                                    after = self.messages.len(),
+                                    "repaired orphaned tool_use/tool_result pairs, retrying"
+                                );
+                                on_event(&RunEvent::RecoveryApplied {
+                                    category: "tool_pairing".into(),
+                                    detail: "removed orphaned tool-use/result blocks before one retry"
+                                        .into(),
+                                    items_affected: before.saturating_sub(self.messages.len()),
+                                });
+                                let params2 = RequestParams {
+                                    messages: strip_unsupported_blocks(
+                                        &self.messages,
+                                        self.client
+                                            .capabilities_for_model(&self.options.model)
+                                            .status(ProviderFeature::Images)
+                                            .is_supported(),
+                                    ),
+                                    trace_label: Some(format!(
+                                        "{}:retry",
+                                        &self.session_id[..8.min(self.session_id.len())]
+                                    )),
+                                    ..params.clone()
+                                };
+                                self.client
+                                    .run_turn_with_cancel(
+                                        &params2,
+                                        |ev| {
+                                            forward_stream_event(
+                                                ev,
+                                                &requested_model,
+                                                &provider,
+                                                turns_made,
+                                                usage_before_turn,
+                                                &mut on_event,
+                                            )
+                                        },
+                                        cancel.child_token(),
+                                    )
+                                    .await
+                                    .map_err(|failure| failure.into_core())?
+                            } else {
+                                return Err(e);
+                            }
                         } else {
                             return Err(e);
                         }
-                    } else {
-                        return Err(e);
                     }
                 }
             };
@@ -1222,6 +1251,7 @@ impl QueryEngine {
                 turn.stop_reason.as_ref(),
                 None | Some(StopReason::EndTurn)
                     | Some(StopReason::StopSequence)
+                    | Some(StopReason::MaxTokens)
                     | Some(StopReason::Other(_))
             );
             if finalizing_after_max_turns {

@@ -16,10 +16,15 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Web UI](#web-ui)
 - [Mobile & Remote Access](#mobile--remote-access)
 - [Skills & Plugins](#skills--plugins)
+- [Agent Profiles](#agent-profiles)
+- [Prompt Templates](#prompt-templates)
+- [Project Context Files](#project-context-files)
 - [Configuration (settings.json)](#configuration-settingsjson)
 - [CLI Reference](#cli-reference)
 - [Architecture](#architecture)
 - [中文摘要](#中文摘要)
+
+> 📖 **详细配置手册**：见 [docs/nonoclaw-handbook.md](docs/nonoclaw-handbook.md)（18 章 + 附录，覆盖全部配置项、优先级链、目录结构速查等）。
 
 ---
 
@@ -604,6 +609,67 @@ Three hook kinds supported — **shell command**, **LLM prompt evaluation**, and
 
 ---
 
+## Agent Profiles
+
+Agent Profiles (`~/.nonoclaw/agents/<name>.md` 或 `.nonoclaw/agents/<name>.md`) 提供可插拔的角色配置，控制 Agent 的行为、工具权限和系统提示词。
+
+```markdown
+---
+name: code-reviewer
+description: 专注于代码审查的 Agent
+systemPromptAppend: |
+  你是代码审查专家。只做审查，不做修改。
+  对每个文件输出：1. 潜在 Bug 2. 样式问题 3. 性能优化建议
+toolsAllow: [Read, Grep, Glob, LSP]
+toolsDeny: [Bash, Write, Edit]
+permissionMode: plan
+---
+```
+
+在 `models[]` 中通过 `profile` 字段引用：
+```json
+{ "name": "claude-sonnet-4-5", "profile": "code-reviewer", ... }
+```
+
+应用 profile 后，该模型的 Agent 会自动应用工具限制、权限模式和附加提示词。
+
+---
+
+## Prompt Templates
+
+类似 slash command 别名系统——`/name args` 自动展开为预定义模板。配置目录：`.nonoclaw/prompts/*.md`（项目级优先于 `~/.nonoclaw/prompts/`）。
+
+```markdown
+---
+argument-hint: "issue numbers"
+---
+Review this PR. Focus on $@.
+```
+
+输入 `/pr 123 456` → 自动展开为 `Review this PR. Focus on 123 456.`
+
+**变量语法**：`$1`, `$2`（位置参数）、`$@` / `$ARGUMENTS`（全部参数）、`${N:-default}`（默认值）、`${@:N}`（切片）。
+
+---
+
+## Project Context Files
+
+NonoClaw 从多个文件加载项目上下文，在 system prompt 中以 `<project_context>` XML 标签注入：
+
+| 文件 | 路径 | 作用 |
+|---|---|---|
+| `NONOCLAW.md` | `.nonoclaw/NONOCLAW.md` / `~/.nonoclaw/NONOCLAW.md` | 项目约定、架构决策、依赖说明 |
+| `NONOCLAW.local.md` | `.nonoclaw/NONOCLAW.local.md` | 本地覆盖（应加入 `.gitignore`） |
+| `rules/*.md` | `.nonoclaw/rules/` / `~/.nonoclaw/rules/` | 按文件名排序拼接的规则集 |
+| `SYSTEM.md` | `.nonoclaw/SYSTEM.md` / `~/.nonoclaw/SYSTEM.md` | **完全替换**默认系统提示词主体（谨慎使用） |
+| `APPEND_SYSTEM.md` | `.nonoclaw/APPEND_SYSTEM.md` / `~/.nonoclaw/APPEND_SYSTEM.md` | **追加**内容到系统提示词末尾 |
+
+**三层优先级**：`SYSTEM.md`（替换 BASE 主体）> `NONOCLAW.md`（项目上下文）> `APPEND_SYSTEM.md`（追加）
+
+**--add-dir PATH**：CLI 参数可额外指定附加目录的 `NONOCLAW.md` 搜索路径。
+
+---
+
 ## Configuration (settings.json)
 
 Full example at `~/.nonoclaw/settings.json`:
@@ -651,18 +717,57 @@ Full example at `~/.nonoclaw/settings.json`:
 | `contextWindow` | Global context window (overridden by per-model `contextWindow`) |
 | `maxTokens` | Global max output per turn (overridden by per-model `maxTokens`) |
 | `charsPerToken` | Global chars-per-token estimator (default 4; overridden per-model) |
+| `maxTurns` | Maximum agent turns per run (default 200) |
+| `promptProfile` | System-prompt profile: `"full"` (default) or `"minimal"` (~60% smaller, keeps identity+safety+task-completion only) |
 | `env` | Configuration inputs and `$ENV` references resolved server-side; existing process values take precedence without mutating process state |
-| `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken` |
-| `docModel` | Model name reference for document processing (OCR) |
+| `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken`, `profile`, `apiFormat` |
+| `docModel` | Model name reference (or inline config) for document processing (OCR) |
 | `compactModel` | Model name reference for auto-compaction summarization |
 | `mcpServers` | MCP server configs: `command`, `args`, `env` |
 | `permissions.defaultMode` | `default` / `acceptEdits` / `auto` / `bypassPermissions` / `plan` |
 | `permissions.allow` | Tool patterns to always allow |
 | `permissions.deny` | Tool patterns to always deny |
-| `compactThreshold` | Auto-compact trigger (estimated tokens) |
-| `autoCompact` | Enable/disable auto-compaction |
+| `compactThreshold` | Auto-compact trigger (estimated tokens); defaults to `contextWindow × 75%` when set |
+| `compactMaxTokens` | Compaction summarizer output cap (default 4096; increase for long conversations) |
+| `autoCompact` | Enable/disable auto-compaction (default `true`) |
 | `autoSelectMcp` | Narrow advertised MCP tools to a keyword-relevant subset, pinned per session for a cache-stable tools array (default `true`) |
 | `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `15`) |
+| `thinking` | Provider thinking configuration: `true` or `{"type":"enabled","budget_tokens":16000}` |
+| `executables` | Explicit rust/node/python executable paths and versions (see below) |
+| `elevenlabsApiKey` | ElevenLabs speech-to-text API key |
+
+### Configuration loading (priority low → high)
+
+```
+1. Built-in defaults
+2. ~/.nonoclaw/settings.json                              (user)
+3. <cwd>/.nonoclaw/settings.json                          (project)
+4. <cwd>/.nonoclaw/settings.local.json                    (gitignored)
+5. --settings <path>                                      (explicit file)
+6. <cwd>/.nonoclaw/mcp.json                               (standalone MCP)
+7. --mcp-config <path>                                    (explicit MCP)
+8. Environment variables                                  (process env > file env)
+9. CLI flags / Web requests                               (per-run highest)
+```
+
+**Merge rules**: scalars overwrite higher-priority; `permissions.allow`/`deny` merge+dedupe across layers; `models[]` is replaced wholesale; `mcpServers` merges by name; `hooks` deep-merges; `env` merges by key (process values win).
+
+### Executable overrides
+
+Explicitly set paths when system PATH versions don't match requirements:
+
+```json
+{
+  "executables": {
+    "rust": {
+      "rustc": { "path": "/usr/local/bin/rustc", "version": "1.85.0" },
+      "cargo": { "path": "/usr/local/bin/cargo" }
+    },
+    "node": { "node": { "path": "/opt/node/bin/node" } },
+    "python": { "python": { "path": "/usr/bin/python3" }, "requireVirtualEnv": true }
+  }
+}
+```
 
 ---
 
@@ -814,6 +919,9 @@ NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI�
 - [Web 界面](#web-ui)
 - [移动端与远程访问](#mobile--remote-access)
 - [技能与插件](#skills--plugins)
+- [Agent 配置文件](#agent-profiles)
+- [提示词模板](#prompt-templates)
+- [项目上下文文件](#project-context-files)
 - [配置 (settings.json)](#configuration-settingsjson)
 - [CLI 参考](#cli-reference)
 - [架构](#architecture)
