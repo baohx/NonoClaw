@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import { breathController } from "./breath";
 import { useStore } from "./store";
+import { THEME_IS_DARK } from "./store/slices";
 import { useWebSocket } from "./websocket";
 import BreathField from "./components/BreathField";
 import ChatView from "./components/ChatView";
@@ -73,6 +74,7 @@ export default function App() {
   // Apply CSS theme to <html> so [data-theme] variable overrides take effect.
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.setAttribute("data-color-scheme", THEME_IS_DARK[theme] ? "dark" : "light");
   }, [theme]);
 
   const chatRef = useRef<HTMLDivElement>(null);

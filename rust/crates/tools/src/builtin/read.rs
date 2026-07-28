@@ -25,6 +25,14 @@ impl Tool for ReadTool {
     fn description(&self) -> &'static str {
         "Read a file from the local filesystem."
     }
+    fn snippet(&self) -> String {
+        "Read a file with optional offset/limit".to_string()
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[
+            "Read a file before editing it. Use offset/limit on large files instead of dumping the whole body.",
+        ]
+    }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

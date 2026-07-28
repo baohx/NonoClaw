@@ -25,6 +25,15 @@ impl Tool for EditTool {
     fn description(&self) -> &'static str {
         "Performs exact string replacements in files."
     }
+    fn snippet(&self) -> String {
+        "Replace an exact string in a file (surgical edits)".to_string()
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[
+            "Make each edit with the smallest sufficient old_string so the match is unambiguous.",
+            "If an Edit fails, re-Read the file to confirm current content before retrying.",
+        ]
+    }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

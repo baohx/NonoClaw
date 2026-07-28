@@ -209,6 +209,23 @@ pub trait Tool: Send + Sync {
     /// One-line human-facing description (shown in tool listings).
     fn description(&self) -> &str;
 
+    /// Short (≤80 chars) one-line snippet shown in the system prompt's
+    /// Available Tools list. Default: first line of `description()`, trimmed.
+    /// Override to provide a model-tailored summary independent of the
+    /// human-facing description.
+    fn snippet(&self) -> String {
+        let first = self.description().lines().next().unwrap_or("");
+        first.chars().take(80).collect()
+    }
+
+    /// Behavioural guidelines this tool wants surfaced in the system prompt
+    /// (e.g. "Use Grep instead of rg in Bash for file content searches").
+    /// Collected across active tools and de-duplicated by the prompt builder.
+    /// Default: empty.
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[]
+    }
+
     /// JSON Schema describing the input object. Serialized into the API request.
     fn input_schema(&self) -> Value;
 

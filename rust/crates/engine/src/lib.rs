@@ -8,6 +8,7 @@ pub mod extensions;
 pub mod hooks;
 pub mod loop_;
 pub mod prompt;
+pub mod prompt_templates;
 pub mod run;
 pub mod session;
 pub mod settings;

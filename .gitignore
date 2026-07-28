@@ -37,6 +37,10 @@ __pycache__/
 # NonoClaw runtime data (don't commit sessions / settings)
 .nonoclaw/
 
+# Project documentation & research (local only)
+docs/
+NONOCLAW.md
+
 # Android
 *.apk
 *.aab

@@ -42,6 +42,15 @@ impl Tool for GrepTool {
     fn description(&self) -> &'static str {
         "Search file contents with ripgrep."
     }
+    fn snippet(&self) -> String {
+        "Search file contents with a regex (ripgrep)".to_string()
+    }
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[
+            "Use Grep over Bash-with-`rg` for content searches: faster, respects .gitignore, structured output.",
+            "Combine Grep with Read to inspect the surrounding context of a match.",
+        ]
+    }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

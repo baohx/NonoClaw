@@ -39,7 +39,46 @@ import {
 } from "./transitions";
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
-export type Theme = "biolume" | "amber" | "frost";
+export type Theme = "biolume" | "amber" | "frost"
+  | "meadow" | "crimson" | "teal" | "indigo"
+  | "burgundy" | "gold" | "aqua" | "scarlet"
+  | "espresso" | "ember" | "navy";
+
+/** Hex color for each theme displayed as the status-bar dot. */
+export const THEME_COLORS: Record<Theme, string> = {
+  biolume: "#0071e3",
+  amber:   "#ff9f0a",
+  frost:   "#64d2ff",
+  meadow:  "#34c759",
+  crimson: "#ff3b30",
+  teal:    "#5ac8fa",
+  indigo:  "#5856d6",
+  burgundy:"#af52de",
+  gold:    "#ffd60a",
+  aqua:    "#00CED9",
+  scarlet: "#ff2d55",
+  espresso:"#a2845e",
+  ember:   "#ff6b35",
+  navy:    "#0a84ff",
+};
+
+/** Whether each theme uses a dark background (affects canvas blending, etc). */
+export const THEME_IS_DARK: Record<Theme, boolean> = {
+  biolume: false,
+  amber:   false,
+  frost:   true,
+  meadow:  false,
+  crimson: false,
+  teal:    false,
+  indigo:  true,
+  burgundy: true,
+  gold:    false,
+  aqua:    false,
+  scarlet: false,
+  espresso: true,
+  ember:   false,
+  navy:    true,
+};
 export type BreathState = BreathPhase;
 
 export interface ConnectionSlice extends ConnectionState {
@@ -190,7 +229,6 @@ export interface UiSlice {
   toggleLeftRail: () => void;
   toggleInsight: () => void;
   setTheme: (theme: Theme) => void;
-  cycleTheme: () => void;
   setPermissionMode: (mode: PermissionMode) => void;
 }
 
@@ -558,7 +596,9 @@ function initialTheme(): Theme {
   if (typeof localStorage === "undefined") return "biolume";
   try {
     const value = localStorage.getItem("nonoclaw:theme");
-    return value === "amber" || value === "frost" || value === "biolume" ? value : "biolume";
+    return Object.prototype.hasOwnProperty.call(THEME_COLORS, value as string)
+      ? (value as Theme)
+      : "biolume";
   } catch { return "biolume"; }
 }
 
@@ -575,11 +615,6 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
     try { if (typeof localStorage !== "undefined") localStorage.setItem("nonoclaw:theme", theme); } catch {}
     set({ theme });
   },
-  cycleTheme: () => set((state) => {
-    const theme = state.theme === "biolume" ? "amber" : state.theme === "amber" ? "frost" : "biolume";
-    try { if (typeof localStorage !== "undefined") localStorage.setItem("nonoclaw:theme", theme); } catch {}
-    return { theme };
-  }),
   setPermissionMode: (permissionMode) => set({ permissionMode }),
 });
 

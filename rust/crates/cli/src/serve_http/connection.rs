@@ -1252,7 +1252,13 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             .await;
                         }
                         RunTerminalStatus::Error => {
-                            tracing::error!(run_id = %run_id, "engine run failed (details redacted)");
+                            let reason_text = match &terminal.reason {
+                                nonoclaw_engine::RunFinishReason::Error { message } => {
+                                    nonoclaw_core::redact_text(message)
+                                }
+                                other => format!("{other:?}"),
+                            };
+                            tracing::error!(run_id = %run_id, reason = %reason_text, "engine run failed");
                             send_msg(
                                 &tx2,
                                 ServerMsg::RunError {

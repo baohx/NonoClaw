@@ -42,16 +42,51 @@ const PALETTE_DARK: [number, number, number][] = [
   [167, 243, 208],
 ];
 
+/** Parse a CSS hex color (e.g. "#0071e3") into an RGB tuple. */
+function hexToRgb(hex: string): [number, number, number] | null {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex.trim());
+  return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+}
+
+/** Build a 6-orb palette derived from the theme's CSS variables. */
+function paletteForTheme(accentRgb: [number, number, number]): [number, number, number][] {
+  const [r, g, b] = accentRgb;
+  // Generate harmonious variants by rotating hue and adjusting lightness.
+  return [
+    accentRgb,
+    [Math.min(255, r + 40), Math.min(255, g + 50), Math.min(255, b + 30)],
+    [Math.min(255, r + 60), Math.max(0, g - 10), Math.min(255, b + 40)],
+    [Math.max(0, r - 20), Math.min(255, g + 50), Math.min(255, b + 30)],
+    [Math.min(255, r + 30), Math.min(255, g + 30), Math.max(0, b - 20)],
+    [Math.max(0, r - 10), Math.min(255, g + 60), Math.min(255, b + 50)],
+  ];
+}
+
 function paletteFor(theme: string | null): [number, number, number][] {
-  if (theme === "frost") return PALETTE_DARK;
+  // Read the accent color from CSS variables for a truly per-theme palette.
+  if (typeof window !== "undefined") {
+    const style = getComputedStyle(document.documentElement);
+    const accent = style.getPropertyValue("--accent").trim();
+    const rgb = hexToRgb(accent);
+    if (rgb) return paletteForTheme(rgb);
+  }
+  // Fallback to legacy hardcoded palettes.
+  if (theme === "frost" || theme === "indigo" || theme === "burgundy" || theme === "espresso" || theme === "navy") return PALETTE_DARK;
   if (theme === "amber") return PALETTE_WARM;
   return PALETTE_LIGHT;
 }
 
 function bgFor(theme: string | null): string {
-  if (theme === "frost") return "#161619";
-  if (theme === "amber") return "#faf6ef";
+  if (typeof window !== "undefined") {
+    const style = getComputedStyle(document.documentElement);
+    const bg = style.getPropertyValue("--bg").trim();
+    if (bg) return bg;
+  }
   return "#f5f5f7";
+}
+
+function isDarkTheme(theme: string | null): boolean {
+  return theme === "frost" || theme === "indigo" || theme === "burgundy" || theme === "espresso" || theme === "navy";
 }
 
 function rng(seed: number) {
@@ -117,7 +152,7 @@ export default function BreathField() {
       breathPhase += elapsed * Math.PI * 2 * frame.frequency;
 
       const theme = document.documentElement.getAttribute("data-theme");
-      const isDark = theme === "frost";
+      const isDark = isDarkTheme(theme);
       const palette = paletteFor(theme);
       if (palette !== currentPalette) {
         currentPalette = palette;
