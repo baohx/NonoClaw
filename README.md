@@ -22,9 +22,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Configuration (settings.json)](#configuration-settingsjson)
 - [CLI Reference](#cli-reference)
 - [Architecture](#architecture)
-- [中文摘要](#中文摘要)
-
-> 📖 **详细配置手册**：见 [docs/nonoclaw-handbook.md](docs/nonoclaw-handbook.md)（18 章 + 附录，覆盖全部配置项、优先级链、目录结构速查等）。
+- [中文翻译](#中文翻译)
 
 ---
 
