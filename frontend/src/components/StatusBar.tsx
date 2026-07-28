@@ -1,4 +1,7 @@
+import { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "../store";
+import { THEME_COLORS, type Theme } from "../store/slices";
 
 interface Props {
   model: string;
@@ -12,6 +15,8 @@ interface Props {
   onToggleLeftRail: () => void;
   onToggleInsight: () => void;
 }
+
+const ALL_THEMES = Object.keys(THEME_COLORS) as Theme[];
 
 export default function StatusBar({
   model,
@@ -28,14 +33,38 @@ export default function StatusBar({
   const inputTokens = useStore((s) => s.inputTokens);
   const outputTokens = useStore((s) => s.outputTokens);
   const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
   const hasMobileAccessToken = useStore((s) => s.hasMobileAccessToken);
   const permissionMode = useStore((s) => s.permissionMode);
   const availableModels = useStore((s) => s.availableModels);
   const breathState = useStore((s) => s.breathState);
   const breathLabel = useStore((s) => s.breathLabel);
 
-  const cycleTheme = useStore((s) => s.cycleTheme);
-  const dotColor = theme === "amber" ? "#ff9f0a" : theme === "frost" ? "#0a84ff" : "#0071e3";
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerPos, setPickerPos] = useState<{ top: number; left: number } | null>(null);
+  const dotRef = useRef<HTMLButtonElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
+          dotRef.current && !dotRef.current.contains(e.target as Node)) {
+        setPickerOpen(false);
+      }
+    };
+    if (pickerOpen) document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [pickerOpen]);
+
+  const openPicker = () => {
+    if (dotRef.current) {
+      const r = dotRef.current.getBoundingClientRect();
+      setPickerPos({ top: r.bottom + 6, left: r.left + r.width / 2 });
+    }
+    setPickerOpen(true);
+  };
+
+  const dotColor = THEME_COLORS[theme];
 
   const dotClass = [
     "breath-dot",
@@ -83,12 +112,34 @@ export default function StatusBar({
           </button>
         )}
         <button
+          ref={dotRef}
           className="theme-dot"
           style={{ background: dotColor }}
-          onClick={cycleTheme}
-          title={`Theme: ${theme} (click to cycle)`}
-          aria-label="Cycle theme"
+          onClick={openPicker}
+          title={`Theme: ${theme} (click to change)`}
+          aria-label="Pick theme color"
         />
+        {pickerOpen && pickerPos && createPortal(
+          <div
+            ref={dropdownRef}
+            className="theme-dropdown"
+            style={{ top: pickerPos.top, left: pickerPos.left }}
+          >
+            {ALL_THEMES.map((name) => (
+              <button
+                key={name}
+                className="theme-option"
+                style={{ background: THEME_COLORS[name] }}
+                onClick={() => { setTheme(name); setPickerOpen(false); }}
+                title={name}
+                aria-label={`Theme: ${name}`}
+              >
+                {name === theme && <span className="theme-check" />}
+              </button>
+            ))}
+          </div>,
+          document.body
+        )}
         <button
           className="iconbtn"
           onClick={onToggleInsight}
