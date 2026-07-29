@@ -108,12 +108,17 @@ const MessageCard = memo(function MessageCard({
     );
   }
 
+  const time = msg.timestamp
+    ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
+
   const isUser = msg.role === "user";
   return (
     <div className={`msg msg-enter msg--${isUser ? "user" : "assistant"}`}>
       <div className={`msg__role msg__role--${isUser ? "user" : "assistant"}`}>
         <span className="msg__role-mark" />
         {isUser ? "you" : "Nono"}
+        {time && <span className="msg__time">{time}</span>}
         {/* User message: copy button */}
         {isUser && (
           <button

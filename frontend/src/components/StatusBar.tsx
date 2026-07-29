@@ -39,6 +39,20 @@ export default function StatusBar({
   const availableModels = useStore((s) => s.availableModels);
   const breathState = useStore((s) => s.breathState);
   const breathLabel = useStore((s) => s.breathLabel);
+  const sessions = useStore((s) => s.sessions);
+
+  // Find the current session's started timestamp for display.
+  const currentStarted = sessions.find((s) => s.id === sessionId)?.started ?? null;
+  const sessionDateLabel = (() => {
+    if (!currentStarted) return null;
+    const d = new Date(currentStarted);
+    if (isNaN(d.getTime())) return null;
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${mm}-${dd} ${hh}:${mi}`;
+  })();
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ top: number; left: number } | null>(null);
@@ -108,7 +122,7 @@ export default function StatusBar({
         )}
         {sessionId && (
           <button className="session-pill" onClick={onOpenSessions} title="Switch / resume session">
-            {sessionId.slice(0, 8)} ▾
+            {sessionId.slice(0, 8)}{sessionDateLabel ? ` · ${sessionDateLabel}` : ""} ▾
           </button>
         )}
         <button

@@ -1197,6 +1197,13 @@
       .msg__role--user { color: var(--violet); }
       .msg__role--assistant { color: var(--accent); }
       .msg__role-mark { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+      .msg__time {
+        font-weight: 400;
+        font-size: 9.5px;
+        letter-spacing: 0.03em;
+        color: var(--faint);
+        margin-left: 2px;
+      }
 
       .msg--user .msg__inner { display: flex; justify-content: flex-end; }
       .msg--user .msg__bubble {
@@ -1767,6 +1774,11 @@
         transition: background 0.15s;
       }
       .sp-new:hover { background: var(--accent-soft); }
+
+      .sp-list {
+        display: flex; flex-direction: column; gap: 7px; margin-top: 4px;
+        max-height: calc(5 * 74px + 4 * 7px); overflow-y: auto;
+      }
 
       .q-opt {
         display: flex; align-items: center; gap: 10px;

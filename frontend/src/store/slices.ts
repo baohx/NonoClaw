@@ -351,7 +351,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   availableModels: [],
   addMessage: (message) => set((state) => state.messages.some((item) => item.id === message.id)
     ? {}
-    : { messages: [...state.messages, message] }),
+    : { messages: [...state.messages, { timestamp: Date.now(), ...message }] }),
   ensureStreaming: () => set((state) => ensureStreamingTransition(state)),
   appendStreaming: (text) => set((state) => appendStreamingTransition(state, text)),
   finishStreaming: () => set((state) => finishStreamingTransition(state)),

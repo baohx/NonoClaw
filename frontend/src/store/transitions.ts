@@ -271,6 +271,7 @@ export function ensureStreamingTransition(state: ChatStreamState): ChatStreamSta
     role: "assistant",
     content: "",
     streaming: true,
+    timestamp: Date.now(),
   };
   return {
     messages: [...state.messages, message],

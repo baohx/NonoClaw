@@ -666,6 +666,15 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 },
                             )
                             .await;
+                            // Refresh the list so sessions that received messages
+                            // since the last SessionList push are visible.
+                            send_msg(
+                                &tx,
+                                ServerMsg::SessionList {
+                                    sessions: list_sessions_wire(&state),
+                                },
+                            )
+                            .await;
                         }
                         Err(_) => {
                             send_msg(
@@ -1211,6 +1220,16 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             let current_model = s.active_model.lock().await.clone();
                             let info = s.project_service.snapshot(&current_model).await;
                             send_msg(&tx2, ServerMsg::ProjectInfo { info: info.clone() }).await;
+
+                            // Push a refreshed session list so newly-persisted
+                            // sessions appear in the picker immediately.
+                            send_msg(
+                                &tx2,
+                                ServerMsg::SessionList {
+                                    sessions: list_sessions_wire(&s),
+                                },
+                            )
+                            .await;
 
                             // Broadcast updated messages + project info to all
                             // other peers sharing this session.

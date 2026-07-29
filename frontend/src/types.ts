@@ -566,6 +566,8 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
+  /** When this message was created (epoch ms). */
+  timestamp?: number;
   /** Attachment names associated with this user turn. */
   attachments?: MessageAttachment[];
   /** Tool name (only for tool messages). */
