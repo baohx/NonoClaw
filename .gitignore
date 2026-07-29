@@ -45,3 +45,14 @@ NONOCLAW.md
 *.apk
 *.aab
 local.properties
+# Added by code-review-graph
+.code-review-graph/
+
+# AI tool local configs (auto-generated, machine-specific)
+.claude/
+.codebuddy/
+.gemini/
+.kiro/
+.qoder/
+.mcp.json
+opencode.jsonc
