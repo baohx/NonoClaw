@@ -7,19 +7,64 @@ import { createRenderedExportArtifact, type ExportFormat } from "../export";
 interface Props {
   messages: ChatMessage[];
   streamingIdx: number | null;
+  toolsHidden: boolean;
 }
 
-export default function ChatView({ messages }: Props) {
-  return (
-    <div>
-      {messages.length === 0 && <WelcomeMessage />}
-      {messages.map((msg) => (
+export default function ChatView({ messages, toolsHidden }: Props) {
+  if (!toolsHidden) {
+    return (
+      <div>
+        {messages.length === 0 && <WelcomeMessage />}
+        {messages.map((msg) => (
+          <MessageCard
+            key={msg.id}
+            msg={msg}
+            isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  // toolsHidden: group consecutive tool messages into a single placeholder.
+  const rendered: React.ReactNode[] = [];
+  let toolGroupCount = 0;
+  let groupKeyIndex = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role !== "tool") {
+      toolGroupCount = 0;
+      rendered.push(
         <MessageCard
           key={msg.id}
           msg={msg}
           isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
         />
-      ))}
+      );
+      continue;
+    }
+    // This is a tool message — count it in the current group.
+    toolGroupCount++;
+    // Peek ahead: if the next message is also a tool, skip rendering the placeholder.
+    const nextMsg = messages[i + 1];
+    if (nextMsg && nextMsg.role === "tool") continue;
+    // This is the last tool in a consecutive group — render a single placeholder.
+    rendered.push(
+      <div className="msg msg-enter tool-hidden-placeholder" key={`tool-group-${groupKeyIndex++}`}>
+        <span className="tool-hidden-placeholder__icon">◇</span>
+        <span className="tool-hidden-placeholder__text">
+          {toolGroupCount === 1
+            ? "tool box hidden"
+            : `${toolGroupCount} tool boxes hidden`}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {messages.length === 0 && <WelcomeMessage />}
+      {rendered}
     </div>
   );
 }
@@ -108,9 +153,22 @@ const MessageCard = memo(function MessageCard({
     );
   }
 
-  const time = msg.timestamp
-    ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : "";
+  const time = (() => {
+    if (!msg.timestamp) return "";
+    const d = new Date(msg.timestamp);
+    if (isNaN(d.getTime())) return "";
+    const today = new Date();
+    const sameDay =
+      d.getFullYear() === today.getFullYear() &&
+      d.getMonth() === today.getMonth() &&
+      d.getDate() === today.getDate();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    if (sameDay) return `${hh}:${mi}`;
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${mm}-${dd} ${hh}:${mi}`;
+  })();
 
   const isUser = msg.role === "user";
   return (

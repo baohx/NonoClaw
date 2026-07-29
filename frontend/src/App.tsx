@@ -22,7 +22,7 @@ const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
 import type { AttachmentRef } from "./types";
 
 export default function App() {
-  const { send, forceReconnect } = useWebSocket(WS_URL);
+  const { send } = useWebSocket(WS_URL);
   const connectionStatus = useStore((s) => s.connectionStatus);
   const model = useStore((s) => s.model);
   const sessionId = useStore((s) => s.sessionId);
@@ -49,6 +49,7 @@ export default function App() {
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
+  const [toolsHidden, setToolsHidden] = useState(false);
 
   useEffect(() => breathController.subscribe(({ phase, label }) => {
     setBreathState(phase, label);
@@ -348,14 +349,14 @@ export default function App() {
           <main className="stage">
             <button
               className="chat-refresh"
-              onClick={forceReconnect}
-              title="Reconnect & sync conversation"
-              aria-label="Reconnect and sync"
+              onClick={() => setToolsHidden((v) => !v)}
+              title={toolsHidden ? "Show tool boxes" : "Hide tool boxes"}
+              aria-label="Toggle tool boxes"
             >
-              ↻
+              {toolsHidden ? "◈" : "◇"}
             </button>
             <div ref={chatRef} className="chat-scroll" onScroll={handleScroll}>
-              <ChatView messages={messages} streamingIdx={streamingIdx} />
+              <ChatView messages={messages} streamingIdx={streamingIdx} toolsHidden={toolsHidden} />
             </div>
             <InputBox
               onSubmit={handleSubmit}

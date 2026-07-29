@@ -498,6 +498,22 @@
       }
       .chat-refresh:hover { color: var(--accent); border-color: var(--accent-strong); }
       .chat-refresh:active { transform: rotate(180deg); }
+      .tool-hidden-placeholder {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        margin: 4px 0;
+        border: 1px dashed var(--border);
+        border-radius: var(--radius-sm);
+        background: var(--glass);
+        color: var(--faint);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        cursor: default;
+      }
+      .tool-hidden-placeholder__icon { color: var(--faint); font-size: 12px; }
+      .tool-hidden-placeholder__text { letter-spacing: 0.02em; }
       .chat-scroll {
         flex: 1;
         min-height: 0;
