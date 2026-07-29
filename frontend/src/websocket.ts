@@ -357,6 +357,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
       }
       state.finishStreaming();
       state.setAgentRunning(false);
+      state.setCancelling(false);
       state.cancelMultiRun();
       state.addMessage({
         id: `err-${message.run_id ?? message.timestamp_ms ?? Date.now()}`,

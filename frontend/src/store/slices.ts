@@ -130,6 +130,7 @@ export interface RunSlice {
   activeRunId: string | null;
   compacting: boolean;
   agentRunning: boolean;
+  cancelling: boolean;
   taskChanges: TaskChange[];
   traceEntries: TraceEntry[];
   inputTokens: number;
@@ -145,6 +146,7 @@ export interface RunSlice {
   }, terminal: boolean) => boolean;
   setCompacting: (compacting: boolean) => void;
   setAgentRunning: (agentRunning: boolean) => void;
+  setCancelling: (cancelling: boolean) => void;
   completeRun: () => void;
   startMultiRun: (models: string[], prompt: string) => void;
   consumeMultiModel: (model: string) => void;
@@ -264,6 +266,7 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
     nextMessageId: 1,
     activeRunId: null,
     agentRunning: false,
+    cancelling: false,
     compacting: false,
     multiRun: null,
     taskChanges: [],
@@ -375,6 +378,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
         pendingQuestion: null,
         compacting: false,
         agentRunning: false,
+        cancelling: false,
         activeRunId: null,
       };
     });
@@ -417,6 +421,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     childIdsByParentToolId: {},
     activeRunId: null,
     agentRunning: false,
+    cancelling: false,
     compacting: false,
     multiRun: null,
     pendingPermission: null,
@@ -432,6 +437,7 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
   activeRunId: null,
   compacting: false,
   agentRunning: false,
+  cancelling: false,
   taskChanges: [],
   traceEntries: [],
   inputTokens: 0,
@@ -453,13 +459,15 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
   },
   setCompacting: (compacting) => set({ compacting }),
   setAgentRunning: (agentRunning) => set({ agentRunning }),
+  setCancelling: (cancelling) => set({ cancelling }),
   completeRun: () => set((state) => {
     const remaining = state.multiRun?.remaining ?? [];
-    if (!state.multiRun) return { agentRunning: false, activeRunId: null };
-    if (state.multiRun.nextModel) return { agentRunning: false, activeRunId: null };
-    if (remaining.length === 0) return { agentRunning: false, activeRunId: null, multiRun: null };
+    if (!state.multiRun) return { agentRunning: false, cancelling: false, activeRunId: null };
+    if (state.multiRun.nextModel) return { agentRunning: false, cancelling: false, activeRunId: null };
+    if (remaining.length === 0) return { agentRunning: false, cancelling: false, activeRunId: null, multiRun: null };
     return {
       agentRunning: false,
+      cancelling: false,
       activeRunId: null,
       multiRun: { ...state.multiRun, remaining: remaining.slice(1), nextModel: remaining[0] },
     };

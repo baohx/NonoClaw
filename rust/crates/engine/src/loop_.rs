@@ -1116,6 +1116,12 @@ impl QueryEngine {
             {
                 Ok(t) => t,
                 Err(failure) => {
+                    // User-initiated cancellation takes priority over the
+                    // graceful truncation path, even if partial content was
+                    // received before the stream stopped.
+                    if failure.error.code == nonoclaw_api::ProviderErrorCode::Cancelled {
+                        return Err(failure.into_core());
+                    }
                     // Graceful truncation: when the provider stream produced
                     // partial content before failing (e.g. output length limit,
                     // connection reset mid-response), surface the usable
@@ -1359,6 +1365,13 @@ impl QueryEngine {
                     completed = &mut execution => break completed,
                 }
             };
+
+            // If cancellation fired during tool execution, stop immediately
+            // instead of appending tool results and starting another turn.
+            if cancel.is_cancelled() {
+                return Err(nonoclaw_core::Error::Cancelled);
+            }
+
             // T7.3: a mutating tool ran → next turn must refresh git context.
             if ran_mutating_tool {
                 self.cached_git_context = None;

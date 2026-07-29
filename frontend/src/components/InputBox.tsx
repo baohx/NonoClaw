@@ -6,9 +6,11 @@ import type { AttachmentRef, PermissionMode, UploadResponse } from "../types";
 
 interface Props {
   onSubmit: (text: string, attachments: AttachmentRef[]) => void;
+  onCancel: () => void;
   onSetPermissionMode: (mode: PermissionMode) => void;
   onSetModel: (name: string) => void;
   disabled?: boolean;
+  cancelling?: boolean;
 }
 
 const ALLOWED_EXT = ".pdf,.docx,.doc,.txt,.md,.markdown,.png,.jpg,.jpeg";
@@ -18,7 +20,7 @@ function authenticatedApiUrl(path: string): string {
   return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 }
 
-export default function InputBox({ onSubmit, onSetPermissionMode, onSetModel, disabled }: Props) {
+export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSetModel, disabled, cancelling }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyRef = useRef<string[]>([]);
@@ -389,15 +391,27 @@ export default function InputBox({ onSubmit, onSetPermissionMode, onSetModel, di
               {disabled && <span className="composer__run-status" role="status">Run settings are locked until the current run ends.</span>}
             </div>
           </div>
-          <button
-            className="composer__send"
-            onClick={submit}
-            disabled={!canSend}
-            aria-label="Send message"
-          >
-            send
-            <span className="composer__send__arrow">↗</span>
-          </button>
+          {disabled ? (
+            <button
+              className="composer__stop"
+              onClick={onCancel}
+              disabled={cancelling}
+              aria-label={cancelling ? "Stopping…" : "Stop run (Esc)"}
+              title="Esc"
+            >
+              {cancelling ? "stopping…" : "stop"}
+            </button>
+          ) : (
+            <button
+              className="composer__send"
+              onClick={submit}
+              disabled={!canSend}
+              aria-label="Send message"
+            >
+              send
+              <span className="composer__send__arrow">↗</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -101,6 +101,28 @@ export default function App() {
   const setAgentRunning = useStore((s) => s.setAgentRunning);
   const agentRunning = useStore((s) => s.agentRunning);
   const multiRun = useStore((s) => s.multiRun);
+  const cancelling = useStore((s) => s.cancelling);
+  const setCancelling = useStore((s) => s.setCancelling);
+
+  // ESC key during a run (foreground or background) sends an immediate
+  // cancel. The backend CancellationToken tree stops provider streams,
+  // tool execution, child agents, and background tasks.
+  const handleCancel = useCallback(() => {
+    if (!agentRunning || cancelling) return;
+    setCancelling(true);
+    send({ type: "cancel" });
+  }, [agentRunning, cancelling, send, setCancelling]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && useStore.getState().agentRunning) {
+        e.preventDefault();
+        handleCancel();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleCancel]);
 
   // Multi-model sequencing is owned by the run slice. The timer is scoped to
   // this mounted app and is cancelled on unmount or any session boundary.
@@ -337,7 +359,9 @@ export default function App() {
             </div>
             <InputBox
               onSubmit={handleSubmit}
+              onCancel={handleCancel}
               disabled={compacting || agentRunning}
+              cancelling={cancelling}
               onSetPermissionMode={(mode) => {
                 useStore.getState().setPermissionMode(mode);
                 send({ type: "set_permission_mode", mode });
