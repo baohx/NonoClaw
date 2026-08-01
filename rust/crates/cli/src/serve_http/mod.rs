@@ -6,6 +6,7 @@
 mod connection;
 mod download_service;
 mod http_error;
+mod permission_api;
 mod project_service;
 mod protocol;
 mod run_handler;

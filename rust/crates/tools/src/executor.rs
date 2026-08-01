@@ -323,7 +323,10 @@ impl ToolExecutor {
                     call,
                     metadata,
                     trace,
-                    format!("Permission denied: {reason}"),
+                    format!(
+                        "<human_response>\n  tool: {}\n  decision: denied\n  reason: {reason}\n</human_response>",
+                        call.name
+                    ),
                 );
             }
             PermissionDecision::Ask { message } => {
@@ -384,7 +387,10 @@ impl ToolExecutor {
                     call,
                     metadata,
                     trace,
-                    format!("Permission denied by PreToolUse hook: {reason}"),
+                    format!(
+                        "<human_response>\n  tool: {}\n  decision: denied by PreToolUse hook\n  reason: {reason}\n</human_response>",
+                        call.name
+                    ),
                 );
             }
             PermissionDecision::Ask { message } => {

@@ -344,9 +344,17 @@ fn expand_configured_path(raw: &str, workspace: &Path) -> Option<PathBuf> {
     } else if let Some(rest) = raw.strip_prefix("${WORKSPACE}") {
         workspace.join(rest.trim_start_matches(['/', '\\']))
     } else {
-        PathBuf::from(raw)
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            p
+        } else {
+            // Relative paths resolve against the working directory, same as
+            // `${WORKSPACE}`. This matches the mental model of portable
+            // deployments where executables live next to nonoclaw.exe.
+            workspace.join(p)
+        }
     };
-    expanded.is_absolute().then_some(expanded)
+    Some(expanded)
 }
 
 fn primary_name(name: &str) -> Option<&'static str> {
@@ -705,6 +713,16 @@ mod tests {
             expand_configured_path("${WORKSPACE}/bin/node", workspace),
             Some(PathBuf::from("/workspace/bin/node"))
         );
-        assert_eq!(expand_configured_path("relative/node", workspace), None);
+        // Relative paths resolve against the workspace (not settings dir), and
+        // return the resolved absolute path so callers can probe/canonicalize it.
+        assert_eq!(
+            expand_configured_path("relative/node", workspace),
+            Some(PathBuf::from("/workspace/relative/node"))
+        );
+        // Absolute paths pass through unchanged.
+        assert_eq!(
+            expand_configured_path("/usr/bin/node", workspace),
+            Some(PathBuf::from("/usr/bin/node"))
+        );
     }
 }

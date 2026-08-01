@@ -47,6 +47,7 @@ use crate::project_info::ProjectInfo;
 #[cfg(test)]
 use nonoclaw_engine::{EngineEvent, EventEnvelope};
 
+use super::permission_api::PendingPermissionMeta;
 use super::project_service::ProjectService;
 use super::run_handler::{
     build_options, enrich_prompt_with_attachments, PermissionMap, QuestionMap, WsQuestionResolver,
@@ -73,8 +74,10 @@ pub(super) struct AppState {
     session_service: SessionService,
     /// Session peer registration and revisioned broadcast owner.
     session_hub: SessionHub,
-    pending_permissions: Arc<PermissionMap>,
+    pub(super) pending_permissions: Arc<PermissionMap>,
     pending_questions: Arc<QuestionMap>,
+    /// Metadata for pending permission requests (for REST API inspection).
+    pub(super) permission_meta: PendingPermissionMeta,
     /// Runtime-mutable permission mode (switchable via UI).
     permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
     /// Skill manager: discovers, parses, and dynamically activates skills.
@@ -144,6 +147,7 @@ pub(super) fn upload_exploration_state(
         session_hub: SessionHub::new(),
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        permission_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
         skills_manager,
         project_service,
@@ -297,6 +301,7 @@ pub async fn serve(
         session_hub: SessionHub::new(),
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
+        permission_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
         skills_manager,
         project_service,
@@ -335,6 +340,14 @@ pub async fn serve(
         .route(
             "/api/stt",
             axum::routing::post(super::speech_service::stt_handler),
+        )
+        .route(
+            "/api/sessions/:session_id/permissions",
+            axum::routing::get(super::permission_api::list_pending_permissions),
+        )
+        .route(
+            "/api/sessions/:session_id/permissions/:request_id",
+            axum::routing::post(super::permission_api::resolve_permission),
         )
         .route("/manifest.json", get(super::static_service::serve_manifest))
         .route("/sw.js", get(super::static_service::serve_sw))
@@ -750,6 +763,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     .await;
                 }
             },
+            ClientMsg::SessionPrompts { session_id } => {
+                const PROMPT_PREVIEW_CHARS: usize = 40;
+                let prompts =
+                    super::protocol::session_run_prompts(&state.cwd, &session_id, PROMPT_PREVIEW_CHARS);
+                send_msg(&tx, ServerMsg::SessionPrompts { session_id, prompts }).await;
+            }
             ClientMsg::OpenFile { path, force_code } => {
                 if state.project_service.open(&path, force_code).is_err() {
                     tracing::warn!(
@@ -899,6 +918,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 *s.permission_mode.lock().await,
                                 Arc::clone(&s.skills_manager),
                                 Arc::clone(&s.background_registry),
+                                Arc::clone(&s.permission_meta),
                             );
                             o.max_turns = o.max_turns.min(20);
                             o.is_non_interactive = true;
@@ -1075,6 +1095,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         *s.permission_mode.lock().await,
                         Arc::clone(&s.skills_manager),
                         Arc::clone(&s.background_registry),
+                        Arc::clone(&s.permission_meta),
                     );
 
                     // Question resolver (per-run to avoid oneshot key clashes).
@@ -1500,6 +1521,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     *state.permission_mode.lock().await,
                     Arc::clone(&state.skills_manager),
                     Arc::clone(&state.background_registry),
+                    Arc::clone(&state.permission_meta),
                 );
                 let compact_client = match state
                     .config
@@ -1594,6 +1616,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 request_id,
                 decision,
             } => {
+                state.permission_meta.lock().await.remove(&request_id);
                 let sender = state.pending_permissions.lock().await.remove(&request_id);
                 if let Some(sender) = sender {
                     let decision = match decision.as_str() {
@@ -1619,6 +1642,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     if let Some(handle) = run_handle.take() {
         let _ = handle.await;
     }
+    // Note on Factor 6: pending permission metadata remains in the shared
+    // `permission_meta` map after disconnection. The run itself is cancelled,
+    // so resolving it via REST returns 410 Gone. Stale entries are cleaned up
+    // lazily on next access. A future improvement would decouple run lifetime
+    // from WebSocket lifetime to enable true cross-connection pause/resume.
     // Loop exited — stop the keepalive pinger for this connection.
     ping_handle.abort();
     // Connection closed — remove this Tx from the shared session's broadcast
@@ -1706,6 +1734,7 @@ mod characterization_tests {
             ClientMsg::OpenFile { .. } => "open_file",
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
             ClientMsg::GitShow { .. } => "git_show",
+            ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
         }
@@ -1860,6 +1889,9 @@ mod characterization_tests {
                 request_id: "q".into(),
                 prompt: "choose".into(),
                 options: vec!["a".into()],
+                context: None,
+                urgency: "medium".into(),
+                format: "multiple_choice".into(),
             },
             ServerMsg::Done {
                 protocol_version: WS_PROTOCOL_VERSION,

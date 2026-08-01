@@ -206,7 +206,13 @@ fn walk_dir(root: &Path, dir: &Path, depth: u32, out: &mut Vec<FileEntry>, count
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        if name.starts_with('.') || is_dir && FILE_TREE_SKIP_DIRS.contains(&name.as_str()) {
+        // NonoClaw's own config directory stays visible — it holds the files
+        // (NONOCLAW.md, settings, skills, rules, prompts, agents) that this UI
+        // is designed to surface and edit.
+        let is_nonoclaw_config = name == ".nonoclaw";
+        if (name.starts_with('.') && !is_nonoclaw_config)
+            || is_dir && FILE_TREE_SKIP_DIRS.contains(&name.as_str())
+        {
             continue;
         }
         let Ok(relative) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
@@ -345,5 +351,22 @@ mod tests {
         let entries = build_file_tree(temp.path());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "visible.txt");
+    }
+
+    #[test]
+    fn file_tree_keeps_nonoclaw_config_dir_but_hides_other_dotfiles() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".nonoclaw/rules")).unwrap();
+        std::fs::write(temp.path().join(".nonoclaw/NONOCLAW.md"), "cfg").unwrap();
+        std::fs::write(temp.path().join(".nonoclaw/rules/a.md"), "rule").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "x").unwrap();
+        std::fs::write(temp.path().join("visible.txt"), "ok").unwrap();
+        let entries = build_file_tree(temp.path());
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&".nonoclaw"));
+        assert!(paths.contains(&".nonoclaw/NONOCLAW.md"));
+        assert!(paths.contains(&".nonoclaw/rules/a.md"));
+        assert!(!paths.contains(&".gitignore"));
+        assert!(paths.contains(&"visible.txt"));
     }
 }

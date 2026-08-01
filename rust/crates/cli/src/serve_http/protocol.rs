@@ -64,6 +64,9 @@ pub(super) enum ClientMsg {
     GitShow {
         sha: String,
     },
+    SessionPrompts {
+        session_id: String,
+    },
     SetPermissionMode {
         mode: String,
     },
@@ -132,6 +135,9 @@ pub(super) enum ServerMsg {
         request_id: String,
         prompt: String,
         options: Vec<String>,
+        context: Option<String>,
+        urgency: String,
+        format: String,
     },
     Done {
         protocol_version: u16,
@@ -180,6 +186,10 @@ pub(super) enum ServerMsg {
         root: String,
         entries: Vec<FileEntry>,
     },
+    SessionPrompts {
+        session_id: String,
+        prompts: Vec<SessionRunPrompt>,
+    },
     ProjectInfo {
         info: ProjectInfo,
     },
@@ -190,6 +200,13 @@ pub(super) enum ServerMsg {
         sha: String,
         output: String,
     },
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(super) struct SessionRunPrompt {
+    pub preview: String,
+    pub message_index: usize,
+    pub timestamp_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -222,6 +239,7 @@ pub(super) fn timestamp_ms() -> u64 {
 }
 
 pub(super) fn messages_loaded(session_id: &str, snapshot: SessionSnapshot) -> ServerMsg {
+    let started_ms = snapshot.started.as_deref().and_then(parse_rfc3339_ms);
     ServerMsg::MessagesLoaded {
         protocol_version: WS_PROTOCOL_VERSION,
         session_id: session_id.to_string(),
@@ -230,20 +248,154 @@ pub(super) fn messages_loaded(session_id: &str, snapshot: SessionSnapshot) -> Se
         messages: snapshot
             .messages
             .into_iter()
-            .map(message_for_wire)
+            .enumerate()
+            .map(|(index, message)| message_for_wire(message, started_ms, index))
             .collect(),
     }
+}
+
+/// Parse an RFC3339 timestamp into epoch milliseconds (session `started`
+/// headers are written in local RFC3339 form).
+fn parse_rfc3339_ms(value: &str) -> Option<u64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    u64::try_from(dt.timestamp_millis()).ok()
+}
+
+/// Estimate a persisted message's display time from the session start time
+/// plus its ordinal position. Exact per-message timestamps are not recorded
+/// in the JSONL format, so spacing is synthetic but monotonic.
+fn estimated_message_ms(started_ms: Option<u64>, index: usize) -> Option<u64> {
+    started_ms.map(|base| base + (index as u64) * 1000)
+}
+
+/// Extract the first user prompt of each run from a session JSONL file.
+///
+/// A "run" boundary is defined as: a real user text message that follows at
+/// least one assistant message since the previous real user message. The
+/// first real user message in the file always opens run #1. Tool results
+/// (user role carrying only `tool_result` blocks) never open a run.
+pub(super) fn session_run_prompts(
+    cwd: &std::path::Path,
+    session_id: &str,
+    max_chars: usize,
+) -> Vec<SessionRunPrompt> {
+    let Some(path) = nonoclaw_engine::session::session_path(cwd, session_id) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let started_ms = text
+        .lines()
+        .find_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            if value.get("kind").and_then(|k| k.as_str()) != Some("session") {
+                return None;
+            }
+            value
+                .get("started")
+                .and_then(|s| s.as_str())
+                .and_then(parse_rfc3339_ms)
+        });
+
+    let mut prompts = Vec::new();
+    let mut message_index = 0usize;
+    let mut seen_assistant_since_prompt = false;
+    for raw in text.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if value.get("kind").and_then(|k| k.as_str()) != Some("message") {
+            continue;
+        }
+        let index = message_index;
+        message_index += 1;
+        let role = value.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "assistant" => seen_assistant_since_prompt = true,
+            "user" => {
+                let is_tool_result_only = value
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|blocks| {
+                        !blocks.is_empty()
+                            && blocks.iter().all(|b| {
+                                b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            })
+                    });
+                if is_tool_result_only {
+                    continue;
+                }
+                let opens_run = prompts.is_empty() || seen_assistant_since_prompt;
+                if !opens_run {
+                    continue;
+                }
+                let text_body = extract_user_text(value.get("content"));
+                if text_body.is_empty() {
+                    continue;
+                }
+                let preview = truncate_chars(text_body.trim(), max_chars);
+                prompts.push(SessionRunPrompt {
+                    preview,
+                    message_index: index,
+                    timestamp_ms: estimated_message_ms(started_ms, index),
+                });
+                seen_assistant_since_prompt = false;
+            }
+            _ => {}
+        }
+    }
+    prompts
+}
+
+/// Pull the visible text out of a user message content value (string form or
+/// text blocks; tool_result / image blocks are ignored).
+fn extract_user_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block.get("text").and_then(|t| t.as_str()).map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Convert persisted model messages to the browser compatibility shape while
 /// removing data that the UI never needs: provider thinking/signatures,
 /// attachment bytes/extracted bodies, and unsafe tool payload fields.
-fn message_for_wire(message: Message) -> serde_json::Value {
+fn message_for_wire(
+    message: Message,
+    started_ms: Option<u64>,
+    index: usize,
+) -> serde_json::Value {
     let attachments = attachment_filenames(&message.content);
     let mut wire = serde_json::json!({
         "role": message.role,
         "content": safe_message_content(message.content),
     });
+    if let Some(ts) = estimated_message_ms(started_ms, index) {
+        wire["ts"] = serde_json::Value::from(ts);
+    }
     if !attachments.is_empty() {
         wire["attachments"] = serde_json::Value::Array(
             attachments
@@ -438,6 +590,40 @@ mod tests {
     use nonoclaw_core::{ImageSource, Role};
 
     #[test]
+    fn session_run_prompts_detects_run_boundaries() {
+        let dir = std::env::temp_dir().join(format!("nonoclaw-prompts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "test-session";
+        let path = nonoclaw_engine::session::session_path(&dir, id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines = [
+            r#"{"kind":"session","id":"test-session","cwd":"/x","model":"m","started":"2026-07-30T10:00:00+08:00"}"#,
+            r#"{"kind":"message","role":"user","content":"first question here"}"#,
+            r#"{"kind":"message","role":"assistant","content":[{"type":"text","text":"answer"}]}"#,
+            r#"{"kind":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}"#,
+            r#"{"kind":"message","role":"assistant","content":[{"type":"text","text":"more"}]}"#,
+            r#"{"kind":"message","role":"user","content":"second question that is deliberately quite a bit longer than forty characters"}"#,
+            r#"{"kind":"message","role":"assistant","content":[{"type":"text","text":"done"}]}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let prompts = session_run_prompts(&dir, id, 40);
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].preview, "first question here");
+        assert_eq!(prompts[0].message_index, 0);
+        assert!(prompts[0].timestamp_ms.is_some());
+        assert_eq!(prompts[1].message_index, 4);
+        assert!(prompts[1].preview.ends_with("..."));
+        assert_eq!(prompts[1].preview.chars().count(), 43);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_run_prompts_missing_file_returns_empty() {
+        let dir = std::path::Path::new("/nonexistent-dir-xyz");
+        assert!(session_run_prompts(dir, "nope", 40).is_empty());
+    }
+
+    #[test]
     fn session_wire_messages_hide_thinking_attachments_and_sensitive_tool_fields() {
         // **Validates: Requirements 8.8, 9.8, 11.1**
         let attachment = Message::user(MessageContent::from_blocks(vec![
@@ -478,7 +664,7 @@ mod tests {
             ]),
         };
 
-        let attachment_wire = message_for_wire(attachment);
+        let attachment_wire = message_for_wire(attachment, None, 0);
         assert_eq!(
             attachment_wire["attachments"],
             serde_json::json!([
@@ -490,7 +676,7 @@ mod tests {
             attachment_wire["content"],
             serde_json::json!([{ "type": "text", "text": "please summarize" }])
         );
-        let encoded = serde_json::json!([attachment_wire, message_for_wire(assistant)]).to_string();
+        let encoded = serde_json::json!([attachment_wire, message_for_wire(assistant, None, 1)]).to_string();
         for forbidden in [
             "private attachment body",
             "private-image-data",
@@ -522,6 +708,7 @@ mod tests {
             ClientMsg::OpenFile { .. } => "open_file",
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
             ClientMsg::GitShow { .. } => "git_show",
+            ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
         }

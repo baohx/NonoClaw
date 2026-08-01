@@ -91,13 +91,13 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. No embeddings, no vector DB. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
 | **Core Tools (registry-derived)** | Core tool names and model-facing schemas come from `ToolRegistry` and are contract-tested against `rust/crates/tools/tests/snapshots/builtin_tool_contract.json`; MCP tools are added dynamically. The runtime registry, not this README, is the count/source of truth. |
-| **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts, tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
+| **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts (`systemPromptAppend` or **`systemPromptOverride`**), tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
 | **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge**, **session-pinned keyword selection** (advertise only the relevant MCP-tool subset per session so the tools array stays cache-stable; `autoSelectMcp`/`autoSelectMcpTopK`) |
 | **Unified Model Profiles** | All models in single `models[]` array with `role` tags (`main`/`doc`/`compact`); `docModel` and `compactModel` reference by name; **per-model contextWindow / maxTokens / charsPerToken**; **compactModel** independent summarization model |
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
-| **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown |
+| **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
 | **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session), **per-model token estimation** |
 | **Goal Tracking** | Multi-step task plans in `memory/goals/*.md`. Agent self-manages steps, verification criteria, and progress. `Memory goal_create/goal_update/goal_list` actions. |
@@ -413,6 +413,8 @@ Also configurable via `settings.json`:
 { "permissions": { "defaultMode": "auto" } }
 ```
 
+**REST API** (v0.10+): `GET /api/sessions/:id/permissions` lists pending permission requests; `POST /api/sessions/:id/permissions/:request_id` approves or denies. Enables CI/CD pipelines and webhooks to manage agent permissions without an active WebSocket connection.
+
 ---
 
 ## Web UI
@@ -629,7 +631,13 @@ permissionMode: plan
 { "name": "claude-sonnet-4-5", "profile": "code-reviewer", ... }
 ```
 
-应用 profile 后，该模型的 Agent 会自动应用工具限制、权限模式和附加提示词。
+应用 profile 后，该模型的 Agent 会自动应用工具限制、权限模式和提示词。
+
+**两种 prompt 控制**（v0.10+）：
+- `systemPromptAppend` — 在默认系统提示词基础上**追加**内容
+- `systemPromptOverride` — **完全替换**子 Agent 系统提示词（非空时忽略 `systemPromptAppend`）
+
+适用于高度专业化的子 Agent（如"代码审查专用"、"测试生成专用"）。
 
 ---
 
@@ -1282,6 +1290,8 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 ```json
 { "permissions": { "defaultMode": "auto" } }
 ```
+
+**REST API**（v0.10+）：`GET /api/sessions/:id/permissions` 列出待处理权限请求；`POST /api/sessions/:id/permissions/:request_id` 审批或拒绝。支持 CI/CD 流水线和 webhook 在无 WebSocket 连接下管理 Agent 权限。
 
 ---
 

@@ -19,7 +19,10 @@ use crate::tool::{Tool, ToolCtx, ToolResult};
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 1_200_000;
 
-const PROMPT: &str = "Executes a command inside a persistent shell and returns its combined stdout+stderr.\n\nThe working directory persists between calls. Shell environment (env vars, aliases) does not — each invocation starts from a fresh profile. On Linux/macOS the shell is bash; on Windows it is cmd /C.\n\nIMPORTANT: Always prefer dedicated tools (Read, Write, Edit, Grep, Glob, WebFetch, WebSearch) over raw shell commands. Only use Bash when no dedicated tool exists for the task.\n\n## Available commands\n- Package managers: cargo, npm, pip, apt, brew, etc.\n- Git: `git status`, `git diff`, `git log`, `git add -p`, `git commit -m`, `git stash`, `git branch`. NEVER run `git push --force`, `git reset --hard`, `git branch -D`, or destructive git commands unless the user explicitly requests them. NEVER update git config.\n- Build/test: `cargo build`, `cargo test`, `cargo check`, `npm test`, `make`, etc.\n- File listing: `ls -la`, `find`, `tree`. Prefer the Glob tool for pattern-based file discovery.\n- System info: `uname -a`, `which`, `env`, `cat /proc/cpuinfo` (Linux).\n- NEVER run interactive commands (e.g. commands without `-y` / `--yes`).\n- NEVER run destructive system commands (`sudo rm -rf /`, `shutdown`, `reboot`, etc.) unless the user explicitly requests them.\n\n## Parameters\n- `command` (required): the shell command to execute.\n- `timeout_ms` (optional, default 300000 = 5 minutes, max 1200000 = 20 minutes). Increase for long builds.\n- `run_in_background` (optional): start a managed background task and return its task ID immediately.\n\n## Output\n- Combined stdout+stderr. Oversized results are summarized by the shared tool runtime, with the complete output saved to a local reference.\n- The exit code is appended to the output for non-zero exits.\n- If the command succeeds but produces no output, `[ok — no output]` is returned.";
+const PROMPT: &str = "Executes a command inside a persistent shell and returns its combined stdout+stderr.\n\nThe working directory persists between calls. Shell environment (env vars, aliases) does not — each invocation starts from a fresh profile. On Linux/macOS the shell is bash; on Windows it is cmd /C.\n\nIMPORTANT: Always prefer dedicated tools (Read, Write, Edit, Grep, Glob, WebFetch, WebSearch) over raw shell commands. Only use Bash when no dedicated tool exists for the task.\n\n## Available commands\n- Package managers: cargo, npm, pip, apt, brew, etc.\n- Git: `git status`, `git diff`, `git log`, `git add -p`, `git commit -m`, `git stash`, `git branch`. NEVER run `git push --force`, `git reset --hard`, `git branch -D`, or destructive git commands unless the user explicitly requests them. NEVER update git config.\n- Build/test: `cargo build`, `cargo test`, `cargo check`, `npm test`, `make`, etc.\n- File listing: `ls -la`, `find`, `tree`. Prefer the Glob tool for pattern-based file discovery.\n- System info: `uname -a`, `which`, `env`, `cat /proc/cpuinfo` (Linux).\n- NEVER run interactive commands (e.g. commands without `-y` / `--yes`). stdin is closed — commands that prompt for input (sudo, ssh, passwd, etc.) will fail immediately.
+- When a command needs stdin input, use heredoc (`<<'EOF'`) or pipe the data in.
+- The agent automatically inserts `-n` after `sudo` so it runs in non-interactive mode. To allow passwordless sudo for specific commands, add a NOPASSWD rule via `visudo`, e.g.:
+  `username ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl`\n- NEVER run destructive system commands (`sudo rm -rf /`, `shutdown`, `reboot`, etc.) unless the user explicitly requests them.\n\n## Parameters\n- `command` (required): the shell command to execute.\n- `timeout_ms` (optional, default 300000 = 5 minutes, max 1200000 = 20 minutes). Increase for long builds.\n- `run_in_background` (optional): start a managed background task and return its task ID immediately.\n\n## Output\n- Combined stdout+stderr. Oversized results are summarized by the shared tool runtime, with the complete output saved to a local reference.\n- The exit code is appended to the output for non-zero exits.\n- If the command succeeds but produces no output, `[ok — no output]` is returned.";
 
 pub struct BashTool;
 
@@ -79,7 +82,12 @@ impl Tool for BashTool {
         ctx: &ToolCtx<'_>,
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
-        let command = require_command(&input)?;
+        let raw_command = require_command(&input)?;
+        // sudo reads from the terminal by default — but stdin is closed and
+        // there is no TTY. Insert `-n` (non-interactive) so that:
+        //  - commands the user has allowed via NOPASSWD in sudoers succeed
+        //  - everything else fails immediately with "sudo: a password is required"
+        let command = ensure_sudo_noninteractive(raw_command);
         let timeout_ms = input["timeout_ms"]
             .as_u64()
             .unwrap_or(DEFAULT_TIMEOUT_MS)
@@ -89,7 +97,7 @@ impl Tool for BashTool {
         if input["run_in_background"].as_bool().unwrap_or(false) {
             if let Some(ref reg) = ctx.background_registry {
                 let task_id = reg.lock().unwrap().spawn_in_with_cancel(
-                    command,
+                    &command,
                     ctx.cwd,
                     timeout_ms,
                     cancel.child_token(),
@@ -113,12 +121,18 @@ impl Tool for BashTool {
         let (shell, arg) = ("bash", "-c");
 
         let mut cmd = Command::new(shell);
-        cmd.arg(arg).arg(command);
-        // `bash --login` loads the user's profile; cmd /C doesn't need one.
+        // `bash --login` loads the user's profile before executing -c; cmd /C
+        // doesn't need it.
         #[cfg(not(windows))]
         {
             cmd.arg("--login");
         }
+        cmd.arg(arg).arg(command);
+        // Close stdin so interactive commands (sudo, ssh, passwd, etc.)
+        // fail-fast with EOF instead of hanging until the timeout. The agent
+        // should use non-interactive flags (-n, --yes, --non-interactive) or
+        // inline input via heredoc/piping instead.
+        cmd.stdin(std::process::Stdio::null());
 
         let mut child = cmd
             .current_dir(ctx.cwd)
@@ -185,6 +199,26 @@ fn require_command(input: &Value) -> Result<&str> {
     })
 }
 
+/// Insert `-n` after `sudo` so it runs in non-interactive mode.
+/// `sudo apt install` → `sudo -n apt install`
+/// `sudo` already has `-n` → no change.
+/// Non-sudo commands pass through unchanged.
+fn ensure_sudo_noninteractive(cmd: &str) -> String {
+    let trimmed = cmd.trim_start();
+    let indent = &cmd[..cmd.len() - trimmed.len()];
+    let mut words = trimmed.split_whitespace();
+    if words.next() != Some("sudo") {
+        return cmd.to_string();
+    }
+    // Already has -n somewhere in the args — don't double-add.
+    if trimmed.split_whitespace().any(|w| w == "-n") {
+        return cmd.to_string();
+    }
+    // Insert -n right after sudo, preserving any whitespace that followed it.
+    let after_sudo = trimmed.strip_prefix("sudo").unwrap();
+    format!("{indent}sudo -n{after_sudo}")
+}
+
 /// Very small read-only heuristic for common harmless commands. Not a security
 /// boundary — the real classifier is deferred. Conservative: any shell
 /// metacharacter, chaining operator, or risky subcommand -> treat as mutating.
@@ -218,5 +252,22 @@ mod tests {
         assert!(!classify_readonly("rm -rf /"));
         assert!(!classify_readonly("echo hi | sudo tee /etc/x"));
         assert!(classify_readonly(""));
+    }
+
+    #[test]
+    fn sudo_gets_noninteractive_flag() {
+        assert_eq!(ensure_sudo_noninteractive("sudo apt install"), "sudo -n apt install");
+        assert_eq!(ensure_sudo_noninteractive("sudo systemctl restart nginx"), "sudo -n systemctl restart nginx");
+        assert_eq!(ensure_sudo_noninteractive("  sudo make install"), "  sudo -n make install");
+        // Plain sudo with no args
+        assert_eq!(ensure_sudo_noninteractive("sudo"), "sudo -n");
+        // Already has -n — no change
+        assert_eq!(ensure_sudo_noninteractive("sudo -n apt install"), "sudo -n apt install");
+        assert_eq!(ensure_sudo_noninteractive("sudo -E -n apt install"), "sudo -E -n apt install");
+        // Non-sudo commands pass through
+        assert_eq!(ensure_sudo_noninteractive("ls -la"), "ls -la");
+        assert_eq!(ensure_sudo_noninteractive("apt install"), "apt install");
+        // sudo in a pipe is NOT modified (not a leading sudo)
+        assert_eq!(ensure_sudo_noninteractive("echo foo | sudo tee /x"), "echo foo | sudo tee /x");
     }
 }

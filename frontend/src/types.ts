@@ -190,6 +190,9 @@ export interface QuestionRequired {
   request_id: string;
   prompt: string;
   options: string[];
+  context?: string | null;
+  urgency?: string | null;
+  format?: string | null;
 }
 
 export interface DoneResult extends RunWireMeta {
@@ -264,6 +267,19 @@ export interface FileTreeMsg {
   type: "file_tree";
   root: string;
   entries: FileEntry[];
+}
+
+/** First user prompt of one run within a session (for the rail browser). */
+export interface SessionRunPrompt {
+  preview: string;
+  message_index: number;
+  timestamp_ms?: number | null;
+}
+
+export interface SessionPromptsMsg {
+  type: "session_prompts";
+  session_id: string;
+  prompts: SessionRunPrompt[];
 }
 
 // ── Project context (Insight rail + Git pane) ──────────────────────────────
@@ -427,6 +443,11 @@ export interface GitShowRequest {
   sha: string;
 }
 
+export interface SessionPromptsRequest {
+  type: "session_prompts";
+  session_id: string;
+}
+
 export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions" | "plan";
 
 export interface SetPermissionModeRequest {
@@ -455,6 +476,7 @@ export type ServerMsg =
   | SessionListMsg
   | MessagesLoadedMsg
   | FileTreeMsg
+  | SessionPromptsMsg
   | ProjectInfoMsg
   | SystemProbeMsg
   | GitShowMsg;
@@ -553,6 +575,7 @@ export type ClientMsg =
   | OpenFileRequest
   | ProjectInfoRefreshRequest
   | GitShowRequest
+  | SessionPromptsRequest
   | SetPermissionModeRequest
   | SetModelRequest;
 
@@ -580,4 +603,7 @@ export interface ChatMessage {
   streaming?: boolean;
   /** Collapsed tool output. */
   collapsed?: boolean;
+  /** Index of the source JSONL message this chat entry derives from
+   * (restored sessions only — used by the session rail to locate prompts). */
+  srcIndex?: number;
 }

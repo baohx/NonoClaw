@@ -28,6 +28,11 @@ pub struct AgentProfile {
     /// Additional text appended to the system prompt when this profile is active.
     #[serde(default, rename = "system_prompt_append")]
     pub system_prompt_append: Option<String>,
+    /// When set, **completely replaces** the fixed subagent prompt (and any
+    /// append text) with this content. Use for highly specialized agents that
+    /// need an entirely different instruction set rather than an addition.
+    #[serde(default, rename = "system_prompt_override")]
+    pub system_prompt_override: Option<String>,
     /// Tools to allow (if empty, all tools allowed).
     #[serde(default, rename = "tools_allow")]
     pub tools_allow: Vec<String>,
@@ -220,12 +225,17 @@ pub(crate) fn apply_subagent_profile(
         }
     }
 
-    options.append_system_prompt = Some(
-        match profile.and_then(|p| p.system_prompt_append.as_deref()) {
+    // Override takes complete precedence over append: the profile provides
+    // a standalone instruction set, bypassing the default fixed prompt.
+    options.append_system_prompt = Some(match profile {
+        Some(p) if p.system_prompt_override.as_deref().is_some_and(|s| !s.trim().is_empty()) => {
+            p.system_prompt_override.clone().unwrap()
+        }
+        _ => match profile.and_then(|p| p.system_prompt_append.as_deref()) {
             Some(extra) if !extra.trim().is_empty() => format!("{fixed_prompt}\n\n{extra}"),
             _ => fixed_prompt,
         },
-    );
+    });
 }
 
 fn permission_strictness(mode: nonoclaw_core::PermissionMode) -> u8 {
@@ -625,5 +635,56 @@ Body text here."#;
             at_limit.run(async { Ok(()) }).await,
             Err(Error::Other(message)) if message.contains("recursion depth")
         ));
+    }
+
+    #[test]
+    fn system_prompt_override_replaces_fixed_prompt_entirely() {
+        let profile = AgentProfile {
+            name: "specialist".into(),
+            system_prompt_override: Some(
+                "You are a code reviewer. Review code diffs and provide feedback only.".into(),
+            ),
+            ..Default::default()
+        };
+        let mut options = crate::EngineOptions::default();
+        apply_subagent_profile(&mut options, Some(&profile), "Default fixed prompt.".into());
+        assert_eq!(
+            options.append_system_prompt.as_deref(),
+            Some("You are a code reviewer. Review code diffs and provide feedback only.")
+        );
+        assert!(!options
+            .append_system_prompt
+            .as_deref()
+            .unwrap_or("")
+            .contains("Default fixed prompt."));
+    }
+
+    #[test]
+    fn system_prompt_override_takes_precedence_over_append() {
+        let profile = AgentProfile {
+            name: "specialist".into(),
+            system_prompt_override: Some("Override content.".into()),
+            system_prompt_append: Some("Append content.".into()),
+            ..Default::default()
+        };
+        let mut options = crate::EngineOptions::default();
+        apply_subagent_profile(&mut options, Some(&profile), "Fixed.".into());
+        assert_eq!(options.append_system_prompt.as_deref(), Some("Override content."));
+    }
+
+    #[test]
+    fn empty_system_prompt_override_falls_back_to_append() {
+        let profile = AgentProfile {
+            name: "specialist".into(),
+            system_prompt_override: Some("   ".into()),
+            system_prompt_append: Some("Append content.".into()),
+            ..Default::default()
+        };
+        let mut options = crate::EngineOptions::default();
+        apply_subagent_profile(&mut options, Some(&profile), "Fixed prompt.".into());
+        assert_eq!(
+            options.append_system_prompt.as_deref(),
+            Some("Fixed prompt.\n\nAppend content.")
+        );
     }
 }

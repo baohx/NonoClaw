@@ -157,22 +157,18 @@ const MessageCard = memo(function MessageCard({
     if (!msg.timestamp) return "";
     const d = new Date(msg.timestamp);
     if (isNaN(d.getTime())) return "";
-    const today = new Date();
-    const sameDay =
-      d.getFullYear() === today.getFullYear() &&
-      d.getMonth() === today.getMonth() &&
-      d.getDate() === today.getDate();
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mi = String(d.getMinutes()).padStart(2, "0");
-    if (sameDay) return `${hh}:${mi}`;
+    const yyyy = d.getFullYear();
     const mm = String(d.getMonth() + 1).padStart(2, "0");
     const dd = String(d.getDate()).padStart(2, "0");
-    return `${mm}-${dd} ${hh}:${mi}`;
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
   })();
 
   const isUser = msg.role === "user";
+  const located = useStore((s) => s.locatedMessageId === msg.id);
   return (
-    <div className={`msg msg-enter msg--${isUser ? "user" : "assistant"}`}>
+    <div id={`msg-${msg.id}`} className={`msg msg-enter msg--${isUser ? "user" : "assistant"}${located ? " msg--located" : ""}`}>
       <div className={`msg__role msg__role--${isUser ? "user" : "assistant"}`}>
         <span className="msg__role-mark" />
         {isUser ? "you" : "Nono"}

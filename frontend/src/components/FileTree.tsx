@@ -8,6 +8,8 @@ interface Props {
   entries: FileEntry[];
   onOpen: (path: string, forceCode: boolean) => void;
   onRefresh: () => void;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
 }
 
 /** Basename of the cwd — shown as the tree root label. */
@@ -46,7 +48,7 @@ function fileGlyph(name: string): string {
   }
 }
 
-export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
+export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, onToggleCollapsed }: Props) {
   // ALL directories collapsed by default — user expands what they need.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>());
   const [menu, setMenu] = useState<{ entry: FileEntry; x: number; y: number } | null>(null);
@@ -160,10 +162,15 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
   return (
     <div className="filetree">
       <div className="filetree__head">
-        <span className="filetree__root" title={root}>
-          <span className="filetree__rootmark">◆</span>
+        <button
+          className="filetree__root filetree__root--toggle"
+          title={collapsed ? "Expand files" : root}
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+        >
+          <span className="filetree__rootmark">{collapsed ? "▸" : "◆"}</span>
           {rootLabel(root)}
-        </span>
+        </button>
         <span className="filetree__actions">
           <button className="iconbtn" title="Collapse all" onClick={collapseAll}>
             ⇲
@@ -174,6 +181,7 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
         </span>
       </div>
 
+      {!collapsed && (
       <div className="filetree__list">
         {visible.length === 0 && (
           <div className="filetree__empty">No files.</div>
@@ -219,6 +227,7 @@ export default function FileTree({ root, entries, onOpen, onRefresh }: Props) {
           );
         })}
       </div>
+      )}
       <iframe name="nonoclaw-download-target" className="download-target" title="Download target" />
       {menu && createPortal(
         <div

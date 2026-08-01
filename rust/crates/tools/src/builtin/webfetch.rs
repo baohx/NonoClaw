@@ -111,7 +111,10 @@ impl Tool for WebFetchTool {
             message: format!("read failed: {e}"),
         })?;
         if bytes.len() > MAX_BYTES {
-            bytes.truncate(MAX_BYTES);
+            // MAX_BYTES may not align on a UTF-8 char boundary.
+            // floor_char_boundary returns the nearest boundary ≤ MAX_BYTES.
+            let boundary = bytes.floor_char_boundary(MAX_BYTES);
+            bytes.truncate(boundary);
         }
 
         let text = html_to_text(&bytes);

@@ -5,9 +5,11 @@ interface Props {
   git: GitInfo | null;
   onRefresh: () => void;
   onShow: (sha: string) => void;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
 }
 
-export default function GitPane({ git, onRefresh, onShow }: Props) {
+export default function GitPane({ git, onRefresh, onShow, collapsed, onToggleCollapsed }: Props) {
   const [q, setQ] = useState("");
   const filtered = useMemo(() => {
     if (!git) return [];
@@ -22,14 +24,26 @@ export default function GitPane({ git, onRefresh, onShow }: Props) {
     );
   }, [git, q]);
 
+  const dirty = git ? git.staged + git.modified + git.untracked + git.conflicts : 0;
+
   return (
     <div className="gitpane">
       <div className="gitpane__head">
-        <span className="gitpane__title">git</span>
+        <button
+          className="gitpane__head-toggle"
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+          title={collapsed ? "Expand git" : "Collapse git"}
+        >
+          <span className="gitpane__head-caret">{collapsed ? "▸" : "▾"}</span>
+          <span className="gitpane__title">git</span>
+          {dirty > 0 && <span className="gitpane__dirty-dot" title={`${dirty} uncommitted change${dirty === 1 ? "" : "s"}`} />}
+        </button>
         <button className="iconbtn" onClick={onRefresh} title="Refresh status">
           ↻
         </button>
       </div>
+      {!collapsed && (
       <div className="gitpane__body">
         {!git && <div className="git-none">not a git repo</div>}
 
@@ -76,6 +90,7 @@ export default function GitPane({ git, onRefresh, onShow }: Props) {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

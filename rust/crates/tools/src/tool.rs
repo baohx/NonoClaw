@@ -83,11 +83,39 @@ pub trait SubagentRunner: Send + Sync {
     }
 }
 
+/// Urgency level for a human-contact question (Factor 7 structured field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestionUrgency {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+/// Response format the UI should present (Factor 7 structured field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestionFormat {
+    #[default]
+    MultipleChoice,
+    YesNo,
+    FreeText,
+}
+
 /// A question put to the user by an interactive tool (AskUserQuestion).
+/// Follows the 12-Factor Factor 7 pattern of structured human-contact tool calls.
 #[derive(Debug, Clone)]
 pub struct QuestionRequest {
     pub prompt: String,
     pub options: Vec<String>,
+    /// Context/background explaining why the question is being asked.
+    #[allow(dead_code)]
+    pub context: Option<String>,
+    /// Urgency hint for the UI (affects styling, e.g. high-stakes highlight).
+    #[allow(dead_code)]
+    pub urgency: QuestionUrgency,
+    /// How the UI should present the answer input.
+    #[allow(dead_code)]
+    pub format: QuestionFormat,
 }
 
 /// Asks the user a multiple-choice question and returns the chosen option text

@@ -437,8 +437,21 @@
   {
     "input_schema": {
       "properties": {
+        "context": {
+          "description": "Background explaining why you're asking (optional)",
+          "type": "string"
+        },
+        "format": {
+          "description": "How the user should answer (default: multiple_choice)",
+          "enum": [
+            "multiple_choice",
+            "yes_no",
+            "free_text"
+          ],
+          "type": "string"
+        },
         "options": {
-          "description": "2-4 short options",
+          "description": "2-4 short options (required for multiple_choice and yes_no; ignored for free_text)",
           "items": {
             "type": "string"
           },
@@ -449,11 +462,19 @@
         "question": {
           "description": "The question to ask",
           "type": "string"
+        },
+        "urgency": {
+          "description": "How time-sensitive or high-stakes this is (default: medium)",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
         }
       },
       "required": [
-        "question",
-        "options"
+        "question"
       ],
       "type": "object"
     },

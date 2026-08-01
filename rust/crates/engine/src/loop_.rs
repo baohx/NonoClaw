@@ -279,18 +279,10 @@ impl Drop for CancelChildrenOnDrop {
     }
 }
 
-pub struct QueryEngine {
-    client: Arc<Client>,
-    registry: Arc<ToolRegistry>,
-    todos: Arc<TodoStore>,
-    options: EngineOptions,
-    messages: Vec<Message>,
-    total_usage: Usage,
-    session_id: String,
-    session: Option<Session>,
-    session_revision: u64,
-    session_repairs: Vec<SessionRepair>,
-    hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
+/// Performance-only cache fields that do NOT participate in the reducer
+/// semantics of the agent loop (Factor 12). Can be dropped and rebuilt from
+/// `messages` at any time without affecting correctness.
+struct EngineCache {
     /// Background compaction task spawned when tokens reach 80% threshold.
     pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
     /// Message count when background compact was spawned (for correct delta).
@@ -304,6 +296,35 @@ pub struct QueryEngine {
     /// Cached git context from the last `get_system_context` call. Reused on
     /// turns that follow read-only tools; refreshed after Bash/Edit/Write.
     cached_git_context: Option<crate::context::SystemContext>,
+}
+
+impl Default for EngineCache {
+    fn default() -> Self {
+        EngineCache {
+            pending_compact: None,
+            pending_compact_msg_count: 0,
+            pending_compact_revision: 0,
+            pending_compact_tokens_est: 0,
+            cached_git_context: None,
+        }
+    }
+}
+
+pub struct QueryEngine {
+    client: Arc<Client>,
+    registry: Arc<ToolRegistry>,
+    todos: Arc<TodoStore>,
+    options: EngineOptions,
+    messages: Vec<Message>,
+    total_usage: Usage,
+    session_id: String,
+    session: Option<Session>,
+    session_revision: u64,
+    session_repairs: Vec<SessionRepair>,
+    hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
+    /// Performance-only cache. Does not participate in the reducer state;
+    /// reset to `Default` on session restore and rebuilt lazily.
+    cache: EngineCache,
 }
 
 impl QueryEngine {
@@ -325,11 +346,7 @@ impl QueryEngine {
             session_revision: 0,
             session_repairs: Vec::new(),
             hooks: Vec::new(),
-            pending_compact: None,
-            pending_compact_msg_count: 0,
-            pending_compact_revision: 0,
-            pending_compact_tokens_est: 0,
-            cached_git_context: None,
+            cache: EngineCache::default(),
         }
     }
 
@@ -343,23 +360,28 @@ impl QueryEngine {
         session: Session,
         snapshot: SessionSnapshot,
     ) -> Self {
+        // Repair orphaned tool_use/tool_result blocks left behind by a previous
+        // cancelled or crashed run. The session writer keeps messages in memory
+        // and only runs repair_tool_pairing once during initial disk-load
+        // (session.rs:563). Subsequent runs that start from an in-memory
+        // snapshot would otherwise inherit stale orphans and cause the provider
+        // to reject the request (tool_use blocks must always be paired with
+        // tool_result blocks).
+        let mut messages = snapshot.messages;
+        repair_tool_pairing(&mut messages);
         QueryEngine {
             client,
             registry,
             todos,
             options,
-            messages: snapshot.messages,
+            messages,
             total_usage: Usage::default(),
             session_id: session.id().to_string(),
             session: Some(session),
             session_revision: snapshot.revision,
             session_repairs: snapshot.repairs,
             hooks: Vec::new(),
-            pending_compact: None,
-            pending_compact_msg_count: 0,
-            pending_compact_revision: 0,
-            pending_compact_tokens_est: 0,
-            cached_git_context: None,
+            cache: EngineCache::default(),
         }
     }
 
@@ -523,7 +545,7 @@ impl QueryEngine {
         let system_ctx = get_system_context(cwd).await;
         // T7.3: seed the cache so subsequent turns can skip the git subprocess
         // unless a mutating tool ran in between.
-        self.cached_git_context = Some(system_ctx.clone());
+        self.cache.cached_git_context = Some(system_ctx.clone());
         let user_ctx = get_user_context(cwd, &self.options.add_dirs);
         let memory = load_memory_prompt(cwd);
         let tool_prompts: Vec<crate::prompt::ToolPromptEntry> = self
@@ -800,11 +822,11 @@ impl QueryEngine {
             // T7.3: skip the git subprocess when no mutating tool ran on the
             // previous turn — the cached snapshot is still accurate.
             {
-                let live_git = match self.cached_git_context.take() {
+                let live_git = match self.cache.cached_git_context.take() {
                     Some(cached) => cached,
                     None => {
                         let fresh = get_system_context(cwd).await;
-                        self.cached_git_context = Some(fresh.clone());
+                        self.cache.cached_git_context = Some(fresh.clone());
                         fresh
                     }
                 };
@@ -831,16 +853,16 @@ impl QueryEngine {
             };
 
             // Two-pass auto-compact: check for completed background compact first.
-            let compact_done = if let Some(ref handle) = self.pending_compact {
+            let compact_done = if let Some(ref handle) = self.cache.pending_compact {
                 handle.is_finished()
             } else {
                 false
             };
             if compact_done {
-                let handle = self.pending_compact.take().unwrap();
-                let msg_count_at_spawn = self.pending_compact_msg_count;
-                let revision_at_spawn = self.pending_compact_revision;
-                let tokens_at_spawn = self.pending_compact_tokens_est;
+                let handle = self.cache.pending_compact.take().unwrap();
+                let msg_count_at_spawn = self.cache.pending_compact_msg_count;
+                let revision_at_spawn = self.cache.pending_compact_revision;
+                let tokens_at_spawn = self.cache.pending_compact_tokens_est;
                 match handle.await {
                     Ok(Ok(compacted)) => {
                         let kept = compacted.len();
@@ -901,7 +923,7 @@ impl QueryEngine {
                 );
                 // Pre-fire: spawn background compact at 80% of threshold.
                 if est > self.options.compact_threshold_tokens * 8 / 10
-                    && self.pending_compact.is_none()
+                    && self.cache.pending_compact.is_none()
                 {
                     let model = self
                         .options
@@ -917,9 +939,9 @@ impl QueryEngine {
                     let keep = KEEP_RECENT_TURNS;
                     let m = model.clone();
                     let max_summary_tokens = self.options.compact_max_tokens;
-                    self.pending_compact_msg_count = messages.len();
-                    self.pending_compact_revision = self.session_revision;
-                    self.pending_compact_tokens_est = est;
+                    self.cache.pending_compact_msg_count = messages.len();
+                    self.cache.pending_compact_revision = self.session_revision;
+                    self.cache.pending_compact_tokens_est = est;
                     on_event(&RunEvent::CompactionStarted {
                         automatic: true,
                         tokens_before: est,
@@ -953,7 +975,7 @@ impl QueryEngine {
                             ) => result,
                         }
                     });
-                    self.pending_compact = Some(handle);
+                    self.cache.pending_compact = Some(handle);
                 }
 
                 if est > self.options.compact_threshold_tokens {
@@ -1374,7 +1396,7 @@ impl QueryEngine {
 
             // T7.3: a mutating tool ran → next turn must refresh git context.
             if ran_mutating_tool {
-                self.cached_git_context = None;
+                self.cache.cached_git_context = None;
             }
             drop(execution);
             drop(execution_context);
@@ -1533,7 +1555,7 @@ impl QueryEngine {
 
         // No run-owned background compaction task may outlive the run.
         cancel.cancel();
-        if let Some(handle) = self.pending_compact.take() {
+        if let Some(handle) = self.cache.pending_compact.take() {
             let _ = handle.await;
         }
 
@@ -2350,6 +2372,58 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         }
+    }
+
+    #[test]
+    fn repair_removes_orphaned_tool_use_at_end_of_messages() {
+        // Simulates the exact scenario after a cancelled run: the assistant
+        // message with tool_use blocks was persisted, but the corresponding
+        // tool_result message was never appended because the run returned
+        // Error::Cancelled before reaching the tool_result append code path.
+        let mut msgs = vec![
+            Message::user(MessageContent::from_text("read a file")),
+            // Assistant with tool_use blocks — no matching tool_result follows.
+            Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::text("let me read that"),
+                ContentBlock::ToolUse {
+                    id: "tu_cancel".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "/tmp/x"}),
+                },
+            ])),
+            // No next message — this assistant is the last message in the array.
+        ];
+        repair_tool_pairing(&mut msgs);
+        // The orphaned tool_use should be removed; the assistant keeps its text.
+        assert_eq!(msgs.len(), 2);
+        if let MessageContent::Blocks(ref blocks) = msgs[1].content {
+            assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { .. })));
+            assert!(!blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+        } else {
+            panic!("expected blocks");
+        }
+    }
+
+    #[test]
+    fn repair_removes_textless_assistant_with_orphaned_tools_at_end() {
+        // When the last message is an assistant with ONLY tool_use blocks and
+        // no text, the entire assistant message should be removed after orphan
+        // cleanup (it would otherwise be empty and cause provider errors).
+        let mut msgs = vec![
+            Message::user(MessageContent::from_text("read file")),
+            // Assistant with ONLY tool_use blocks — no text content.
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
+                id: "tu_no_text".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/y"}),
+            }])),
+        ];
+        repair_tool_pairing(&mut msgs);
+        // The assistant message should be fully removed since it had no text.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, nonoclaw_core::Role::User);
     }
 
     async fn spawn_provider_fixture(

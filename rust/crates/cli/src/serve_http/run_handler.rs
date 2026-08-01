@@ -15,7 +15,7 @@ use nonoclaw_engine::{
     ConfigSource, EngineOptions, PermissionRequest, ResolvedConfig, RunConfigOverrides,
     SkillsManager,
 };
-use nonoclaw_tools::tool::{QuestionRequest, QuestionResolver};
+use nonoclaw_tools::tool::{QuestionFormat, QuestionRequest, QuestionResolver, QuestionUrgency};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
@@ -55,6 +55,19 @@ impl QuestionResolver for WsQuestionResolver {
                         .into_iter()
                         .map(|option| redact_text(&option))
                         .collect(),
+                    context: req.context.map(|c| redact_text(&c)),
+                    urgency: match req.urgency {
+                        QuestionUrgency::Low => "low",
+                        QuestionUrgency::Medium => "medium",
+                        QuestionUrgency::High => "high",
+                    }
+                    .to_string(),
+                    format: match req.format {
+                        QuestionFormat::MultipleChoice => "multiple_choice",
+                        QuestionFormat::YesNo => "yes_no",
+                        QuestionFormat::FreeText => "free_text",
+                    }
+                    .to_string(),
                 },
             )
             .await;
@@ -137,14 +150,25 @@ pub(super) fn enrich_prompt_with_attachments(
 fn make_permission_resolver(
     tx: Tx,
     pending: Arc<PermissionMap>,
+    meta: super::permission_api::PendingPermissionMeta,
 ) -> nonoclaw_engine::PermissionResolver {
     Arc::new(move |request: PermissionRequest| {
         let tx = tx.clone();
         let pending = Arc::clone(&pending);
+        let meta = Arc::clone(&meta);
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
             let request_id = Uuid::new_v4().to_string();
             pending.lock().await.insert(request_id.clone(), sender);
+            meta.lock().await.insert(
+                request_id.clone(),
+                super::permission_api::PendingPermissionInfo {
+                    request_id: request_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    message: redact_text(&request.message),
+                    input: redact_value(request.input.clone()),
+                },
+            );
             send_msg(
                 &tx,
                 ServerMsg::PermissionRequired {
@@ -174,6 +198,7 @@ pub(super) fn build_options(
     permission_mode: nonoclaw_core::PermissionMode,
     skills_manager: Arc<RwLock<SkillsManager>>,
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
+    permission_meta: super::permission_api::PendingPermissionMeta,
 ) -> EngineOptions {
     let mut options = config
         .resolve_run(RunConfigOverrides {
@@ -189,7 +214,7 @@ pub(super) fn build_options(
             ..Default::default()
         })
         .options;
-    options.permission_resolver = Some(make_permission_resolver(tx, pending_permissions));
+    options.permission_resolver = Some(make_permission_resolver(tx, pending_permissions, permission_meta));
     options.skills_manager = Some(skills_manager);
     options.background_registry = Some(background_registry);
     options

@@ -240,6 +240,9 @@ export function dispatchServerMessage(message: ServerMsg): void {
     case "file_tree":
       state.setFileTree(message.root, message.entries);
       break;
+    case "session_prompts":
+      state.setSessionPrompts(message.session_id, message.prompts);
+      break;
     case "project_info":
       state.setProjectInfo(message.info);
       break;

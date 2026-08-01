@@ -8,16 +8,17 @@ interface Props {
   onClose: () => void;
 }
 
-/** Format an RFC3339 timestamp in the browser's local timezone as MM-DD HH:mm. */
+/** Format an RFC3339 timestamp in the browser's local timezone as YYYY-MM-DD HH:mm. */
 function formatLocalDate(started: string | null): string | null {
   if (!started) return null;
   const d = new Date(started);
   if (isNaN(d.getTime())) return null;
+  const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   const hh = String(d.getHours()).padStart(2, "0");
   const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${mm}-${dd} ${hh}:${mi}`;
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
 }
 
 export default function SessionPicker({ sessions, currentId, onNew, onResume, onClose }: Props) {

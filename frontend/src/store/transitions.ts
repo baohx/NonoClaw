@@ -110,6 +110,8 @@ function outboundKey(message: ClientMsg): string {
       return `${message.type}:${message.path}:${message.force_code === true}`;
     case "git_show":
       return `${message.type}:${message.sha}`;
+    case "session_prompts":
+      return `${message.type}:${message.session_id}`;
     case "set_permission_mode":
       return `${message.type}:${message.mode}`;
     case "set_model":

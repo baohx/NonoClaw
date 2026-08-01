@@ -14,6 +14,7 @@ import PermissionDialog from "./components/PermissionDialog";
 import QrDialog from "./components/QrDialog";
 import QuestionDialog from "./components/QuestionDialog";
 import SessionPicker from "./components/SessionPicker";
+import SessionRail from "./components/SessionRail";
 import StatusBar from "./components/StatusBar";
 
 const WS_PROTO = window.location.protocol === "https:" ? "wss" : "ws";
@@ -46,10 +47,33 @@ export default function App() {
   const toggleInsight = useStore((s) => s.toggleInsight);
   const theme = useStore((s) => s.theme);
   const setBreathState = useStore((s) => s.setBreathState);
+  const locatedMessageId = useStore((s) => s.locatedMessageId);
+  const setLocatedMessage = useStore((s) => s.setLocatedMessage);
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
   const [toolsHidden, setToolsHidden] = useState(false);
+  const [railSections, setRailSections] = useState<{ files: boolean; sessions: boolean; git: boolean }>(() => {
+    try {
+      const raw = localStorage.getItem("nonoclaw:rail-sections");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          files: parsed.files !== false,
+          sessions: parsed.sessions !== false,
+          git: parsed.git !== false,
+        };
+      }
+    } catch {}
+    return { files: true, sessions: true, git: true };
+  });
+  const toggleRailSection = useCallback((key: "files" | "sessions" | "git") => {
+    setRailSections((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem("nonoclaw:rail-sections", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
 
   useEffect(() => breathController.subscribe(({ phase, label }) => {
     setBreathState(phase, label);
@@ -89,6 +113,23 @@ export default function App() {
     if (!chatRef.current || userScrolledUp.current) return;
     chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages]);
+
+  // Locate a message jumped to from the session rail: scroll into view and
+  // briefly highlight it, then release the marker.
+  useEffect(() => {
+    if (!locatedMessageId) return;
+    userScrolledUp.current = true;
+    const frame = requestAnimationFrame(() => {
+      document
+        .getElementById(`msg-${locatedMessageId}`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+    const timer = window.setTimeout(() => setLocatedMessage(null), 3200);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [locatedMessageId, setLocatedMessage]);
 
   const handleScroll = useCallback(() => {
     const el = chatRef.current;
@@ -330,19 +371,32 @@ export default function App() {
         />
         <div className={bodyClass}>
           <aside className="rail">
-            <div className="rail__files">
+            <div className={`rail__files${railSections.files ? "" : " rail__files--collapsed"}`}>
               <FileTree
                 root={fileTreeRoot}
                 entries={fileTree}
                 onOpen={handleOpenFile}
                 onRefresh={() => send({ type: "file_tree" })}
+                collapsed={!railSections.files}
+                onToggleCollapsed={() => toggleRailSection("files")}
               />
             </div>
-            <div className="rail__git">
+            <div className={`rail__sessions${railSections.sessions ? "" : " rail__section--collapsed"}`}>
+              <SessionRail
+                sessions={sessions}
+                currentId={sessionId}
+                send={send}
+                collapsed={!railSections.sessions}
+                onToggleCollapsed={() => toggleRailSection("sessions")}
+              />
+            </div>
+            <div className={`rail__git${railSections.git ? "" : " rail__section--collapsed"}`}>
               <GitPane
                 git={projectInfo?.git ?? null}
                 onRefresh={() => send({ type: "project_info_refresh" })}
                 onShow={(sha) => send({ type: "git_show", sha })}
+                collapsed={!railSections.git}
+                onToggleCollapsed={() => toggleRailSection("git")}
               />
             </div>
           </aside>
@@ -407,6 +461,9 @@ export default function App() {
         <QuestionDialog
           prompt={pendingQuestion.prompt}
           options={pendingQuestion.options}
+          context={pendingQuestion.context}
+          urgency={pendingQuestion.urgency}
+          format={pendingQuestion.format}
           onAnswer={handleQuestion}
         />
       )}

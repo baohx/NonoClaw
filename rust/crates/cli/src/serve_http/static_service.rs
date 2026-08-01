@@ -22,6 +22,9 @@ pub(super) fn frontend_dir(cwd: &Path) -> Option<PathBuf> {
         candidates.push(home.join(".nonoclaw/frontend/dist"));
     }
     if let Some(directory) = exe_parent {
+        // Portable layout: nonoclaw.exe sits next to frontend/dist/
+        candidates.push(directory.join("frontend/dist"));
+        // Dev layout: target/debug/nonoclaw → ../../../frontend/dist
         candidates.push(directory.join("../../../frontend/dist"));
     }
     candidates.into_iter().find(|path| {

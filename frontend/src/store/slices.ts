@@ -12,6 +12,7 @@ import type {
   QuestionRequired,
   ScopedSubagentEvent,
   SessionInfoWire,
+  SessionRunPrompt,
   SubagentRun,
   TaskChange,
 } from "../types";
@@ -174,8 +175,11 @@ export interface ProjectSlice {
   fileTreeRoot: string;
   fileTree: FileEntry[];
   projectInfo: ProjectInfo | null;
+  /** Run-boundary prompts per session id, lazily fetched from the server. */
+  sessionPrompts: Record<string, SessionRunPrompt[]>;
   setFileTree: (root: string, entries: FileEntry[]) => void;
   setProjectInfo: (info: ProjectInfo) => void;
+  setSessionPrompts: (sessionId: string, prompts: SessionRunPrompt[]) => void;
 }
 
 export interface DialogSlice {
@@ -226,12 +230,15 @@ export interface UiSlice {
   insightCollapsed: boolean;
   theme: Theme;
   permissionMode: PermissionMode;
+  /** Chat message id to scroll into view and highlight (rail session jump). */
+  locatedMessageId: string | null;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
   toggleLeftRail: () => void;
   toggleInsight: () => void;
   setTheme: (theme: Theme) => void;
   setPermissionMode: (mode: PermissionMode) => void;
+  setLocatedMessage: (id: string | null) => void;
 }
 
 export type AppState = ConnectionSlice & SessionSlice & RunSlice & ToolSlice & SubagentSlice & ProjectSlice & DialogSlice & MediaSlice & BreathSlice & UiSlice;
@@ -519,8 +526,12 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
   fileTreeRoot: "",
   fileTree: [],
   projectInfo: null,
+  sessionPrompts: {},
   setFileTree: (fileTreeRoot, fileTree) => set({ fileTreeRoot, fileTree }),
   setProjectInfo: (projectInfo) => set({ projectInfo: sanitizeProjectInfo(projectInfo) }),
+  setSessionPrompts: (sessionId, prompts) => set((state) => ({
+    sessionPrompts: { ...state.sessionPrompts, [sessionId]: prompts },
+  })),
 });
 
 export const createDialogSlice: Slice<DialogSlice> = (set) => ({
@@ -601,13 +612,13 @@ export const createBreathSlice: Slice<BreathSlice> = (set) => ({
 });
 
 function initialTheme(): Theme {
-  if (typeof localStorage === "undefined") return "biolume";
+  if (typeof localStorage === "undefined") return "frost";
   try {
     const value = localStorage.getItem("nonoclaw:theme");
     return Object.prototype.hasOwnProperty.call(THEME_COLORS, value as string)
       ? (value as Theme)
-      : "biolume";
-  } catch { return "biolume"; }
+      : "frost";
+  } catch { return "frost"; }
 }
 
 export const createUiSlice: Slice<UiSlice> = (set) => ({
@@ -615,6 +626,7 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   insightCollapsed: false,
   theme: initialTheme(),
   permissionMode: "default",
+  locatedMessageId: null,
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),
@@ -624,6 +636,7 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
     set({ theme });
   },
   setPermissionMode: (permissionMode) => set({ permissionMode }),
+  setLocatedMessage: (locatedMessageId) => set({ locatedMessageId }),
 });
 
 export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
@@ -651,6 +664,12 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
   }
 
   const emittedUses = new Set<string>();
+  // Timestamp of the last source message — inherited by messages exploded
+  // from the same persisted entry (text + tool calls share one source line).
+  let currentTs: number | undefined;
+  // Ordinal of the source JSONL message — recorded on each derived chat
+  // message so the session rail can locate a run's first prompt exactly.
+  let currentSrcIndex = 0;
   const appendText = (
     role: "user" | "assistant",
     text: string,
@@ -660,11 +679,21 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
     const previous = output[output.length - 1];
     if (previous?.role === role && !previous.streaming && !previous.toolName
       && !previous.attachments?.length && !attachments.length) previous.content += text;
-    else output.push({ id: nextId(), role, content: text, ...(attachments.length ? { attachments } : {}) });
+    else output.push({
+      id: nextId(),
+      role,
+      content: text,
+      srcIndex: currentSrcIndex,
+      ...(currentTs !== undefined ? { timestamp: currentTs } : {}),
+      ...(attachments.length ? { attachments } : {}),
+    });
   };
 
-  for (const raw of messages) {
-    const message = raw as { role?: string; content?: unknown; attachments?: unknown };
+  for (let srcIndex = 0; srcIndex < messages.length; srcIndex++) {
+    const raw = messages[srcIndex];
+    currentSrcIndex = srcIndex;
+    const message = raw as { role?: string; content?: unknown; attachments?: unknown; ts?: unknown };
+    currentTs = typeof message.ts === "number" && Number.isFinite(message.ts) ? message.ts : undefined;
     const attachments = Array.isArray(message.attachments)
       ? message.attachments.flatMap((value) => {
         const filename = (value as { filename?: unknown })?.filename;
@@ -700,6 +729,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
           toolInput: sanitizeBrowserValue(block.input),
           toolOk: result ? !result.is_error : undefined,
           streaming: false,
+          srcIndex: currentSrcIndex,
         });
         if (duplicateUses.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool call ignored: ${callId}` });
         if (duplicateResults.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool results resolved to the last result: ${callId}` });
@@ -715,6 +745,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
           toolName: "Command unavailable",
           toolOk: !block.is_error,
           streaming: false,
+          srcIndex: currentSrcIndex,
         });
       }
     }

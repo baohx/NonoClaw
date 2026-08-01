@@ -129,10 +129,16 @@ export default function BreathField() {
     let lastFrameAt = performance.now();
     let currentPalette = paletteFor(document.documentElement.getAttribute("data-theme"));
     let orbs = makeOrbs(currentPalette);
+    let idleFrameSkip = 0;
     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 
     const resize = () => {
-      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      // Cap canvas DPR at 1.0 to reduce GPU load (radial gradients at
+      // full-viewport resolution are one of the most GPU-intensive canvas
+      // operations; on Intel iGPU / nouveau with Chrome hardware acceleration,
+      // running 7 gradients per frame at 60fps can cause GPU hangs that
+      // trigger kernel panics on Linux).
+      dpr = Math.min(window.devicePixelRatio || 1, 1.0);
       width = window.innerWidth;
       height = window.innerHeight;
       canvas.width = Math.floor(width * dpr);
@@ -148,6 +154,18 @@ export default function BreathField() {
       const elapsed = Math.min(Math.max((now - lastFrameAt) / 1000, 0), 0.1);
       lastFrameAt = now;
       const frame = breathController.sample();
+      // Throttle rendering in idle state to reduce GPU load: the 7 radial
+      // gradients per frame are the most GPU-intensive operation.  Skipping
+      // 3 of 4 frames (~15fps draw rate) when nothing is happening keeps GPU
+      // energy low without visible degradation.
+      const isIdle = breathController.getSnapshot().phase === "idle";
+      if (isIdle) {
+        idleFrameSkip = (idleFrameSkip + 1) % 4;
+        if (idleFrameSkip !== 0) {
+          if (!frame.paused) raf = requestAnimationFrame(render);
+          return;
+        }
+      }
       fieldTime += elapsed;
       breathPhase += elapsed * Math.PI * 2 * frame.frequency;
 
