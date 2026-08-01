@@ -56,7 +56,7 @@ impl Tool for AskUserQuestionTool {
         &self,
         input: Value,
         ctx: &ToolCtx<'_>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolResult> {
         let question = input["question"].as_str().ok_or_else(|| Error::Tool {
             tool: "AskUserQuestion".into(),
@@ -143,7 +143,11 @@ impl Tool for AskUserQuestionTool {
             urgency,
             format,
         };
-        Ok(match resolver.ask(req).await {
+        Ok(match tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            answer = resolver.ask(req) => answer,
+        } {
             Some(answer) => ToolResult::ok(format!(
                 "<human_response>\n  response: {answer}\n</human_response>"
             )),

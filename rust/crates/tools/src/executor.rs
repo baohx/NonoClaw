@@ -177,6 +177,27 @@ impl ToolExecutor {
         let mut ordered: Vec<Option<ToolExecutionResult>> = vec![None; calls.len()];
 
         for batch in batches {
+            // Bail early when cancellation fires during a multi-tool run so
+            // we don't needlessly process every remaining call.
+            if context.cancel.is_cancelled() {
+                // Fill remaining slots with cancelled results.
+                for i in 0..calls.len() {
+                    if ordered[i].is_none() {
+                        ordered[i] = Some(ToolExecutionResult {
+                            id: calls[i].id.clone(),
+                            name: calls[i].name.clone(),
+                            is_error: true,
+                            content: "execution cancelled".into(),
+                            local_reference: None,
+                            metadata: None,
+                            original_chars: 0,
+                            task_changes: vec![],
+                            trace: vec![],
+                        });
+                    }
+                }
+                return ordered.into_iter().map(Option::unwrap).collect();
+            }
             if batch.concurrency_safe {
                 let completed = stream::iter(batch.indices.into_iter().map(|index| async move {
                     (index, self.execute_one(&calls[index], context).await)

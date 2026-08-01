@@ -1383,6 +1383,15 @@ impl QueryEngine {
             let executions = loop {
                 tokio::select! {
                     biased;
+                    _ = cancel.cancelled() => {
+                        // Drop the Box::pin'd execution future immediately, which
+                        // cascades through all in-flight tool calls. For Bash this
+                        // triggers kill_on_drop; for other tools the future is simply
+                        // cancelled. Without this arm the outer select! only checks
+                        // cancel once all tool calls have been processed.
+                        drop(execution);
+                        return Err(nonoclaw_core::Error::Cancelled);
+                    },
                     Some(event) = child_event_rx.recv() => on_event(&event),
                     completed = &mut execution => break completed,
                 }
