@@ -47,7 +47,8 @@ pub use settings::{
 };
 pub use skills::{substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillsManager};
 pub use toolchain::{
-    probe_runtime, probe_runtime_with_updates, ExecutableProbe, PythonVenvProbe, RuntimeProbeReport,
+    probe_runtime, probe_runtime_with_updates, ExecutableProbe, MarkItDownProbe, PythonVenvProbe,
+    RuntimeProbeReport,
 };
 
 pub use trace::TraceCollector;

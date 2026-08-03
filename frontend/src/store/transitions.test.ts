@@ -1,5 +1,5 @@
-import type { ClientMsg, EngineEvent, ScopedSubagentEvent } from "../types.ts";
-import { engineMessagesToChat } from "./slices.ts";
+import type { ClientMsg, EngineEvent, QuestionRequired, ScopedSubagentEvent } from "../types.ts";
+import { createDialogSlice, engineMessagesToChat } from "./slices.ts";
 import { checkTraceStateInvariants } from "../trace.test.ts";
 import {
   MAX_OUTBOUND_QUEUE,
@@ -274,6 +274,7 @@ snapshotAndRunOrderingChecks();
 chatPromptAndUsageChecks();
 subagentTransitionChecks();
 scopedEnvelopeGateChecks();
+questionQueueRegression();
 checkTraceStateInvariants();
 console.log("frontend transition checks passed");
 
@@ -301,4 +302,75 @@ function scopedEnvelopeGateChecks(): void {
   }, null));
   assert(direct.accepted && direct.state.subagentRunsById["direct-agent"].index === 0,
     "direct Agent index:null must normalize to zero");
+}
+
+// ── Question queue regression: parallel AskUserQuestion frames ────────────
+// Minimal zustand-style harness for createDialogSlice so queue semantics can
+// be asserted without a browser. The setter merges object patches and applies
+// functional patches against the current state, mirroring zustand's set().
+function dialogHarness() {
+  let state = {
+    pendingPermission: null,
+    pendingQuestions: [] as QuestionRequired[],
+    pendingCommit: null,
+    showSessionPicker: false,
+    resolvedPermissionIds: [] as string[],
+    resolvedQuestionIds: [] as string[],
+  };
+  const set = (partial: unknown) => {
+    const patch =
+      typeof partial === "function"
+        ? (partial as (s: typeof state) => Partial<typeof state>)(state)
+        : (partial as Partial<typeof state>);
+    state = { ...state, ...patch };
+  };
+  // zustand's StateCreator invokes the slice with (set, get, store); supply
+  // get/store stubs so the type check passes and only `set` is exercised.
+  const slice = createDialogSlice(
+    set as never,
+    (() => state) as never,
+    {} as never,
+  );
+  return { get: () => state, slice };
+}
+
+function question(request_id: string): QuestionRequired {
+  return {
+    type: "question_required",
+    request_id,
+    prompt: `question ${request_id}`,
+    options: ["Yes", "No"],
+    context: null,
+    urgency: "medium",
+    format: "multiple_choice",
+  };
+}
+
+function questionQueueRegression() {
+  const { get, slice } = dialogHarness();
+
+  // Parallel question_required frames must queue, not clobber each other.
+  slice.setPendingQuestion(question("q1"));
+  slice.setPendingQuestion(question("q2"));
+  slice.setPendingQuestion(question("q3"));
+  const queued = get().pendingQuestions.map((q) => q.request_id);
+  assert(queued.join(",") === "q1,q2,q3",
+    "concurrent question frames must queue in FIFO order (regression: single-slot clobber)");
+
+  // Resolving the head advances the queue; the next question becomes visible.
+  slice.resolveQuestion("q1");
+  const afterHead = get().pendingQuestions.map((q) => q.request_id);
+  assert(afterHead.join(",") === "q2,q3",
+    "resolving the current question must surface the next queued question");
+  assert(get().resolvedQuestionIds.includes("q1"), "resolved id must be remembered");
+
+  // Already-resolved or duplicate frames are ignored.
+  slice.setPendingQuestion(question("q1"));
+  slice.setPendingQuestion(question("q2"));
+  assert(get().pendingQuestions.length === 2,
+    "resolved or duplicate frames must not re-enter the queue");
+
+  // null clears the whole queue (connection teardown).
+  slice.setPendingQuestion(null);
+  assert(get().pendingQuestions.length === 0, "null must clear the question queue");
 }

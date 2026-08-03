@@ -594,6 +594,16 @@ function SystemSection({ info }: { info: ProjectInfo | null }) {
         <div className="insight-row__meta">required: {system.python_venv.required ? "yes" : "no"}</div>
         {system.python_venv.suggestion && <div className="insight-row__meta">fix: {system.python_venv.suggestion}</div>}
       </div>
+      <div className="insight-row">
+        <div className="insight-row__top">
+          <span className={`dot ${system.markitdown.status === "available" ? "on" : system.markitdown.status === "invalid" ? "bad" : "off"}`} />
+          <span className="insight-row__name">MarkItDown</span>
+          <span className="tag">{system.markitdown.status}</span>
+        </div>
+        <div className="insight-row__meta">path: {system.markitdown.path ?? "—"}</div>
+        {system.markitdown.version && <div className="insight-row__meta">v{system.markitdown.version}</div>}
+        {system.markitdown.suggestion && <div className="insight-row__meta">fix: {system.markitdown.suggestion}</div>}
+      </div>
     </div>
   );
 }

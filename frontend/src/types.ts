@@ -401,6 +401,16 @@ export interface RuntimeProbeReport {
     required: boolean;
     suggestion: string | null;
   };
+  /** Probe result for the MarkItDown CLI
+   *  (https://github.com/microsoft/markitdown), used to convert
+   *  office documents, HTML, EPUB, and other formats to structured
+   *  Markdown for LLM consumption. */
+  markitdown: {
+    status: "available" | "missing" | "invalid";
+    path: string | null;
+    version: string | null;
+    suggestion: string | null;
+  };
 }
 export interface ProjectInfo {
   cwd: string;

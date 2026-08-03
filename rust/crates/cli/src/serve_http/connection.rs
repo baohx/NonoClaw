@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
     response::IntoResponse,
     routing::get,
     Router,
@@ -43,6 +43,7 @@ use super::protocol::{
     terminal_fields, ClientMsg, ModelInfo, ServerMsg, SessionInfoWire,
 };
 #[cfg(test)]
+use crate::attachments;
 use crate::project_info::ProjectInfo;
 #[cfg(test)]
 use nonoclaw_engine::{EngineEvent, EventEnvelope};
@@ -88,6 +89,10 @@ pub(super) struct AppState {
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
     /// Directory where uploaded attachments are stored.
     pub(super) upload_dir: PathBuf,
+    /// Resolved path to the `markitdown` CLI, from the runtime probe.
+    /// `None` before the probe completes or when MarkItDown is absent.
+    /// Updated atomically by the probe updater via `Arc<Mutex<..>>`.
+    pub(super) markitdown_path: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -155,6 +160,7 @@ pub(super) fn upload_exploration_state(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
         upload_dir,
+        markitdown_path: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -309,6 +315,7 @@ pub async fn serve(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
         upload_dir,
+        markitdown_path: Arc::new(Mutex::new(None)),
     });
 
     // Spawn file watcher for hot-reloading skills.
@@ -335,7 +342,8 @@ pub async fn serve(
         )
         .route(
             "/api/upload",
-            axum::routing::post(super::upload_service::upload_handler),
+            axum::routing::post(super::upload_service::upload_handler)
+                .layer(DefaultBodyLimit::max(attachments::MAX_FILE_SIZE as usize)),
         )
         .route(
             "/api/stt",
@@ -730,10 +738,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             }
             ClientMsg::ProjectInfoRefresh => {
                 let current_model = state.active_model.lock().await.clone();
-                let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (updates_tx, mut updates_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<nonoclaw_engine::RuntimeProbeReport>();
                 let updates_socket = Arc::clone(&tx);
+                let md_flag = Arc::clone(&state.markitdown_path);
                 let forward_updates = tokio::spawn(async move {
                     while let Some(system) = updates_rx.recv().await {
+                        // Keep the markitdown path in sync so the upload
+                        // handler can route documents through MarkItDown
+                        // without waiting for the full probe to finish.
+                        if system.markitdown.status == "available" {
+                            *md_flag.lock().await = system.markitdown.path.clone();
+                        }
                         send_msg(&updates_socket, ServerMsg::SystemProbe { system }).await;
                     }
                 });
@@ -896,13 +912,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
                 let active_for_run = Arc::clone(&active_controller);
                 run_handle = Some(tokio::spawn(async move {
-                    let request_id = Uuid::new_v4().to_string();
-
                     // If executing in fork context: run as a fresh sub-engine.
                     if let Some(body) = fork_body {
-                        let fork_request_id = Uuid::new_v4().to_string();
                         let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
-                            request_id: format!("{fork_request_id}-q"),
                             pending: Arc::clone(&s.pending_questions),
                             tx: tx2.clone(),
                         });
@@ -1100,7 +1112,6 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
                     // Question resolver (per-run to avoid oneshot key clashes).
                     let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
-                        request_id: format!("{request_id}-q"),
                         pending: Arc::clone(&s.pending_questions),
                         tx: tx2.clone(),
                     });
@@ -1858,6 +1869,12 @@ mod characterization_tests {
                     status: "missing".into(),
                     python_path: None,
                     required: false,
+                    suggestion: None,
+                },
+                markitdown: nonoclaw_engine::MarkItDownProbe {
+                    status: "missing".into(),
+                    path: None,
+                    version: None,
                     suggestion: None,
                 },
             },

@@ -20,6 +20,7 @@ pub struct RuntimeProbeReport {
     pub output_limit_bytes: usize,
     pub entries: Vec<ExecutableProbe>,
     pub python_venv: PythonVenvProbe,
+    pub markitdown: MarkItDownProbe,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +40,18 @@ pub struct PythonVenvProbe {
     pub status: String,
     pub python_path: Option<String>,
     pub required: bool,
+    pub suggestion: Option<String>,
+}
+
+/// Status of the MarkItDown CLI (https://github.com/microsoft/markitdown).
+/// The tool converts office documents, HTML, EPUB, and many more formats
+/// to structured Markdown for LLM consumption.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkItDownProbe {
+    pub status: String,
+    /// Resolved path to the `markitdown` executable.
+    pub path: Option<String>,
+    pub version: Option<String>,
     pub suggestion: Option<String>,
 }
 
@@ -112,6 +125,15 @@ where
             },
             |report| report.python_venv.clone(),
         ),
+        markitdown: previous.map_or(
+            MarkItDownProbe {
+                status: "missing".into(),
+                path: None,
+                version: None,
+                suggestion: None,
+            },
+            |report| report.markitdown.clone(),
+        ),
     };
     report.python_venv.required = required;
 
@@ -130,6 +152,13 @@ where
         .iter()
         .find(|entry| entry.name == "python.python");
     report.python_venv = probe_python_venv(python, required, timeout, output_limit).await;
+    // MarkItDown is a Python CLI with a slow cold start (~3–4 s on first
+    // invocation while it imports magika/charset_normalizer). The generic
+    // probe budget (default 3 s) would kill `--version` before it finishes,
+    // misreporting an installed tool as invalid. Give it a dedicated,
+    // generous floor instead.
+    let markitdown_timeout = timeout.max(Duration::from_secs(20));
+    report.markitdown = probe_markitdown(settings, markitdown_timeout, output_limit).await;
     report.completed_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -553,6 +582,75 @@ async fn probe_python_venv(
             suggestion: Some("Install the Python venv module for this interpreter.".into()),
         },
     }
+}
+
+async fn probe_markitdown(
+    _settings: Option<&ExecutableSettings>,
+    timeout: Duration,
+    limit: usize,
+) -> MarkItDownProbe {
+    // Prefer the dedicated NonoClaw venv, then common system paths, then PATH.
+    let home = dirs_rs_home();
+    let venv_path = format!("{home}/.nonoclaw/venvs/markitdown/bin/markitdown");
+    if Path::new(&venv_path).exists() {
+        return probe_markitdown_exec(&venv_path, timeout, limit).await;
+    }
+    for candidate in ["/usr/local/bin/markitdown", "/usr/bin/markitdown"] {
+        if Path::new(candidate).exists() {
+            return probe_markitdown_exec(candidate, timeout, limit).await;
+        }
+    }
+    if let Ok(which) = std::process::Command::new("which")
+        .arg("markitdown")
+        .output()
+    {
+        if which.status.success() {
+            let path = String::from_utf8_lossy(&which.stdout).trim().to_string();
+            if !path.is_empty() && Path::new(&path).exists() {
+                return probe_markitdown_exec(&path, timeout, limit).await;
+            }
+        }
+    }
+
+    MarkItDownProbe {
+        status: "missing".into(),
+        path: None,
+        version: None,
+        suggestion: Some(
+            "Install MarkItDown CLI: create a venv at ~/.nonoclaw/venvs/markitdown then \
+             `pip install 'markitdown[pdf,docx,pptx,xlsx]'`.\
+             Without it, document attachments fall back to the legacy \
+             docModel OCR pipeline."
+                .into(),
+        ),
+    }
+}
+
+async fn probe_markitdown_exec(
+    path: &str,
+    timeout: Duration,
+    limit: usize,
+) -> MarkItDownProbe {
+    match bounded_command(Path::new(path), &["--version"], timeout, limit).await {
+        Ok(version) => MarkItDownProbe {
+            status: "available".into(),
+            path: Some(path.into()),
+            version: Some(version.trim().to_string()),
+            suggestion: None,
+        },
+        Err(failure) => MarkItDownProbe {
+            status: "invalid".into(),
+            path: Some(path.into()),
+            version: None,
+            suggestion: Some(failure.suggestion.to_string()),
+        },
+    }
+}
+
+fn dirs_rs_home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".into())
 }
 
 fn env_number(name: &str, fallback: u64) -> u64 {

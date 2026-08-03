@@ -34,3 +34,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 zip = "2"
 notify = { workspace = true }
 chrono = { workspace = true }
+pdf-inspector = "0.1.7"

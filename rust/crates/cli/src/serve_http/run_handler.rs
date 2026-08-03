@@ -29,7 +29,6 @@ const MAX_ATTACHMENTS_PER_RUN: usize = 8;
 const MAX_IMAGES_PER_ATTACHMENT: usize = 8;
 
 pub(super) struct WsQuestionResolver {
-    pub request_id: String,
     pub pending: Arc<QuestionMap>,
     pub tx: Tx,
 }
@@ -41,9 +40,14 @@ impl QuestionResolver for WsQuestionResolver {
     ) -> Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
-        let request_id = self.request_id.clone();
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
+            // A fresh id per ask() call — parallel AskUserQuestion invocations
+            // share this resolver, so a fixed id would make concurrent frames
+            // overwrite each other's pending sender and hang every call but
+            // the last. The permission resolver (make_permission_resolver)
+            // does the same per-request uuid allocation.
+            let request_id = Uuid::new_v4().to_string();
             pending.lock().await.insert(request_id.clone(), sender);
             send_msg(
                 &tx,

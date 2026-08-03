@@ -32,7 +32,9 @@ export default function App() {
   const setShowSessionPicker = useStore((s) => s.setShowSessionPicker);
   const compacting = useStore((s) => s.compacting);
   const pendingPermission = useStore((s) => s.pendingPermission);
-  const pendingQuestion = useStore((s) => s.pendingQuestion);
+  // Questions queue in FIFO order (parallel AskUserQuestion calls must not
+  // clobber each other); show only the current head of the queue.
+  const pendingQuestion = useStore((s) => s.pendingQuestions[0] ?? null);
   const pendingCommit = useStore((s) => s.pendingCommit);
   const setPendingCommit = useStore((s) => s.setPendingCommit);
   const clearMessages = useStore((s) => s.clearMessages);
@@ -459,6 +461,7 @@ export default function App() {
       )}
       {pendingQuestion && (
         <QuestionDialog
+          key={pendingQuestion.request_id}
           prompt={pendingQuestion.prompt}
           options={pendingQuestion.options}
           context={pendingQuestion.context}

@@ -179,6 +179,15 @@ pub struct SettingsFile {
     pub chars_per_token: usize,
     #[serde(rename = "docModel", default)]
     pub doc_model: Option<DocModelSetting>,
+    /// Document conversion strategy for file uploads.
+    /// - `"auto"` (default): probe for MarkItDown CLI → use if available,
+    ///   fall back to legacy `docModel` OCR otherwise.
+    /// - `"markitdown"`: require MarkItDown; uploads fail with a
+    ///   configuration error when it's not installed.
+    /// - `"legacy"`: always use the `docModel` OCR pipeline, never try
+    ///   MarkItDown even if installed.
+    #[serde(rename = "attachmentConverter", default)]
+    pub attachment_converter: Option<String>,
     #[serde(default)]
     pub executables: Option<ExecutableSettings>,
     #[serde(flatten)]
@@ -354,6 +363,7 @@ impl Default for SettingsFile {
             elevenlabs_api_key: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
+            attachment_converter: None,
             executables: None,
             extra: HashMap::new(),
         }
@@ -429,7 +439,9 @@ impl ModelProfile {
 
     pub fn infer_doc_provider(&self) -> &str {
         let name = self.name.to_lowercase();
-        if name.contains("mistral") {
+        if name.contains("baidu") && (name.contains("unlimited") || name.contains("ocr")) {
+            "baidu_unlimited"
+        } else if name.contains("mistral") {
             "mistral_ocr"
         } else if name.contains("deepseek") && name.contains("ocr") {
             "deepseek_ocr"
@@ -471,6 +483,11 @@ pub struct DocModelConfig {
     pub base_url: String,
     #[serde(rename = "apiKey")]
     pub api_key: String,
+    /// Optional second credential. Required by `baidu_unlimited` (Baidu
+    /// Cloud Unlimited-OCR) which authenticates with an API Key + Secret Key
+    /// pair via OAuth client_credentials. Ignored by other providers.
+    #[serde(rename = "apiSecret", default)]
+    pub api_secret: Option<String>,
 }
 
 impl fmt::Debug for DocModelConfig {
@@ -481,6 +498,7 @@ impl fmt::Debug for DocModelConfig {
             .field("model", &self.model)
             .field("base_url", &self.base_url)
             .field("api_key", &"[REDACTED]")
+            .field("api_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -492,11 +510,27 @@ impl DocModelConfig {
         resolve_process_env_ref(&self.api_key)
     }
 
+    /// Resolve the optional secret key (environment references supported).
+    pub fn resolved_api_secret(&self) -> Option<String> {
+        self.api_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(resolve_process_env_ref)
+    }
+
     pub fn is_enabled(&self) -> bool {
-        !self.provider.is_empty()
-            && self.provider != "none"
-            && !self.api_key.is_empty()
-            && !self.base_url.is_empty()
+        if self.provider.is_empty()
+            || self.provider == "none"
+            || self.base_url.is_empty()
+        {
+            return false;
+        }
+        // Baidu Cloud Unlimited-OCR needs both keys for OAuth.
+        if self.provider == "baidu_unlimited" {
+            return !self.api_key.is_empty()
+                && self.resolved_api_secret().is_some();
+        }
+        !self.api_key.is_empty()
     }
 }
 
@@ -896,6 +930,7 @@ impl ResolvedConfig {
                     model: profile.name.clone(),
                     base_url: profile.base_url.clone(),
                     api_key: profile.api_key.clone(),
+                    api_secret: None,
                 }
             }
             None => return None,
@@ -905,7 +940,19 @@ impl ResolvedConfig {
             model: config.model,
             base_url: self.resolve_reference(&config.base_url),
             api_key: self.resolve_reference(&config.api_key),
+            api_secret: config.api_secret.clone(),
         })
+    }
+
+    /// Document conversion strategy. `"auto"` (unset or explicit) probes for
+    /// MarkItDown and falls back to `docModel`; `"markitdown"` requires it;
+    /// `"legacy"` uses `docModel` exclusively.
+    pub fn attachment_converter(&self) -> &str {
+        self.settings
+            .attachment_converter
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("auto")
     }
 
     pub fn elevenlabs_api_key(&self) -> Option<String> {
@@ -2262,6 +2309,7 @@ fn record_layer_sources(layer: &ConfigLayer, sources: &mut BTreeMap<String, Vec<
         "elevenlabsApiKey",
         "charsPerToken",
         "docModel",
+        "attachmentConverter",
     ] {
         if layer.has(field) {
             set_scalar_source(sources, field, layer.source.clone());
@@ -2538,7 +2586,12 @@ fn diagnose_unknown_fields(
     if let Some(doc_model) = object.get("docModel").and_then(Value::as_object) {
         for key in doc_model
             .keys()
-            .filter(|key| !matches!(key.as_str(), "provider" | "model" | "baseUrl" | "apiKey"))
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "provider" | "model" | "baseUrl" | "apiKey" | "apiSecret"
+                )
+            })
         {
             unknown_field(&format!("docModel.{key}"), source, diagnostics);
         }

@@ -200,12 +200,39 @@ pub(super) async fn upload_handler(
         );
     }
     let http = state.config.client_factory().http_client();
+
+    // Determine the active conversion strategy.
+    let converter = state.config.attachment_converter();
+    let md_path_guard = state.markitdown_path.lock().await;
+    let md_path: Option<String> = match converter {
+        "legacy" => None,
+        "markitdown" => {
+            if md_path_guard.is_none() {
+                return upload_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    ErrorCode::Configuration,
+                    "attachmentConverter requires MarkItDown, but it is not installed",
+                    false,
+                    serde_json::json!({
+                        "setting": "attachmentConverter",
+                        "fix": "create ~/.nonoclaw/venvs/markitdown with `pip install 'markitdown[pdf,docx,pptx,xlsx]'`"
+                    }),
+                );
+            }
+            md_path_guard.clone()
+        }
+        // "auto" or unknown — use if available, silently fall back.
+        _ => md_path_guard.clone(),
+    };
+    drop(md_path_guard);
+
     let extracted = attachments::process_file(
         &doc_model,
         http.as_ref(),
         &stored_path,
         &safe_name,
         &upload_id,
+        md_path.as_deref(),
     )
     .await;
     if extracted.error.is_some() {

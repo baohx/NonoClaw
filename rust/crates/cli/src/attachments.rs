@@ -1,26 +1,39 @@
-//! File attachment processing — routes uploaded documents through a configurable
-//! multimodal document-processing model to extract text + images.
+//! File attachment processing — routes uploaded documents through a two-tier
+//! pipeline:
 //!
-//! Supported providers:
-//! - `mistral_ocr` → Mistral OCR API (`/v1/ocr`)
-//! - `gemini` → Gemini Files API + generateContent (stub)
-//! - `generic_vision` → PDF→images via pdftoppm → vision chat API (stub)
+//! **Tier 1 (local)**: Microsoft [MarkItDown](https://github.com/microsoft/markitdown)
+//! CLI converts office documents, HTML, EPUB, CSV, JSON, XML, ZIP, and many
+//! more formats to structured Markdown. Requires Python 3.10+ and
+//! `pip install 'markitdown[pdf,docx,pptx,xlsx]'` in a venv. Falls back
+//! gracefully when unavailable.
 //!
-//! Supported file types:
-//! - .txt / .md  → direct read (no model)
-//! - .pdf        → sent to the doc model
-//! - .docx/.doc  → libreoffice → PDF → doc model
-//! - .png/.jpg   → sent to the doc model as image
+//! **Tier 2 (cloud OCR)**: the configured `docModel` (Mistral, DeepSeek OCR,
+//! generic vision) handles scanned/image-only PDFs and standalone images
+//! that MarkItDown cannot extract text from.
+//!
+//! Supported file types (expanded from the legacy set):
+//! - .txt / .md  → direct read (no tool)
+//! - .pdf / .docx / .doc / .pptx / .xlsx / .xls / .html / .epub / .csv
+//!   / .json / .xml / .zip → MarkItDown (local) → then docModel OCR fallback
+//! - .png / .jpg  → docModel OCR directly (images have no structural text)
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use nonoclaw_engine::settings::DocModelConfig;
 use serde::{Deserialize, Serialize};
 
 const MAX_EXTRACTED_DOCX_XML_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EMBEDDED_IMAGE_BYTES: u64 = 1024 * 1024;
+/// Maximum stdout bytes from a single MarkItDown subprocess call.
+const MAX_MARKITDOWN_BYTES: u64 = 8 * 1024 * 1024;
+/// Subprocess hard timeout for MarkItDown conversion.
+const MARKITDOWN_TIMEOUT_SECS: u64 = 60;
+/// Non-whitespace character threshold below which MarkItDown output is
+/// considered a scan/imaged-only document and routed to cloud OCR fallback.
+const MIN_NON_WHITESPACE_CHARS: usize = 50;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -49,12 +62,20 @@ pub struct ImageB64 {
 }
 
 /// Top-level router: detect file type, pre-process if needed, extract content.
+///
+/// When `markitdown_path` is `Some`, it is tried first for all convertible
+/// formats (pdf, docx, pptx, xlsx, xls, html, epub, csv, json, xml, zip).
+/// Scanned/image-only documents fall through to the configured `docModel` OCR
+/// pipeline. Images (png/jpg) and plain text always bypass MarkItDown.
+/// When `markitdown_path` is `None`, the legacy `docModel`-only behaviour is
+/// preserved without change.
 pub async fn process_file(
     config: &DocModelConfig,
     http: &reqwest::Client,
     file_path: &Path,
     original_name: &str,
     upload_id: &str,
+    markitdown_path: Option<&str>,
 ) -> ExtractedDoc {
     let mime = mime_type(file_path, original_name);
 
@@ -82,6 +103,96 @@ pub async fn process_file(
                     images_base64: vec![],
                     error: Some(format!("failed to read file: {e}")),
                 };
+            }
+        }
+    }
+
+    // ── PDF: pdf-inspector (pure Rust, fast local extraction) ───────────
+    // Priority: pdf-inspector → (markitdown skipped for PDF) → OCR fallback.
+    // pdf-inspector classifies the PDF (TextBased/Scanned/ImageBased/Mixed),
+    // extracts position-aware text and converts to Markdown locally in ~200ms.
+    // Scanned/ImageBased pages are routed to the configured docModel OCR.
+    if mime == "application/pdf" {
+        match process_pdf_with_inspector(file_path) {
+            Ok(Some(markdown)) if non_whitespace_chars(&markdown) >= MIN_NON_WHITESPACE_CHARS => {
+                tracing::info!(
+                    chars = markdown.len(),
+                    "pdf-inspector extraction successful (text-based PDF)"
+                );
+                return ExtractedDoc {
+                    id: upload_id.into(),
+                    filename: original_name.into(),
+                    extracted_text: markdown,
+                    image_count: 0,
+                    images_base64: vec![],
+                    error: None,
+                };
+            }
+            Ok(Some(_sparse)) => {
+                tracing::info!(
+                    "pdf-inspector classified text-based but produced sparse text — falling back to OCR"
+                );
+                // Fall through to OCR below.
+            }
+            Ok(None) => {
+                // Scanned / ImageBased — no text layer to extract locally.
+                tracing::info!(
+                    "pdf-inspector classified as scanned/image-based — routing to cloud OCR"
+                );
+                // Fall through to OCR below.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "pdf-inspector failed for {} — falling back to legacy pipeline (details: {})",
+                    original_name, e
+                );
+                // Fall through to pdftotext/OCR below.
+            }
+        }
+        // Non-PDF markitdown formats below; PDF intentionally skips markitdown
+        // (it scores far worse on PDFs — benchmark 0.589 vs 0.875).
+    } else {
+        // ── MarkItDown (local) — tried for all convertible non-PDF formats ─
+        if let Some(md_path) = markitdown_path {
+            if is_markitdown_format(&mime) {
+                match process_with_markitdown(md_path, file_path).await {
+                    Ok(text) if non_whitespace_chars(&text) >= MIN_NON_WHITESPACE_CHARS => {
+                        tracing::info!(
+                            chars = text.len(),
+                            "MarkItDown extraction successful"
+                        );
+                        return ExtractedDoc {
+                            id: upload_id.into(),
+                            filename: original_name.into(),
+                            extracted_text: text,
+                            image_count: 0,
+                            images_base64: vec![],
+                            error: None,
+                        };
+                    }
+                    Ok(sparse) => {
+                        let nws = non_whitespace_chars(&sparse);
+                        tracing::info!(
+                            chars = sparse.len(),
+                            non_ws = nws,
+                            "MarkItDown returned sparse text — falling back to cloud OCR"
+                        );
+                        // Fall through — let the existing pipeline handle this
+                        // as a scan/imaged-only document.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "MarkItDown conversion failed for {} — falling back to cloud OCR",
+                            original_name
+                        );
+                        // Log a debug-level trace for diagnostics.
+                        tracing::debug!(error = %e, "MarkItDown failure detail");
+                    }
+                }
+                // If MarkItDown produced sparse text or failed entirely, the
+                // function does NOT return here — it continues into the legacy
+                // pdftotext / OCR / libreoffice branches below so every
+                // document eventually produces some output.
             }
         }
     }
@@ -179,6 +290,7 @@ pub async fn process_file(
     let result: Result<(String, usize, Vec<ImageB64>), String> = match config.provider.as_str() {
         "mistral_ocr" => process_mistral(config, http, process_target, &mime).await,
         "deepseek_ocr" => process_deepseek_ocr(config, http, process_target, &mime).await,
+        "baidu_unlimited" => process_baidu_unlimited(config, http, process_target).await,
         _ => {
             let r: Result<(String, usize), String> = match config.provider.as_str() {
                 "gemini" => process_gemini_stub(config, process_target, &mime).await,
@@ -231,6 +343,75 @@ pub async fn process_file(
             error: Some(e),
         },
     }
+}
+
+/// Whether the given mime type is handled by MarkItDown. PDFs are excluded:
+/// they are handled by pdf-inspector (faster and higher quality).
+fn is_markitdown_format(mime: &str) -> bool {
+    mime.contains("officedocument")
+        || mime == "application/msword"
+        || mime == "application/vnd.ms-excel"
+        || mime == "text/html"
+        || mime == "application/epub+zip"
+        || mime == "text/csv"
+        || mime == "application/json"
+        || mime == "text/xml"
+        || mime == "application/xml"
+        || mime == "application/zip"
+}
+
+/// Use pdf-inspector (pure Rust) to classify and extract a PDF.
+/// Returns:
+/// - `Ok(Some(markdown))` — text-based PDF, markdown extracted locally
+/// - `Ok(None)` — scanned/image-based PDF (no text layer; caller should OCR)
+/// - `Err(..)` — parse failure (caller should fall back to legacy pipeline)
+fn process_pdf_with_inspector(file_path: &Path) -> Result<Option<String>, String> {
+    let result = pdf_inspector::process_pdf(file_path)
+        .map_err(|e| format!("pdf-inspector failed: {e}"))?;
+
+    match result.pdf_type {
+        pdf_inspector::PdfType::TextBased | pdf_inspector::PdfType::Mixed => {
+            let markdown = result.markdown.unwrap_or_default();
+            Ok(Some(markdown))
+        }
+        pdf_inspector::PdfType::Scanned | pdf_inspector::PdfType::ImageBased => Ok(None),
+    }
+}
+
+fn non_whitespace_chars(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Call the MarkItDown CLI (`markitdown <path>`) and collect its stdout.
+/// Hard timeout: 60 s. Output hard cap: 8 MB.
+async fn process_with_markitdown(md_path: &str, file_path: &Path) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(MARKITDOWN_TIMEOUT_SECS),
+        tokio::process::Command::new(md_path)
+            .arg(file_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("markitdown timed out after {MARKITDOWN_TIMEOUT_SECS}s"))?
+    .map_err(|e| format!("markitdown spawn failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let truncated: String = stderr.chars().take(512).collect();
+        return Err(format!("markitdown exit {}: {truncated}", output.status));
+    }
+
+    let raw = output.stdout;
+    if raw.len() as u64 > MAX_MARKITDOWN_BYTES {
+        return Err(format!(
+            "markitdown output exceeds limit ({} bytes)",
+            MAX_MARKITDOWN_BYTES
+        ));
+    }
+
+    String::from_utf8(raw).map_err(|e| format!("markitdown output is not UTF-8: {e}"))
 }
 
 // ── Direct text extraction (no OCR needed) ─────────────────────────────────
@@ -560,6 +741,16 @@ fn mime_type(file_path: &Path, original_name: &str) -> String {
         "pdf" => "application/pdf".into(),
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
         "doc" => "application/msword".into(),
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            .into(),
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+        "xls" => "application/vnd.ms-excel".into(),
+        "html" | "htm" => "text/html".into(),
+        "epub" => "application/epub+zip".into(),
+        "csv" => "text/csv".into(),
+        "json" => "application/json".into(),
+        "xml" => "text/xml".into(),
+        "zip" => "application/zip".into(),
         "png" => "image/png".into(),
         "jpg" | "jpeg" => "image/jpeg".into(),
         _ => {
@@ -752,6 +943,182 @@ struct MistralOcrPage {
     markdown: String,
     #[serde(default)]
     images: Vec<serde_json::Value>,
+}
+
+// ── Baidu Cloud Unlimited-OCR provider (async task API) ─────────────────────
+//
+// Unlike the synchronous OpenAI-compatible providers above, Baidu Cloud's
+// hosted Unlimited-OCR is an asynchronous task API:
+//   1. OAuth client_credentials → access_token (30-day validity)
+//   2. POST /rest/2.0/brain/online/v2/unlimited-ocr-parser/task
+//      (form: file_data base64 + file_name) → { result: { task_id } }
+//   3. Poll POST .../task/query (form: task_id) until status=success,
+//      then download `markdown_url`.
+// Reference: https://cloud.baidu.com/doc/OCR/s/fmr1p39gb
+
+const BAIDU_UNLIMITED_TASK_PATH: &str =
+    "/rest/2.0/brain/online/v2/unlimited-ocr-parser/task";
+const BAIDU_UNLIMITED_QUERY_PATH: &str =
+    "/rest/2.0/brain/online/v2/unlimited-ocr-parser/task/query";
+/// Poll interval between task/query calls.
+const BAIDU_UNLIMITED_POLL_INTERVAL_SECS: u64 = 5;
+/// Hard cap on total wait for an async parse task.
+const BAIDU_UNLIMITED_MAX_WAIT_SECS: u64 = 300;
+
+async fn process_baidu_unlimited(
+    config: &DocModelConfig,
+    http: &reqwest::Client,
+    file_path: &Path,
+) -> Result<(String, usize, Vec<ImageB64>), String> {
+    let base = config.base_url.trim_end_matches('/').to_string();
+    let api_key = config.resolved_api_key();
+    let api_secret = config
+        .resolved_api_secret()
+        .ok_or("baidu_unlimited requires apiSecret (API Key + Secret Key pair)")?;
+
+    // 1. OAuth token.
+    let token = baidu_get_access_token(http, &base, &api_key, &api_secret).await?;
+
+    // 2. Submit the document.
+    let bytes =
+        std::fs::read(file_path).map_err(|e| format!("failed to read file for OCR: {e}"))?;
+    let file_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document")
+        .to_string();
+
+    let submit_url = format!("{base}{BAIDU_UNLIMITED_TASK_PATH}?access_token={token}");
+    let submit_resp = http
+        .post(&submit_url)
+        .form(&[("file_data", &file_b64), ("file_name", &file_name)])
+        .send()
+        .await
+        .map_err(|e| format!("baidu submit request failed: {e}"))?;
+    let submit_json: serde_json::Value = submit_resp
+        .json()
+        .await
+        .map_err(|_| "baidu submit returned invalid JSON".to_string())?;
+    if submit_json["error_code"].as_i64() != Some(0) {
+        return Err(format!(
+            "baidu submit failed: {}",
+            submit_json["error_msg"].as_str().unwrap_or("unknown error")
+        ));
+    }
+    let task_id = submit_json["result"]["task_id"]
+        .as_str()
+        .ok_or("baidu submit returned no task_id")?
+        .to_string();
+    tracing::info!(task_id, "baidu unlimited-ocr task submitted");
+
+    // 3. Poll for the result.
+    let markdown = baidu_poll_result(http, &base, &token, &task_id).await?;
+    tracing::info!(chars = markdown.len(), "baidu unlimited-ocr extraction complete");
+    Ok((markdown, 0, vec![]))
+}
+
+async fn baidu_get_access_token(
+    http: &reqwest::Client,
+    base: &str,
+    api_key: &str,
+    api_secret: &str,
+) -> Result<String, String> {
+    let url = format!("{base}/oauth/2.0/token");
+    let resp = http
+        .get(&url)
+        .query(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", api_key),
+            ("client_secret", api_secret),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("baidu token request failed: {e}"))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| "baidu token returned invalid JSON".to_string())?;
+    json["access_token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "baidu token request failed: {}",
+                json["error_description"]
+                    .as_str()
+                    .unwrap_or("no access_token in response")
+            )
+        })
+}
+
+async fn baidu_poll_result(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let query_url = format!("{base}{BAIDU_UNLIMITED_QUERY_PATH}?access_token={token}");
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(BAIDU_UNLIMITED_MAX_WAIT_SECS);
+
+    loop {
+        let resp = http
+            .post(&query_url)
+            .form(&[("task_id", task_id)])
+            .send()
+            .await
+            .map_err(|e| format!("baidu query request failed: {e}"))?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|_| "baidu query returned invalid JSON".to_string())?;
+        let status = json["result"]["status"].as_str().unwrap_or("pending");
+        match status {
+            "success" => {
+                let md_url = json["result"]["markdown_url"]
+                    .as_str()
+                    .ok_or("baidu result has no markdown_url")?;
+                let md_resp = http
+                    .get(md_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("baidu markdown download failed: {e}"))?;
+                if !md_resp.status().is_success() {
+                    return Err(format!(
+                        "baidu markdown download returned HTTP {}",
+                        md_resp.status()
+                    ));
+                }
+                let text = md_resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("baidu markdown read failed: {e}"))?;
+                return Ok(text.trim().to_string());
+            }
+            "failed" => {
+                return Err(format!(
+                    "baidu parse failed: {}",
+                    json["result"]["task_error"]
+                        .as_str()
+                        .unwrap_or("unknown task error")
+                ))
+            }
+            // pending | running (or unknown) → keep polling.
+            _ => {
+                if std::time::Instant::now() > deadline {
+                    return Err(format!(
+                        "baidu parse timed out after {}s",
+                        BAIDU_UNLIMITED_MAX_WAIT_SECS
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    BAIDU_UNLIMITED_POLL_INTERVAL_SECS,
+                ))
+                .await;
+            }
+        }
+    }
 }
 
 // ── DeepSeek OCR provider (OpenAI-compatible) ───────────────────────────────
@@ -1084,6 +1451,7 @@ fn pdf_to_images(file_path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 /// Allowed file extensions.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
     "pdf", "docx", "doc", "txt", "md", "markdown", "png", "jpg", "jpeg",
+    "pptx", "xlsx", "xls", "html", "htm", "epub", "csv", "json", "xml", "zip",
 ];
 
 /// Max file size in bytes (32 MB).
@@ -1119,8 +1487,45 @@ pub fn file_signature_matches(filename: &str, bytes: &[u8]) -> bool {
                 .map(|archive| archive.file_names().any(|name| name == "word/document.xml"))
                 .unwrap_or(false)
         }
+        "pptx" => {
+            let cursor = std::io::Cursor::new(bytes);
+            zip::ZipArchive::new(cursor)
+                .map(|archive| archive.file_names().any(|name| name == "ppt/presentation.xml"))
+                .unwrap_or(false)
+        }
+        "xlsx" => {
+            let cursor = std::io::Cursor::new(bytes);
+            zip::ZipArchive::new(cursor)
+                .map(|archive| archive.file_names().any(|name| name == "xl/workbook.xml"))
+                .unwrap_or(false)
+        }
+        "xls" => bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+        "html" | "htm" => {
+            let lower = bytes.iter().take(256).map(|&b| b.to_ascii_lowercase()).collect::<Vec<_>>();
+            lower.windows(6).any(|w| w == b"<html " || w == b"<html>")
+                || lower.windows(9).any(|w| w == b"<!doctype")
+        }
+        "epub" => {
+            let cursor = std::io::Cursor::new(bytes);
+            zip::ZipArchive::new(cursor)
+                .map(|archive| archive.file_names().any(|name| name == "META-INF/container.xml"))
+                .unwrap_or(false)
+        }
+        "csv" => is_valid_utf8_text(bytes),
+        "json" => is_valid_utf8_text(bytes)
+            && bytes.iter().any(|&b| b == b'{' || b == b'['),
+        "xml" => is_valid_utf8_text(bytes)
+            && bytes.windows(5).any(|w| w == b"<?xml"),
+        "zip" => {
+            let cursor = std::io::Cursor::new(bytes);
+            zip::ZipArchive::new(cursor).is_ok()
+        }
         _ => false,
     }
+}
+
+fn is_valid_utf8_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
 /// Sanitize a filename: strip path separators and `..`.

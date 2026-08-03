@@ -184,7 +184,11 @@ export interface ProjectSlice {
 
 export interface DialogSlice {
   pendingPermission: PermissionRequired | null;
-  pendingQuestion: QuestionRequired | null;
+  /** FIFO queue of unanswered questions. Concurrent `question_required`
+   *  frames (e.g. parallel AskUserQuestion calls) must never clobber each
+   *  other — the frontend shows `pendingQuestions[0]` and advances on
+   *  resolve, so every question gets a chance to be answered. */
+  pendingQuestions: QuestionRequired[];
   pendingCommit: { sha: string; output: string } | null;
   showSessionPicker: boolean;
   resolvedPermissionIds: string[];
@@ -286,7 +290,7 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
     subagentRunsById: {},
     childIdsByParentToolId: {},
     pendingPermission: null,
-    pendingQuestion: null,
+    pendingQuestions: [],
     pendingCommit: null,
     resolvedPermissionIds: [],
     resolvedQuestionIds: [],
@@ -382,7 +386,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
         ...result.state,
         streamingIdx: null,
         pendingPermission: null,
-        pendingQuestion: null,
+        pendingQuestions: [],
         compacting: false,
         agentRunning: false,
         cancelling: false,
@@ -432,7 +436,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     compacting: false,
     multiRun: null,
     pendingPermission: null,
-    pendingQuestion: null,
+    pendingQuestions: [],
     outboundQueue: [],
   })),
 });
@@ -536,7 +540,7 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
 
 export const createDialogSlice: Slice<DialogSlice> = (set) => ({
   pendingPermission: null,
-  pendingQuestion: null,
+  pendingQuestions: [],
   pendingCommit: null,
   showSessionPicker: false,
   resolvedPermissionIds: [],
@@ -548,20 +552,28 @@ export const createDialogSlice: Slice<DialogSlice> = (set) => ({
       input: sanitizeBrowserValue(pendingPermission.input),
       message: sanitizeBrowserText(pendingPermission.message),
     } : null }),
-  setPendingQuestion: (pendingQuestion) => set((state) => pendingQuestion && state.resolvedQuestionIds.includes(pendingQuestion.request_id)
-    ? {}
-    : { pendingQuestion: pendingQuestion ? {
+  setPendingQuestion: (pendingQuestion) => set((state) => {
+    // `null` clears the whole queue (connection teardown). A non-null frame
+    // is appended unless already resolved or already queued — never clobbered.
+    if (!pendingQuestion) return { pendingQuestions: [] };
+    const { request_id } = pendingQuestion;
+    if (state.resolvedQuestionIds.includes(request_id)) return {};
+    if (state.pendingQuestions.some((queued) => queued.request_id === request_id)) return {};
+    return { pendingQuestions: [...state.pendingQuestions, {
       ...pendingQuestion,
       prompt: sanitizeBrowserText(pendingQuestion.prompt),
       options: pendingQuestion.options.map(sanitizeBrowserText),
-    } : null }),
+    }] };
+  }),
   resolvePermission: (requestId) => set((state) => ({
     ...resolvePromptTransition(state, "permission", requestId),
     pendingPermission: state.pendingPermission?.request_id === requestId ? null : state.pendingPermission,
   })),
   resolveQuestion: (requestId) => set((state) => ({
     ...resolvePromptTransition(state, "question", requestId),
-    pendingQuestion: state.pendingQuestion?.request_id === requestId ? null : state.pendingQuestion,
+    // Remove the answered question; the next queued question surfaces as
+    // pendingQuestions[0] so sequential confirmation of parallel questions works.
+    pendingQuestions: state.pendingQuestions.filter((queued) => queued.request_id !== requestId),
   })),
   setPendingCommit: (pendingCommit) => set({ pendingCommit }),
   setShowSessionPicker: (showSessionPicker) => set({ showSessionPicker }),
