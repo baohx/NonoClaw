@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::background::BackgroundTaskRegistry;
 use crate::permissions::PermissionGate;
 use crate::registry::ToolRegistry;
-use crate::tool::{QuestionResolver, SubagentRunner, ToolCtx, ToolOptions};
+use crate::tool::{GraphRunner, QuestionResolver, SubagentRunner, ToolCtx, ToolOptions};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 10;
 const SUMMARY_SUFFIX_RESERVE: usize = 512;
@@ -116,6 +116,7 @@ pub struct ToolExecutionContext<'a> {
     pub cancel: &'a CancellationToken,
     pub task_scope: Option<&'a str>,
     pub subagent: Option<&'a dyn SubagentRunner>,
+    pub graph_runner: Option<&'a dyn GraphRunner>,
     pub question: Option<&'a dyn QuestionResolver>,
     pub background_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
     pub is_non_interactive: bool,
@@ -258,6 +259,7 @@ impl ToolExecutor {
             tool_use_id: &call.id,
             task_scope: context.task_scope,
             subagent: context.subagent,
+            graph_runner: context.graph_runner,
             question: context.question,
             background_registry: context.background_registry.clone(),
         };
@@ -889,6 +891,7 @@ mod tests {
             cancel,
             task_scope: Some("executor-test"),
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
             is_non_interactive: true,

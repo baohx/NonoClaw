@@ -307,6 +307,7 @@ mod tests {
             tool_use_id: "webfetch-test-call",
             task_scope: Some("webfetch-test"),
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
         };

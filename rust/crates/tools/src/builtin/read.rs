@@ -150,6 +150,7 @@ mod tests {
             tool_use_id: "read-test-call",
             task_scope: Some("read-test"),
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
         };

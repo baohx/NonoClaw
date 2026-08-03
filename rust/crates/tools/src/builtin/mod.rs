@@ -9,6 +9,7 @@ pub mod bash;
 pub mod coordinator;
 pub mod edit;
 pub mod glob;
+pub mod graph;
 pub mod grep;
 pub mod lsp;
 pub mod memory;
@@ -28,6 +29,7 @@ pub use bash::BashTool;
 pub use coordinator::CoordinatorTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
+pub use graph::GraphTool;
 pub use grep::GrepTool;
 pub use lsp::LspTool;
 pub use memory::MemoryTool;
@@ -94,6 +96,7 @@ pub fn register_all() -> (ToolRegistry, Arc<TodoStore>) {
     reg.register(std::sync::Arc::new(AgentTool));
     reg.register(std::sync::Arc::new(AskUserQuestionTool));
     reg.register(std::sync::Arc::new(CoordinatorTool));
+    reg.register(std::sync::Arc::new(GraphTool));
     reg.register(std::sync::Arc::new(task_tools::TaskCreateTool {
         store: Arc::clone(&todos),
     }));

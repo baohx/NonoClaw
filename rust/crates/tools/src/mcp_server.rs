@@ -134,6 +134,7 @@ async fn call_tool(
         tool_use_id: "mcp-call",
         task_scope: Some("mcp"),
         subagent: None,
+        graph_runner: None,
         question: None,
         background_registry: None,
     };
@@ -195,8 +196,9 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Graph"));
         assert!(names.contains(&"TaskOutput"));
         assert!(names.contains(&"TaskStop"));
         assert!(!names.contains(&"Agent"));

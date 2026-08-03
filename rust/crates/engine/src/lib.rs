@@ -5,6 +5,7 @@ pub mod agents;
 pub mod compact;
 pub mod context;
 pub mod extensions;
+pub mod graph;
 pub mod hooks;
 pub mod loop_;
 pub mod prompt;

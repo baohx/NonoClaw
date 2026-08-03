@@ -518,6 +518,29 @@
   {
     "input_schema": {
       "properties": {
+        "args": {
+          "description": "Optional input state merged into the graph",
+          "type": "object"
+        },
+        "graph": {
+          "description": "Graph name (filename stem under .nonoclaw/graphs/)",
+          "type": "string"
+        },
+        "resume": {
+          "description": "Resume from the last checkpoint",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "graph"
+      ],
+      "type": "object"
+    },
+    "name": "Graph"
+  },
+  {
+    "input_schema": {
+      "properties": {
         "activeForm": {
           "description": "Present continuous (e.g. 'Running tests')",
           "type": "string"

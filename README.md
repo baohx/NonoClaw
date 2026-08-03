@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.10.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **progressive skill disclosure**, **session-pinned MCP tool selection**, and **high-fidelity DOCX/PDF export**.
+> **Version**: v0.12.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, and **high-fidelity DOCX/PDF export**.
 
 ---
 
@@ -17,6 +17,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Mobile & Remote Access](#mobile--remote-access)
 - [Skills & Plugins](#skills--plugins)
 - [Agent Profiles](#agent-profiles)
+- [Agent Graphs](#agent-graphs)
 - [Prompt Templates](#prompt-templates)
 - [Project Context Files](#project-context-files)
 - [Configuration (settings.json)](#configuration-settingsjson)
@@ -90,7 +91,8 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). BM25 search with importance ranking. The `Memory` tool is part of the registry-derived core tool set and is auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
 | **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. No embeddings, no vector DB. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
-| **Core Tools (registry-derived)** | Core tool names and model-facing schemas come from `ToolRegistry` and are contract-tested against `rust/crates/tools/tests/snapshots/builtin_tool_contract.json`; MCP tools are added dynamically. The runtime registry, not this README, is the count/source of truth. |
+| **Subagent Delegation** | `Agent` tool spawns a full subagent (autonomous, depth=1, non-interactive); `Coordinator` fans out parallel tasks. Both inherit CancellationToken + hooks + events. Child toolset excludes Agent/Coordinator/Graph (no recursion). **Graph tool** runs declarative DAG pipelines. |
+| **Agent Graphs** | **Declarative DAG pipelines** in `.nonoclaw/graphs/<name>.md`: YAML frontmatter defines nodes (subagent / LLM router / human gate) and `next` edges; fan-out parallelism + fan-in gathering; router picks branches dynamically; gate pauses for human approval; **checkpoint resume** after interruption. `Graph` tool for dynamic invocation + `/graph` slash command. Covers all 5 Anthropic workflow patterns. |
 | **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts (`systemPromptAppend` or **`systemPromptOverride`**), tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
@@ -441,7 +443,7 @@ Start with `--serve-http 127.0.0.1:8765` and open the browser.
 
 ### Key UI Features
 - **Breathing background** — aurora orbs pulse in rhythm with token-stream velocity
-- **Three themes** — Biolume (cyan/mint) · Amber Forge (gold) · Glacial Frost (ice-blue) — cycled via status bar dot
+- **14 themes** — Biolume / Amber / Meadow / Crimson / Teal / Gold / Aqua / Scarlet / Ember / Frost / Indigo / Burgundy / Espresso / Navy — dark-mode auto-detection, per-theme aurora palette
 - **File tree** — click file → open in OS default editor; Shift+click → VS Code
 - **Git pane** — branch, ahead/behind, staged/modified/untracked counts, recent commits (click → `git show` modal), filter by author/subject
 - **Insight accordion** — Tools (click → expand input schema + prompt preview), MCP servers, Models, Skills, Hooks, Slash commands, Docs & config (clickable to edit), CLI reference, Project info
@@ -455,6 +457,7 @@ Start with `--serve-http 127.0.0.1:8765` and open the browser.
 | `/compact` | Summarise long context |
 | `/skill-name` | Inject a skill's instructions into system prompt (with args: `/deploy prod main`) |
 | `/multi model1,model2 <prompt>` | Compare answers from multiple models |
+| `/graph <name> k=v ...` | Pre-execute a declarative agent graph and inject its result |
 | `/rename <title>` | Set a custom session title |
 
 ---
@@ -638,6 +641,72 @@ permissionMode: plan
 - `systemPromptOverride` — **完全替换**子 Agent 系统提示词（非空时忽略 `systemPromptAppend`）
 
 适用于高度专业化的子 Agent（如"代码审查专用"、"测试生成专用"）。
+
+---
+
+## Agent Graphs
+
+**声明式编排图**——将 Agent 多步工作流定义为可复用、可审计、可版本化的文件产物，覆盖 Anthropic 全部 5 种 workflow 模式：prompt chaining / routing / parallelization / orchestrator-workers / evaluator-optimizer。
+
+### 图定义（`.nonoclaw/graphs/<name>.md`）
+
+```markdown
+---
+name: research
+description: 调研 → 分析 → 报告
+version: 1
+start: gather
+max_steps: 20
+state:
+  topic: ""                     # 输入参数
+nodes:
+  gather:
+    profile: researcher         # 可选 agent profile
+    prompt: "调研 {topic} 并返回结构化要点。"
+    next: analyze               # 单个后继；列表 = fan-out
+  analyze:
+    prompt: "基于 {gather} 分析，给出结论。"
+    next: decide
+  decide:
+    kind: router                # LLM 路由：回复必须是某个分支名
+    prompt: "根据进展选择下一步。"
+    branches: [draft, rewrite]
+  draft:
+    prompt: "起草方案。"
+    next: review
+  review:
+    kind: gate                  # 人工审批（Continue / Abort）
+    prompt: "方案需要人工确认。"
+    next: report
+  report:
+    prompt: "汇总最终报告。"
+    end: true                   # 终止节点
+---
+```
+
+### 执行语义
+
+```
+Kahn 拓扑 + 动态边（数据流 DAG）
+  ├─ fan-out: 多后继并行执行（就绪批并发）
+  ├─ fan-in:  等所有确定性前驱完成
+  ├─ router:  子 agent 回复规范化匹配 branches → 仅激活所选分支
+  ├─ gate:    QuestionResolver.ask()（Continue / Abort）；headless 默认继续
+  ├─ checkpoint: 每节点原子写入 .checkpoints/<name>.json
+  ├─ resume:  版本匹配时跳过已完成节点，重放分支选择
+  └─ 防递归:  子 agent registry 移除 Agent/Coordinator/Graph
+```
+
+### 触发方式
+
+| 方式 | 用法 | 说明 |
+|---|---|---|
+| `Graph` 工具 | `{"graph":"research","args":{"topic":"AI"}}` | 主 agent 动态调用（需权限审批） |
+| `/graph` 命令 | `/graph research topic=AI` 或 `/graph research {"topic":"AI"}` | 预执行后注入结果，LLM 继续 |
+
+### Prompt 模板
+
+节点 prompt 中 `{var}` 引用图级 state：输入参数（`{topic}`）、前驱节点输出（`{gather}`、`{analyze}`）都可直接嵌入。
 
 ---
 
@@ -911,7 +980,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.10.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**技能渐进式披露**、**MCP 会话级工具选择**和**高保真 DOCX/PDF 导出**。
+> **版本**: v0.12.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**和**高保真 DOCX/PDF 导出**。
 
 ---
 
@@ -926,6 +995,7 @@ NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI�
 - [移动端与远程访问](#mobile--remote-access)
 - [技能与插件](#skills--plugins)
 - [Agent 配置文件](#agent-profiles)
+- [Agent 图](#agent-graphs)
 - [提示词模板](#prompt-templates)
 - [项目上下文文件](#project-context-files)
 - [配置 (settings.json)](#configuration-settingsjson)
@@ -998,7 +1068,8 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。BM25 搜索 + 重要性排序。`Memory` 属于注册表生成的核心工具集合。每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。 |
 | **LLM Wiki** | Karpathy 风格的结构化知识编译：`wiki/` 目录含有 concepts、entities、comparisons、decisions、sources 页面。`raw/` 存放不可变的源文档。LLM 充当编译器——摄入原始资料，创建/更新互链的 wiki 页面。BM25 搜索 + `Memory` 工具操作（`wiki_search`、`wiki_ingest`、`wiki_lint`）。`wiki/index.md` 在会话启动时自动注入。无嵌入向量，无向量数据库。 |
 | **系统提示词** | 增强型：手术级编辑规则、6 种命名失败模式、反过度工程规则、ToolSearch 使用指南、**Git 上下文在非缓存块中**（缓存跨轮次保持有效）、**记忆回写指令** |
-| **核心工具（从注册表派生）** | 核心工具名称及面向模型的 schema 来自 `ToolRegistry`，并由 `rust/crates/tools/tests/snapshots/builtin_tool_contract.json` 做契约测试；MCP 工具动态加入。运行时注册表（而非 README 中的手写数字）是数量与契约的事实源。 |
+| **子委托与编排** | `Agent` 工具生成完整子代理（自主、depth=1、非交互）；`Coordinator` 并行扇出多任务。全部继承 CancellationToken + hooks + 事件。子级工具集排除 Agent/Coordinator/Graph（禁止递归）。**Graph 工具**执行声明式 DAG 管线。 |
+| **Agent 图** | **声明式 DAG 管线**（`.nonoclaw/graphs/<name>.md`）：YAML frontmatter 定义节点（子代理 / LLM 路由 / 人工审批）和 `next` 边；fan-out 并行 + fan-in 汇聚；路由动态选择分支；看门暂停等待人工审批；**checkpoint 断点续跑**。`Graph` 工具动态调用 + `/graph` 斜杠命令。覆盖 Anthropic 全部 5 种工作流模式。 |
 | **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。 |
 | **文件附件** | 通过纸夹按钮、拖拽或粘贴上传 PDF/DOCX/DOC/TXT/MD/PNG/JPG；通过可配置的 Mistral/DeepSeek 文档模型**自动 OCR**；**直接文本提取**（pdftotext + ZIP XML）尽可能跳过 OCR；**嵌入图片提取**（pdfimages + word/media）并为每张图片生成 OCR 描述；多模态模型的 **ContentBlock::Image 注入** |
 | **Bash 后台任务** | `run_in_background: true` 启动分离进程，输出持久化到磁盘，完成时注入 `<task_notification>` |
@@ -1319,7 +1390,7 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 
 ### 主要 UI 功能
 - **呼吸式背景** — aurora 光球随 token 输出速度脉动
-- **三种主题** — Biolume（青/薄荷）· Amber Forge（金色）· Glacial Frost（冰蓝）— 通过状态栏圆点切换
+- **14 种主题** — Biolume / Amber / Meadow / Crimson / Teal / Gold / Aqua / Scarlet / Ember / Frost / Indigo / Burgundy / Espresso / Navy — 暗色模式自动检测，每主题 aurora 调色板
 - **文件树** — 点击文件 → 用系统默认编辑器打开；Shift+点击 → VS Code
 - **Git 面板** — 分支、领先/落后、暂存/修改/未追踪计数、最近提交（点击 → `git show` 弹窗）、按作者/主题过滤
 - **Insight 手风琴** — 工具（点击 → 展开输入 schema + 提示词预览）、MCP 服务器、模型、技能、钩子、斜杠命令、文档与配置（可点击编辑）、CLI 参考、项目信息
@@ -1333,6 +1404,7 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 | `/compact` | 压缩长上下文 |
 | `/skill-name` | 将技能指令注入系统提示词（可带参数：`/deploy prod main`） |
 | `/multi model1,model2 <prompt>` | 用多个模型对比回答 |
+| `/graph <name> k=v ...` | 预执行声明式 agent graph 后将结果注入上下文 |
 | `/rename <title>` | 设置自定义会话标题 |
 
 ---

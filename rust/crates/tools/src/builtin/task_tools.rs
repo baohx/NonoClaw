@@ -340,6 +340,7 @@ mod tests {
             tool_use_id: "task-test-call",
             task_scope: Some("coordinator"),
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
         };

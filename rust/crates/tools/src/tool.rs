@@ -83,6 +83,19 @@ pub trait SubagentRunner: Send + Sync {
     }
 }
 
+/// Runs a named declarative agent graph (`.nonoclaw/graphs/<name>.md`) and
+/// returns the graph's final text answer. Provided by the engine; the Graph
+/// tool reads it from [`ToolCtx::graph_runner`]. `resume` re-runs from the
+/// graph's last checkpoint (completed nodes are skipped).
+pub trait GraphRunner: Send + Sync {
+    fn run_graph<'a>(
+        &'a self,
+        name: &str,
+        args: serde_json::Value,
+        resume: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+}
+
 /// Urgency level for a human-contact question (Factor 7 structured field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuestionUrgency {
@@ -152,6 +165,9 @@ pub struct ToolCtx<'a> {
     /// Subagent runner (set by the engine). `None` in tests / when subagents
     /// are unavailable; the Agent tool errors if it's missing.
     pub subagent: Option<&'a dyn SubagentRunner>,
+    /// Declarative graph runner (set by the engine). `None` when graphs are
+    /// unavailable; the Graph tool errors if it's missing.
+    pub graph_runner: Option<&'a dyn GraphRunner>,
     /// Interactive question resolver (AskUserQuestion). `None` when headless.
     pub question: Option<&'a dyn QuestionResolver>,
     /// Background task registry for `run_in_background` bash commands.

@@ -295,10 +295,26 @@ impl SubagentLifecycle {
                 self.depth, self.max_depth
             )));
         }
-        // Agent and Coordinator are removed at the depth boundary so direct
-        // and batched recursion are blocked. TodoWrite remains available: its
-        // canonical store isolates entries by child session scope.
-        Ok(registry.filtered(&["Agent", "Coordinator"]))
+        // Agent, Coordinator, and Graph are removed at the depth boundary so
+        // direct, batched, and graph-based recursion are all blocked. TodoWrite
+        // remains available: its canonical store isolates entries by child
+        // session scope.
+        Ok(registry.filtered(&["Agent", "Coordinator", "Graph"]))
+    }
+
+    /// Cancellation token shared by every child spawned under this lifecycle.
+    pub(crate) fn cancel(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Current recursion depth (0 for a root agent).
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Maximum allowed recursion depth.
+    pub(crate) fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     pub(crate) async fn run<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {

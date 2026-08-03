@@ -170,6 +170,7 @@ mod tests {
             tool_use_id: "todo-test-call",
             task_scope: Some("parent"),
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
         };

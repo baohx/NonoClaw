@@ -1,6 +1,7 @@
 //! Coordinator tool — parallel multi-subagent dispatch. Mirrors the role of
 //! `src/coordinator/`: fan out independent subtasks to subagents, gather
 //! results. Uses [`SubagentRunner::run_subagents`] for concurrent execution.
+//! Child agents never see Agent/Coordinator/Graph, so nesting is blocked.
 
 use crate::tool::{normalize_optional_profile, SubagentRequest, Tool, ToolCtx, ToolResult};
 use async_trait::async_trait;
@@ -235,6 +236,7 @@ mod tests {
             tool_use_id: "profile-normalization-fixture",
             task_scope: None,
             subagent: Some(&runner),
+            graph_runner: None,
             question: None,
             background_registry: None,
         };
@@ -330,6 +332,7 @@ mod tests {
             tool_use_id: "coordinator-fixture",
             task_scope: None,
             subagent: None,
+            graph_runner: None,
             question: None,
             background_registry: None,
         };

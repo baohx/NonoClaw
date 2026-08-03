@@ -16,7 +16,7 @@ use nonoclaw_core::{
     Result, RunEvent, SessionRepair, StopReason, StreamState, TechnicalStatus, Usage, UsagePart,
 };
 use nonoclaw_tools::permissions::PermissionGate;
-use nonoclaw_tools::tool::{QuestionResolver, SubagentRunner};
+use nonoclaw_tools::tool::{GraphRunner, QuestionResolver, SubagentRunner};
 use nonoclaw_tools::{
     PermissionResolverFuture, SubagentRequest, TodoStore, ToolCall, ToolExecutionContext,
     ToolExecutor, ToolHookRunner, ToolOptions, ToolPermissionRequest, ToolPermissionResolver,
@@ -763,6 +763,29 @@ impl QueryEngine {
             )));
         }
 
+        // Graph slash command: `/graph <name> [k=v ...]` runs a declarative
+        // agent graph inline and injects its final answer before the first LLM
+        // turn, so the model can continue from the graph's result.
+        if let Some(rest) = user_text
+            .strip_prefix('/')
+            .filter(|rest| rest.split_whitespace().next() == Some("graph"))
+        {
+            let mut parts = rest.split_whitespace();
+            let _command = parts.next();
+            if let Some(graph_name) = parts.next() {
+                let args_text = parts.collect::<Vec<_>>().join(" ");
+                let args = crate::graph::parse_args(&args_text);
+                let inline = match spawner.run_graph(graph_name, args, false).await {
+                    Ok(text) => format!("<graph name=\"{graph_name}\">\n{text}\n</graph>"),
+                    Err(error) => format!(
+                        "<graph name=\"{graph_name}\" error=\"true\">\n{error}\n</graph>"
+                    ),
+                };
+                self.messages
+                    .push(Message::user(MessageContent::from_text(inline)));
+            }
+        }
+
         let finish_reason = loop {
             if cancel.is_cancelled() {
                 return Err(nonoclaw_core::Error::Cancelled);
@@ -1375,6 +1398,7 @@ impl QueryEngine {
                 cancel: &cancel,
                 task_scope: Some(task_scope),
                 subagent: Some(&spawner),
+                graph_runner: Some(&spawner),
                 question: self.options.question_resolver.as_deref(),
                 background_registry: self.options.background_registry.clone(),
                 is_non_interactive: self.options.is_non_interactive,
@@ -2016,6 +2040,39 @@ impl SubagentRunner for EngineSubagent {
                 .map(|request| self.run_subagent(request))
                 .collect::<Vec<_>>();
             futures::future::join_all(futures).await
+        })
+    }
+}
+
+impl GraphRunner for EngineSubagent {
+    fn run_graph<'a>(
+        &'a self,
+        name: &str,
+        args: serde_json::Value,
+        resume: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if self.lifecycle.depth() >= self.lifecycle.max_depth() {
+                return Err(nonoclaw_core::Error::Other(
+                    "agent graphs are not allowed at this recursion depth".into(),
+                ));
+            }
+            let def = crate::graph::load_graph_checked(&self.cwd, &name)?;
+            let result = crate::graph::executor::run_graph(
+                &def,
+                &args,
+                &crate::graph::executor::GraphRunOptions {
+                    cwd: &self.cwd,
+                    session_id: &self.run_context.session_id,
+                    cancel: self.lifecycle.cancel(),
+                    subagent: self,
+                    question: self.options.question_resolver.as_deref(),
+                    resume,
+                },
+            )
+            .await?;
+            Ok(result.text)
         })
     }
 }
