@@ -43,6 +43,7 @@ use super::protocol::{
     terminal_fields, ClientMsg, ModelInfo, ServerMsg, SessionInfoWire,
 };
 use crate::attachments;
+#[cfg(test)]
 use crate::project_info::ProjectInfo;
 #[cfg(test)]
 use nonoclaw_engine::{EngineEvent, EventEnvelope};
@@ -534,7 +535,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         send_msg(
             &tx,
             ServerMsg::FileTree {
-                root: state.cwd.to_string_lossy().to_string(),
+                root: nonoclaw_core::display_path(&state.cwd),
                 entries: state.project_service.file_tree(),
             },
         )
@@ -742,7 +743,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 send_msg(
                     &tx,
                     ServerMsg::FileTree {
-                        root: state.cwd.to_string_lossy().to_string(),
+                        root: nonoclaw_core::display_path(&state.cwd),
                         entries: state.project_service.file_tree(),
                     },
                 )

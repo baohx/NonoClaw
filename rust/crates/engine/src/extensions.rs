@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use nonoclaw_core::{
-    resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic,
+    display_path, resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic,
     ExtensionDiagnosticSeverity, ExtensionKind, ExtensionSourceKind, ExtensionStatus,
 };
 
@@ -69,7 +69,7 @@ pub fn discover_profiles(cwd: &Path) -> ExtensionDiscovery {
                 Some(name) => discovery.descriptors.push(ExtensionDescriptor::new(
                     ExtensionKind::Profile,
                     name,
-                    path.display().to_string(),
+                    display_path(&path),
                     source_kind,
                     precedence,
                 )),
@@ -77,7 +77,7 @@ pub fn discover_profiles(cwd: &Path) -> ExtensionDiscovery {
                     let mut descriptor = ExtensionDescriptor::new(
                         ExtensionKind::Profile,
                         fallback.clone(),
-                        path.display().to_string(),
+                        display_path(&path),
                         source_kind,
                         precedence,
                     );
@@ -127,7 +127,7 @@ pub fn discover_plugins(cwd: &Path) -> ExtensionDiscovery {
             descriptors.push(ExtensionDescriptor::new(
                 ExtensionKind::Plugin,
                 name,
-                path.display().to_string(),
+                display_path(&path),
                 source_kind,
                 precedence,
             ));
@@ -141,13 +141,14 @@ pub fn discover_plugins(cwd: &Path) -> ExtensionDiscovery {
 }
 
 fn load_failure(kind: ExtensionKind, name: String, path: &Path) -> ExtensionDiagnostic {
+    let displayed = display_path(path);
     ExtensionDiagnostic {
         severity: ExtensionDiagnosticSeverity::Error,
         code: "extension_load_failed".into(),
         kind,
         name: Some(name),
-        source: Some(path.display().to_string()),
-        message: format!("failed to load {} from {}", kind.as_str(), path.display()),
+        source: Some(displayed.clone()),
+        message: format!("failed to load {} from {}", kind.as_str(), displayed),
         suggestion: "fix or remove this extension; unrelated extensions remain available".into(),
     }
 }

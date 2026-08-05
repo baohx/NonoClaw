@@ -10,7 +10,7 @@ use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const MAX_LINES: usize = 2000;
 
-const PROMPT: &str = "Reads a file from the local filesystem. You can access any file directly by using this tool.\nAssume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- The file_path parameter must be an absolute path, not a relative path\n- By default, it reads up to 2000 lines starting from the beginning of the file\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Results are returned using cat -n format, with line numbers starting at 1\n- This tool allows reading images (PNG, JPG, etc.) as content is presented visually (multimodal).\n- This tool can read Jupyter notebooks (.ipynb) and returns all cells with their outputs.\n- This tool can only read files, not directories. To read a directory, use an `ls` command via the Bash tool.\n- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.";
+const PROMPT: &str = "Reads a file from the local filesystem. You can access any file directly by using this tool.\nAssume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- The file_path parameter can be an absolute path or a path relative to cwd (e.g. paths returned by Glob or Grep)\n- By default, it reads up to 2000 lines starting from the beginning of the file\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Results are returned using cat -n format, with line numbers starting at 1\n- This tool allows reading images (PNG, JPG, etc.) as content is presented visually (multimodal).\n- This tool can read Jupyter notebooks (.ipynb) and returns all cells with their outputs.\n- This tool can only read files, not directories. To read a directory, use an `ls` command via the Bash tool.\n- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.";
 
 pub struct ReadTool;
 
@@ -39,7 +39,7 @@ impl Tool for ReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to read"
+                    "description": "The path to the file to read (absolute or relative to cwd)"
                 },
                 "offset": {
                     "type": "integer",

@@ -53,3 +53,10 @@ pub fn nonoclaw_data_dir() -> Option<std::path::PathBuf> {
     }
     home_dir().map(|h| h.join(".nonoclaw"))
 }
+
+/// Cross-platform path display: normalises `\` → `/` so every OS produces
+/// the same forward-slash representation for the web frontend and diagnostics.
+/// Linux/macOS paths already use `/` so this is a no-op there.
+pub fn display_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}

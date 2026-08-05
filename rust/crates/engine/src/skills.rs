@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nonoclaw_core::{
-    resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic, ExtensionKind,
-    ExtensionSourceKind, ExtensionStatus,
+    display_path, resolve_extension_conflicts, ExtensionDescriptor, ExtensionDiagnostic,
+    ExtensionKind, ExtensionSourceKind, ExtensionStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -670,7 +670,7 @@ impl SkillsManager {
                 code: "skill_load_failed".into(),
                 kind: ExtensionKind::Skill,
                 name: Some(name),
-                source: Some(dir.display().to_string()),
+                source: Some(display_path(dir)),
                 message: "failed to parse SKILL.md".into(),
                 suggestion: "fix the YAML frontmatter or make the file readable".into(),
             });
@@ -750,16 +750,26 @@ impl SkillsManager {
 fn discover(cwd: &Path) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
 
-    for skill in scan_skill_dir(&cwd.join(".nonoclaw").join("skills")) {
+    let project_nono = cwd.join(".nonoclaw");
+    for skill in scan_skill_dir(&project_nono.join("skills")) {
         skills.push(skill);
     }
     if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
-        for skill in scan_skill_dir(&home.join("skills")) {
-            skills.push(skill);
+        // When NONOCLAW_HOME is cwd/.nonoclaw (portable mode), the project
+        // scan already covered the same directory — skip the redundant
+        // user scan to avoid spurious "extension_name_conflict" diagnostics.
+        if are_same_or_under(&home, &project_nono) {
+            load_plugin_skills(&project_nono.join("plugins"), &mut skills);
+        } else {
+            for skill in scan_skill_dir(&home.join("skills")) {
+                skills.push(skill);
+            }
+            load_plugin_skills(&home.join("plugins"), &mut skills);
+            load_plugin_skills(&project_nono.join("plugins"), &mut skills);
         }
-        load_plugin_skills(&home.join("plugins"), &mut skills);
+    } else {
+        load_plugin_skills(&project_nono.join("plugins"), &mut skills);
     }
-    load_plugin_skills(&cwd.join(".nonoclaw").join("plugins"), &mut skills);
     skills
 }
 
@@ -839,7 +849,7 @@ pub fn parse_skill(path: &Path) -> Option<Skill> {
         .map(|s| s.to_string());
     let source = path
         .parent()
-        .map(|p| p.display().to_string())
+        .map(|p| display_path(p))
         .unwrap_or_default();
 
     let mut skill = parse_skill_str(&text, fallback_name.as_deref(), &source)?;
@@ -1170,6 +1180,15 @@ fn relative_to(abs: &Path, base: &Path) -> String {
 
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// True when `a` canonicalizes to the same directory as `b`, or when `a` is a
+/// subdirectory of `b`. Used to detect the portable case where NONOCLAW_HOME
+/// equals cwd/.nonoclaw so we skip double-discovery.
+fn are_same_or_under(a: &Path, b: &Path) -> bool {
+    let ac = canonical(a);
+    let bc = canonical(b);
+    ac == bc || ac.starts_with(&bc)
 }
 
 fn walk_ref_dir(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1894,5 +1913,35 @@ mod tests {
         // ~/.nonoclaw/skills may also be present.
         let dup = active.iter().find(|s| s.name == "dup").unwrap();
         assert_eq!(dup.description, "dynamic version");
+    }
+
+    /// Portable-mode regression: when NONOCLAW_HOME == cwd/.nonoclaw, the
+    /// discovery path must NOT double-scan the same skills directory. A
+    /// double-scan would generate spurious "extension_name_conflict"
+    /// diagnostics for every skill.
+    #[test]
+    fn portable_mode_avoids_double_discovery() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempdir();
+        let home = dir.join(".nonoclaw");
+        std::fs::create_dir_all(home.join("skills").join("portable-skill")).unwrap();
+        std::fs::write(
+            home.join("skills").join("portable-skill").join("SKILL.md"),
+            "---\nname: portable-skill\ndescription: test\n---\nbody",
+        )
+        .unwrap();
+
+        std::env::set_var("NONOCLAW_HOME", &home);
+        let mgr = SkillsManager::new(&dir);
+        std::env::remove_var("NONOCLAW_HOME");
+
+        // Skill must be active (not shadowed by a duplicate).
+        assert!(mgr.get_skill("portable-skill").is_some());
+        // Diagnostics must be empty — no spurious conflicts.
+        assert!(
+            mgr.diagnostics().is_empty(),
+            "portable mode must not generate diagnostics: got {:?}",
+            mgr.diagnostics()
+        );
     }
 }

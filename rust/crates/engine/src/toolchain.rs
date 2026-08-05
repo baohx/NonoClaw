@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nonoclaw_core::display_path;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
@@ -273,7 +274,7 @@ async fn probe_one(
     ExecutableProbe {
         name: name.into(),
         status: "available".into(),
-        path: Some(canonical.to_string_lossy().into_owned()),
+        path: Some(display_path(&canonical)),
         version: Some(actual),
         expected_version: expected,
         resolution_source: source,
@@ -302,7 +303,7 @@ fn failed(
     ExecutableProbe {
         name: name.into(),
         status: status.into(),
-        path: path.map(|path| path.to_string_lossy().into_owned()),
+        path: path.as_ref().map(|p| display_path(p)),
         version: None,
         expected_version,
         resolution_source,
@@ -590,17 +591,30 @@ async fn probe_markitdown(
     limit: usize,
 ) -> MarkItDownProbe {
     // Prefer the dedicated NonoClaw venv, then common system paths, then PATH.
-    let home = dirs_rs_home();
-    let venv_path = format!("{home}/.nonoclaw/venvs/markitdown/bin/markitdown");
-    if Path::new(&venv_path).exists() {
-        return probe_markitdown_exec(&venv_path, timeout, limit).await;
+    // The venv lives under the NonoClaw data dir so portable deployments can
+    // point `$NONOCLAW_HOME` at a bundled `.nonoclaw/` folder next to the exe.
+    let mut candidates = Vec::new();
+    if let Some(data) = nonoclaw_core::nonoclaw_data_dir() {
+        let venv_script = if cfg!(windows) {
+            "Scripts/markitdown.exe"
+        } else {
+            "bin/markitdown"
+        };
+        candidates.push(data.join("venvs/markitdown").join(venv_script));
     }
-    for candidate in ["/usr/local/bin/markitdown", "/usr/bin/markitdown"] {
-        if Path::new(candidate).exists() {
-            return probe_markitdown_exec(candidate, timeout, limit).await;
+    #[cfg(not(windows))]
+    {
+        candidates.push(PathBuf::from("/usr/local/bin/markitdown"));
+        candidates.push(PathBuf::from("/usr/bin/markitdown"));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return probe_markitdown_exec(&candidate.to_string_lossy(), timeout, limit).await;
         }
     }
-    if let Ok(which) = std::process::Command::new("which")
+    // PATH discovery: `which` on Unix, `where` on Windows.
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(which) = std::process::Command::new(finder)
         .arg("markitdown")
         .output()
     {
@@ -645,12 +659,6 @@ async fn probe_markitdown_exec(
             suggestion: Some(failure.suggestion.to_string()),
         },
     }
-}
-
-fn dirs_rs_home() -> String {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".into())
 }
 
 fn env_number(name: &str, fallback: u64) -> u64 {

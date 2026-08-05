@@ -50,6 +50,22 @@ fn default_stdio() -> String {
     "stdio".into()
 }
 
+/// Expand `${NONOCLAW_HOME}` / `${HOME}` / `${USERPROFILE}` placeholders in
+/// MCP command, args and env values so portable deployments can reference the
+/// bundled config directory without baking absolute paths into settings.json.
+fn expand_placeholders(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for key in ["NONOCLAW_HOME", "HOME", "USERPROFILE"] {
+        let placeholder = format!("${{{key}}}");
+        if out.contains(&placeholder) {
+            if let Some(value) = std::env::var_os(key) {
+                out = out.replace(&placeholder, &value.to_string_lossy());
+            }
+        }
+    }
+    out
+}
+
 /// Parsed mcp-config file: `{ "mcpServers": { "<name>": {...} } }`.
 #[derive(Debug, Deserialize)]
 struct McpConfigFile {
@@ -78,10 +94,11 @@ pub struct McpClient {
 impl McpClient {
     /// Spawn the server process and perform the initialize handshake.
     pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<std::sync::Arc<Self>> {
-        let mut command = Command::new(&cfg.command);
-        command.args(&cfg.args);
+        let mut command = Command::new(&expand_placeholders(&cfg.command));
+        let expanded_args: Vec<String> = cfg.args.iter().map(|a| expand_placeholders(a)).collect();
+        command.args(&expanded_args);
         for (k, v) in &cfg.env {
-            command.env(k, v);
+            command.env(k, expand_placeholders(v));
         }
         command
             .stdin(Stdio::piped())
@@ -497,6 +514,17 @@ fn mcp_failure(name: &str, source: &str, error: &Error) -> ExtensionDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_nonoclaw_home_placeholder() {
+        std::env::set_var("NONOCLAW_HOME", "C:\\Portable\\NonoClaw\\.nonoclaw");
+        assert_eq!(
+            expand_placeholders("${NONOCLAW_HOME}/mcp-proxies/zhihuiya-proxy.mjs"),
+            "C:\\Portable\\NonoClaw\\.nonoclaw/mcp-proxies/zhihuiya-proxy.mjs"
+        );
+        // Unknown placeholders pass through untouched.
+        assert_eq!(expand_placeholders("${WORKSPACE}/x"), "${WORKSPACE}/x");
+    }
 
     #[tokio::test]
     async fn failed_mcp_is_isolated_from_core_registry() {

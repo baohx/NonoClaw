@@ -24,7 +24,7 @@ use std::sync::Arc;
 use nonoclaw_api::{
     ApiFormat, Client, ClientConfig, ClientFactory, ClientPurpose, ThinkingConfig, DEFAULT_BASE_URL,
 };
-use nonoclaw_core::{PermissionMode, RunEvent, TechnicalStatus};
+use nonoclaw_core::{display_path, PermissionMode, RunEvent, TechnicalStatus};
 use nonoclaw_tools::McpServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -615,12 +615,12 @@ impl ConfigSource {
     pub fn label(&self) -> String {
         match self {
             Self::BuiltIn => "built-in default".into(),
-            Self::User { path } => format!("user {}", path.display()),
-            Self::Project { path } => format!("project {}", path.display()),
-            Self::Local { path } => format!("local {}", path.display()),
-            Self::ExplicitSettings { path } => format!("--settings {}", path.display()),
-            Self::StandaloneMcp { path } => format!("project MCP {}", path.display()),
-            Self::ExplicitMcp { path } => format!("--mcp-config {}", path.display()),
+            Self::User { path } => format!("user {}", display_path(path)),
+            Self::Project { path } => format!("project {}", display_path(path)),
+            Self::Local { path } => format!("local {}", display_path(path)),
+            Self::ExplicitSettings { path } => format!("--settings {}", display_path(path)),
+            Self::StandaloneMcp { path } => format!("project MCP {}", display_path(path)),
+            Self::ExplicitMcp { path } => format!("--mcp-config {}", display_path(path)),
             Self::Environment { variable } => format!("environment ${variable}"),
             Self::CommandLine { field } => format!("CLI {field}"),
             Self::RemoteRequest { field } => format!("remote request {field}"),

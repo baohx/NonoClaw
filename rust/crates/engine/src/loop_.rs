@@ -14,6 +14,7 @@ use nonoclaw_api::{
 use nonoclaw_core::{
     CacheControl, ContentBlock, Message, MessageContent, PermissionDecision, PermissionMode,
     Result, RunEvent, SessionRepair, StopReason, StreamState, TechnicalStatus, Usage, UsagePart,
+    display_path,
 };
 use nonoclaw_tools::permissions::PermissionGate;
 use nonoclaw_tools::tool::{GraphRunner, QuestionResolver, SubagentRunner};
@@ -1613,7 +1614,7 @@ impl QueryEngine {
                                 local_reference: execution
                                     .local_reference
                                     .as_ref()
-                                    .map(|path| path.to_string_lossy().to_string()),
+                                    .map(|path| display_path(path)),
                             });
                         }
                         nonoclaw_tools::ToolTraceStage::PreHook

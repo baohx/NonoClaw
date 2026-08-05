@@ -285,7 +285,7 @@ pub async fn gather(
     let git = git_info(cwd).await;
 
     ProjectInfo {
-        cwd: cwd.to_string_lossy().to_string(),
+        cwd: nonoclaw_core::display_path(cwd),
         model: model.to_string(),
         tools,
         mcp_servers,
@@ -415,7 +415,7 @@ fn list_plugins(cwd: &Path) -> Vec<PluginInfo> {
                 .unwrap_or(0);
             out.push(PluginInfo {
                 name,
-                dir: path.to_string_lossy().to_string(),
+                dir: nonoclaw_core::display_path(&path),
                 skill_count,
             });
         }
@@ -432,7 +432,7 @@ fn collect_doc_layers(cwd: &Path) -> Vec<PathLayer> {
         out.push(PathLayer {
             label: label.into(),
             exists: path.exists(),
-            path: path.to_string_lossy().to_string(),
+            path: nonoclaw_core::display_path(&path),
         });
     };
 
@@ -490,7 +490,7 @@ fn extend_rules(out: &mut Vec<PathLayer>, prefix: &str, rules_dir: &Path) {
         out.push(PathLayer {
             label: format!("{prefix}/{name}"),
             exists: true,
-            path: p.to_string_lossy().to_string(),
+            path: nonoclaw_core::display_path(&p),
         });
     }
 }
@@ -502,7 +502,7 @@ fn collect_settings_layers(cwd: &Path) -> Vec<PathLayer> {
         out.push(PathLayer {
             label: label.into(),
             exists: path.exists(),
-            path: path.to_string_lossy().to_string(),
+            path: nonoclaw_core::display_path(&path),
         });
     };
     if let Some(home) = nonoclaw_home() {

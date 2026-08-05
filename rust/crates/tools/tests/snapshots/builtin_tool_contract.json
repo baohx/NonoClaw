@@ -3,7 +3,7 @@
     "input_schema": {
       "properties": {
         "file_path": {
-          "description": "The absolute path to the file to read",
+          "description": "The path to the file to read (absolute or relative to cwd)",
           "type": "string"
         },
         "limit": {

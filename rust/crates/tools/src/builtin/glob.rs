@@ -87,7 +87,12 @@ impl Tool for GlobTool {
         }
         let body = found
             .iter()
-            .map(|(_, p)| p.display().to_string())
+            .map(|(_, p)| {
+                p.strip_prefix(ctx.cwd)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolResult::ok(body))

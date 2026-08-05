@@ -99,7 +99,7 @@ pub fn get_user_context(cwd: &Path, add_dirs: &[PathBuf]) -> UserContext {
         if let Some(content) = read_optional(&d.join(".nonoclaw/NONOCLAW.md")) {
             append_md(
                 &mut nonoclaw_md,
-                &d.join(".nonoclaw/NONOCLAW.md").display().to_string(),
+                &d.join(".nonoclaw/NONOCLAW.md").to_string_lossy().replace('\\', "/"),
                 content,
             );
         }
