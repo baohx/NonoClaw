@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-api"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-core"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "schemars",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-engine"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "nonoclaw-tools"
-version = "0.10.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
