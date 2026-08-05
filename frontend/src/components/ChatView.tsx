@@ -147,7 +147,7 @@ const MessageCard = memo(function MessageCard({
   }
   if (msg.role === "tool") {
     return (
-      <div className="msg-enter">
+      <div className="msg msg-enter">
         <ToolCard msg={msg} />
       </div>
     );
@@ -216,14 +216,25 @@ const MessageCard = memo(function MessageCard({
               {msg.attachments && msg.attachments.length > 0 && (
                 <div className="msg__attachments" aria-label="Attachments">
                   {msg.attachments.map((attachment, index) => (
-                    <span
-                      key={`${attachment.filename}-${index}`}
-                      className="msg__attachment"
-                      title={attachment.filename}
-                    >
-                      <span className="msg__attachment-icon" aria-hidden="true">↗</span>
-                      <span className="msg__attachment-name">{attachment.filename}</span>
-                    </span>
+                    attachment.previewUrl ? (
+                      <img
+                        key={`${attachment.filename}-${index}`}
+                        src={attachment.previewUrl}
+                        alt={attachment.filename}
+                        className="msg__image"
+                        title={attachment.filename}
+                        onClick={() => window.open(attachment.previewUrl, "_blank")}
+                      />
+                    ) : (
+                      <span
+                        key={`${attachment.filename}-${index}`}
+                        className="msg__attachment"
+                        title={attachment.filename}
+                      >
+                        <span className="msg__attachment-icon" aria-hidden="true">↗</span>
+                        <span className="msg__attachment-name">{attachment.filename}</span>
+                      </span>
+                    )
                   ))}
                 </div>
               )}

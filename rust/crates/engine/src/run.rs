@@ -342,6 +342,8 @@ impl RunController {
                     RunTerminalStatus::Error,
                     RunFinishReason::Error {
                         message: "event delivery failed".into(),
+                        retryable: false,
+                        status: None,
                     },
                     None,
                 );
@@ -370,10 +372,17 @@ impl RunController {
                             },
                         )
                     } else {
+                        let retryable = error.is_retryable();
+                        let status = match &error {
+                            Error::Api { status, .. } => Some(*status),
+                            _ => None,
+                        };
                         (
                             RunTerminalStatus::Error,
                             RunFinishReason::Error {
                                 message: AppError::from_core(&error, "run").message,
+                                retryable,
+                                status,
                             },
                         )
                     };
@@ -386,6 +395,8 @@ impl RunController {
                 Err(_join_error) => {
                     let reason = RunFinishReason::Error {
                         message: "run task failed".into(),
+                        retryable: false,
+                        status: None,
                     };
                     let terminal = controller.commit(RunTerminalStatus::Error, reason, None);
                     RunCompletion {
@@ -430,6 +441,8 @@ impl RunHandle {
                     RunTerminalStatus::Error,
                     RunFinishReason::Error {
                         message: "run supervisor failed".into(),
+                        retryable: false,
+                        status: None,
                     },
                     None,
                 );
@@ -591,6 +604,8 @@ mod tests {
                 RunTerminalStatus::Error,
                 RunFinishReason::Error {
                     message: "late error".into(),
+                    retryable: false,
+                    status: None,
                 },
                 None,
             )

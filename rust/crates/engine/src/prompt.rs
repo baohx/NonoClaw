@@ -261,6 +261,21 @@ pub fn build_system_blocks_with_profile(
         }),
     });
 
+    // Block 2a (cached per-run): NONOCLAW.md content. Byte-stable within a
+    // run — it only changes between sessions. Splitting it into a separate
+    // cached block means the provider caches it after turn 1 instead of
+    // retransmitting on every turn. (Memory is kept uncached because it can
+    // change mid-run when the agent creates/updates facts and beads.)
+    if !user.nonoclaw_md.is_empty() {
+        blocks.push(SystemBlock {
+            kind: "text".into(),
+            text: user.nonoclaw_md.clone(),
+            cache_control: Some(CacheControl {
+                kind: nonoclaw_core::CacheControlKind::Ephemeral,
+            }),
+        });
+    }
+
     let mut context = String::new();
     context.push_str(&format!("# Current date\n{}\n\n", user.date));
     // Git summary goes here (uncached) so it doesn't invalidate the prompt
@@ -269,9 +284,6 @@ pub fn build_system_blocks_with_profile(
         context.push_str("# Git status (snapshot at conversation start)\n```\n");
         context.push_str(&system.git_summary);
         context.push_str("```\n\n");
-    }
-    if !user.nonoclaw_md.is_empty() {
-        context.push_str(&user.nonoclaw_md);
     }
     if let Some(mem) = memory {
         context.push_str("<memory>\n");
@@ -288,11 +300,12 @@ pub fn build_system_blocks_with_profile(
     blocks
 }
 
-/// Rebuild only the uncached context block (Block 2) with fresh git status.
-/// Call this before each turn so the model sees up-to-date git info without
-/// invalidating the cached Block 1 (identity + tools + static skill metadata).
-/// Dynamically activated skill metadata is rendered into this uncached block,
-/// so activations are visible without touching the cached prefix.
+/// Rebuild only the uncached context block (Block 2b) with fresh git status.
+/// All blocks carrying `cache_control` are preserved verbatim — this includes
+/// Block 1 (identity + tools + static skills) and Block 2a (NONOCLAW.md +
+/// memory, stable across turns within a run). Dynamically activated skill
+/// metadata is rendered into the rebuilt uncached block, so activations are
+/// visible without touching the cached prefix.
 pub fn refresh_context_block(
     old_blocks: &[SystemBlock],
     system: &SystemContext,
@@ -300,21 +313,20 @@ pub fn refresh_context_block(
     memory: &Option<String>,
     skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
 ) -> Vec<SystemBlock> {
-    let mut blocks = Vec::with_capacity(2);
-    // Block 1: preserved as-is (cached).
-    if let Some(first) = old_blocks.first() {
-        blocks.push(first.clone());
+    let mut blocks = Vec::with_capacity(old_blocks.len());
+    // Preserve all cached blocks as-is (Block 1 + Block 2a).
+    for block in old_blocks.iter() {
+        if block.cache_control.is_some() {
+            blocks.push(block.clone());
+        }
     }
-    // Block 2: rebuilt with fresh git.
+    // Rebuild the uncached block with fresh date + git + memory + dynamic skills.
     let mut context = String::new();
     context.push_str(&format!("# Current date\n{}\n\n", user.date));
     if !system.git_summary.is_empty() {
         context.push_str("# Git status (live)\n```\n");
         context.push_str(&system.git_summary);
         context.push_str("```\n\n");
-    }
-    if !user.nonoclaw_md.is_empty() {
-        context.push_str(&user.nonoclaw_md);
     }
     if let Some(mem) = memory {
         context.push_str("<memory>\n");

@@ -256,6 +256,12 @@ pub enum RunFinishReason {
     },
     Error {
         message: String,
+        /// True when the underlying failure is transient (network, 5xx/429).
+        /// Lets logs and the UI distinguish provider-side problems from
+        /// request/programming errors instead of a bare "provider request failed".
+        retryable: bool,
+        /// HTTP status from the provider when the failure was an HTTP error.
+        status: Option<u16>,
     },
 }
 
@@ -296,6 +302,41 @@ struct EngineCache {
     /// Cached git context from the last `get_system_context` call. Reused on
     /// turns that follow read-only tools; refreshed after Bash/Edit/Write.
     cached_git_context: Option<crate::context::SystemContext>,
+    /// Per-run cache of tool results for deduplication. When a Read/Bash/Grep
+    /// returns identical content to a previous call on the same resource, the
+    /// duplicate is replaced with a compact reference to save context tokens.
+    /// Keyed by tool-specific resource identifier (e.g. "Read:/path/to/file").
+    tool_result_cache: std::collections::HashMap<String, ToolResultCacheEntry>,
+}
+
+/// Cached tool result entry for deduplication.
+struct ToolResultCacheEntry {
+    turn: u32,
+    content: String,
+}
+
+/// Build a stable resource key for tool-result deduplication.
+/// Returns `None` for tools that aren't worth caching (small/fast/volatile).
+fn tool_resource_key(tool_name: &str, input: &Value) -> Option<String> {
+    match tool_name {
+        "Read" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|fp| format!("Read:{fp}")),
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|cmd| format!("Bash:{cmd}")),
+        "Grep" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str())?;
+            let path = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            Some(format!("Grep:{path}:{pattern}"))
+        }
+        _ => None,
+    }
 }
 
 impl Default for EngineCache {
@@ -306,6 +347,7 @@ impl Default for EngineCache {
             pending_compact_revision: 0,
             pending_compact_tokens_est: 0,
             cached_git_context: None,
+            tool_result_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -317,6 +359,10 @@ pub struct QueryEngine {
     options: EngineOptions,
     messages: Vec<Message>,
     total_usage: Usage,
+    /// Last turn's provider-reported `input_tokens` (full prompt size).
+    /// Used as the primary compact-threshold signal; falls back to the
+    /// `estimate_total` heuristic when zero (e.g. before the first turn).
+    last_input_tokens: usize,
     session_id: String,
     session: Option<Session>,
     session_revision: u64,
@@ -341,6 +387,7 @@ impl QueryEngine {
             options,
             messages: Vec::new(),
             total_usage: Usage::default(),
+            last_input_tokens: 0,
             session_id: new_session_id(),
             session: None,
             session_revision: 0,
@@ -376,6 +423,7 @@ impl QueryEngine {
             options,
             messages,
             total_usage: Usage::default(),
+            last_input_tokens: 0,
             session_id: session.id().to_string(),
             session: Some(session),
             session_revision: snapshot.revision,
@@ -925,25 +973,66 @@ impl QueryEngine {
                                 )
                                 .await;
                         } else {
+                            // The background compact produced nothing usable
+                            // (empty result, transcript changed since spawn,
+                            // or the persist failed). Pair the earlier
+                            // CompactionStarted with a terminal event so the
+                            // UI's compacting indicator always clears.
+                            let kept = self.messages.len();
+                            let tokens_after = estimate_total(
+                                &self.messages,
+                                system_chars,
+                                tools_chars,
+                                self.options.chars_per_token,
+                            );
                             tracing::debug!(
                                 "background compact stale — transcript or revision changed since spawn"
                             );
+                            on_event(&EngineEvent::Compacted {
+                                removed: 0,
+                                kept,
+                                tokens_before: tokens_at_spawn,
+                                tokens_after,
+                            });
                         }
                     }
-                    Ok(Err(e)) => tracing::warn!("background compact failed: {e}"),
-                    Err(e) => tracing::warn!("background compact panicked: {e}"),
+                    Ok(Err(e)) => {
+                        tracing::warn!("background compact failed: {e}");
+                        on_event(&EngineEvent::Compacted {
+                            removed: 0,
+                            kept: self.messages.len(),
+                            tokens_before: tokens_at_spawn,
+                            tokens_after: tokens_at_spawn,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("background compact panicked: {e}");
+                        on_event(&EngineEvent::Compacted {
+                            removed: 0,
+                            kept: self.messages.len(),
+                            tokens_before: tokens_at_spawn,
+                            tokens_after: tokens_at_spawn,
+                        });
+                    }
                 }
             }
 
             // Auto-compact: if the estimated prompt exceeds the threshold,
             // summarize the older transcript before the next turn.
             if self.options.auto_compact {
-                let est = estimate_total(
-                    &self.messages,
-                    system_chars,
-                    tools_chars,
-                    self.options.chars_per_token,
-                );
+                // Use the provider-reported last-turn input_tokens when available;
+                // falls back to the chars/4 heuristic for runs that haven't had
+                // a turn yet (e.g. initial compact check).
+                let est = if self.last_input_tokens > 0 {
+                    self.last_input_tokens
+                } else {
+                    estimate_total(
+                        &self.messages,
+                        system_chars,
+                        tools_chars,
+                        self.options.chars_per_token,
+                    )
+                };
                 // Pre-fire: spawn background compact at 80% of threshold.
                 if est > self.options.compact_threshold_tokens * 8 / 10
                     && self.cache.pending_compact.is_none()
@@ -1080,6 +1169,22 @@ impl QueryEngine {
                                 ),
                             )
                             .await;
+                    } else {
+                        // Pair the CompactionStarted above with a terminal
+                        // event even when there was nothing to remove or the
+                        // persist failed, so the UI's compacting indicator
+                        // always clears.
+                        on_event(&EngineEvent::Compacted {
+                            removed: 0,
+                            kept: before,
+                            tokens_before,
+                            tokens_after: estimate_total(
+                                &self.messages,
+                                system_chars,
+                                tools_chars,
+                                self.options.chars_per_token,
+                            ),
+                        });
                     }
                 }
             }
@@ -1256,6 +1361,11 @@ impl QueryEngine {
             };
 
             self.total_usage.accumulate(&turn.usage);
+            // Track the provider-reported prompt size for precise compact
+            // threshold calibration. The per-turn `input_tokens` from Anthropic
+            // (before cache deduction) is the full prompt token count — much
+            // more accurate than the chars/4 heuristic (~20-30% off).
+            self.last_input_tokens = turn.usage.input_tokens as usize;
             on_event(&RunEvent::UsageUpdated {
                 turn: turns_made,
                 turn_usage: UsagePart {
@@ -1518,6 +1628,47 @@ impl QueryEngine {
                 .into_iter()
                 .map(|result| (result.id, result.content, result.is_error))
                 .collect::<Vec<_>>();
+
+            // Tool-result deduplication: when the same Read/Bash/Grep returns
+            // identical content to a previous call on the same resource, replace
+            // the duplicate with a compact reference. This avoids re-appending
+            // thousands of chars of unchanged file content to the context window.
+            // Threshold: only dedup results > 2000 chars (below that the cache
+            // bookkeeping overhead isn't worth it).
+            const DEDUP_MIN_LEN: usize = 2000;
+            let results: Vec<_> = results
+                .into_iter()
+                .zip(tool_uses.iter())
+                .map(|((id, content, is_error), (_tid, tname, tinput))| {
+                    let resource_key = tool_resource_key(tname, tinput);
+                    let deduped = if let Some(key) = resource_key {
+                        if content.len() > DEDUP_MIN_LEN {
+                            if let Some(entry) = self.cache.tool_result_cache.get(&key) {
+                                if entry.content == content {
+                                    // Identical content — emit compact reference.
+                                    let compact = format!(
+                                        "[Content unchanged since turn {} ({} of {}). Omitted to save context.]",
+                                        entry.turn, tname, key,
+                                    );
+                                    return (id, compact, is_error);
+                                }
+                            }
+                            // Cache this result for future dedup.
+                            self.cache.tool_result_cache.insert(
+                                key,
+                                ToolResultCacheEntry {
+                                    turn: turns_made,
+                                    content: content.clone(),
+                                },
+                            );
+                        }
+                        content
+                    } else {
+                        content
+                    };
+                    (id, deduped, is_error)
+                })
+                .collect();
 
             // Dynamic skill activation: extract file paths from Read/Write/Edit
             // tool uses and check against conditional skills + discover new skill

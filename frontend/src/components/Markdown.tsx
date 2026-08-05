@@ -21,6 +21,12 @@ function MermaidBlock({ source }: { source: string }) {
     el.innerHTML = "";
     const id = `mermaid-${Math.random().toString(36).slice(2, 9)}`;
     el.innerHTML = `<div class="mermaid" id="${id}">${source}</div>`;
+    // Give mermaid a wide canvas so diagrams fill the container.
+    const mermaidDiv = el.querySelector<HTMLElement>(`#${id}`);
+    if (mermaidDiv) {
+      const w = el.clientWidth || 800;
+      mermaidDiv.style.width = `${w}px`;
+    }
     // Trigger mermaid if loaded
     const win = window as any;
     if (win.mermaid) {

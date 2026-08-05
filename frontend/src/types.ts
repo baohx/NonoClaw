@@ -593,6 +593,8 @@ export type ClientMsg =
 
 export interface MessageAttachment {
   filename: string;
+  /** Local object-URL for image preview (images only). */
+  previewUrl?: string;
 }
 
 export interface ChatMessage {

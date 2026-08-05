@@ -108,6 +108,14 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Model profile used for transcript compaction.",
     },
     ConfigFieldReference {
+        name: "compactMaxTokens",
+        description: "Cap on the compaction summarizer's output length (tokens). Default 4096.",
+    },
+    ConfigFieldReference {
+        name: "promptProfile",
+        description: "System-prompt section profile: \"full\" (default) or \"minimal\".",
+    },
+    ConfigFieldReference {
         name: "elevenlabsApiKey",
         description: "Server-side speech-to-text credential or environment reference.",
     },
@@ -122,6 +130,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
     ConfigFieldReference {
         name: "docModel",
         description: "Document/OCR model name or inline configuration.",
+    },
+    ConfigFieldReference {
+        name: "attachmentConverter",
+        description: "Document conversion strategy for file uploads: \"auto\", \"markitdown\", or \"legacy\".",
     },
 ];
 

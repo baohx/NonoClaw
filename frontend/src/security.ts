@@ -27,6 +27,7 @@ export interface BrowserMediaAttachment {
   extracted_text: string;
   image_count: number;
   images?: unknown[];
+  previewUrl?: string;
   uploading: boolean;
   error?: string;
 }
@@ -37,6 +38,7 @@ export function sanitizeMediaAttachment<T extends BrowserMediaAttachment>(attach
     filename: sanitizeBrowserText(attachment.filename),
     extracted_text: "",
     images: undefined,
+    previewUrl: attachment.previewUrl,
     error: attachment.error ? sanitizeBrowserText(attachment.error) : undefined,
   } as T;
 }

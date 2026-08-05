@@ -11,6 +11,11 @@ interface Props {
 
 const DEFAULT_OPEN = new Set<string>();
 
+/** True when the source string points to an on-disk file (not a bundled:… identifier). */
+function isFsPath(source: string): boolean {
+  return source.startsWith("/") || source.startsWith("~") || source.startsWith(".");
+}
+
 export default function InsightRail({ info, onOpen, onRefresh }: Props) {
   const [open, setOpen] = useState<Set<string>>(DEFAULT_OPEN);
   const toggle = (id: string) =>
@@ -110,12 +115,15 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
               none — drop a <code>SKILL.md</code> in .nonoclaw/skills/&lt;name&gt;/
             </div>
           ) : (
-            info?.skills.map((s) => (
+            info?.skills.map((s) => {
+              const canOpen = isFsPath(s.source);
+              return (
               <button
                 key={s.source}
                 className="insight-row"
-                onClick={(ev) => onOpen(s.source, ev.shiftKey)}
-                title={`${s.source} — click to open`}
+                disabled={!canOpen}
+                onClick={canOpen ? (ev) => onOpen(s.source, ev.shiftKey) : undefined}
+                title={canOpen ? `${s.source} — click to open` : `${s.source} (bundled — cannot open)`}
               >
                 <div className="insight-row__top">
                   <span className="tag">/{s.name}</span>
@@ -123,7 +131,8 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
                 </div>
                 <div className="insight-row__meta">{s.source}</div>
               </button>
-            ))
+              );
+            })
           )}
         </Section>
 

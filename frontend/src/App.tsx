@@ -107,7 +107,12 @@ export default function App() {
   const chatRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (connectionStatus === "connected") send({ type: "file_tree" });
+    if (connectionStatus === "connected") {
+      send({ type: "file_tree" });
+      // Sync the frontend's initial permission mode to the server.
+      const mode = useStore.getState().permissionMode;
+      send({ type: "set_permission_mode", mode });
+    }
   }, [connectionStatus, send]);
 
   const userScrolledUp = useRef(false);
@@ -190,7 +195,7 @@ export default function App() {
   }, [multiRun?.nextModel, send]);
 
   const handleSubmit = useCallback(
-    (prompt: string, attachments: AttachmentRef[]) => {
+    (prompt: string, attachments: AttachmentRef[], previewUrls?: Record<string, string>) => {
       const cmd = prompt.trim();
       if (cmd === "/clear") {
         useStore.getState().setAgentRunning(false);
@@ -280,7 +285,10 @@ export default function App() {
         id: `user-${Date.now()}`,
         role: "user",
         content: prompt,
-        attachments: attachments.map(({ filename }) => ({ filename })),
+        attachments: attachments.map(({ id, filename }) => ({
+          filename,
+          previewUrl: previewUrls?.[id],
+        })),
       });
       userScrolledUp.current = false;
       useStore.getState().setAgentRunning(true);

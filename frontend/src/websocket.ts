@@ -307,11 +307,13 @@ export function dispatchServerMessage(message: ServerMsg): void {
           break;
         case "compacted":
           state.setCompacting(false);
-          state.addMessage({
-            id: message.event_id || `compacted-${message.timestamp_ms ?? Date.now()}`,
-            role: "system",
-            content: `compacted: removed ${event.removed ?? 0}, kept ${event.kept ?? 0} messages`,
-          });
+          if ((event.removed ?? 0) > 0) {
+            state.addMessage({
+              id: message.event_id || `compacted-${message.timestamp_ms ?? Date.now()}`,
+              role: "system",
+              content: `compacted: removed ${event.removed ?? 0}, kept ${event.kept ?? 0} messages`,
+            });
+          }
           break;
       }
       break;
@@ -325,8 +327,17 @@ export function dispatchServerMessage(message: ServerMsg): void {
       breathController.consumePrompt("question", true);
       break;
     case "done": {
-      if (!acceptRunMessage(message, true)) break;
+      // A run-scoped done means that run is over. Clear running/cancelling/
+      // compacting state before the ordering guard — even if this frame is
+      // rejected as a duplicate/late terminal, the UI must not stay stuck on
+      // "stop" (mirrors the run-scoped error path below). completeRun() still
+      // owns multi-model sequencing and usage accounting for the accepted
+      // (first) terminal.
       state.finishStreaming();
+      state.setCompacting(false);
+      state.setAgentRunning(false);
+      state.setCancelling(false);
+      if (!acceptRunMessage(message, true)) break;
       breathController.consumeTerminal("success", message.stop_reason ?? undefined);
       state.addTraceEntry(traceTerminalEntry(message, "done", {
         usage: message.usage,
@@ -351,6 +362,14 @@ export function dispatchServerMessage(message: ServerMsg): void {
     }
     case "error": {
       const safeMessage = sanitizeBrowserText(message.message || "operation failed");
+      // A run-scoped error means that run is over. Reset running/cancelling
+      // state before the ordering guard: even if this frame is rejected as a
+      // duplicate/late terminal, the UI must not stay stuck on "stop".
+      state.finishStreaming();
+      state.setAgentRunning(false);
+      state.setCancelling(false);
+      state.setCompacting(false);
+      state.cancelMultiRun();
       if (!acceptRunMessage(message, message.run_id !== undefined)) break;
       if (message.run_id !== undefined) {
         state.addTraceEntry(traceTerminalEntry(message, "wire_error", { message: safeMessage }));
@@ -358,10 +377,6 @@ export function dispatchServerMessage(message: ServerMsg): void {
       } else {
         breathController.signalError(safeMessage);
       }
-      state.finishStreaming();
-      state.setAgentRunning(false);
-      state.setCancelling(false);
-      state.cancelMultiRun();
       state.addMessage({
         id: `err-${message.run_id ?? message.timestamp_ms ?? Date.now()}`,
         role: "system",

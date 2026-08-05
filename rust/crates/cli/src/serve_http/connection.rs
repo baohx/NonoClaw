@@ -42,7 +42,6 @@ use super::protocol::{
     event_message, messages_loaded, safe_error, send_msg, send_msg_ok, synthetic_event_message,
     terminal_fields, ClientMsg, ModelInfo, ServerMsg, SessionInfoWire,
 };
-#[cfg(test)]
 use crate::attachments;
 use crate::project_info::ProjectInfo;
 #[cfg(test)]
@@ -153,7 +152,7 @@ pub(super) fn upload_exploration_state(
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
-        permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
+        permission_mode: Arc::new(Mutex::new(initial_permission_mode(&config))),
         skills_manager,
         project_service,
         background_registry: Arc::new(std::sync::Mutex::new(
@@ -162,6 +161,18 @@ pub(super) fn upload_exploration_state(
         upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
     })
+}
+
+/// Resolve the initial permission mode from settings.json's `permissions.defaultMode`.
+/// Falls back to `PermissionMode::Default` when the field is absent or unrecognised.
+fn initial_permission_mode(config: &ResolvedConfig) -> nonoclaw_core::PermissionMode {
+    config
+        .settings()
+        .permissions
+        .as_ref()
+        .and_then(|p| p.default_mode.as_deref())
+        .and_then(nonoclaw_core::PermissionMode::from_kebab)
+        .unwrap_or_default()
 }
 
 fn token_is_authorized(require_auth: bool, expected: &str, supplied: Option<&str>) -> bool {
@@ -294,6 +305,7 @@ pub async fn serve(
         public_url.clone(),
         Arc::clone(&skills_manager),
     ));
+    let default_permission_mode = initial_permission_mode(&config);
     let state = Arc::new(AppState {
         config,
         active_model: Arc::new(Mutex::new(active_model)),
@@ -308,7 +320,7 @@ pub async fn serve(
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
-        permission_mode: Arc::new(Mutex::new(nonoclaw_core::PermissionMode::Default)),
+        permission_mode: Arc::new(Mutex::new(default_permission_mode)),
         skills_manager,
         project_service,
         background_registry: Arc::new(std::sync::Mutex::new(
@@ -786,20 +798,29 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 send_msg(&tx, ServerMsg::SessionPrompts { session_id, prompts }).await;
             }
             ClientMsg::OpenFile { path, force_code } => {
-                if state.project_service.open(&path, force_code).is_err() {
-                    tracing::warn!(
-                        "open-file request denied or failed (path and details redacted)"
-                    );
-                    send_msg(
-                        &tx,
-                        safe_error(
-                            ErrorCode::PathDenied,
-                            "file could not be opened",
-                            false,
-                            "open_file",
-                        ),
-                    )
-                    .await;
+                match state.project_service.open(&path, force_code) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let kind = e.kind();
+                        let msg = match kind {
+                            std::io::ErrorKind::PermissionDenied => {
+                                "file outside project or home directory"
+                            }
+                            std::io::ErrorKind::NotFound => {
+                                "file or parent directory not found"
+                            }
+                            _ => "failed to open file with system editor",
+                        };
+                        tracing::warn!(
+                            kind = ?kind,
+                            "open-file failed (path redacted)"
+                        );
+                        send_msg(
+                            &tx,
+                            safe_error(ErrorCode::PathDenied, msg, false, "open_file"),
+                        )
+                        .await;
+                    }
                 }
             }
 
@@ -1303,13 +1324,45 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             .await;
                         }
                         RunTerminalStatus::Error => {
-                            let reason_text = match &terminal.reason {
-                                nonoclaw_engine::RunFinishReason::Error { message } => {
-                                    nonoclaw_core::redact_text(message)
-                                }
-                                other => format!("{other:?}"),
+                            let (reason_text, retryable, status) = match &terminal.reason {
+                                nonoclaw_engine::RunFinishReason::Error {
+                                    message,
+                                    retryable,
+                                    status,
+                                } => (
+                                    nonoclaw_core::redact_text(message),
+                                    *retryable,
+                                    *status,
+                                ),
+                                other => (format!("{other:?}"), false, None),
                             };
-                            tracing::error!(run_id = %run_id, reason = %reason_text, "engine run failed");
+                            tracing::error!(
+                                run_id = %run_id,
+                                retryable,
+                                ?status,
+                                reason = %reason_text,
+                                "engine run failed"
+                            );
+                            let mut app_error = if retryable {
+                                let message = match status {
+                                    Some(code) => {
+                                        format!("provider request failed (HTTP {code})")
+                                    }
+                                    None => reason_text.clone(),
+                                };
+                                AppError::new(
+                                    ErrorCode::ProviderUnavailable,
+                                    message,
+                                    true,
+                                    "run",
+                                )
+                            } else {
+                                AppError::new(ErrorCode::Internal, reason_text, false, "run")
+                            };
+                            if let Some(code) = status {
+                                app_error =
+                                    app_error.with_safe_details(serde_json::json!({ "status": code }));
+                            }
                             send_msg(
                                 &tx2,
                                 ServerMsg::RunError {
@@ -1319,13 +1372,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                     session_revision,
                                     sequence,
                                     timestamp_ms,
-                                    error: AppError::new(
-                                        ErrorCode::Internal,
-                                        "run failed",
-                                        false,
-                                        "run",
-                                    )
-                                    .with_trace_id(Uuid::new_v4().to_string()),
+                                    error: app_error.with_trace_id(Uuid::new_v4().to_string()),
                                 },
                             )
                             .await;
@@ -1608,6 +1655,25 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .await;
                     }
                     Err(_) => {
+                        // Pair the Compacting event above with a terminal event
+                        // so the UI's compacting indicator always clears, even
+                        // when the summarizer run fails.
+                        send_msg(
+                            &tx,
+                            synthetic_event_message(
+                                &compact_run_id,
+                                &compact_session_id,
+                                compact_start_revision,
+                                2,
+                                RunEvent::Compacted {
+                                    removed: 0,
+                                    kept: original_count,
+                                    tokens_before: 0,
+                                    tokens_after: 0,
+                                },
+                            ),
+                        )
+                        .await;
                         send_msg(
                             &tx,
                             safe_error(

@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "test:breath": "node --experimental-strip-types src/breath.test.ts",
     "test:transitions": "node --experimental-strip-types --loader ./src/ts-extension-loader.mjs src/store/transitions.test.ts",
+    "test:websocket": "node --experimental-strip-types --loader ./src/ts-extension-loader.mjs src/websocket.test.ts",
     "test:security": "node --experimental-strip-types src/security.test.ts",
     "test:export": "node --experimental-strip-types src/export.test.ts",
     "preview": "vite preview"

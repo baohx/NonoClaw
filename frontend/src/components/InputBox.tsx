@@ -5,7 +5,7 @@ import type { MediaAttachment } from "../store/slices";
 import type { AttachmentRef, PermissionMode, UploadResponse } from "../types";
 
 interface Props {
-  onSubmit: (text: string, attachments: AttachmentRef[]) => void;
+  onSubmit: (text: string, attachments: AttachmentRef[], previewUrls?: Record<string, string>) => void;
   onCancel: () => void;
   onSetPermissionMode: (mode: PermissionMode) => void;
   onSetModel: (name: string) => void;
@@ -60,6 +60,7 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
       recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
       recordingStreamRef.current = null;
       const state = useStore.getState();
+      state.attachments.forEach((a) => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
       state.setRecording(false);
       state.clearAttachments();
     };
@@ -119,12 +120,15 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
 
   const uploadFile = useCallback(async (file: File) => {
     const id = crypto.randomUUID();
+    const isImage = /\.(png|jpe?g)$/i.test(file.name);
+    const previewUrl = isImage ? URL.createObjectURL(file) : undefined;
     const chip: MediaAttachment = {
       id,
       filename: file.name,
       extracted_text: "",
       image_count: 0,
       uploading: true,
+      previewUrl,
     };
     addAttachment(chip);
 
@@ -154,6 +158,8 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
   }, [addAttachment, updateAttachment]);
 
   const removeAttachment = useCallback((id: string) => {
+    const att = useStore.getState().attachments.find((a) => a.id === id);
+    if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
     removeMediaAttachment(id);
   }, [removeMediaAttachment]);
 
@@ -227,9 +233,18 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
         filename: attachment.filename,
         extracted_text: "",
       }));
+    // Pass image preview URLs to the chat message before clearing.
+    const previewUrls = attachments
+      .filter((a) => !a.error && !a.uploading && a.previewUrl)
+      .reduce<Record<string, string>>((map, a) => {
+        map[a.id] = a.previewUrl!;
+        return map;
+      }, {});
     setDraft("");
     clearAttachments();
-    onSubmit(text, ready);
+    // Revoke URLs only for attachments that won't be shown in chat
+    // (errored or duplicate). Chat-shown URLs are kept for the message lifetime.
+    onSubmit(text, ready, previewUrls);
   }, [attachments, clearAttachments, disabled, draft, onSubmit, setDraft]);
 
   const handleKeyDown = useCallback(
@@ -283,25 +298,45 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
       {attachments.length > 0 && (
         <div className="composer__attachments">
           {attachments.map((a) => (
-            <span
-              key={a.id}
-              className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${a.error ? " composer__chip--error" : ""}`}
-              title={a.error || (a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`) }
-            >
-              <span className="composer__chip__icon">
-                {a.uploading ? "◌" : a.error ? "✕" : "✓"}
+            a.previewUrl && !a.error ? (
+              <span
+                key={a.id}
+                className={`composer__preview-chip${a.uploading ? " composer__chip--uploading" : ""}`}
+                title={a.uploading ? "uploading…" : a.filename}
+              >
+                <img src={a.previewUrl} alt={a.filename} className="composer__preview-img" />
+                {!a.uploading && (
+                  <button
+                    className="composer__preview-remove"
+                    onClick={() => removeAttachment(a.id)}
+                    aria-label={`Remove ${a.filename}`}
+                  >
+                    ×
+                  </button>
+                )}
+                {a.uploading && <span className="composer__preview-loading" />}
               </span>
-              <span className="composer__chip__name">{a.filename}</span>
-              {!a.uploading && (
-                <button
-                  className="composer__chip__remove"
-                  onClick={() => removeAttachment(a.id)}
-                  aria-label={`Remove ${a.filename}`}
-                >
-                  ×
-                </button>
-              )}
-            </span>
+            ) : (
+              <span
+                key={a.id}
+                className={`composer__chip${a.uploading ? " composer__chip--uploading" : ""}${a.error ? " composer__chip--error" : ""}`}
+                title={a.error || (a.uploading ? "uploading…" : `${a.image_count} image(s) extracted`) }
+              >
+                <span className="composer__chip__icon">
+                  {a.uploading ? "◌" : a.error ? "✕" : "✓"}
+                </span>
+                <span className="composer__chip__name">{a.filename}</span>
+                {!a.uploading && (
+                  <button
+                    className="composer__chip__remove"
+                    onClick={() => removeAttachment(a.id)}
+                    aria-label={`Remove ${a.filename}`}
+                  >
+                    ×
+                  </button>
+                )}
+              </span>
+            )
           ))}
         </div>
       )}

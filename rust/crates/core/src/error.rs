@@ -216,7 +216,7 @@ impl Error {
     /// retry classifier in `src/services/api/errors.ts`.
     pub fn classify_status(status: u16) -> ApiErrorKind {
         match status {
-            408 | 409 | 429 | 500 | 502 | 503 | 529 => ApiErrorKind::Retryable,
+            408 | 409 | 429 | 500 | 502 | 503 | 504 | 529 => ApiErrorKind::Retryable,
             _ => ApiErrorKind::NonRetryable,
         }
     }
@@ -297,5 +297,21 @@ mod tests {
         assert!(!encoded.contains("Bearer"));
         assert!(!error.operation.contains('/'));
         assert!(!error.trace_id.as_deref().unwrap().contains('/'));
+    }
+
+    #[test]
+    fn gateway_timeout_504_is_retryable() {
+        // Regression: 504 (gateway timeout) must be retried like sibling gateway
+        // errors (502/503). It used to fall into the `_` arm and fail the run
+        // immediately instead of riding out transient upstream timeouts.
+        assert_eq!(Error::classify_status(504), ApiErrorKind::Retryable);
+        // Sibling gateway/server errors stay retryable.
+        for status in [408, 409, 429, 500, 502, 503, 529] {
+            assert_eq!(Error::classify_status(status), ApiErrorKind::Retryable);
+        }
+        // Permanent errors stay non-retryable.
+        for status in [400, 401, 403, 404, 422] {
+            assert_eq!(Error::classify_status(status), ApiErrorKind::NonRetryable);
+        }
     }
 }

@@ -207,6 +207,8 @@ export interface MediaAttachment {
   extracted_text: string;
   image_count: number;
   images?: ImageRef[];
+  /** Local object-URL for image thumbnail preview (images only). */
+  previewUrl?: string;
   uploading: boolean;
   error?: string;
 }
@@ -637,7 +639,7 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   leftRailCollapsed: false,
   insightCollapsed: false,
   theme: initialTheme(),
-  permissionMode: "default",
+  permissionMode: "auto",
   locatedMessageId: null,
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
