@@ -16,7 +16,8 @@
     "session_id": "session-fixture",
     "revision": 7,
     "timestamp_ms": 1700000000001,
-    "messages": []
+    "messages": [],
+    "cumulative_usage": {}
   },
   "done": {
     "type": "done",

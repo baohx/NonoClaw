@@ -135,6 +135,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         name: "attachmentConverter",
         description: "Document conversion strategy for file uploads: \"auto\", \"markitdown\", or \"legacy\".",
     },
+    ConfigFieldReference {
+        name: "providerBilling",
+        description: "Provider API balance-check endpoints: { providers: { name: { balanceUrl, apiKey } } }.",
+    },
 ];
 
 pub fn config_reference() -> &'static [ConfigFieldReference] {
@@ -202,6 +206,8 @@ pub struct SettingsFile {
     pub attachment_converter: Option<String>,
     #[serde(default)]
     pub executables: Option<ExecutableSettings>,
+    #[serde(rename = "providerBilling", default)]
+    pub provider_billing: Option<ProviderBilling>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -348,6 +354,14 @@ impl fmt::Debug for SettingsFile {
                 "executables",
                 &self.executables.as_ref().map(|_| "[configured]"),
             )
+            .field(
+                "provider_billing",
+                &self.provider_billing.as_ref().map(|b| {
+                    b.providers
+                        .as_ref()
+                        .map(|p| p.keys().collect::<Vec<_>>())
+                }),
+            )
             .finish()
     }
 }
@@ -377,6 +391,7 @@ impl Default for SettingsFile {
             doc_model: None,
             attachment_converter: None,
             executables: None,
+            provider_billing: None,
             extra: HashMap::new(),
         }
     }
@@ -412,6 +427,10 @@ pub struct ModelProfile {
     pub profile: Option<String>,
     #[serde(rename = "apiFormat", default)]
     pub api_format: Option<String>,
+    /// Explicit billing provider key (from `providerBilling.providers`) for
+    /// balance display. Overrides `base_url` inference.
+    #[serde(rename = "billingProvider", default)]
+    pub billing_provider: Option<String>,
 }
 
 impl fmt::Debug for ModelProfile {
@@ -429,6 +448,7 @@ impl fmt::Debug for ModelProfile {
             .field("chars_per_token", &self.chars_per_token)
             .field("profile", &self.profile)
             .field("api_format", &self.api_format)
+            .field("billing_provider", &self.billing_provider)
             .finish()
     }
 }
@@ -544,6 +564,38 @@ impl DocModelConfig {
         }
         !self.api_key.is_empty()
     }
+}
+
+/// Configuration for querying API balances from LLM providers.
+/// Each entry maps a provider key to its balance-check endpoint + credentials.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderBilling {
+    /// Named provider billing entries (e.g. "kimi", "deepseek", "glm", "jiekou").
+    pub providers: Option<HashMap<String, ProviderBillingEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBillingEntry {
+    /// URL for the provider's balance/usage query endpoint.
+    #[serde(rename = "balanceUrl")]
+    pub balance_url: String,
+    /// API key (or `$ENV_VAR` reference).
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+/// Result of a single provider balance query. Safe to display in the UI
+/// (no secrets, no raw API responses).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderBalance {
+    /// Provider key from settings (e.g. "kimi", "deepseek").
+    pub provider: String,
+    /// Human-readable balance summary, e.g. "¥123.45" or "CNY 50.00".
+    pub summary: String,
+    /// Whether the query succeeded.
+    pub ok: bool,
+    /// Error message when `ok` is false.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -965,6 +1017,28 @@ impl ResolvedConfig {
             .as_deref()
             .filter(|v| !v.is_empty())
             .unwrap_or("auto")
+    }
+
+    /// Resolved provider billing entries with environment references expanded.
+    pub fn provider_billing_entries(&self) -> Vec<(String, ProviderBillingEntry)> {
+        let Some(billing) = &self.settings.provider_billing else {
+            return vec![];
+        };
+        let Some(providers) = &billing.providers else {
+            return vec![];
+        };
+        providers
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    ProviderBillingEntry {
+                        balance_url: self.resolve_reference(&entry.balance_url),
+                        api_key: self.resolve_reference(&entry.api_key),
+                    },
+                )
+            })
+            .collect()
     }
 
     pub fn elevenlabs_api_key(&self) -> Option<String> {
@@ -1522,6 +1596,9 @@ fn merge_settings_value(
             }
             None => executables.clone(),
         });
+    }
+    if present("providerBilling", overlay.provider_billing.is_some()) {
+        base.provider_billing.clone_from(&overlay.provider_billing);
     }
     base.extra.extend(overlay.extra.clone());
 }
@@ -2585,6 +2662,7 @@ fn diagnose_unknown_fields(
             "charsPerToken",
             "profile",
             "apiFormat",
+            "billingProvider",
         ];
         for (index, model) in models.iter().filter_map(Value::as_object).enumerate() {
             for key in model

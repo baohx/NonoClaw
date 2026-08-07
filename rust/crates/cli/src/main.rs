@@ -3,6 +3,7 @@
 //! positional prompt) or starts the web UI (`--serve-http`).
 
 mod attachments;
+mod billing;
 mod project_info;
 mod remote;
 mod serve_http;

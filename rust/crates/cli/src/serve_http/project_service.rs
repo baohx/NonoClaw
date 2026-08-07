@@ -69,7 +69,8 @@ impl ProjectService {
 
     pub(super) async fn snapshot(&self, model: &str) -> ProjectInfo {
         let _refresh = self.refresh_gate.lock().await;
-        self.gather_with(model, &self.config, false, None, &mut |_| {})
+        let balances = self.fetch_balances(&self.config).await;
+        self.gather_with(model, &self.config, false, None, &mut |_| {}, balances)
             .await
     }
 
@@ -84,14 +85,27 @@ impl ProjectService {
         self.skills_manager.write().unwrap().rescan(&self.cwd);
         let config = self.config.reload();
         config.log_diagnostics();
+        let balances = self.fetch_balances(&config).await;
         self.gather_with(
             model,
             &config,
             true,
             Some(observed_generation),
             &mut on_update,
+            balances,
         )
         .await
+    }
+
+    async fn fetch_balances(
+        &self,
+        config: &ResolvedConfig,
+    ) -> Vec<nonoclaw_engine::ProviderBalance> {
+        let entries = config.provider_billing_entries();
+        if entries.is_empty() {
+            return vec![];
+        }
+        crate::billing::query_balances(&entries).await
     }
 
     async fn gather_with(
@@ -101,6 +115,7 @@ impl ProjectService {
         force_probe: bool,
         observed_generation: Option<u64>,
         on_update: &mut (dyn FnMut(nonoclaw_engine::RuntimeProbeReport) + Send),
+        provider_balances: Vec<nonoclaw_engine::ProviderBalance>,
     ) -> ProjectInfo {
         let fingerprint = config.executable_fingerprint();
         let cached = self.system_cache.lock().await.clone();
@@ -142,6 +157,7 @@ impl ProjectService {
             &skills,
             &extensions,
             &diagnostics,
+            provider_balances,
         )
         .await
     }

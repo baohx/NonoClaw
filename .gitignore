@@ -48,6 +48,7 @@ local.properties
 
 # Build artifacts (large binaries, release zips)
 nonoclaw-windows-portable.zip
+release/
 *.portable.zip
 # Added by code-review-graph
 .code-review-graph/

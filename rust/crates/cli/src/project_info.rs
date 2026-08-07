@@ -48,6 +48,10 @@ pub struct ProjectInfo {
     pub compact_threshold: usize,
     /// Public URL for QR-code mobile access, if set via --public-url.
     pub public_url: Option<String>,
+    /// API balances for configured billing providers (query per-insight refresh).
+    pub provider_balances: Vec<nonoclaw_engine::ProviderBalance>,
+    /// Model name → billing provider key (only models with configured billing).
+    pub model_providers: Vec<crate::billing::ModelProviderMapping>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -174,6 +178,7 @@ pub async fn gather(
     skills: &[Skill],
     skill_extensions: &[ExtensionDescriptor],
     skill_diagnostics: &[ExtensionDiagnostic],
+    provider_balances: Vec<nonoclaw_engine::ProviderBalance>,
 ) -> ProjectInfo {
     let tools: Vec<ToolInfo> = registry
         .all()
@@ -283,6 +288,15 @@ pub async fn gather(
         .collect();
     let (context_window, compact_threshold) = config.model_budget(model);
     let git = git_info(cwd).await;
+    let billing_providers: Vec<String> = config
+        .provider_billing_entries()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let model_providers = crate::billing::model_provider_map(
+        config.all_models(),
+        &billing_providers,
+    );
 
     ProjectInfo {
         cwd: nonoclaw_core::display_path(cwd),
@@ -304,6 +318,8 @@ pub async fn gather(
         context_window,
         compact_threshold,
         public_url,
+        provider_balances,
+        model_providers,
     }
 }
 

@@ -234,7 +234,20 @@ export function dispatchServerMessage(message: ServerMsg): void {
       const accepted = message.session_id !== undefined && message.revision !== undefined
         ? state.acceptSnapshot(message.session_id, message.revision)
         : state.acceptLegacySnapshot();
-      if (accepted) state.loadMessages(message.messages);
+      if (accepted) {
+        state.loadMessages(message.messages);
+        // Restore cumulative token usage so the right-rail in/out display
+        // survives a page refresh. These are real API token counts accumulated
+        // across all completed runs in this session.
+        if (message.cumulative_usage) {
+          state.addUsage({
+            input: message.cumulative_usage.input_tokens ?? 0,
+            output: message.cumulative_usage.output_tokens ?? 0,
+            cacheRead: message.cumulative_usage.cache_read_input_tokens ?? 0,
+            cacheWrite: message.cumulative_usage.cache_creation_input_tokens ?? 0,
+          });
+        }
+      }
       break;
     }
     case "file_tree":

@@ -107,7 +107,14 @@ pub enum RunEvent {
         max_budget_usd: Option<f64>,
     },
     ContextPrepared {
+        /// Estimated token count for the initial context. This is an estimate
+        /// (chars/4 heuristic) because the real token count is only available
+        /// after the first API call. Use `UsageUpdated.total.input_tokens` for
+        /// the ground-truth value once the first turn completes.
         estimated_tokens: usize,
+        /// Whether the token count is based on chars/4 estimation (always true
+        /// before the first turn).
+        is_estimated: bool,
         context_window: Option<usize>,
         tool_count: usize,
         skill_count: usize,

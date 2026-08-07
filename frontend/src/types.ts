@@ -250,6 +250,8 @@ export interface MessagesLoadedMsg {
   timestamp_ms?: number;
   /** Each entry is a serialized engine Message ({role, content}). */
   messages: unknown[];
+  /** Cumulative token usage from all completed runs (restores the in/out display). */
+  cumulative_usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
 }
 
 /** One node of the flattened project file tree. */
@@ -437,6 +439,22 @@ export interface ProjectInfo {
   /** Public URL for QR-code mobile access, if set via --public-url. */
   public_url: string | null;
   git: GitInfo | null;
+  /** API balances for configured billing providers. */
+  provider_balances: ProviderBalance[];
+  /** Model name → billing provider key (only models with configured billing). */
+  model_providers: ModelProviderMapping[];
+}
+
+export interface ProviderBalance {
+  provider: string;
+  summary: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface ModelProviderMapping {
+  model: string;
+  provider: string;
 }
 export interface ProjectInfoMsg {
   type: "project_info";

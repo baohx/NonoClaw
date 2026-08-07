@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use nonoclaw_engine::session::CumulativeUsageWire;
 use nonoclaw_engine::{ResolvedConfig, Session, SessionService};
 use tokio::sync::Mutex;
 
@@ -24,6 +25,11 @@ struct SharedEntry {
 #[derive(Default)]
 pub(super) struct SessionHub {
     entries: Mutex<HashMap<String, SharedEntry>>,
+    /// Fast in-memory cache of cumulative token usage per session.  Backed by
+    /// durable storage: every write also calls `session.write_usage()` so the
+    /// values survive server restarts (reloaded from the session JSONL on
+    /// reconnect).
+    cumulative_usages: Mutex<HashMap<String, CumulativeUsageWire>>,
 }
 
 impl SessionHub {
@@ -126,7 +132,11 @@ impl SessionHub {
         let Ok(snapshot) = session.snapshot().await else {
             return;
         };
-        let message = messages_loaded(session_id, snapshot);
+        let message = messages_loaded(
+            session_id,
+            snapshot,
+            self.cumulative_usage_json(session_id).await,
+        );
         let mut dead = Vec::new();
         for peer in peers {
             if Arc::ptr_eq(&peer, exclude) {
@@ -175,6 +185,74 @@ impl SessionHub {
         if remove {
             entries.remove(session_id);
         }
+    }
+
+    /// Accumulate real API token usage for a session (called when a run completes).
+    /// Updates the in-memory cache and persists to the session JSONL file so the
+    /// value survives server restarts.
+    pub(super) async fn accumulate_usage(
+        &self,
+        session_id: &str,
+        usage: &nonoclaw_core::Usage,
+    ) {
+        // 1. Update in-memory cache.
+        let wire = {
+            let mut cum = self.cumulative_usages.lock().await;
+            let entry = cum.entry(session_id.to_string()).or_insert_with(|| CumulativeUsageWire {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            });
+            entry.input_tokens += usage.input_tokens;
+            entry.output_tokens += usage.output_tokens;
+            entry.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+            entry.cache_read_input_tokens += usage.cache_read_input_tokens;
+            entry.clone()
+        };
+
+        // 2. Persist to session file (best-effort – the in-memory cache is
+        //    authoritative during this server session; the disk write ensures
+        //    the next server session can recover from the snapshot).
+        if let Some(handle) = self.handle(session_id).await {
+            if let Some(session_handle) = handle.lock().await.as_ref() {
+                if let Err(e) = session_handle.session.write_usage(&wire).await {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to persist cumulative usage to session file"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Read the cumulative usage for a session, serialized for the WS protocol.
+    /// Tries the in-memory cache first, then falls back to the session snapshot
+    /// (handles server restart without active clients).
+    pub(super) async fn cumulative_usage_json(&self, session_id: &str) -> serde_json::Value {
+        // Fast path: in-memory cache.
+        {
+            let cum = self.cumulative_usages.lock().await;
+            if let Some(wire) = cum.get(session_id) {
+                return serde_json::to_value(wire).unwrap_or_default();
+            }
+        }
+        // Fallback: read from session snapshot (survives server restart).
+        if let Some(handle) = self.handle(session_id).await {
+            if let Some(session_handle) = handle.lock().await.as_ref() {
+                if let Ok(snapshot) = session_handle.session.snapshot().await {
+                    if let Some(cu) = &snapshot.cumulative_usage {
+                        // Seed the in-memory cache for subsequent fast reads.
+                        let mut cum = self.cumulative_usages.lock().await;
+                        cum.entry(session_id.to_string())
+                            .or_insert_with(|| cu.clone());
+                        return serde_json::to_value(cu).unwrap_or_default();
+                    }
+                }
+            }
+        }
+        serde_json::json!({})
     }
 }
 

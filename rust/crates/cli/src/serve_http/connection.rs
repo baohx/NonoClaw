@@ -509,7 +509,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         shared_sid = Some(sid.clone());
         *session.lock().await = Some(handle);
 
-        send_msg(&tx, messages_loaded(&sid, snapshot)).await;
+        send_msg(
+            &tx,
+            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
+        )
+        .await;
         send_msg(
             &tx,
             ServerMsg::Info {
@@ -615,7 +619,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 continue;
                             }
                         };
-                        send_msg(&tx, messages_loaded(&sid, snapshot)).await;
+                        send_msg(
+            &tx,
+            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
+        )
+        .await;
                         state
                             .session_hub
                             .move_registration(shared_sid.as_deref(), &h, &tx)
@@ -676,7 +684,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 .await;
                             shared_sid = Some(sid.clone());
                             *session.lock().await = Some(handle);
-                            send_msg(&tx, messages_loaded(&sid, snapshot)).await;
+                            send_msg(
+            &tx,
+            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
+        )
+        .await;
                             send_msg(
                                 &tx,
                                 ServerMsg::Info {
@@ -1255,6 +1267,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 text_len = r.text.len(),
                                 "engine run complete"
                             );
+                            // Accumulate real API token usage for the session so
+                            // the frontend can restore it after a page refresh.
+                            s.session_hub.accumulate_usage(&session_id, &r.usage).await;
                             let msg = ServerMsg::Done {
                                 protocol_version,
                                 run_id,
@@ -1484,7 +1499,8 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                     match canonical.snapshot().await {
                         Ok(snapshot) => {
-                            let ml = messages_loaded(canonical.id(), snapshot);
+                            let cum_usage = state.session_hub.cumulative_usage_json(canonical.id()).await;
+                            let ml = messages_loaded(canonical.id(), snapshot, cum_usage);
                             send_msg(&tx, ml).await;
                         }
                         Err(_) => {
@@ -1949,6 +1965,8 @@ mod characterization_tests {
             context_window: None,
             compact_threshold: 80_000,
             public_url: None,
+            provider_balances: vec![],
+            model_providers: vec![],
         };
         let system_probe = project_info.system.clone();
         let messages = vec![
@@ -2006,6 +2024,7 @@ mod characterization_tests {
                 revision: 1,
                 timestamp_ms: 1,
                 messages: vec![],
+                cumulative_usage: serde_json::json!({}),
             },
             ServerMsg::FileTree {
                 root: "/fixture".into(),

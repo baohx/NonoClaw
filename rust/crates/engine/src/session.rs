@@ -43,6 +43,15 @@ pub enum SessionEntry {
     Mode {
         mode: String,
     },
+    /// Running total of real API token usage (accumulated across all
+    /// completed runs). Used to restore the frontend right-rail in/out
+    /// display across server restarts.
+    CumulativeUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+    },
 }
 
 pub use nonoclaw_core::{SessionRepair, SessionRepairKind};
@@ -59,6 +68,19 @@ pub struct SessionSnapshot {
     pub tag: Option<String>,
     pub mode: Option<String>,
     pub repairs: Vec<SessionRepair>,
+    /// Cumulative real API token usage from all completed runs, persisted
+    /// across server restarts. `None` if no runs have completed yet.
+    pub cumulative_usage: Option<CumulativeUsageWire>,
+}
+
+/// Wire-friendly representation of cumulative token usage, used in both
+/// SessionSnapshot and the WS `messages_loaded` frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CumulativeUsageWire {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
 /// Metadata for a discovered session (for `--list-sessions`).
@@ -177,6 +199,16 @@ impl Session {
     pub async fn write_mode(&self, mode: impl Into<String>) -> SessionResult<u64> {
         self.append_metadata(SessionEntry::Mode { mode: mode.into() })
             .await
+    }
+
+    pub async fn write_usage(&self, usage: &CumulativeUsageWire) -> SessionResult<u64> {
+        self.append_metadata(SessionEntry::CumulativeUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+        })
+        .await
     }
 
     pub async fn write_summary(&self, text: impl Into<String>) -> SessionResult<u64> {
@@ -394,6 +426,7 @@ struct SessionState {
     last_prompt: Option<String>,
     tag: Option<String>,
     mode: Option<String>,
+    cumulative_usage: Option<CumulativeUsageWire>,
     repairs: Vec<SessionRepair>,
     needs_rewrite: bool,
 }
@@ -416,6 +449,7 @@ impl SessionState {
             last_prompt: None,
             tag: None,
             mode: None,
+            cumulative_usage: None,
             repairs: Vec::new(),
             needs_rewrite: true,
         }
@@ -433,6 +467,7 @@ impl SessionState {
         let mut last_prompt = None;
         let mut tag = None;
         let mut mode = None;
+        let mut cumulative_usage = None;
         let mut repairs = Vec::new();
         let mut revision = 0;
 
@@ -465,6 +500,7 @@ impl SessionState {
                         | "last_prompt"
                         | "tag"
                         | "mode"
+                        | "cumulative_usage"
                 )
             );
             if !known {
@@ -525,6 +561,22 @@ impl SessionState {
                 }
                 SessionEntry::Mode { mode: value_mode } => {
                     mode = Some(value_mode);
+                    preserved.push(value);
+                    revision += 1;
+                }
+                SessionEntry::CumulativeUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                } => {
+                    // Keep the newest CumulativeUsage entry (accumulated total).
+                    cumulative_usage = Some(CumulativeUsageWire {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    });
                     preserved.push(value);
                     revision += 1;
                 }
@@ -591,6 +643,7 @@ impl SessionState {
             last_prompt,
             tag,
             mode,
+            cumulative_usage,
             repairs,
             needs_rewrite: missing_header || tool_pairing_repaired,
         })
@@ -605,6 +658,7 @@ impl SessionState {
             title: self.title(),
             tag: self.tag.clone(),
             mode: self.mode.clone(),
+            cumulative_usage: self.cumulative_usage.clone(),
             repairs: self.repairs.clone(),
         }
     }
@@ -628,6 +682,19 @@ impl SessionState {
             SessionEntry::LastPrompt { prompt } => self.last_prompt = Some(prompt.clone()),
             SessionEntry::Tag { tag } => self.tag = Some(tag.clone()),
             SessionEntry::Mode { mode } => self.mode = Some(mode.clone()),
+            SessionEntry::CumulativeUsage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            } => {
+                self.cumulative_usage = Some(CumulativeUsageWire {
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cache_creation_input_tokens: *cache_creation_input_tokens,
+                    cache_read_input_tokens: *cache_read_input_tokens,
+                });
+            }
             SessionEntry::Session { .. } | SessionEntry::Message(_) => {}
         }
     }
@@ -702,6 +769,7 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
                         last_prompt: None,
                         tag: None,
                         mode: None,
+                        cumulative_usage: state.cumulative_usage.clone(),
                         repairs: state.repairs.clone(),
                         needs_rewrite: false,
                     };

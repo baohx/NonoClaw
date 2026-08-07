@@ -471,20 +471,39 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
 function ModelsSection({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   const models = useStore((s) => s.availableModels);
   const active = useStore((s) => s.model);
+  const projectInfo = useStore((s) => s.projectInfo);
+  const balances = projectInfo?.provider_balances ?? [];
+  const modelProviders = projectInfo?.model_providers ?? [];
+
+  /** Map model name → provider from backend `billing::model_provider_map`. */
+  const providerForModel = new Map<string, string>();
+  for (const mp of modelProviders) providerForModel.set(mp.model, mp.provider);
+  /** Map provider → balance summary. */
+  const balanceMap = new Map<string, string>();
+  for (const b of balances) {
+    if (b.ok && b.summary) balanceMap.set(b.provider, b.summary);
+  }
+
   if (models.length === 0) return null;
   return (
     <Section id="models" label="Models" count={models.length} open={open} onToggle={onToggle}>
       <div className="acc-body">
-        {models.map((m) => (
+        {models.map((m) => {
+          const prov = providerForModel.get(m.name);
+          const bal = prov ? balanceMap.get(prov) : undefined;
+          return (
           <div key={m.name} className="insight-row">
             <div className="insight-row__top">
               <span className={`dot ${m.name === active ? "on" : "off"}`} />
               <span className="insight-row__name">{m.label || m.name}</span>
               {m.name === active && <span className="tag mcp">active</span>}
+              {prov && <span className="tag">{prov}</span>}
             </div>
             <div className="insight-row__meta">{m.name}</div>
+            {bal && <div className="insight-row__meta" style={{ color: "var(--clr-accent)", fontWeight: 500 }}>余额 {bal}</div>}
           </div>
-        ))}
+          );
+        })}
       </div>
     </Section>
   );

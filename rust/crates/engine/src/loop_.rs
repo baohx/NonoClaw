@@ -33,8 +33,29 @@ use crate::context::{get_system_context, get_user_context, load_memory_prompt};
 use crate::run::{RunContext, RunController, RunLimits, RunTerminalStatus};
 use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
 use crate::skills::SkillsManager;
-use crate::tokens::estimate_total;
+use crate::tokens::{estimate_total, message_char_len};
 use nonoclaw_tools::BackgroundTaskRegistry;
+
+/// Ratio-based token estimate: scales a known real `tokens_before` by the
+/// character-count ratio of after/before. Much more accurate than chars/4
+/// because it's calibrated against the provider's real token count.
+fn ratio_tokens(tokens_before: usize, chars_before: usize, chars_after: usize) -> usize {
+    if chars_before == 0 {
+        return tokens_before;
+    }
+    // Use u128 to avoid overflow on large conversations.
+    ((tokens_before as u128 * chars_after as u128) / chars_before as u128) as usize
+}
+
+/// Sum of system + tools + message character counts, used as the `chars_before`
+/// denominator for ratio_tokens.
+fn total_message_chars(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> usize {
+    system_chars + tools_chars + messages.iter().map(message_char_len).sum::<usize>()
+}
 
 /// A request to the active UI adapter to resolve an interactive permission
 /// `Ask` and return the user's decision.
@@ -298,8 +319,13 @@ struct EngineCache {
     pending_compact_revision: u64,
     /// Estimated tokens when background compact was spawned. Recorded so the
     /// `Compacted` event can report the true pre-compact estimate instead of
-    /// a placeholder 0.
+    /// a placeholder 0. Uses the provider-reported `input_tokens` when available;
+    /// falls back to chars/4.
     pending_compact_tokens_est: usize,
+    /// Total character count (system + tools + messages) when background compact
+    /// was spawned. Used for ratio-based `tokens_after` estimation so the
+    /// Compacted event stays calibrated against the real token count.
+    pending_compact_chars_before: usize,
     /// Cached git context from the last `get_system_context` call. Reused on
     /// turns that follow read-only tools; refreshed after Bash/Edit/Write.
     cached_git_context: Option<crate::context::SystemContext>,
@@ -347,6 +373,7 @@ impl Default for EngineCache {
             pending_compact_msg_count: 0,
             pending_compact_revision: 0,
             pending_compact_tokens_est: 0,
+            pending_compact_chars_before: 0,
             cached_git_context: None,
             tool_result_cache: std::collections::HashMap::new(),
         }
@@ -677,6 +704,7 @@ impl QueryEngine {
                 tools_chars,
                 self.options.chars_per_token,
             ),
+            is_estimated: true,
             context_window: self.options.context_window,
             tool_count: tool_defs.len(),
             skill_count,
@@ -935,6 +963,7 @@ impl QueryEngine {
                 let msg_count_at_spawn = self.cache.pending_compact_msg_count;
                 let revision_at_spawn = self.cache.pending_compact_revision;
                 let tokens_at_spawn = self.cache.pending_compact_tokens_est;
+                let chars_at_spawn = self.cache.pending_compact_chars_before;
                 match handle.await {
                     Ok(Ok(compacted)) => {
                         let kept = compacted.len();
@@ -945,14 +974,14 @@ impl QueryEngine {
                                 .persist_compaction(compacted.clone(), revision_at_spawn)
                                 .await
                         {
-                            // Re-estimate after compaction so the event reports
-                            // real numbers, not placeholders.
-                            let tokens_after = estimate_total(
-                                &compacted,
-                                system_chars,
-                                tools_chars,
-                                self.options.chars_per_token,
-                            );
+                            // Ratio-based tokens_after: scale the real token
+                            // count by the character-count reduction. This is far
+                            // more accurate than chars/4 because it uses the
+                            // provider-reported input_tokens as the baseline.
+                            let chars_after =
+                                total_message_chars(&compacted, system_chars, tools_chars);
+                            let tokens_after =
+                                ratio_tokens(tokens_at_spawn, chars_at_spawn, chars_after);
                             self.messages = compacted;
                             on_event(&EngineEvent::Compacted {
                                 removed,
@@ -980,12 +1009,12 @@ impl QueryEngine {
                             // CompactionStarted with a terminal event so the
                             // UI's compacting indicator always clears.
                             let kept = self.messages.len();
-                            let tokens_after = estimate_total(
-                                &self.messages,
-                                system_chars,
-                                tools_chars,
-                                self.options.chars_per_token,
-                            );
+                            // Ratio-based re-estimate against current messages
+                            // so the numbers reflect the actual state.
+                            let current_chars =
+                                total_message_chars(&self.messages, system_chars, tools_chars);
+                            let tokens_after =
+                                ratio_tokens(tokens_at_spawn, chars_at_spawn, current_chars);
                             tracing::debug!(
                                 "background compact stale — transcript or revision changed since spawn"
                             );
@@ -1055,6 +1084,8 @@ impl QueryEngine {
                     self.cache.pending_compact_msg_count = messages.len();
                     self.cache.pending_compact_revision = self.session_revision;
                     self.cache.pending_compact_tokens_est = est;
+                    self.cache.pending_compact_chars_before =
+                        total_message_chars(&messages, system_chars, tools_chars);
                     on_event(&RunEvent::CompactionStarted {
                         automatic: true,
                         tokens_before: est,
@@ -1094,6 +1125,8 @@ impl QueryEngine {
                 if est > self.options.compact_threshold_tokens {
                     let before = self.messages.len();
                     let tokens_before = est;
+                    let chars_before =
+                        total_message_chars(&self.messages, system_chars, tools_chars);
                     let compact_revision = self.session_revision;
                     on_event(&RunEvent::CompactionStarted {
                         automatic: true,
@@ -1136,12 +1169,11 @@ impl QueryEngine {
                             self.options.compact_max_tokens,
                         ) => result?,
                     };
-                    let tokens_after = estimate_total(
-                        &compacted,
-                        system_chars,
-                        tools_chars,
-                        self.options.chars_per_token,
-                    );
+                    let tokens_after = {
+                        let chars_after =
+                            total_message_chars(&compacted, system_chars, tools_chars);
+                        ratio_tokens(tokens_before, chars_before, chars_after)
+                    };
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
                     if removed > 0
@@ -1174,17 +1206,12 @@ impl QueryEngine {
                         // Pair the CompactionStarted above with a terminal
                         // event even when there was nothing to remove or the
                         // persist failed, so the UI's compacting indicator
-                        // always clears.
+                        // always clears. Nothing changed → tokens_after == tokens_before.
                         on_event(&EngineEvent::Compacted {
                             removed: 0,
                             kept: before,
                             tokens_before,
-                            tokens_after: estimate_total(
-                                &self.messages,
-                                system_chars,
-                                tools_chars,
-                                self.options.chars_per_token,
-                            ),
+                            tokens_after: tokens_before,
                         });
                     }
                 }

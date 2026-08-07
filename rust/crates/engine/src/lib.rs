@@ -43,7 +43,8 @@ pub use session::{
 };
 pub use settings::{
     config_reference, load_resolved_config, ConfigDiagnostic, ConfigFieldReference, ConfigSource,
-    ModelProfile, ResolvedConfig, RunConfigOverrides, SettingsFile,
+    ModelProfile, ProviderBalance, ProviderBilling, ProviderBillingEntry, ResolvedConfig,
+    RunConfigOverrides, SettingsFile,
 };
 pub use skills::{substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillsManager};
 pub use toolchain::{

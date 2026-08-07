@@ -1,0 +1,3 @@
+# mold 快速链接器 (由 install.sh --mold 自动配置)
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

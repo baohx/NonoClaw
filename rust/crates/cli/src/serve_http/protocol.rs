@@ -181,6 +181,10 @@ pub(super) enum ServerMsg {
         revision: u64,
         timestamp_ms: u64,
         messages: Vec<serde_json::Value>,
+        /// Cumulative token usage from all completed runs in this session
+        /// (input_tokens, output_tokens, cache tokens). Used by the frontend
+        /// to restore the right-rail in/out display across page refreshes.
+        cumulative_usage: serde_json::Value,
     },
     FileTree {
         root: String,
@@ -238,7 +242,11 @@ pub(super) fn timestamp_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-pub(super) fn messages_loaded(session_id: &str, snapshot: SessionSnapshot) -> ServerMsg {
+pub(super) fn messages_loaded(
+    session_id: &str,
+    snapshot: SessionSnapshot,
+    cumulative_usage: serde_json::Value,
+) -> ServerMsg {
     let started_ms = snapshot.started.as_deref().and_then(parse_rfc3339_ms);
     ServerMsg::MessagesLoaded {
         protocol_version: WS_PROTOCOL_VERSION,
@@ -251,6 +259,7 @@ pub(super) fn messages_loaded(session_id: &str, snapshot: SessionSnapshot) -> Se
             .enumerate()
             .map(|(index, message)| message_for_wire(message, started_ms, index))
             .collect(),
+        cumulative_usage,
     }
 }
 
@@ -784,6 +793,7 @@ mod tests {
             revision: 7,
             timestamp_ms: 1_700_000_000_001,
             messages: vec![],
+            cumulative_usage: serde_json::json!({}),
         };
         let done = ServerMsg::Done {
             protocol_version: 1,

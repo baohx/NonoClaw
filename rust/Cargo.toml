@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -47,7 +47,18 @@ axum = { version = "0.7", features = ["ws", "multipart"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 notify = "6"
 
+# Full release: max optimisation, slow linking (~20 min).
+# Use for final release / distribution builds.
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# Fast release: no LTO, parallel codegen (~3-5 min).
+# Use for daily dev iterations.  Binaries are ~10% larger but
+# functionally identical — full opt-level=3, just with faster
+# compilation and linking.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
