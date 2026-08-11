@@ -84,14 +84,15 @@ fn is_plain_user_prompt(m: &Message) -> bool {
 
 /// Compact `messages`: summarize the older prefix, keep the recent tail.
 /// `keep_recent` is the minimum number of messages / turns to keep verbatim
-/// (interpretation depends on `mode`). `max_summary_tokens` caps the
-/// summarizer's output length — increase for long, dense conversations.
+/// (interpretation depends on `mode`). `max_input_chars` hard-bounds the
+/// summarizer request payload; `max_summary_tokens` caps its output.
 pub async fn compact_messages(
     client: &Client,
     model: &str,
     messages: &[Message],
     keep_recent: usize,
     mode: CompactMode,
+    max_input_chars: usize,
     max_summary_tokens: u32,
 ) -> Result<Vec<Message>> {
     // In segments mode, `keep_recent` counts turns, not messages.
@@ -121,7 +122,7 @@ pub async fn compact_messages(
     let to_compact = &messages[..split];
     let keep = &messages[split..];
 
-    let transcript = render_for_summary(to_compact);
+    let transcript = bound_summary_transcript(&render_for_summary(to_compact), max_input_chars);
     let user_text = format!(
         "Summarize the following conversation so work can continue with only your summary plus \
          the most recent messages. Preserve concrete technical details.\n\n<conversation>\n\
@@ -202,6 +203,43 @@ pub fn render_for_summary(messages: &[Message]) -> String {
         }
     }
     out
+}
+
+const SUMMARY_TRANSCRIPT_OMISSION: &str =
+    "\n...[middle of older history omitted to fit compaction input budget]...\n";
+
+/// Keep the original goal/context at the head and the most recent compacted
+/// details at the tail while strictly bounding the summarizer transcript.
+fn bound_summary_transcript(transcript: &str, max_chars: usize) -> String {
+    let char_count = transcript.chars().count();
+    if char_count <= max_chars {
+        return transcript.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let marker_chars = SUMMARY_TRANSCRIPT_OMISSION.chars().count();
+    if max_chars <= marker_chars {
+        return SUMMARY_TRANSCRIPT_OMISSION
+            .chars()
+            .take(max_chars)
+            .collect();
+    }
+
+    let available = max_chars - marker_chars;
+    let head_chars = available.div_ceil(2);
+    let tail_chars = available - head_chars;
+    let head: String = transcript.chars().take(head_chars).collect();
+    let tail: String = transcript
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}{SUMMARY_TRANSCRIPT_OMISSION}{tail}")
 }
 
 fn compact_json(v: &Value) -> String {
@@ -286,6 +324,18 @@ mod tests {
         assert!(r.contains("tool_result:"));
     }
 
+    #[test]
+    fn summary_transcript_budget_preserves_head_and_tail() {
+        let transcript = format!("goal-at-head\n{}\nrecent-details-at-tail", "x".repeat(400));
+        let bounded = bound_summary_transcript(&transcript, 120);
+
+        assert!(bounded.chars().count() <= 120);
+        assert!(bounded.starts_with("goal-at-head"));
+        assert!(bounded.ends_with("recent-details-at-tail"));
+        assert!(bounded.contains("middle of older history omitted"));
+        assert_eq!(bound_summary_transcript(&transcript, 0), "");
+    }
+
     // ========================================================================
     // Batch 4 — XML structured context wrapping
     // ========================================================================
@@ -324,8 +374,10 @@ mod tests {
         assert!(SUMMARY_SYSTEM.contains("<current_state>"));
         assert!(SUMMARY_SYSTEM.contains("<open_questions>"));
         // Sanity: not the legacy free-form prompt.
-        assert!(!SUMMARY_SYSTEM.contains("Preserve concrete technical details.")
-            || SUMMARY_SYSTEM.contains("Do NOT omit concrete technical details"));
+        assert!(
+            !SUMMARY_SYSTEM.contains("Preserve concrete technical details.")
+                || SUMMARY_SYSTEM.contains("Do NOT omit concrete technical details")
+        );
     }
 
     #[test]

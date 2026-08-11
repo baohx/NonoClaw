@@ -2,6 +2,7 @@
 //! Mirrors `src/query.ts`, `src/QueryEngine.ts`, `src/context.ts`.
 
 pub mod agents;
+pub mod budget;
 pub mod compact;
 pub mod context;
 pub mod extensions;
@@ -19,6 +20,7 @@ pub mod tool_selector;
 pub mod toolchain;
 pub mod trace;
 
+pub use budget::{ContextBudget, ContextBudgetSettings, TokenMode};
 pub use hooks::{
     lifecycle_context, load_hooks, load_hooks_with_diagnostics, HookAction, HookDecision, HookDef,
     HookDiagnostic, HookLoadReport, HookRuntime, HookType,
@@ -46,7 +48,9 @@ pub use settings::{
     ModelProfile, ProviderBalance, ProviderBilling, ProviderBillingEntry, ResolvedConfig,
     RunConfigOverrides, SettingsFile,
 };
-pub use skills::{substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillsManager};
+pub use skills::{
+    substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillDisclosure, SkillsManager,
+};
 pub use toolchain::{
     probe_runtime, probe_runtime_with_updates, ExecutableProbe, MarkItDownProbe, PythonVenvProbe,
     RuntimeProbeReport,

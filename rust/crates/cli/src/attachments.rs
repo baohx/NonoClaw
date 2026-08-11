@@ -144,7 +144,8 @@ pub async fn process_file(
             Err(e) => {
                 tracing::warn!(
                     "pdf-inspector failed for {} — falling back to legacy pipeline (details: {})",
-                    original_name, e
+                    original_name,
+                    e
                 );
                 // Fall through to pdftotext/OCR below.
             }
@@ -157,10 +158,7 @@ pub async fn process_file(
             if is_markitdown_format(&mime) {
                 match process_with_markitdown(md_path, file_path).await {
                     Ok(text) if non_whitespace_chars(&text) >= MIN_NON_WHITESPACE_CHARS => {
-                        tracing::info!(
-                            chars = text.len(),
-                            "MarkItDown extraction successful"
-                        );
+                        tracing::info!(chars = text.len(), "MarkItDown extraction successful");
                         return ExtractedDoc {
                             id: upload_id.into(),
                             filename: original_name.into(),
@@ -366,8 +364,8 @@ fn is_markitdown_format(mime: &str) -> bool {
 /// - `Ok(None)` — scanned/image-based PDF (no text layer; caller should OCR)
 /// - `Err(..)` — parse failure (caller should fall back to legacy pipeline)
 fn process_pdf_with_inspector(file_path: &Path) -> Result<Option<String>, String> {
-    let result = pdf_inspector::process_pdf(file_path)
-        .map_err(|e| format!("pdf-inspector failed: {e}"))?;
+    let result =
+        pdf_inspector::process_pdf(file_path).map_err(|e| format!("pdf-inspector failed: {e}"))?;
 
     match result.pdf_type {
         pdf_inspector::PdfType::TextBased | pdf_inspector::PdfType::Mixed => {
@@ -741,8 +739,9 @@ fn mime_type(file_path: &Path, original_name: &str) -> String {
         "pdf" => "application/pdf".into(),
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
         "doc" => "application/msword".into(),
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            .into(),
+        "pptx" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation".into()
+        }
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
         "xls" => "application/vnd.ms-excel".into(),
         "html" | "htm" => "text/html".into(),
@@ -956,8 +955,7 @@ struct MistralOcrPage {
 //      then download `markdown_url`.
 // Reference: https://cloud.baidu.com/doc/OCR/s/fmr1p39gb
 
-const BAIDU_UNLIMITED_TASK_PATH: &str =
-    "/rest/2.0/brain/online/v2/unlimited-ocr-parser/task";
+const BAIDU_UNLIMITED_TASK_PATH: &str = "/rest/2.0/brain/online/v2/unlimited-ocr-parser/task";
 const BAIDU_UNLIMITED_QUERY_PATH: &str =
     "/rest/2.0/brain/online/v2/unlimited-ocr-parser/task/query";
 /// Poll interval between task/query calls.
@@ -1014,7 +1012,10 @@ async fn process_baidu_unlimited(
 
     // 3. Poll for the result.
     let markdown = baidu_poll_result(http, &base, &token, &task_id).await?;
-    tracing::info!(chars = markdown.len(), "baidu unlimited-ocr extraction complete");
+    tracing::info!(
+        chars = markdown.len(),
+        "baidu unlimited-ocr extraction complete"
+    );
     Ok((markdown, 0, vec![]))
 }
 
@@ -1059,8 +1060,8 @@ async fn baidu_poll_result(
     task_id: &str,
 ) -> Result<String, String> {
     let query_url = format!("{base}{BAIDU_UNLIMITED_QUERY_PATH}?access_token={token}");
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(BAIDU_UNLIMITED_MAX_WAIT_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BAIDU_UNLIMITED_MAX_WAIT_SECS);
 
     loop {
         let resp = http
@@ -1450,8 +1451,8 @@ fn pdf_to_images(file_path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Allowed file extensions.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
-    "pdf", "docx", "doc", "txt", "md", "markdown", "png", "jpg", "jpeg",
-    "pptx", "xlsx", "xls", "html", "htm", "epub", "csv", "json", "xml", "zip",
+    "pdf", "docx", "doc", "txt", "md", "markdown", "png", "jpg", "jpeg", "pptx", "xlsx", "xls",
+    "html", "htm", "epub", "csv", "json", "xml", "zip",
 ];
 
 /// Max file size in bytes (32 MB).
@@ -1490,7 +1491,11 @@ pub fn file_signature_matches(filename: &str, bytes: &[u8]) -> bool {
         "pptx" => {
             let cursor = std::io::Cursor::new(bytes);
             zip::ZipArchive::new(cursor)
-                .map(|archive| archive.file_names().any(|name| name == "ppt/presentation.xml"))
+                .map(|archive| {
+                    archive
+                        .file_names()
+                        .any(|name| name == "ppt/presentation.xml")
+                })
                 .unwrap_or(false)
         }
         "xlsx" => {
@@ -1501,21 +1506,27 @@ pub fn file_signature_matches(filename: &str, bytes: &[u8]) -> bool {
         }
         "xls" => bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
         "html" | "htm" => {
-            let lower = bytes.iter().take(256).map(|&b| b.to_ascii_lowercase()).collect::<Vec<_>>();
+            let lower = bytes
+                .iter()
+                .take(256)
+                .map(|&b| b.to_ascii_lowercase())
+                .collect::<Vec<_>>();
             lower.windows(6).any(|w| w == b"<html " || w == b"<html>")
                 || lower.windows(9).any(|w| w == b"<!doctype")
         }
         "epub" => {
             let cursor = std::io::Cursor::new(bytes);
             zip::ZipArchive::new(cursor)
-                .map(|archive| archive.file_names().any(|name| name == "META-INF/container.xml"))
+                .map(|archive| {
+                    archive
+                        .file_names()
+                        .any(|name| name == "META-INF/container.xml")
+                })
                 .unwrap_or(false)
         }
         "csv" => is_valid_utf8_text(bytes),
-        "json" => is_valid_utf8_text(bytes)
-            && bytes.iter().any(|&b| b == b'{' || b == b'['),
-        "xml" => is_valid_utf8_text(bytes)
-            && bytes.windows(5).any(|w| w == b"<?xml"),
+        "json" => is_valid_utf8_text(bytes) && bytes.iter().any(|&b| b == b'{' || b == b'['),
+        "xml" => is_valid_utf8_text(bytes) && bytes.windows(5).any(|w| w == b"<?xml"),
         "zip" => {
             let cursor = std::io::Cursor::new(bytes);
             zip::ZipArchive::new(cursor).is_ok()
@@ -1543,11 +1554,6 @@ pub fn sanitize_filename(name: &str) -> String {
         .trim_start_matches('.')
         .to_string()
 }
-
-/// Maximum number of chars of extracted text sent inline in the Run message.
-/// If the text exceeds this, it is truncated and the server path is noted so the
-/// model can use the Read tool to access the full content.
-pub const MAX_INLINE_TEXT_CHARS: usize = 50_000;
 
 #[cfg(test)]
 mod security_tests {

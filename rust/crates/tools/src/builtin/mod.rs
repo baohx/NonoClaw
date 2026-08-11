@@ -34,7 +34,7 @@ pub use grep::GrepTool;
 pub use lsp::LspTool;
 pub use memory::MemoryTool;
 pub use read::ReadTool;
-pub use skill::{SkillSource, SkillTool};
+pub use skill::{SkillSearchEntry, SkillSearchTool, SkillSource, SkillTool};
 pub use todo::{TodoStatus, TodoStore, TodoWriteTool};
 pub use tool_search::ToolSearchTool;
 pub use webfetch::WebFetchTool;
@@ -127,10 +127,13 @@ mod characterization_tests {
         fn skill_description(&self, _: &str) -> Option<String> {
             None
         }
+        fn search_skills(&self, _: &str, _: usize) -> Vec<crate::builtin::SkillSearchEntry> {
+            Vec::new()
+        }
     }
 
     /// Characterization contract for the normal CLI/Web registry: the 18 core
-    /// tools plus ToolSearch and Skill, which main registers after MCP
+    /// tools plus ToolSearch, SkillSearch, and Skill, which main registers after
     /// discovery. Feature Preservation Matrix: sections 3.1 and 10;
     /// Requirements 1.4, 11.7.
     #[test]
@@ -138,7 +141,9 @@ mod characterization_tests {
         let (mut registry, _) = register_all();
         let search_entries = registry.search_entries();
         registry.register(Arc::new(ToolSearchTool::new(search_entries)));
-        registry.register(Arc::new(SkillTool::new(Arc::new(StubSource))));
+        let source = Arc::new(StubSource);
+        registry.register(Arc::new(SkillSearchTool::new(source.clone())));
+        registry.register(Arc::new(SkillTool::new(source)));
 
         let tools: Vec<_> = registry
             .definitions(None)

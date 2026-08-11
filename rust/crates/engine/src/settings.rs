@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agents::AgentProfile;
+use crate::budget::{ContextBudget, ContextBudgetSettings, TokenMode};
 use crate::EngineOptions;
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
@@ -69,7 +70,23 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
     },
     ConfigFieldReference {
         name: "autoSelectMcpTopK",
-        description: "Cap on advertised MCP tools once narrowing applies.",
+        description: "Legacy MCP relevance cap; toolAutoSelectTopK takes precedence.",
+    },
+    ConfigFieldReference {
+        name: "toolAutoSelectTopK",
+        description: "Maximum intent-selected non-core tool schemas. Default 5.",
+    },
+    ConfigFieldReference {
+        name: "coreTools",
+        description: "Tool schemas that remain visible on every model request.",
+    },
+    ConfigFieldReference {
+        name: "mcpNoMatchPolicy",
+        description: "MCP fallback when no tool matches: none (default), safe, or all.",
+    },
+    ConfigFieldReference {
+        name: "mcpSafeTools",
+        description: "Exact MCP tool names exposed by the safe no-match policy.",
     },
     ConfigFieldReference {
         name: "compactThreshold",
@@ -112,8 +129,24 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Cap on the compaction summarizer's output length (tokens). Default 4096.",
     },
     ConfigFieldReference {
+        name: "tokenMode",
+        description: "Payload preset: standard (default) or ultra. Explicit settings override preset defaults.",
+    },
+    ConfigFieldReference {
+        name: "contextBudget",
+        description: "Per-partition token caps for system prompt, schemas, skills, project rules, memory, git, tool results, history, and attachments.",
+    },
+    ConfigFieldReference {
         name: "promptProfile",
-        description: "System-prompt section profile: \"full\" (default) or \"minimal\".",
+        description: "System-prompt section profile: \"full\", \"minimal\", or \"ultra\".",
+    },
+    ConfigFieldReference {
+        name: "skillDisclosure",
+        description: "Static skill prompt policy: \"all\", \"index\" (default), or \"search\".",
+    },
+    ConfigFieldReference {
+        name: "skillIndexMaxTokens",
+        description: "Maximum estimated tokens for the static skill index. Default 500.",
     },
     ConfigFieldReference {
         name: "elevenlabsApiKey",
@@ -165,12 +198,33 @@ pub struct SettingsFile {
     /// Cap on advertised MCP tools once narrowing applies.
     #[serde(rename = "autoSelectMcpTopK", default)]
     pub auto_select_mcp_top_k: Option<usize>,
-    /// System-prompt section profile: "full" (default) or "minimal".
-    /// `minimal` keeps only identity + safety + task-completion, dropping
-    /// ~60% of the BASE body for cost-sensitive or compact models. Tool
-    /// guidance / available-tools / skills / append are unaffected.
+    /// Cap on all intent-selected non-core tool schemas.
+    #[serde(rename = "toolAutoSelectTopK", default)]
+    pub tool_auto_select_top_k: Option<usize>,
+    /// Tool schemas that are always advertised. ToolSearch is force-retained.
+    #[serde(rename = "coreTools", default)]
+    pub core_tools: Option<Vec<String>>,
+    /// MCP fallback when relevance selection finds no MCP match.
+    #[serde(rename = "mcpNoMatchPolicy", default)]
+    pub mcp_no_match_policy: Option<String>,
+    /// Exact MCP names allowed by the `safe` fallback.
+    #[serde(rename = "mcpSafeTools", default)]
+    pub mcp_safe_tools: Option<Vec<String>>,
+    /// High-level payload preset: standard (default) or ultra.
+    #[serde(rename = "tokenMode", default)]
+    pub token_mode: Option<String>,
+    /// Per-partition token caps. Partial objects merge across settings layers.
+    #[serde(rename = "contextBudget", default)]
+    pub context_budget: Option<ContextBudgetSettings>,
+    /// System-prompt section profile: full, minimal, or ultra.
     #[serde(rename = "promptProfile", default)]
     pub prompt_profile: Option<String>,
+    /// Static skill prompt policy: all (legacy), index (default), or search.
+    #[serde(rename = "skillDisclosure", default)]
+    pub skill_disclosure: Option<String>,
+    /// Hard cap for the static skill index, in estimated tokens.
+    #[serde(rename = "skillIndexMaxTokens", default)]
+    pub skill_index_max_tokens: Option<usize>,
     #[serde(rename = "contextWindow")]
     pub context_window: Option<usize>,
     pub thinking: Option<Value>,
@@ -313,6 +367,15 @@ impl fmt::Debug for SettingsFile {
             .field("compact_threshold", &self.compact_threshold)
             .field("auto_select_mcp", &self.auto_select_mcp)
             .field("auto_select_mcp_top_k", &self.auto_select_mcp_top_k)
+            .field("tool_auto_select_top_k", &self.tool_auto_select_top_k)
+            .field("core_tools", &self.core_tools)
+            .field("mcp_no_match_policy", &self.mcp_no_match_policy)
+            .field("mcp_safe_tools", &self.mcp_safe_tools)
+            .field("token_mode", &self.token_mode)
+            .field("context_budget", &self.context_budget)
+            .field("prompt_profile", &self.prompt_profile)
+            .field("skill_disclosure", &self.skill_disclosure)
+            .field("skill_index_max_tokens", &self.skill_index_max_tokens)
             .field("context_window", &self.context_window)
             .field("thinking", &self.thinking.as_ref().map(|_| "[configured]"))
             .field("permissions", &self.permissions)
@@ -356,11 +419,10 @@ impl fmt::Debug for SettingsFile {
             )
             .field(
                 "provider_billing",
-                &self.provider_billing.as_ref().map(|b| {
-                    b.providers
-                        .as_ref()
-                        .map(|p| p.keys().collect::<Vec<_>>())
-                }),
+                &self
+                    .provider_billing
+                    .as_ref()
+                    .map(|b| b.providers.as_ref().map(|p| p.keys().collect::<Vec<_>>())),
             )
             .finish()
     }
@@ -376,7 +438,15 @@ impl Default for SettingsFile {
             compact_threshold: None,
             auto_select_mcp: None,
             auto_select_mcp_top_k: None,
+            tool_auto_select_top_k: None,
+            core_tools: None,
+            mcp_no_match_policy: None,
+            mcp_safe_tools: None,
+            token_mode: None,
+            context_budget: None,
             prompt_profile: None,
+            skill_disclosure: None,
+            skill_index_max_tokens: None,
             context_window: None,
             thinking: None,
             permissions: None,
@@ -453,12 +523,26 @@ impl fmt::Debug for ModelProfile {
     }
 }
 
+fn parse_model_api_format(value: &str) -> Option<ApiFormat> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    match normalized.as_str() {
+        "anthropic" | "anthropiccompatible" => Some(ApiFormat::Anthropic),
+        "openai" | "openaicompatible" => Some(ApiFormat::OpenAI),
+        _ => None,
+    }
+}
+
 impl ModelProfile {
     pub fn api_format(&self) -> ApiFormat {
-        match self.api_format.as_deref() {
-            Some("openai") => ApiFormat::OpenAI,
-            _ => ApiFormat::Anthropic,
-        }
+        self.api_format
+            .as_deref()
+            .and_then(parse_model_api_format)
+            .unwrap_or(ApiFormat::Anthropic)
     }
 
     pub fn is_conversation_model(&self) -> bool {
@@ -551,16 +635,12 @@ impl DocModelConfig {
     }
 
     pub fn is_enabled(&self) -> bool {
-        if self.provider.is_empty()
-            || self.provider == "none"
-            || self.base_url.is_empty()
-        {
+        if self.provider.is_empty() || self.provider == "none" || self.base_url.is_empty() {
             return false;
         }
         // Baidu Cloud Unlimited-OCR needs both keys for OAuth.
         if self.provider == "baidu_unlimited" {
-            return !self.api_key.is_empty()
-                && self.resolved_api_secret().is_some();
+            return !self.api_key.is_empty() && self.resolved_api_secret().is_some();
         }
         !self.api_key.is_empty()
     }
@@ -1295,6 +1375,17 @@ impl ResolvedConfig {
             set_scalar_source(&mut sources, "arguments", overrides.source.clone());
         }
         let thinking = self.settings.thinking.as_ref().and_then(parse_thinking);
+        let token_mode = self
+            .settings
+            .token_mode
+            .as_deref()
+            .map(TokenMode::parse)
+            .unwrap_or_default();
+        let context_budget = ContextBudget::resolve(
+            token_mode,
+            self.settings.context_budget.as_ref(),
+            self.settings.skill_index_max_tokens,
+        );
         let mut options = EngineOptions {
             model: model.clone(),
             max_tokens,
@@ -1309,6 +1400,29 @@ impl ResolvedConfig {
                 .settings
                 .auto_select_mcp_top_k
                 .unwrap_or(crate::tool_selector::DEFAULT_TOP_K),
+            tool_auto_select_top_k: self
+                .settings
+                .tool_auto_select_top_k
+                .or(self.settings.auto_select_mcp_top_k)
+                .unwrap_or(if token_mode.is_ultra() {
+                    3
+                } else {
+                    crate::tool_selector::DEFAULT_TOP_K
+                }),
+            core_tools: self.settings.core_tools.clone().unwrap_or_else(|| {
+                if token_mode.is_ultra() {
+                    crate::tool_selector::ultra_core_tools()
+                } else {
+                    crate::tool_selector::default_core_tools()
+                }
+            }),
+            mcp_no_match_policy: self
+                .settings
+                .mcp_no_match_policy
+                .as_deref()
+                .map(crate::tool_selector::McpNoMatchPolicy::parse)
+                .unwrap_or_default(),
+            mcp_safe_tools: self.settings.mcp_safe_tools.clone().unwrap_or_default(),
             add_dirs: overrides.add_dirs,
             max_turns: overrides
                 .max_turns
@@ -1338,12 +1452,29 @@ impl ResolvedConfig {
             chars_per_token,
             context_window,
             max_budget_usd: None,
+            token_mode,
+            context_budget,
             prompt_profile: self
                 .settings
                 .prompt_profile
                 .as_deref()
                 .map(crate::prompt::PromptProfile::parse)
-                .unwrap_or_default(),
+                .unwrap_or(if token_mode.is_ultra() {
+                    crate::prompt::PromptProfile::Ultra
+                } else {
+                    crate::prompt::PromptProfile::Full
+                }),
+            skill_disclosure: self
+                .settings
+                .skill_disclosure
+                .as_deref()
+                .map(crate::skills::SkillDisclosure::parse)
+                .unwrap_or(if token_mode.is_ultra() {
+                    crate::skills::SkillDisclosure::Search
+                } else {
+                    crate::skills::SkillDisclosure::default()
+                }),
+            skill_index_max_tokens: context_budget.skill_index_tokens,
             startup_events: self
                 .diagnostics
                 .iter()
@@ -1531,8 +1662,45 @@ fn merge_settings_value(
     if present("autoSelectMcpTopK", overlay.auto_select_mcp_top_k.is_some()) {
         base.auto_select_mcp_top_k = overlay.auto_select_mcp_top_k;
     }
+    if present(
+        "toolAutoSelectTopK",
+        overlay.tool_auto_select_top_k.is_some(),
+    ) {
+        base.tool_auto_select_top_k = overlay.tool_auto_select_top_k;
+    }
+    if present("coreTools", overlay.core_tools.is_some()) {
+        base.core_tools.clone_from(&overlay.core_tools);
+    }
+    if present("mcpNoMatchPolicy", overlay.mcp_no_match_policy.is_some()) {
+        base.mcp_no_match_policy
+            .clone_from(&overlay.mcp_no_match_policy);
+    }
+    if present("mcpSafeTools", overlay.mcp_safe_tools.is_some()) {
+        base.mcp_safe_tools.clone_from(&overlay.mcp_safe_tools);
+    }
+    if present("tokenMode", overlay.token_mode.is_some()) {
+        base.token_mode.clone_from(&overlay.token_mode);
+    }
+    if present("contextBudget", overlay.context_budget.is_some()) {
+        if let Some(overlay_budget) = &overlay.context_budget {
+            base.context_budget
+                .get_or_insert_with(ContextBudgetSettings::default)
+                .merge_from(overlay_budget);
+        } else {
+            base.context_budget = None;
+        }
+    }
     if present("promptProfile", overlay.prompt_profile.is_some()) {
         base.prompt_profile = overlay.prompt_profile.clone();
+    }
+    if present("skillDisclosure", overlay.skill_disclosure.is_some()) {
+        base.skill_disclosure = overlay.skill_disclosure.clone();
+    }
+    if present(
+        "skillIndexMaxTokens",
+        overlay.skill_index_max_tokens.is_some(),
+    ) {
+        base.skill_index_max_tokens = overlay.skill_index_max_tokens;
     }
     if present("compactMaxTokens", overlay.compact_max_tokens.is_some()) {
         base.compact_max_tokens = overlay.compact_max_tokens;
@@ -1985,6 +2153,91 @@ fn validate_settings(
             "Set charsPerToken to a positive integer (typically 2-4).",
         ));
     }
+    if let Some(mode) = settings.token_mode.as_deref() {
+        if !matches!(mode.to_ascii_lowercase().as_str(), "standard" | "ultra") {
+            diagnostics.push(ConfigDiagnostic::error(
+                "invalid_token_mode",
+                format!("unknown token mode `{mode}`"),
+                Some("tokenMode".into()),
+                source("tokenMode"),
+                "Use standard or ultra.",
+            ));
+        }
+    }
+    if let Some(profile) = settings.prompt_profile.as_deref() {
+        if !matches!(
+            profile.to_ascii_lowercase().as_str(),
+            "full" | "minimal" | "ultra"
+        ) {
+            diagnostics.push(ConfigDiagnostic::error(
+                "invalid_prompt_profile",
+                format!("unknown prompt profile `{profile}`"),
+                Some("promptProfile".into()),
+                source("promptProfile"),
+                "Use full, minimal, or ultra.",
+            ));
+        }
+    }
+    if let Some(context_budget) = &settings.context_budget {
+        for (field, value) in context_budget.fields() {
+            if value == Some(0) {
+                let path = format!("contextBudget.{field}");
+                diagnostics.push(ConfigDiagnostic::error(
+                    "invalid_context_budget",
+                    format!("{path} must be greater than zero"),
+                    Some(path.clone()),
+                    source(&path).or_else(|| source("contextBudget")),
+                    "Use a positive token budget.",
+                ));
+            }
+        }
+    }
+    if let Some(disclosure) = settings.skill_disclosure.as_deref() {
+        if !matches!(
+            disclosure.to_ascii_lowercase().as_str(),
+            "all" | "index" | "search"
+        ) {
+            diagnostics.push(ConfigDiagnostic::error(
+                "invalid_skill_disclosure",
+                format!("unknown skill disclosure policy `{disclosure}`"),
+                Some("skillDisclosure".into()),
+                source("skillDisclosure"),
+                "Use all, index, or search.",
+            ));
+        }
+    }
+    if settings.skill_index_max_tokens == Some(0) {
+        diagnostics.push(ConfigDiagnostic::error(
+            "invalid_skill_index_budget",
+            "skillIndexMaxTokens must be greater than zero",
+            Some("skillIndexMaxTokens".into()),
+            source("skillIndexMaxTokens"),
+            "Use a positive token budget (typically 250-500).",
+        ));
+    }
+    if settings.tool_auto_select_top_k == Some(0) || settings.auto_select_mcp_top_k == Some(0) {
+        diagnostics.push(ConfigDiagnostic::error(
+            "invalid_tool_auto_select_top_k",
+            "tool selection top-k must be greater than zero",
+            Some("toolAutoSelectTopK".into()),
+            source("toolAutoSelectTopK"),
+            "Use a positive cap (typically 3-5).",
+        ));
+    }
+    if let Some(policy) = settings.mcp_no_match_policy.as_deref() {
+        if !matches!(
+            policy.to_ascii_lowercase().as_str(),
+            "none" | "safe" | "all"
+        ) {
+            diagnostics.push(ConfigDiagnostic::error(
+                "invalid_mcp_no_match_policy",
+                format!("unknown MCP no-match policy `{policy}`"),
+                Some("mcpNoMatchPolicy".into()),
+                source("mcpNoMatchPolicy"),
+                "Use none, safe, or all.",
+            ));
+        }
+    }
     if let Some(permissions) = &settings.permissions {
         if let Some(mode) = &permissions.default_mode {
             if PermissionMode::from_kebab(mode).is_none() {
@@ -2049,13 +2302,13 @@ fn validate_settings(
             }
         }
         if let Some(format) = model.api_format.as_deref() {
-            if !matches!(format, "anthropic" | "openai") {
+            if parse_model_api_format(format).is_none() {
                 diagnostics.push(ConfigDiagnostic::error(
                     "invalid_api_format",
                     format!("model `{}` has unknown apiFormat `{format}`", model.name),
                     Some(format!("{base}.apiFormat")),
                     source("models"),
-                    "Use anthropic or openai.",
+                    "Use anthropic, openai, or an explicit *-compatible alias.",
                 ));
             }
         }
@@ -2392,9 +2645,21 @@ fn record_layer_sources(layer: &ConfigLayer, sources: &mut BTreeMap<String, Vec<
         "maxTokens",
         "autoCompact",
         "compactThreshold",
+        "autoSelectMcp",
+        "autoSelectMcpTopK",
+        "toolAutoSelectTopK",
+        "coreTools",
+        "mcpNoMatchPolicy",
+        "mcpSafeTools",
+        "tokenMode",
+        "contextBudget",
+        "promptProfile",
+        "skillDisclosure",
+        "skillIndexMaxTokens",
         "contextWindow",
         "thinking",
         "compactModel",
+        "compactMaxTokens",
         "elevenlabsApiKey",
         "charsPerToken",
         "docModel",
@@ -2479,6 +2744,13 @@ fn record_layer_sources(layer: &ConfigLayer, sources: &mut BTreeMap<String, Vec<
                 }
             }
         }
+    }
+    for field in layer
+        .present_fields
+        .iter()
+        .filter(|field| field.starts_with("contextBudget."))
+    {
+        set_scalar_source(sources, field, layer.source.clone());
     }
     for field in layer
         .present_fields
@@ -2641,6 +2913,25 @@ fn diagnose_unknown_fields(
     }) {
         unknown_field(key, source, diagnostics);
     }
+    if let Some(context_budget) = object.get("contextBudget").and_then(Value::as_object) {
+        const CONTEXT_BUDGET_FIELDS: &[&str] = &[
+            "systemPromptTokens",
+            "toolSchemaTokens",
+            "skillIndexTokens",
+            "projectRulesTokens",
+            "memoryTokens",
+            "gitTokens",
+            "singleToolResultTokens",
+            "historyTokens",
+            "attachmentTokens",
+        ];
+        for key in context_budget
+            .keys()
+            .filter(|key| !CONTEXT_BUDGET_FIELDS.contains(&key.as_str()))
+        {
+            unknown_field(&format!("contextBudget.{key}"), source, diagnostics);
+        }
+    }
     if let Some(permissions) = object.get("permissions").and_then(Value::as_object) {
         for key in permissions
             .keys()
@@ -2674,15 +2965,12 @@ fn diagnose_unknown_fields(
         }
     }
     if let Some(doc_model) = object.get("docModel").and_then(Value::as_object) {
-        for key in doc_model
-            .keys()
-            .filter(|key| {
-                !matches!(
-                    key.as_str(),
-                    "provider" | "model" | "baseUrl" | "apiKey" | "apiSecret"
-                )
-            })
-        {
+        for key in doc_model.keys().filter(|key| {
+            !matches!(
+                key.as_str(),
+                "provider" | "model" | "baseUrl" | "apiKey" | "apiSecret"
+            )
+        }) {
             unknown_field(&format!("docModel.{key}"), source, diagnostics);
         }
     }
@@ -2839,6 +3127,73 @@ pub fn apply_settings(options: &mut EngineOptions, settings: &SettingsFile) {
     options.compact_model.clone_from(&settings.compact_model);
     options.chars_per_token = settings.chars_per_token.max(1);
     options.thinking = settings.thinking.as_ref().and_then(parse_thinking);
+    if let Some(mode) = settings.token_mode.as_deref() {
+        options.token_mode = TokenMode::parse(mode);
+        if options.token_mode.is_ultra() {
+            if settings.tool_auto_select_top_k.is_none() && settings.auto_select_mcp_top_k.is_none()
+            {
+                options.tool_auto_select_top_k = 3;
+            }
+            if settings.core_tools.is_none() {
+                options.core_tools = crate::tool_selector::ultra_core_tools();
+            }
+            if settings.prompt_profile.is_none() {
+                options.prompt_profile = crate::prompt::PromptProfile::Ultra;
+            }
+            if settings.skill_disclosure.is_none() {
+                options.skill_disclosure = crate::skills::SkillDisclosure::Search;
+            }
+        }
+    }
+    if settings.token_mode.is_some()
+        || settings.context_budget.is_some()
+        || settings.skill_index_max_tokens.is_some()
+    {
+        options.context_budget = ContextBudget::resolve(
+            options.token_mode,
+            settings.context_budget.as_ref(),
+            settings.skill_index_max_tokens,
+        );
+        options.skill_index_max_tokens = options.context_budget.skill_index_tokens;
+    }
+    if let Some(value) = settings.auto_select_mcp {
+        options.auto_select_mcp = value;
+    }
+    if let Some(value) = settings.auto_select_mcp_top_k {
+        options.auto_select_mcp_top_k = value;
+    }
+    if let Some(value) = settings
+        .tool_auto_select_top_k
+        .or(settings.auto_select_mcp_top_k)
+    {
+        options.tool_auto_select_top_k = value;
+    }
+    if let Some(core) = &settings.core_tools {
+        options.core_tools.clone_from(core);
+    }
+    if let Some(policy) = settings.mcp_no_match_policy.as_deref() {
+        options.mcp_no_match_policy = crate::tool_selector::McpNoMatchPolicy::parse(policy);
+    }
+    if let Some(safe) = &settings.mcp_safe_tools {
+        options.mcp_safe_tools.clone_from(safe);
+    }
+    if let Some(profile) = settings.prompt_profile.as_deref() {
+        options.prompt_profile = crate::prompt::PromptProfile::parse(profile);
+    }
+    if let Some(disclosure) = settings.skill_disclosure.as_deref() {
+        options.skill_disclosure = crate::skills::SkillDisclosure::parse(disclosure);
+    }
+    if let Some(limit) = settings.skill_index_max_tokens {
+        if settings
+            .context_budget
+            .as_ref()
+            .and_then(|budget| budget.skill_index_tokens)
+            .is_none()
+        {
+            options.skill_index_max_tokens = limit;
+            options.context_budget.skill_index_tokens = limit;
+        }
+    }
     if let Some(permissions) = &settings.permissions {
         if let Some(mode) = permissions
             .default_mode
@@ -2881,6 +3236,8 @@ mod tests {
         assert!(names.contains("models"));
         assert!(names.contains("mcpServers"));
         assert!(names.contains("docModel"));
+        assert!(names.contains("tokenMode"));
+        assert!(names.contains("contextBudget"));
 
         let mut diagnostics = Vec::new();
         diagnose_unknown_fields(
@@ -2894,6 +3251,201 @@ mod tests {
         assert!(!diagnostics
             .iter()
             .any(|diagnostic| diagnostic.field.as_deref() == Some("models")));
+    }
+
+    #[test]
+    fn context_budget_unknown_nested_field_is_diagnosed() {
+        let mut diagnostics = Vec::new();
+        diagnose_unknown_fields(
+            &serde_json::json!({
+                "contextBudget": {
+                    "historyTokens": 12_000,
+                    "histroyTokens": 99
+                }
+            }),
+            &source("budget.json"),
+            &mut diagnostics,
+        );
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "unknown_field"
+                && diagnostic.field.as_deref() == Some("contextBudget.histroyTokens")
+        }));
+        assert!(!diagnostics.iter().any(|diagnostic| {
+            diagnostic.field.as_deref() == Some("contextBudget.historyTokens")
+        }));
+    }
+
+    #[test]
+    fn token_policy_validation_rejects_unknown_modes_and_zero_partitions() {
+        let resolved = resolve_layers(
+            &[layer(
+                "invalid-budget.json",
+                serde_json::json!({
+                    "tokenMode": "extreme",
+                    "promptProfile": "tiny",
+                    "contextBudget": {
+                        "systemPromptTokens": 0,
+                        "toolSchemaTokens": 0,
+                        "skillIndexTokens": 0,
+                        "projectRulesTokens": 0,
+                        "memoryTokens": 0,
+                        "gitTokens": 0,
+                        "singleToolResultTokens": 0,
+                        "historyTokens": 0,
+                        "attachmentTokens": 0
+                    }
+                }),
+            )],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+
+        for (code, field) in [
+            ("invalid_token_mode", "tokenMode"),
+            ("invalid_prompt_profile", "promptProfile"),
+            ("invalid_context_budget", "contextBudget.systemPromptTokens"),
+            ("invalid_context_budget", "contextBudget.toolSchemaTokens"),
+            ("invalid_context_budget", "contextBudget.skillIndexTokens"),
+            ("invalid_context_budget", "contextBudget.projectRulesTokens"),
+            ("invalid_context_budget", "contextBudget.memoryTokens"),
+            ("invalid_context_budget", "contextBudget.gitTokens"),
+            (
+                "invalid_context_budget",
+                "contextBudget.singleToolResultTokens",
+            ),
+            ("invalid_context_budget", "contextBudget.historyTokens"),
+            ("invalid_context_budget", "contextBudget.attachmentTokens"),
+        ] {
+            assert!(
+                resolved.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == code && diagnostic.field.as_deref() == Some(field)
+                }),
+                "missing {code} diagnostic for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_api_format_is_case_insensitive_and_accepts_compatible_aliases() {
+        assert_eq!(
+            parse_model_api_format("Anthropic"),
+            Some(ApiFormat::Anthropic)
+        );
+        assert_eq!(
+            parse_model_api_format("OpenAI-Compatible"),
+            Some(ApiFormat::OpenAI)
+        );
+        assert_eq!(
+            parse_model_api_format("openai_compatible"),
+            Some(ApiFormat::OpenAI)
+        );
+        assert_eq!(parse_model_api_format("unknown"), None);
+
+        let resolved = resolve_layers(
+            &[layer(
+                "models.json",
+                serde_json::json!({
+                    "model": "sonnet-proxy",
+                    "models": [{
+                        "name": "sonnet-proxy",
+                        "baseUrl": "https://gateway.example/v1",
+                        "apiKey": "fixture-key",
+                        "apiFormat": "OpenAI-Compatible",
+                        "default": true
+                    }]
+                }),
+            )],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+        assert_eq!(
+            resolved.client_config(Some("sonnet-proxy")).api_format,
+            ApiFormat::OpenAI
+        );
+        assert!(!resolved
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_api_format"));
+    }
+
+    #[test]
+    fn ultra_mode_sets_low_payload_defaults_and_explicit_values_win() {
+        let ultra_only = resolve_layers(
+            &[layer(
+                "ultra.json",
+                serde_json::json!({"tokenMode": "ultra"}),
+            )],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        )
+        .resolve_run(RunConfigOverrides::default())
+        .options;
+        assert_eq!(ultra_only.token_mode, TokenMode::Ultra);
+        assert_eq!(
+            ultra_only.prompt_profile,
+            crate::prompt::PromptProfile::Ultra
+        );
+        assert_eq!(
+            ultra_only.skill_disclosure,
+            crate::skills::SkillDisclosure::Search
+        );
+        assert_eq!(ultra_only.tool_auto_select_top_k, 3);
+        assert_eq!(ultra_only.context_budget, ContextBudget::ultra());
+        assert_eq!(
+            ultra_only.mcp_no_match_policy,
+            crate::tool_selector::McpNoMatchPolicy::None
+        );
+
+        let layers = vec![
+            layer(
+                "low.json",
+                serde_json::json!({
+                    "tokenMode": "ultra",
+                    "contextBudget": {
+                        "systemPromptTokens": 333,
+                        "memoryTokens": 222
+                    }
+                }),
+            ),
+            layer(
+                "high.json",
+                serde_json::json!({
+                    "contextBudget": {"memoryTokens": 77},
+                    "promptProfile": "full",
+                    "skillDisclosure": "index",
+                    "toolAutoSelectTopK": 4
+                }),
+            ),
+        ];
+        let resolved = resolve_layers(
+            &layers,
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+        let merged_budget = resolved.settings.context_budget.as_ref().unwrap();
+        assert_eq!(merged_budget.system_prompt_tokens, Some(333));
+        assert_eq!(merged_budget.memory_tokens, Some(77));
+
+        let options = resolved.resolve_run(RunConfigOverrides::default()).options;
+        assert_eq!(options.token_mode, TokenMode::Ultra);
+        assert_eq!(options.context_budget.system_prompt_tokens, 333);
+        assert_eq!(options.context_budget.memory_tokens, 77);
+        assert_eq!(
+            options.context_budget.tool_schema_tokens,
+            ContextBudget::ultra().tool_schema_tokens
+        );
+        assert_eq!(options.prompt_profile, crate::prompt::PromptProfile::Full);
+        assert_eq!(
+            options.skill_disclosure,
+            crate::skills::SkillDisclosure::Index
+        );
+        assert_eq!(options.tool_auto_select_top_k, 4);
+        assert_eq!(options.core_tools, crate::tool_selector::ultra_core_tools());
+        assert_eq!(
+            options.mcp_no_match_policy,
+            crate::tool_selector::McpNoMatchPolicy::None
+        );
     }
 
     #[test]

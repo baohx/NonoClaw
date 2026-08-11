@@ -12,6 +12,20 @@ export function checkTraceStateInvariants(): void {
   const tool = eventToSafeFact({ kind: "tool_use_start", id: "tool-1", name: "Read", input: { password: "secret" } });
   check(tool !== null && !("input" in (tool.details ?? {})), "tool input must be omitted");
 
+  const budget = eventToSafeFact({
+    kind: "token_budget_breakdown",
+    estimated_tokens: 30,
+    chars_per_token: 4,
+    system_chars: 80,
+    tools_chars: 30,
+    messages_chars: 10,
+    system: [{ name: "base_prompt", chars: 80, estimated_tokens: 20 }],
+    tools: [{ name: "builtin:Read", chars: 30, estimated_tokens: 8 }],
+    messages: [{ name: "user", chars: 10, estimated_tokens: 3 }],
+  });
+  check(budget?.details?.system_chars === 80, "budget totals must be retained");
+  check(budget?.details?.system_top === "base_prompt:80", "largest safe contributors must be visible");
+
   check(contextUsagePercent(50, 200) === 25, "context usage must be calculated independently of rendering");
   check(contextUsagePercent(1, 3) === 33.3, "context usage must round to one decimal");
   check(contextUsagePercent(50, 0) === 0, "zero context window must report 0.0 percent");

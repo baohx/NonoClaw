@@ -55,6 +55,15 @@ use super::run_handler::{
 };
 use super::session_hub::{create_new_session, resume_session, SessionHub, SharedHandle};
 
+fn safe_provider_failure_message(reason: &str, status: Option<u16>) -> String {
+    if reason == "provider request failed" {
+        if let Some(status) = status {
+            return format!("provider request failed (HTTP {status})");
+        }
+    }
+    reason.to_string()
+}
+
 // ── Shared application state ────────────────────────────────────────────────
 
 pub(super) struct AppState {
@@ -511,7 +520,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
         send_msg(
             &tx,
-            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
+            messages_loaded(
+                &sid,
+                snapshot,
+                state.session_hub.cumulative_usage_json(&sid).await,
+            ),
         )
         .await;
         send_msg(
@@ -620,10 +633,14 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             }
                         };
                         send_msg(
-            &tx,
-            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
-        )
-        .await;
+                            &tx,
+                            messages_loaded(
+                                &sid,
+                                snapshot,
+                                state.session_hub.cumulative_usage_json(&sid).await,
+                            ),
+                        )
+                        .await;
                         state
                             .session_hub
                             .move_registration(shared_sid.as_deref(), &h, &tx)
@@ -685,10 +702,14 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             shared_sid = Some(sid.clone());
                             *session.lock().await = Some(handle);
                             send_msg(
-            &tx,
-            messages_loaded(&sid, snapshot, state.session_hub.cumulative_usage_json(&sid).await),
-        )
-        .await;
+                                &tx,
+                                messages_loaded(
+                                    &sid,
+                                    snapshot,
+                                    state.session_hub.cumulative_usage_json(&sid).await,
+                                ),
+                            )
+                            .await;
                             send_msg(
                                 &tx,
                                 ServerMsg::Info {
@@ -806,9 +827,19 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             },
             ClientMsg::SessionPrompts { session_id } => {
                 const PROMPT_PREVIEW_CHARS: usize = 40;
-                let prompts =
-                    super::protocol::session_run_prompts(&state.cwd, &session_id, PROMPT_PREVIEW_CHARS);
-                send_msg(&tx, ServerMsg::SessionPrompts { session_id, prompts }).await;
+                let prompts = super::protocol::session_run_prompts(
+                    &state.cwd,
+                    &session_id,
+                    PROMPT_PREVIEW_CHARS,
+                );
+                send_msg(
+                    &tx,
+                    ServerMsg::SessionPrompts {
+                        session_id,
+                        prompts,
+                    },
+                )
+                .await;
             }
             ClientMsg::OpenFile { path, force_code } => {
                 match state.project_service.open(&path, force_code) {
@@ -819,9 +850,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             std::io::ErrorKind::PermissionDenied => {
                                 "file outside project or home directory"
                             }
-                            std::io::ErrorKind::NotFound => {
-                                "file or parent directory not found"
-                            }
+                            std::io::ErrorKind::NotFound => "file or parent directory not found",
                             _ => "failed to open file with system editor",
                         };
                         tracing::warn!(
@@ -1180,6 +1209,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .status(nonoclaw_api::ProviderFeature::Images)
                         .is_supported();
                     let session_for_wire = session_for_run.clone();
+                    let attachment_max_chars = nonoclaw_engine::ContextBudget::chars(
+                        options.context_budget.attachment_tokens,
+                        options.chars_per_token,
+                    );
                     let engine = QueryEngine::with_session(
                         run_client,
                         s.registry.clone(),
@@ -1190,12 +1223,14 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     );
 
                     // Text extraction/OCR is always included. Raw image blocks
-                    // are added only when the selected provider accepts them.
+                    // are added only when the selected provider accepts them
+                    // and the real encoded payload fits the attachment budget.
                     let enriched = enrich_prompt_with_attachments(
                         &prompt,
                         &attachments,
                         &s.upload_dir,
                         include_attachment_images,
+                        attachment_max_chars,
                     );
                     let controller = RunController::for_engine(&engine, s.cwd.clone());
                     *active_for_run.lock().await = Some(controller.clone());
@@ -1345,11 +1380,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                     message,
                                     retryable,
                                     status,
-                                } => (
-                                    nonoclaw_core::redact_text(message),
-                                    *retryable,
-                                    *status,
-                                ),
+                                } => (nonoclaw_core::redact_text(message), *retryable, *status),
                                 other => (format!("{other:?}"), false, None),
                             };
                             tracing::error!(
@@ -1359,25 +1390,17 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 reason = %reason_text,
                                 "engine run failed"
                             );
-                            let mut app_error = if retryable {
-                                let message = match status {
-                                    Some(code) => {
-                                        format!("provider request failed (HTTP {code})")
-                                    }
-                                    None => reason_text.clone(),
-                                };
-                                AppError::new(
-                                    ErrorCode::ProviderUnavailable,
-                                    message,
-                                    true,
-                                    "run",
-                                )
+                            let error_message = safe_provider_failure_message(&reason_text, status);
+                            let error_code = if retryable || status.is_some() {
+                                ErrorCode::ProviderUnavailable
                             } else {
-                                AppError::new(ErrorCode::Internal, reason_text, false, "run")
+                                ErrorCode::Internal
                             };
+                            let mut app_error =
+                                AppError::new(error_code, error_message, retryable, "run");
                             if let Some(code) = status {
-                                app_error =
-                                    app_error.with_safe_details(serde_json::json!({ "status": code }));
+                                app_error = app_error
+                                    .with_safe_details(serde_json::json!({ "status": code }));
                             }
                             send_msg(
                                 &tx2,
@@ -1499,7 +1522,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                     match canonical.snapshot().await {
                         Ok(snapshot) => {
-                            let cum_usage = state.session_hub.cumulative_usage_json(canonical.id()).await;
+                            let cum_usage = state
+                                .session_hub
+                                .cumulative_usage_json(canonical.id())
+                                .await;
                             let ml = messages_loaded(canonical.id(), snapshot, cum_usage);
                             send_msg(&tx, ml).await;
                         }
@@ -1755,6 +1781,22 @@ mod characterization_tests {
     use super::*;
 
     #[test]
+    fn provider_failures_expose_only_safe_http_status() {
+        assert_eq!(
+            safe_provider_failure_message("provider request failed", Some(404)),
+            "provider request failed (HTTP 404)"
+        );
+        assert_eq!(
+            safe_provider_failure_message("authentication failed", Some(401)),
+            "authentication failed"
+        );
+        assert_eq!(
+            safe_provider_failure_message("provider request failed", None),
+            "provider request failed"
+        );
+    }
+
+    #[test]
     fn public_token_policy_keeps_loopback_low_friction() {
         assert!(token_is_authorized(false, "secret", None));
         assert!(token_is_authorized(true, "secret", Some("secret")));
@@ -1773,9 +1815,7 @@ mod characterization_tests {
                 "https://public.example/app?mode=mobile&token=stale#share",
                 "current-token"
             ),
-            Some(
-                "https://public.example/app?mode=mobile&token=current-token#share".into()
-            )
+            Some("https://public.example/app?mode=mobile&token=current-token#share".into())
         );
         assert_eq!(authenticated_public_url("not a URL", "current-token"), None);
     }

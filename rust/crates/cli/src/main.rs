@@ -298,11 +298,14 @@ async fn main() -> Result<()> {
     // Register ToolSearch with a snapshot of all tools (including MCP).
     let tool_search = nonoclaw_tools::builtin::ToolSearchTool::new(registry.search_entries());
     registry.register(Arc::new(tool_search));
-    // Register the Skill tool (progressive disclosure): it loads skill bodies
-    // on demand via the shared skills manager, so bodies stay out of the cached
-    // system prefix. Like ToolSearch, registered after MCP discovery.
+    // Register skill discovery/loading after MCP discovery. SkillSearch exposes
+    // only bounded metadata; Skill loads one selected body on demand.
+    let skill_source = Arc::new(EngineSkillSource::new(Arc::clone(&skills_manager)));
+    registry.register(Arc::new(nonoclaw_tools::builtin::SkillSearchTool::new(
+        skill_source.clone(),
+    )));
     registry.register(Arc::new(nonoclaw_tools::builtin::SkillTool::new(
-        Arc::new(EngineSkillSource::new(Arc::clone(&skills_manager))),
+        skill_source,
     )));
     let registry = Arc::new(registry);
 

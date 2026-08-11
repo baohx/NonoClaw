@@ -85,19 +85,38 @@ pub(super) fn enrich_prompt_with_attachments(
     attachments: &Option<Vec<AttachmentRef>>,
     upload_dir: &std::path::Path,
     include_images: bool,
+    attachment_max_chars: usize,
 ) -> MessageContent {
     let attachments = match attachments {
-        Some(attachments) if !attachments.is_empty() => attachments,
+        Some(attachments) if !attachments.is_empty() && attachment_max_chars > 0 => attachments,
         _ => return MessageContent::from_text(prompt),
     };
+    let selected = attachments
+        .iter()
+        .take(MAX_ATTACHMENTS_PER_RUN)
+        .collect::<Vec<_>>();
+    let intro = "The user attached files. Extracted content follows; use it directly.\n\n";
+    if intro.chars().count() > attachment_max_chars {
+        return MessageContent::from_text(prompt);
+    }
 
-    let mut blocks = vec![ContentBlock::text(
-        "The user has attached the following files. Their content has already been extracted and is shown below — you do NOT need to read or process these files. Just use the content directly.\n\n",
-    )];
-    for attachment in attachments.iter().take(MAX_ATTACHMENTS_PER_RUN) {
-        // New clients send only an opaque upload ID. The legacy inline fields
-        // remain accepted as a compatibility fallback, but are bounded and are
-        // never logged or reflected back through ProjectInfo/trace.
+    let mut blocks = vec![ContentBlock::text(intro)];
+    let mut remaining = attachment_max_chars - intro.chars().count();
+    for (index, attachment) in selected.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        // Divide the remaining budget across remaining files so one large
+        // document cannot starve every later attachment.
+        let slots = selected.len() - index;
+        let share = remaining / slots.max(1);
+        if share == 0 {
+            break;
+        }
+        let mut file_remaining = share;
+
+        // New clients send only an opaque upload ID. Legacy inline fields are
+        // retained as a bounded compatibility fallback.
         let stored = super::upload_service::load_stored_attachment(upload_dir, &attachment.id);
         let filename = stored
             .as_ref()
@@ -116,10 +135,25 @@ pub(super) fn enrich_prompt_with_attachments(
             .as_ref()
             .map(|value| value.extracted_text.as_str())
             .unwrap_or(attachment.extracted_text.as_str());
-        blocks.push(ContentBlock::text(format!("## File: {filename}\n\n")));
+
+        push_attachment_text(
+            &mut blocks,
+            &format!("## File: {filename}\n\n"),
+            &mut file_remaining,
+            false,
+        );
+        // Prefer extracted/OCR text. It is cheaper and works for every
+        // provider; raw base64 images consume only leftover budget.
+        let text_was_truncated = text.chars().count() > file_remaining;
+        push_attachment_text(&mut blocks, text, &mut file_remaining, text_was_truncated);
+        push_attachment_text(&mut blocks, "\n\n", &mut file_remaining, false);
+
         if include_images {
             for image in images.iter().take(MAX_IMAGES_PER_ATTACHMENT) {
-                if image.data.len() < 2_000_000 {
+                let image_chars = image.data.chars().count()
+                    + image.media_type.chars().count()
+                    + "base64".chars().count();
+                if image_chars <= file_remaining && image.data.len() < 2_000_000 {
                     blocks.push(ContentBlock::Image {
                         source: ImageSource {
                             kind: "base64".into(),
@@ -127,28 +161,51 @@ pub(super) fn enrich_prompt_with_attachments(
                             data: image.data.clone(),
                         },
                     });
-                    blocks.push(ContentBlock::text(format!(
-                        "(extracted image: {})\n",
-                        image.media_type
-                    )));
+                    file_remaining -= image_chars;
+                } else {
+                    push_attachment_text(
+                        &mut blocks,
+                        "[image omitted by attachment token budget]\n",
+                        &mut file_remaining,
+                        false,
+                    );
                 }
             }
         }
-        let display = if text.chars().count() > attachments::MAX_INLINE_TEXT_CHARS {
-            let truncated: String = text
-                .chars()
-                .take(attachments::MAX_INLINE_TEXT_CHARS)
-                .collect();
-            format!("{truncated}\n\n[... content truncated]\n\n")
-        } else {
-            format!("{text}\n\n")
-        };
-        blocks.push(ContentBlock::text(display));
+        remaining = remaining.saturating_sub(share - file_remaining);
     }
+
     blocks.push(ContentBlock::text(format!(
         "---\n\n## User message\n\n{prompt}"
     )));
     MessageContent::from_blocks(blocks)
+}
+
+fn push_attachment_text(
+    blocks: &mut Vec<ContentBlock>,
+    text: &str,
+    remaining: &mut usize,
+    mark_truncated: bool,
+) {
+    if text.is_empty() || *remaining == 0 {
+        return;
+    }
+    const MARKER: &str = "\n[attachment content truncated]\n";
+    let marker_chars = if mark_truncated {
+        MARKER.chars().count().min(*remaining)
+    } else {
+        0
+    };
+    let body_limit = remaining.saturating_sub(marker_chars);
+    let mut rendered = text.chars().take(body_limit).collect::<String>();
+    if mark_truncated {
+        rendered.push_str(&MARKER.chars().take(marker_chars).collect::<String>());
+    }
+    let chars = rendered.chars().count();
+    if chars > 0 {
+        blocks.push(ContentBlock::text(rendered));
+        *remaining = remaining.saturating_sub(chars);
+    }
 }
 
 fn make_permission_resolver(
@@ -218,7 +275,11 @@ pub(super) fn build_options(
             ..Default::default()
         })
         .options;
-    options.permission_resolver = Some(make_permission_resolver(tx, pending_permissions, permission_meta));
+    options.permission_resolver = Some(make_permission_resolver(
+        tx,
+        pending_permissions,
+        permission_meta,
+    ));
     options.skills_manager = Some(skills_manager);
     options.background_registry = Some(background_registry);
     options
@@ -235,7 +296,7 @@ mod tests {
             .map(|index| AttachmentRef {
                 id: format!("invalid-{index}"),
                 filename: "../../private.txt".into(),
-                extracted_text: "x".repeat(attachments::MAX_INLINE_TEXT_CHARS + 100),
+                extracted_text: "x".repeat(50_000 + 100),
                 images: vec![],
             })
             .collect::<Vec<_>>();
@@ -244,6 +305,7 @@ mod tests {
             &Some(attachments),
             std::path::Path::new("/nonexistent-upload-root"),
             false,
+            50_000,
         );
         let MessageContent::Blocks(blocks) = content else {
             panic!("attachments must produce block content");
@@ -257,7 +319,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(text.matches("## File:").count(), MAX_ATTACHMENTS_PER_RUN);
         assert!(!text.contains("../"));
-        assert!(text.contains("[... content truncated]"));
+        assert!(text.contains("[attachment content truncated]"));
         assert!(text.ends_with("visible user request"));
     }
 
@@ -280,6 +342,7 @@ mod tests {
             &Some(vec![attachment_with_image()]),
             std::path::Path::new("/nonexistent-upload-root"),
             false,
+            usize::MAX,
         );
         let MessageContent::Blocks(blocks) = content else {
             panic!("attachments must produce block content");
@@ -305,6 +368,7 @@ mod tests {
             &Some(vec![attachment_with_image()]),
             std::path::Path::new("/nonexistent-upload-root"),
             true,
+            usize::MAX,
         );
         let MessageContent::Blocks(blocks) = content else {
             panic!("attachments must produce block content");
@@ -319,5 +383,38 @@ mod tests {
         assert!(blocks.iter().any(|block| {
             matches!(block, ContentBlock::Text { text, .. } if text.contains("Extracted PDF text"))
         }));
+    }
+
+    #[test]
+    fn attachment_partition_is_global_and_counts_encoded_images() {
+        let mut attachment = attachment_with_image();
+        attachment.extracted_text = "document ".repeat(200);
+        attachment.images[0].data = "a".repeat(1_000);
+        let content = enrich_prompt_with_attachments(
+            "keep this user request",
+            &Some(vec![attachment]),
+            std::path::Path::new("/nonexistent-upload-root"),
+            true,
+            120,
+        );
+        let MessageContent::Blocks(blocks) = content else {
+            panic!("attachments must produce block content");
+        };
+        assert!(!blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })));
+        let attachment_chars: usize = blocks[..blocks.len() - 1]
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => text.chars().count(),
+                ContentBlock::Image { source } => source.data.chars().count(),
+                _ => 0,
+            })
+            .sum();
+        assert!(attachment_chars <= 120);
+        assert!(matches!(
+            blocks.last(),
+            Some(ContentBlock::Text { text, .. }) if text.ends_with("keep this user request")
+        ));
     }
 }

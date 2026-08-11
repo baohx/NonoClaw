@@ -41,20 +41,14 @@ pub fn model_provider(model: &ModelProfile) -> Option<String> {
     None
 }
 
-/// Model name → billing provider key, resolved from each model's `base_url`.
-/// Only models whose provider is configured in `providerBilling` are included.
-pub fn model_provider_map(
-    models: &[ModelProfile],
-    configured_providers: &[String],
-) -> Vec<ModelProviderMapping> {
-    let known: Vec<&str> = configured_providers.iter().map(String::as_str).collect();
+/// Model name → billing provider key, resolved from each model's `base_url` or
+/// `billingProvider` override.  All models with a resolvable provider are
+/// included — balance lookup is handled separately by `query_balances`.
+pub fn model_provider_map(models: &[ModelProfile]) -> Vec<ModelProviderMapping> {
     models
         .iter()
         .filter_map(|model| {
             let provider = model_provider(model)?;
-            if !known.contains(&provider.as_str()) {
-                return None;
-            }
             Some(ModelProviderMapping {
                 model: model.name.clone(),
                 provider,
@@ -462,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_map_filters_unconfigured_providers() {
+    fn model_provider_map_includes_all_resolvable() {
         let models = vec![
             profile("deepseek-chat", "https://api.deepseek.com/v1"),
             profile("claude-sonnet-4-5", "https://api.anthropic.com/v1"),
             profile("kimi-k2", "https://api.moonshot.cn/v1"),
         ];
-        let configured = vec!["deepseek".to_string(), "kimi".to_string()];
-        let map = model_provider_map(&models, &configured);
+        let map = model_provider_map(&models);
+        // deepseek + kimi resolved; anthropic has no match → excluded
         assert_eq!(map.len(), 2);
         assert!(map.iter().any(|m| m.model == "deepseek-chat" && m.provider == "deepseek"));
         assert!(map.iter().any(|m| m.model == "kimi-k2" && m.provider == "kimi"));

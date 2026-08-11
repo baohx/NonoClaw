@@ -23,6 +23,27 @@ use serde::{Deserialize, Serialize};
 
 mod bundled;
 
+/// How much static skill metadata enters the system prompt. `Index` is the
+/// low-cost default; `Search` keeps only discovery instructions; `All` retains
+/// the legacy verbose metadata for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillDisclosure {
+    All,
+    #[default]
+    Index,
+    Search,
+}
+
+impl SkillDisclosure {
+    pub fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "search" => Self::Search,
+            _ => Self::Index,
+        }
+    }
+}
+
 // ── Usage tracking ──────────────────────────────────────────────────────────
 
 /// Records how often and when each skill is used. Persisted to disk for
@@ -425,12 +446,49 @@ impl SkillsManager {
         self.render_metadata_for(&active)
     }
 
-    /// Metadata for **static** skills only. Injected into the frozen, cached
-    /// system Block 1 — deterministic from `SkillsManager::new`, so it is
-    /// byte-stable for the entire session and never invalidates the prompt
-    /// cache on skill activation.
+    /// Legacy verbose metadata rendering retained for explicit `all` mode.
     pub fn render_static_skill_metadata(&self) -> String {
-        self.render_metadata_for(&self.static_skills)
+        self.render_static_skill_metadata_with(SkillDisclosure::All, usize::MAX)
+    }
+
+    /// Render static skill discovery according to the configured disclosure
+    /// policy. The output is hard-bounded in characters; every skill remains
+    /// discoverable through SkillSearch even when the visible index is clipped.
+    pub fn render_static_skill_metadata_with(
+        &self,
+        disclosure: SkillDisclosure,
+        max_chars: usize,
+    ) -> String {
+        let rendered = match disclosure {
+            SkillDisclosure::All => self.render_metadata_for(&self.static_skills),
+            SkillDisclosure::Search => {
+                "# Skills\nUse `SkillSearch` to discover a relevant workflow, then call `Skill` with its exact name."
+                    .to_string()
+            }
+            SkillDisclosure::Index => {
+                let mut names: Vec<&str> = self
+                    .static_skills
+                    .iter()
+                    .filter(|skill| !skill.disable_model_invocation)
+                    .map(|skill| skill.name.as_str())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                format!(
+                    "# Skills\nUse `SkillSearch` for descriptions and `Skill` to load one.\nAvailable: {}",
+                    names.join(", ")
+                )
+            }
+        };
+        if rendered.chars().count() <= max_chars {
+            rendered
+        } else if max_chars == 0 {
+            String::new()
+        } else {
+            let mut clipped: String = rendered.chars().take(max_chars - 1).collect();
+            clipped.push('…');
+            clipped
+        }
     }
 
     /// Metadata for **dynamically activated** skills. Injected into the
@@ -504,6 +562,100 @@ impl SkillsManager {
             return Some(s.clone());
         }
         self.static_skills.iter().find(|s| s.name == name).cloned()
+    }
+
+    /// Search every discoverable skill (including conditional skills) without
+    /// loading bodies into the model context.
+    pub fn search_skills(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<nonoclaw_tools::builtin::SkillSearchEntry> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let tokens: Vec<&str> = query
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+            .filter(|token| !token.is_empty())
+            .collect();
+        let mut by_name = HashMap::<&str, &Skill>::new();
+        for skill in &self.static_skills {
+            by_name.insert(skill.name.as_str(), skill);
+        }
+        for skill in self.conditional_skills.values() {
+            by_name.insert(skill.name.as_str(), skill);
+        }
+        for skill in self.dynamic_skills.values() {
+            by_name.insert(skill.name.as_str(), skill);
+        }
+
+        let mut scored = by_name
+            .into_values()
+            .filter(|skill| !skill.disable_model_invocation)
+            .filter_map(|skill| {
+                let name = skill.name.to_lowercase();
+                let description = skill.description.to_lowercase();
+                let when_to_use = skill
+                    .when_to_use
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let triggers = skill.triggers.join(" ").to_lowercase();
+                let mut score = 0i32;
+                for token in &tokens {
+                    if name == *token {
+                        score += 100;
+                    } else if name.contains(token) {
+                        score += 50;
+                    }
+                    if description.contains(token) {
+                        score += 20;
+                    }
+                    if when_to_use.contains(token) {
+                        score += 20;
+                    }
+                    if triggers.contains(token) {
+                        score += 10;
+                    }
+                }
+                (score > 0).then(|| {
+                    (
+                        nonoclaw_tools::builtin::SkillSearchEntry {
+                            name: skill.name.clone(),
+                            description: if skill.description.trim().is_empty() {
+                                "No description provided.".into()
+                            } else {
+                                truncate_str(skill.description.trim(), 180)
+                            },
+                            when_to_use: skill
+                                .when_to_use
+                                .as_deref()
+                                .map(|value| truncate_str(value.trim(), 180)),
+                        },
+                        score,
+                        self.usage.score(&skill.name),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| {
+                    right
+                        .2
+                        .partial_cmp(&left.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.0.name.cmp(&right.0.name))
+        });
+        scored
+            .into_iter()
+            .take(limit.min(10))
+            .map(|(entry, _, _)| entry)
+            .collect()
     }
 
     /// Render a single skill's body with argument substitution applied.
@@ -847,10 +999,7 @@ pub fn parse_skill(path: &Path) -> Option<Skill> {
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
-    let source = path
-        .parent()
-        .map(|p| display_path(p))
-        .unwrap_or_default();
+    let source = path.parent().map(|p| display_path(p)).unwrap_or_default();
 
     let mut skill = parse_skill_str(&text, fallback_name.as_deref(), &source)?;
 
@@ -1387,6 +1536,14 @@ impl nonoclaw_tools::builtin::skill::SkillSource for EngineSkillSource {
             .get_skill(name)
             .map(|s| s.description)
     }
+
+    fn search_skills(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<nonoclaw_tools::builtin::SkillSearchEntry> {
+        self.manager.read().unwrap().search_skills(query, limit)
+    }
 }
 
 #[cfg(test)]
@@ -1404,6 +1561,61 @@ mod tests {
         let skill_dir = dir.join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn manager_with_static(static_skills: Vec<Skill>) -> SkillsManager {
+        SkillsManager {
+            static_skills,
+            conditional_skills: HashMap::new(),
+            dynamic_skills: HashMap::new(),
+            dynamic_skill_dirs: HashSet::new(),
+            activated_conditional_names: HashSet::new(),
+            descriptors: Vec::new(),
+            diagnostics: Vec::new(),
+            activation_events: VecDeque::new(),
+            version: AtomicU64::new(0),
+            usage: SkillUsageTracker::load(),
+        }
+    }
+
+    #[test]
+    fn skill_index_is_hard_bounded_and_search_mode_is_constant_size() {
+        let skills = (0..100)
+            .map(|index| Skill {
+                name: format!("skill-{index:03}"),
+                description: "A deliberately verbose capability description".into(),
+                ..Skill::default()
+            })
+            .collect();
+        let manager = manager_with_static(skills);
+        let index = manager.render_static_skill_metadata_with(SkillDisclosure::Index, 500);
+        let search = manager.render_static_skill_metadata_with(SkillDisclosure::Search, 500);
+        assert!(index.chars().count() <= 500);
+        assert!(index.contains("SkillSearch"));
+        assert!(search.chars().count() < 150);
+        assert!(!search.contains("skill-000"));
+    }
+
+    #[test]
+    fn skill_search_scores_metadata_without_returning_bodies() {
+        let manager = manager_with_static(vec![
+            Skill {
+                name: "deploy-service".into(),
+                description: "Deploy a service to production".into(),
+                body: "SECRET FULL BODY".into(),
+                when_to_use: Some("shipping a release".into()),
+                ..Skill::default()
+            },
+            Skill {
+                name: "draw-diagram".into(),
+                description: "Create architecture diagrams".into(),
+                ..Skill::default()
+            },
+        ]);
+        let matches = manager.search_skills("production release", 5);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "deploy-service");
+        assert!(!matches[0].description.contains("SECRET FULL BODY"));
     }
 
     // ── Frontmatter parsing ──────────────────────────────────────────────
@@ -1643,7 +1855,9 @@ mod tests {
             Some("first skill")
         );
         // Unknown skill -> None.
-        assert!(source.render_skill_body("nope", "", "test-session").is_none());
+        assert!(source
+            .render_skill_body("nope", "", "test-session")
+            .is_none());
     }
 
     /// Regression for the core cache-stability invariant: activating a
@@ -1694,8 +1908,7 @@ mod tests {
 
         // A path-based activation (a different activation path) also leaves
         // static metadata untouched.
-        let more =
-            mgr.activate_conditional_for_paths(&[PathBuf::from("notes.md")], dir.as_path());
+        let more = mgr.activate_conditional_for_paths(&[PathBuf::from("notes.md")], dir.as_path());
         assert!(more.contains(&"docs".to_string()));
         assert_eq!(static_before, mgr.render_static_skill_metadata());
     }

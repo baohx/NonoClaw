@@ -28,12 +28,22 @@ pub struct UserContext {
 }
 
 const GIT_STATUS_MAX: usize = 2000;
+const LEGACY_MEMORY_MAX: usize = 50_000;
+const PROJECT_OPEN: &str = "<project_context>\n";
+const PROJECT_CLOSE: &str = "</project_context>\n";
 
-/// Collect a git snapshot for the system prompt. Runs git as a subprocess;
-/// fails quietly (returns empty) outside a repo. The four git commands are
-/// spawned in parallel — they're independent and the latency win is real
-/// (4 × ~10ms sequential → ~10ms wall time).
+/// Collect a git snapshot using the legacy compatibility cap.
 pub async fn get_system_context(cwd: &Path) -> SystemContext {
+    get_system_context_with_limit(cwd, usize::MAX).await
+}
+
+/// Collect a git snapshot with a hard character cap. The cap applies before
+/// the snapshot reaches prompt assembly and is independent of provider cache
+/// support.
+pub async fn get_system_context_with_limit(cwd: &Path, max_chars: usize) -> SystemContext {
+    if max_chars == 0 {
+        return SystemContext::default();
+    }
     let (branch, status, log, user) = tokio::join!(
         git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
         git_out(cwd, &["status"]),
@@ -41,23 +51,25 @@ pub async fn get_system_context(cwd: &Path) -> SystemContext {
         git_out(cwd, &["config", "user.name"]),
     );
 
-    let mut s = String::new();
+    let mut summary = String::new();
     if !branch.is_empty() {
-        s.push_str(&format!("Current branch: {branch}\n"));
+        summary.push_str(&format!("Current branch: {branch}\n"));
     }
     if !user.is_empty() {
-        s.push_str(&format!("Git user: {user}\n"));
+        summary.push_str(&format!("Git user: {user}\n"));
     }
     if !status.is_empty() {
-        let status = truncate_chars(status.trim(), GIT_STATUS_MAX);
-        s.push_str(&format!("Git status:\n{status}\n"));
+        let status = truncate_chars(status.trim(), GIT_STATUS_MAX.min(max_chars));
+        summary.push_str(&format!("Git status:\n{status}\n"));
     }
     if !log.is_empty() {
-        s.push_str("Recent commits:\n");
-        s.push_str(log.trim());
-        s.push('\n');
+        summary.push_str("Recent commits:\n");
+        summary.push_str(log.trim());
+        summary.push('\n');
     }
-    SystemContext { git_summary: s }
+    SystemContext {
+        git_summary: hard_limit_chars(&summary, max_chars),
+    }
 }
 
 async fn git_out(cwd: &Path, args: &[&str]) -> String {
@@ -71,63 +83,82 @@ async fn git_out(cwd: &Path, args: &[&str]) -> String {
     }
 }
 
-/// Gather NONOCLAW.md content + current date.
-///
-/// Loading order (each source appended in sequence):
-///   1. project `<cwd>/.nonoclaw/NONOCLAW.md`
-///   2. project `<cwd>/.nonoclaw/NONOCLAW.local.md` (gitignored, local-only)
-///   3. project `<cwd>/.nonoclaw/rules/*.md`       (alphabetically sorted)
-///   4. each `--add-dir/.nonoclaw/NONOCLAW.md`
-///   5. user   `~/.nonoclaw/NONOCLAW.md`
-///   6. user   `~/.nonoclaw/rules/*.md`
+/// Gather project instructions without a practical compatibility limit.
 pub fn get_user_context(cwd: &Path, add_dirs: &[PathBuf]) -> UserContext {
+    get_user_context_with_limit(cwd, add_dirs, usize::MAX)
+}
+
+/// Gather project instructions under an exact character budget. Project-local
+/// files and rules are processed before add-dir and user-global sources, so
+/// mandatory repository instructions win when the budget is exhausted. Every
+/// retained source keeps well-formed XML wrappers.
+pub fn get_user_context_with_limit(
+    cwd: &Path,
+    add_dirs: &[PathBuf],
+    project_max_chars: usize,
+) -> UserContext {
     let mut nonoclaw_md = String::new();
 
-    // 1. Project NONOCLAW.md
     if let Some(content) = read_optional(&cwd.join(".nonoclaw/NONOCLAW.md")) {
-        append_md(&mut nonoclaw_md, ".nonoclaw/NONOCLAW.md", content);
+        append_md_bounded(
+            &mut nonoclaw_md,
+            ".nonoclaw/NONOCLAW.md",
+            content,
+            project_max_chars,
+        );
     }
-    // 2. Project NONOCLAW.local.md (gitignored)
     if let Some(content) = read_optional(&cwd.join(".nonoclaw/NONOCLAW.local.md")) {
-        append_md(&mut nonoclaw_md, ".nonoclaw/NONOCLAW.local.md", content);
+        append_md_bounded(
+            &mut nonoclaw_md,
+            ".nonoclaw/NONOCLAW.local.md",
+            content,
+            project_max_chars,
+        );
     }
-    // 3. Project rules/*.md
-    load_rules(&cwd.join(".nonoclaw/rules"), &mut nonoclaw_md);
+    load_rules(
+        &cwd.join(".nonoclaw/rules"),
+        &mut nonoclaw_md,
+        project_max_chars,
+    );
 
-    // 4. --add-dir NONOCLAW.md files
-    for d in add_dirs {
-        if let Some(content) = read_optional(&d.join(".nonoclaw/NONOCLAW.md")) {
-            append_md(
+    for directory in add_dirs {
+        if let Some(content) = read_optional(&directory.join(".nonoclaw/NONOCLAW.md")) {
+            append_md_bounded(
                 &mut nonoclaw_md,
-                &d.join(".nonoclaw/NONOCLAW.md").to_string_lossy().replace('\\', "/"),
+                &directory
+                    .join(".nonoclaw/NONOCLAW.md")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
                 content,
+                project_max_chars,
             );
         }
     }
 
-    // 5-6. User-global
     if let Some(home) = nonoclaw_core::nonoclaw_data_dir() {
-        // 5. User NONOCLAW.md
         if let Some(content) = read_optional(&PathBuf::from(&home).join(".nonoclaw/NONOCLAW.md")) {
-            append_md(&mut nonoclaw_md, "~/.nonoclaw/NONOCLAW.md", content);
+            append_md_bounded(
+                &mut nonoclaw_md,
+                "~/.nonoclaw/NONOCLAW.md",
+                content,
+                project_max_chars,
+            );
         }
-        // 6. User rules/*.md
         load_rules(
             &PathBuf::from(&home).join(".nonoclaw/rules"),
             &mut nonoclaw_md,
+            project_max_chars,
         );
     }
 
     let date = chrono::Local::now().format("%Y/%m/%d").to_string();
     close_project_context(&mut nonoclaw_md);
 
-    // SYSTEM.md / APPEND_SYSTEM.md discovery. Project-local file wins over
-    // the user-global one; only the first found is used. These are loaded
-    // raw (no XML wrapping) — they're prompt-body content, not context.
+    // SYSTEM.md / APPEND_SYSTEM.md are bounded later as part of Block 1's
+    // systemPromptTokens partition rather than the project-rules partition.
     let system_md_override = read_optional(&cwd.join(".nonoclaw/SYSTEM.md")).or_else(|| {
-        nonoclaw_core::nonoclaw_data_dir().and_then(|home| {
-            read_optional(&PathBuf::from(&home).join(".nonoclaw/SYSTEM.md"))
-        })
+        nonoclaw_core::nonoclaw_data_dir()
+            .and_then(|home| read_optional(&PathBuf::from(&home).join(".nonoclaw/SYSTEM.md")))
     });
     let append_system_md = read_optional(&cwd.join(".nonoclaw/APPEND_SYSTEM.md")).or_else(|| {
         nonoclaw_core::nonoclaw_data_dir().and_then(|home| {
@@ -143,63 +174,74 @@ pub fn get_user_context(cwd: &Path, add_dirs: &[PathBuf]) -> UserContext {
     }
 }
 
-/// Scan `rules_dir/*.md`, sorted by filename, and append each to `buf`.
-fn load_rules(rules_dir: &Path, buf: &mut String) {
+/// Scan `rules_dir/*.md`, sorted by filename, and append each under the shared
+/// project-context budget.
+fn load_rules(rules_dir: &Path, buf: &mut String, max_chars: usize) {
     let Ok(entries) = std::fs::read_dir(rules_dir) else {
         return;
     };
     let mut paths: Vec<std::path::PathBuf> = entries
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("md"))
         .collect();
     paths.sort();
-    for p in &paths {
-        let rel = p.file_name().and_then(|n| n.to_str()).unwrap_or("rule.md");
-        if let Some(content) = read_optional(p) {
-            append_md(buf, &format!("rules/{rel}"), content);
+    for path in &paths {
+        let relative = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("rule.md");
+        if let Some(content) = read_optional(path) {
+            append_md_bounded(buf, &format!("rules/{relative}"), content, max_chars);
         }
     }
 }
 
-fn append_md(buf: &mut String, source: &str, content: String) {
-    if buf.is_empty() {
-        buf.push_str("<project_context>\n");
+fn append_md_bounded(buf: &mut String, source: &str, content: String, max_chars: usize) {
+    let opening = if buf.is_empty() { PROJECT_OPEN } else { "" };
+    let prefix = format!("<project_instructions path=\"{source}\">\n");
+    let suffix = "\n</project_instructions>\n";
+    let fixed_chars = opening.chars().count()
+        + prefix.chars().count()
+        + suffix.chars().count()
+        + PROJECT_CLOSE.chars().count();
+    let used_chars = buf.chars().count();
+    if fixed_chars > max_chars.saturating_sub(used_chars) {
+        return;
     }
-    buf.push_str(&format!(
-        "<project_instructions path=\"{source}\">\n{content}\n</project_instructions>\n"
-    ));
+    let content_chars = max_chars - used_chars - fixed_chars;
+    if content_chars == 0 && !content.is_empty() {
+        return;
+    }
+    buf.push_str(opening);
+    buf.push_str(&prefix);
+    buf.push_str(&hard_limit_chars(&content, content_chars));
+    buf.push_str(suffix);
 }
 
-/// Close the `<project_context>` wrapper opened by the first `append_md` call.
-/// Idempotent: only appends the closing tag when the buffer actually opened
-/// one. Must be called once after all `append_md`/`load_rules` calls, before
-/// returning the assembled NONOCLAW.md context.
 fn close_project_context(buf: &mut String) {
-    if buf.starts_with("<project_context>\n") && !buf.ends_with("</project_context>\n") {
-        buf.push_str("</project_context>\n");
+    if buf.starts_with(PROJECT_OPEN) && !buf.ends_with(PROJECT_CLOSE) {
+        buf.push_str(PROJECT_CLOSE);
     }
 }
 
-/// Load the memory index + individual fact files from `.nonoclaw/memory/`.
-///
-/// Loads:
-/// 1. `MEMORY.md` — the index (25 KB / 200 line cap)
-/// 2. Individual `.md` fact files (excluding `MEMORY.md`) — each file is one
-///    memory fact. Files with YAML frontmatter have it stripped; the body text
-///    is what the model sees.
-///
-/// Total output capped at ~50 KB. Returns `None` if the memory directory doesn't
-/// exist or contains nothing.
+/// Load memory with the legacy 50K-character compatibility cap.
 pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
+    load_memory_prompt_with_limit(cwd, LEGACY_MEMORY_MAX)
+}
+
+/// Load memory in importance-first order under a hard character limit.
+pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<String> {
+    let max_chars = max_chars.min(LEGACY_MEMORY_MAX);
+    if max_chars == 0 {
+        return None;
+    }
     let mem_dir = cwd.join(".nonoclaw/memory");
     if !mem_dir.is_dir() {
         return None;
     }
 
     let mut buf = String::new();
-
-    // 0. Active beads + important facts (cross-session memory)
     let beads = nonoclaw_tools::memory::load_beads(cwd);
     let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads)
         .into_iter()
@@ -207,73 +249,96 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
         .collect();
     let facts = nonoclaw_tools::memory::load_facts(cwd);
     let mut top_facts: Vec<&nonoclaw_tools::memory::Fact> = facts.iter().collect();
-    top_facts.sort_by(|a, b| {
-        b.importance
-            .partial_cmp(&a.importance)
+    top_facts.sort_by(|left, right| {
+        right
+            .importance
+            .partial_cmp(&left.importance)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     top_facts.truncate(10);
 
     if !active.is_empty() || !top_facts.is_empty() {
-        let ctx = nonoclaw_tools::memory::render_memory_context(&active, &top_facts, 20_000);
-        if !ctx.is_empty() {
-            buf.push_str(&ctx);
+        let context = nonoclaw_tools::memory::render_memory_context(
+            &active,
+            &top_facts,
+            20_000.min(max_chars),
+        );
+        if !context.is_empty() {
+            buf.push_str(&context);
             buf.push_str("\n---\n\n");
         }
     }
 
-    // 0.5 Wiki index (LLM Wiki knowledge base)
-    if let Some(wiki_index) = nonoclaw_tools::memory::load_wiki_index(cwd) {
-        let preview = truncate_chars(&wiki_index, 5000);
-        buf.push_str("## Knowledge Base (Wiki Index)\n\n");
-        buf.push_str(&preview);
-        buf.push_str("\n\n---\n\n");
-    }
-
-    // 1. MEMORY.md index
-    let index_path = mem_dir.join("MEMORY.md");
-    if let Some(index) = read_optional(&index_path) {
-        let trimmed = truncate_chars(&index, 25_000);
-        let lines: Vec<&str> = trimmed.lines().take(200).collect();
-        if !lines.is_empty() {
-            buf.push_str(&lines.join("\n"));
-            buf.push_str("\n\n");
+    if buf.chars().count() < max_chars {
+        if let Some(wiki_index) = nonoclaw_tools::memory::load_wiki_index(cwd) {
+            let preview = truncate_chars(&wiki_index, 5000.min(max_chars));
+            buf.push_str("## Knowledge Base (Wiki Index)\n\n");
+            buf.push_str(&preview);
+            buf.push_str("\n\n---\n\n");
         }
     }
 
-    // 2. Individual fact files
-    if let Ok(entries) = std::fs::read_dir(&mem_dir) {
-        let mut paths: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e == "md")
-                    .unwrap_or(false)
-                    && p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n != "MEMORY.md")
+    if buf.chars().count() < max_chars {
+        let index_path = mem_dir.join("MEMORY.md");
+        if let Some(index) = read_optional(&index_path) {
+            let trimmed = truncate_chars(&index, 25_000.min(max_chars));
+            let lines: Vec<&str> = trimmed.lines().take(200).collect();
+            if !lines.is_empty() {
+                buf.push_str(&lines.join("\n"));
+                buf.push_str("\n\n");
+            }
+        }
+    }
+
+    if buf.chars().count() < max_chars {
+        if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+            let mut paths: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension == "md")
                         .unwrap_or(false)
-            })
-            .collect();
-        paths.sort();
-        for p in &paths {
-            if let Some(content) = read_optional(p) {
-                let fact = strip_frontmatter(&content);
-                if !fact.trim().is_empty() {
-                    let name = p.file_stem().and_then(|n| n.to_str()).unwrap_or("fact");
-                    buf.push_str(&format!("**{name}**: {fact}\n\n"));
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name != "MEMORY.md")
+                            .unwrap_or(false)
+                })
+                .collect();
+            paths.sort();
+            for path in &paths {
+                if buf.chars().count() >= max_chars {
+                    break;
+                }
+                if let Some(content) = read_optional(path) {
+                    let fact = strip_frontmatter(&content);
+                    if !fact.trim().is_empty() {
+                        let name = path
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("fact");
+                        buf.push_str(&format!("**{name}**: {fact}\n\n"));
+                    }
                 }
             }
         }
     }
 
-    let trimmed = buf.trim().to_string();
+    let trimmed = buf.trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(truncate_chars(&trimmed, 50_000))
+        Some(hard_limit_chars(trimmed, max_chars))
+    }
+}
+
+fn hard_limit_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        value.chars().take(max_chars).collect()
     }
 }
 
@@ -329,6 +394,50 @@ mod tests {
         assert!(!uc.date.is_empty());
     }
 
+    #[test]
+    fn project_context_budget_preserves_local_rules_and_xml_boundaries() {
+        let root =
+            std::env::temp_dir().join(format!("nonoclaw-context-budget-{}", uuid::Uuid::new_v4()));
+        let added = root.join("added");
+        std::fs::create_dir_all(root.join(".nonoclaw")).unwrap();
+        std::fs::create_dir_all(added.join(".nonoclaw")).unwrap();
+        std::fs::write(
+            root.join(".nonoclaw/NONOCLAW.md"),
+            format!("LOCAL_PRIORITY {}", "x".repeat(1000)),
+        )
+        .unwrap();
+        std::fs::write(
+            added.join(".nonoclaw/NONOCLAW.md"),
+            "LOWER_PRIORITY_ADD_DIR",
+        )
+        .unwrap();
+
+        let context = get_user_context_with_limit(&root, &[added], 180).nonoclaw_md;
+        assert!(context.chars().count() <= 180);
+        assert!(context.starts_with(PROJECT_OPEN));
+        assert!(context.ends_with(PROJECT_CLOSE));
+        assert!(context.contains("LOCAL_PRIORITY"));
+        assert!(!context.contains("LOWER_PRIORITY_ADD_DIR"));
+        assert!(context.contains("</project_instructions>"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_loader_applies_exact_hard_limit() {
+        let root =
+            std::env::temp_dir().join(format!("nonoclaw-memory-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".nonoclaw/memory")).unwrap();
+        std::fs::write(
+            root.join(".nonoclaw/memory/MEMORY.md"),
+            "important-memory ".repeat(100),
+        )
+        .unwrap();
+        let memory = load_memory_prompt_with_limit(&root, 64).unwrap();
+        assert!(memory.chars().count() <= 64);
+        assert!(memory.starts_with("important-memory"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // ========================================================================
     // Batch 4 — XML structured context wrapping
     // ========================================================================
@@ -345,16 +454,30 @@ mod tests {
         drop(f);
 
         let uc = get_user_context(&tmp, &[]);
-        assert!(uc.nonoclaw_md.contains("<project_context>"),
-                "must open <project_context>: got\n{}", uc.nonoclaw_md);
-        assert!(uc.nonoclaw_md.contains("</project_context>"),
-                "must close </project_context>: got\n{}", uc.nonoclaw_md);
-        assert!(uc.nonoclaw_md.contains("<project_instructions path=\".nonoclaw/NONOCLAW.md\">"),
-                "must use <project_instructions> with path attr: got\n{}", uc.nonoclaw_md);
-        assert!(uc.nonoclaw_md.contains("</project_instructions>"),
-                "must close <project_instructions>");
-        assert!(uc.nonoclaw_md.contains("project rules here"),
-                "must embed the file content");
+        assert!(
+            uc.nonoclaw_md.contains("<project_context>"),
+            "must open <project_context>: got\n{}",
+            uc.nonoclaw_md
+        );
+        assert!(
+            uc.nonoclaw_md.contains("</project_context>"),
+            "must close </project_context>: got\n{}",
+            uc.nonoclaw_md
+        );
+        assert!(
+            uc.nonoclaw_md
+                .contains("<project_instructions path=\".nonoclaw/NONOCLAW.md\">"),
+            "must use <project_instructions> with path attr: got\n{}",
+            uc.nonoclaw_md
+        );
+        assert!(
+            uc.nonoclaw_md.contains("</project_instructions>"),
+            "must close <project_instructions>"
+        );
+        assert!(
+            uc.nonoclaw_md.contains("project rules here"),
+            "must embed the file content"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -365,8 +488,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let uc = get_user_context(&tmp, &[]);
-        assert!(uc.nonoclaw_md.is_empty(),
-                "no NONOCLAW.md → empty string, got\n{}", uc.nonoclaw_md);
+        assert!(
+            uc.nonoclaw_md.is_empty(),
+            "no NONOCLAW.md → empty string, got\n{}",
+            uc.nonoclaw_md
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

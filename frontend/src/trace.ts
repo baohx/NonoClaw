@@ -80,6 +80,18 @@ function usageDetails(value: unknown, prefix: string): Record<string, TraceDetai
   });
 }
 function compactNumber(value: unknown): string { return number(value).toLocaleString(); }
+function budgetTop(value: unknown, limit = 5): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .filter((item): item is { name: string; chars: number } => Boolean(item)
+      && typeof item === "object"
+      && typeof (item as Record<string, unknown>).name === "string"
+      && typeof (item as Record<string, unknown>).chars === "number")
+    .sort((a, b) => b.chars - a.chars || a.name.localeCompare(b.name))
+    .slice(0, limit)
+    .map((item) => `${item.name}:${item.chars}`)
+    .join(" · ");
+}
 
 /** Calculate context usage whenever a window is known, independently of UI visibility. */
 export function contextUsagePercent(estimated: unknown, window: unknown): number | null {
@@ -102,6 +114,21 @@ export function eventToSafeFact(event: EngineEvent): Fact | null {
   switch (event.kind) {
     case "run_started": return { category: "lifecycle", status: "active", summary: `Run started · ${text(event.requested_model, "model pending")}`, details: detail({ requested_model: event.requested_model, max_turns: event.max_turns, max_budget_usd: event.max_budget_usd }) };
     case "context_prepared": return { category: "context", status: "success", summary: `Context ${compactNumber(event.estimated_tokens)} / ${event.context_window ? compactNumber(event.context_window) : "?"} tokens`, details: detail({ estimated_tokens: event.estimated_tokens, context_window: event.context_window, tool_count: event.tool_count, skill_count: event.skill_count }) };
+    case "token_budget_breakdown": return {
+      category: "context",
+      status: "info",
+      summary: `Payload · system ${compactNumber(event.system_chars)} · tools ${compactNumber(event.tools_chars)} · messages ${compactNumber(event.messages_chars)} chars`,
+      details: detail({
+        estimated_tokens: event.estimated_tokens,
+        chars_per_token: event.chars_per_token,
+        system_chars: event.system_chars,
+        tools_chars: event.tools_chars,
+        messages_chars: event.messages_chars,
+        system_top: budgetTop(event.system),
+        tools_top: budgetTop(event.tools),
+        messages_top: budgetTop(event.messages),
+      }),
+    };
     case "model_request_started": return { category: "model", status: "active", summary: `Turn ${number(event.turn)} · requesting ${text(event.requested_model, "model")}`, details: detail({ requested_model: event.requested_model, provider: event.provider, turn: event.turn }) };
     case "model_resolved": return { category: "model", status: "success", summary: `${text(event.requested_model, "requested")} → ${text(event.actual_model, "actual")}`, details: detail({ requested_model: event.requested_model, actual_model: event.actual_model, provider: event.provider, turn: event.turn }) };
     case "model_info": return { category: "model", status: "success", summary: `Actual model · ${text(event.model, "unknown")}`, details: detail({ model: event.model }) };

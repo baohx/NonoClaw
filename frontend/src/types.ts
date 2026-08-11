@@ -21,13 +21,19 @@ export interface TaskChange {
   tasks: TaskSnapshot[];
 }
 
+export interface TokenBudgetComponent {
+  name: string;
+  chars: number;
+  estimated_tokens: number;
+}
+
 /** Engine event (streamed per-turn). */
 export interface EngineEvent {
   kind:
     | "text_delta" | "tool_use_start" | "tool_result" | "assistant_done"
     | "compacted" | "compacting" | "model_info" | "skill_activated"
     | "session_repair" | "task_changed" | "run_started" | "context_prepared"
-    | "model_request_started" | "model_resolved" | "provider_diagnostic"
+    | "token_budget_breakdown" | "model_request_started" | "model_resolved" | "provider_diagnostic"
     | "stream_state_changed" | "thinking_state" | "retry_scheduled"
     | "tool_queued" | "tool_validation" | "permission_requested"
     | "permission_resolved" | "tool_execution_started" | "tool_execution_finished"
@@ -62,6 +68,13 @@ export interface EngineEvent {
   max_turns?: number;
   max_budget_usd?: number | null;
   estimated_tokens?: number;
+  chars_per_token?: number;
+  system_chars?: number;
+  tools_chars?: number;
+  messages_chars?: number;
+  system?: TokenBudgetComponent[];
+  tools?: TokenBudgetComponent[];
+  messages?: TokenBudgetComponent[];
   context_window?: number | null;
   tool_count?: number;
   skill_count?: number;

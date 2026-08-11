@@ -647,6 +647,27 @@
   {
     "input_schema": {
       "properties": {
+        "limit": {
+          "default": 5,
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Capability or workflow keywords.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "SkillSearch"
+  },
+  {
+    "input_schema": {
+      "properties": {
         "args": {
           "default": "",
           "description": "Optional arguments to substitute into the skill body.",

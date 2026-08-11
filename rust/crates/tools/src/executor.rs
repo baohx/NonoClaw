@@ -23,7 +23,6 @@ use crate::registry::ToolRegistry;
 use crate::tool::{GraphRunner, QuestionResolver, SubagentRunner, ToolCtx, ToolOptions};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 10;
-const SUMMARY_SUFFIX_RESERVE: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -114,6 +113,8 @@ pub struct ToolExecutionContext<'a> {
     pub cwd: &'a Path,
     pub options: &'a ToolOptions,
     pub cancel: &'a CancellationToken,
+    /// Engine-level hard cap applied in addition to each tool's own limit.
+    pub max_result_chars: Option<usize>,
     pub task_scope: Option<&'a str>,
     pub subagent: Option<&'a dyn SubagentRunner>,
     pub graph_runner: Option<&'a dyn GraphRunner>,
@@ -474,12 +475,16 @@ impl ToolExecutor {
             },
         ));
 
+        let max_result_chars = context
+            .max_result_chars
+            .map(|configured| configured.min(tool.max_result_size_chars()))
+            .unwrap_or_else(|| tool.max_result_size_chars());
         let normalized = normalize_result(
             context.cwd,
             &call.id,
             &call.name,
             raw_content,
-            tool.max_result_size_chars(),
+            max_result_chars,
         )
         .await;
         trace.push(trace_record(
@@ -633,9 +638,52 @@ async fn normalize_result(
     }
     .await;
 
-    let body_limit = max_chars.saturating_sub(SUMMARY_SUFFIX_RESERVE).max(128);
-    let head_chars = body_limit * 2 / 3;
-    let tail_chars = body_limit.saturating_sub(head_chars);
+    let (local_reference, persist_error, notice) = match persisted {
+        Ok(()) => (
+            Some(relative.clone()),
+            None,
+            format!("[full result saved locally: {}]\n", relative.display()),
+        ),
+        Err(error) => {
+            let detail = format!("failed to persist oversized result: {error}");
+            (None, Some(detail.clone()), format!("[{detail}]\n"))
+        }
+    };
+    let content = bounded_result_preview(&raw, original_chars, &notice, max_chars);
+
+    NormalizedResult {
+        content,
+        local_reference,
+        original_chars,
+        persist_error,
+    }
+}
+
+fn bounded_result_preview(
+    raw: &str,
+    original_chars: usize,
+    notice: &str,
+    max_chars: usize,
+) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let notice = hard_limit_chars(notice, max_chars);
+    let notice_chars = notice.chars().count();
+    if notice_chars >= max_chars {
+        return notice;
+    }
+
+    let marker = format!("\n…[{original_chars} total characters; middle omitted]…\n");
+    let marker = hard_limit_chars(&marker, max_chars - notice_chars);
+    let fixed_chars = notice_chars + marker.chars().count();
+    if fixed_chars >= max_chars {
+        return format!("{notice}{marker}");
+    }
+
+    let body_chars = max_chars - fixed_chars;
+    let head_chars = body_chars * 2 / 3;
+    let tail_chars = body_chars.saturating_sub(head_chars);
     let head: String = raw.chars().take(head_chars).collect();
     let tail: String = raw
         .chars()
@@ -645,27 +693,14 @@ async fn normalize_result(
         .chars()
         .rev()
         .collect();
+    hard_limit_chars(&format!("{notice}{head}{marker}{tail}"), max_chars)
+}
 
-    match persisted {
-        Ok(()) => NormalizedResult {
-            content: format!(
-                "{head}\n\n…[{} characters omitted; full result saved locally]\n\n{tail}\n\n[Full result: {}]",
-                original_chars.saturating_sub(head_chars + tail_chars),
-                relative.display()
-            ),
-            local_reference: Some(relative),
-            original_chars,
-            persist_error: None,
-        },
-        Err(error) => NormalizedResult {
-            content: format!(
-                "{head}\n\n…[{} characters omitted; failed to save full result: {error}]\n\n{tail}",
-                original_chars.saturating_sub(head_chars + tail_chars)
-            ),
-            local_reference: None,
-            original_chars,
-            persist_error: Some(format!("failed to persist oversized result: {error}")),
-        },
+fn hard_limit_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        value.chars().take(max_chars).collect()
     }
 }
 
@@ -889,6 +924,7 @@ mod tests {
             cwd,
             options,
             cancel,
+            max_result_chars: None,
             task_scope: Some("executor-test"),
             subagent: None,
             graph_runner: None,
@@ -1022,13 +1058,13 @@ mod tests {
             name: "Large".into(),
             input: json!({"label":"x"}),
         }];
-        let result = executor
-            .execute(&calls, &context(&cwd, &options, &cancel))
-            .await
-            .remove(0);
+        let mut execution_context = context(&cwd, &options, &cancel);
+        execution_context.max_result_chars = Some(160);
+        let result = executor.execute(&calls, &execution_context).await.remove(0);
 
         let reference = result.local_reference.expect("large result reference");
         assert!(result.content.contains("full result saved locally"));
+        assert!(result.content.chars().count() <= 160);
         assert_eq!(
             tokio::fs::read_to_string(cwd.join(reference))
                 .await

@@ -85,7 +85,8 @@ export default function TechnicalTrace() {
   };
 
   const summaryRun = selected;
-  const context = lastMatching(summaryRun?.entries, (entry) => entry.category === "context");
+  const context = lastMatching(summaryRun?.entries, (entry) => entry.kind === "context_prepared");
+  const budget = lastMatching(summaryRun?.entries, (entry) => entry.kind === "token_budget_breakdown");
   const model = lastMatching(summaryRun?.entries, (entry) => entry.kind === "model_resolved" || entry.kind === "model_info");
   const usage = lastMatching(summaryRun?.entries, (entry) => entry.category === "usage" || entry.kind === "run_finished" || entry.kind === "done");
   const turnEntry = lastMatching(summaryRun?.entries, (entry) => typeof entry.details.turn === "number" || typeof entry.details.turns === "number");
@@ -99,6 +100,7 @@ export default function TechnicalTrace() {
         <div title={model?.summary ?? "尚无数据"}><span>model</span><b>{model?.summary ?? "—"}</b></div>
         <div title={turn === undefined ? "尚无数据" : undefined}><span>turn</span><b>{turn ?? "—"}</b></div>
         <div title={context?.summary ?? "尚无数据"}><span>context</span><b>{context?.details.estimated_tokens?.toLocaleString?.() ?? "—"}{contextPercent !== null ? ` · ${contextPercent.toFixed(1)}%` : ""}</b></div>
+        <div title={budget?.summary ?? "尚无分项数据"}><span>payload chars</span><b>{budget ? `sys ${budget.details.system_chars ?? 0} · tools ${budget.details.tools_chars ?? 0} · msg ${budget.details.messages_chars ?? 0}` : "—"}</b></div>
         <div title={usage ? undefined : "尚无数据"}><span>tokens</span><b>{usage ? `in ${usage.details.total_in ?? 0} · out ${usage.details.total_out ?? 0} · r ${usage.details.total_cache_read ?? 0} · w ${usage.details.total_cache_write ?? 0}` : "—"}</b></div>
       </div>
 

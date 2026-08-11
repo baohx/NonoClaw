@@ -16,6 +16,15 @@ pub const MAX_EVENT_ARRAY_ITEMS: usize = 128;
 
 pub type RunId = String;
 
+/// Size of one bounded request component. Only names and counts are exposed;
+/// prompt/tool/message contents never enter the technical event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBudgetComponent {
+    pub name: String,
+    pub chars: usize,
+    pub estimated_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRepairKind {
@@ -118,6 +127,19 @@ pub enum RunEvent {
         context_window: Option<usize>,
         tool_count: usize,
         skill_count: usize,
+    },
+    /// Content-free accounting of the exact payload assembled for the first
+    /// model request. Component arrays are bounded by event redaction and carry
+    /// only stable labels plus sizes, never prompt or tool contents.
+    TokenBudgetBreakdown {
+        chars_per_token: usize,
+        estimated_tokens: usize,
+        system_chars: usize,
+        tools_chars: usize,
+        messages_chars: usize,
+        system: Vec<TokenBudgetComponent>,
+        tools: Vec<TokenBudgetComponent>,
+        messages: Vec<TokenBudgetComponent>,
     },
     ModelRequestStarted {
         requested_model: String,
@@ -518,6 +540,37 @@ mod tests {
         assert!(!value["event_id"].as_str().unwrap().is_empty());
         let decoded: EventEnvelope = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.sequence, 42);
+    }
+
+    #[test]
+    fn token_budget_breakdown_serializes_counts_without_payload_content() {
+        let event = RunEvent::TokenBudgetBreakdown {
+            chars_per_token: 4,
+            estimated_tokens: 30,
+            system_chars: 80,
+            tools_chars: 30,
+            messages_chars: 10,
+            system: vec![TokenBudgetComponent {
+                name: "base_prompt".into(),
+                chars: 80,
+                estimated_tokens: 20,
+            }],
+            tools: vec![TokenBudgetComponent {
+                name: "builtin:Read".into(),
+                chars: 30,
+                estimated_tokens: 8,
+            }],
+            messages: vec![TokenBudgetComponent {
+                name: "user".into(),
+                chars: 10,
+                estimated_tokens: 3,
+            }],
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["kind"], "token_budget_breakdown");
+        assert_eq!(value["system"][0]["name"], "base_prompt");
+        assert_eq!(value["tools"][0]["chars"], 30);
+        assert!(value.to_string().len() < 1_000);
     }
 
     #[test]

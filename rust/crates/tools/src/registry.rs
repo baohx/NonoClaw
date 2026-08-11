@@ -1,7 +1,7 @@
 //! Tool registry. Mirrors `src/tools.ts` (registration) and the
 //! `findToolByName` / `toolMatchesName` helpers in `src/Tool.ts`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::tool::{matches_name, Tool, ToolDefinition};
@@ -97,6 +97,32 @@ impl ToolRegistry {
                 }),
             })
             .map(|t| t.definition())
+            .collect()
+    }
+
+    /// Definitions for an explicit progressive-disclosure visibility set.
+    /// Execution permissions remain independent and are still enforced by the
+    /// PermissionGate.
+    pub fn definitions_for_names(
+        &self,
+        visible: &HashSet<String>,
+        allowlist: Option<&[String]>,
+    ) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|tool| visible.contains(tool.name()))
+            .filter(|tool| match allowlist {
+                None => true,
+                Some(names) => names.iter().any(|name| {
+                    matches_name(tool.name(), tool.aliases(), name)
+                        || name
+                            .split('(')
+                            .next()
+                            .map(|prefix| tool.name() == prefix.trim())
+                            .unwrap_or(false)
+                }),
+            })
+            .map(|tool| tool.definition())
             .collect()
     }
 
@@ -282,5 +308,28 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(Disabled));
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn definitions_for_names_only_advertises_visible_and_allowed_tools() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DummyTool {
+            name: "Read",
+            read_only: true,
+        }));
+        reg.register(Arc::new(DummyTool {
+            name: "DeferredTool",
+            read_only: true,
+        }));
+
+        let visible = HashSet::from(["DeferredTool".to_string()]);
+        let definitions = reg.definitions_for_names(&visible, None);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "DeferredTool");
+
+        let allowlist = vec!["Read".to_string()];
+        assert!(reg
+            .definitions_for_names(&visible, Some(&allowlist))
+            .is_empty());
     }
 }

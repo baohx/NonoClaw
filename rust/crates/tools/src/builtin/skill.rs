@@ -16,6 +16,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillSearchEntry {
+    pub name: String,
+    pub description: String,
+    pub when_to_use: Option<String>,
+}
+
 /// Live read-access to skill bodies without coupling the `tools` crate to the
 /// engine (which owns `SkillsManager`). Implemented in the engine crate; the
 /// tool holds an `Arc<dyn SkillSource>`.
@@ -26,6 +33,9 @@ pub trait SkillSource: Send + Sync {
 
     /// One-line description for a skill (used in error hints). `None` if unknown.
     fn skill_description(&self, name: &str) -> Option<String>;
+
+    /// Search all discoverable skills without loading their bodies.
+    fn search_skills(&self, query: &str, limit: usize) -> Vec<SkillSearchEntry>;
 }
 
 /// Tool that loads a skill's full body by name.
@@ -65,6 +75,9 @@ impl Tool for SkillTool {
     }
     fn should_defer(&self) -> bool {
         false
+    }
+    fn max_result_size_chars(&self) -> usize {
+        12_000
     }
     fn aliases(&self) -> &[&str] {
         &[]
@@ -125,5 +138,126 @@ impl Tool for SkillTool {
                 )))
             }
         }
+    }
+}
+
+/// Lightweight discovery tool for progressive skill disclosure.
+pub struct SkillSearchTool {
+    source: Arc<dyn SkillSource>,
+}
+
+impl SkillSearchTool {
+    pub fn new(source: Arc<dyn SkillSource>) -> Self {
+        Self { source }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillSearchInput {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    5
+}
+
+#[async_trait]
+impl Tool for SkillSearchTool {
+    fn name(&self) -> &str {
+        "SkillSearch"
+    }
+
+    fn description(&self) -> &str {
+        "Find relevant skills by keyword without loading their full instructions."
+    }
+
+    fn prompt(&self) -> &str {
+        "Search skills, then call Skill with the exact selected name."
+    }
+
+    fn search_hint(&self) -> Option<&str> {
+        Some("find skill workflow instructions")
+    }
+
+    fn should_defer(&self) -> bool {
+        false
+    }
+
+    fn max_result_size_chars(&self) -> usize {
+        4_000
+    }
+
+    fn aliases(&self) -> &[&str] {
+        &[]
+    }
+
+    fn is_read_only(&self, _: &Value) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Capability or workflow keywords."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn check_permissions(&self, _: &Value, _: &ToolCtx<'_>) -> PermissionResult {
+        PermissionResult::allow()
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolCtx<'_>,
+        _cancel: CancellationToken,
+    ) -> Result<ToolResult> {
+        let parsed: SkillSearchInput = match serde_json::from_value(input) {
+            Ok(value) => value,
+            Err(error) => return Ok(ToolResult::error(format!("invalid input: {error}"))),
+        };
+        let query = parsed.query.trim();
+        if query.is_empty() {
+            return Ok(ToolResult::error("query must not be empty"));
+        }
+        let matches = self.source.search_skills(query, parsed.limit.clamp(1, 10));
+        if matches.is_empty() {
+            return Ok(ToolResult::ok(
+                "No matching skills found. Continue without a skill or try broader keywords.",
+            ));
+        }
+        let lines = matches
+            .into_iter()
+            .map(|entry| {
+                let when = entry
+                    .when_to_use
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(" — use when {value}"))
+                    .unwrap_or_default();
+                format!("- **{}**: {}{}", entry.name, entry.description, when)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolResult::ok(format!(
+            "{lines}\n\nCall `Skill` with the exact selected name to load its instructions."
+        )))
     }
 }

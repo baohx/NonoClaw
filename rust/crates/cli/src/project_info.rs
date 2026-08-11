@@ -288,15 +288,7 @@ pub async fn gather(
         .collect();
     let (context_window, compact_threshold) = config.model_budget(model);
     let git = git_info(cwd).await;
-    let billing_providers: Vec<String> = config
-        .provider_billing_entries()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    let model_providers = crate::billing::model_provider_map(
-        config.all_models(),
-        &billing_providers,
-    );
+    let model_providers = crate::billing::model_provider_map(config.all_models());
 
     ProjectInfo {
         cwd: nonoclaw_core::display_path(cwd),

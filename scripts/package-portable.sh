@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REL="$ROOT/release"
 PKG="$REL/NonoClawPortable"
-OUT="$REL/nonoclaw-v0.16.0-windows-portable.zip"
+OUT="$REL/nonoclaw-v0.17.0-windows-portable.zip"
 
 cd "$ROOT"
 

@@ -203,6 +203,23 @@ impl ApiFormat {
     }
 }
 
+/// Join a provider base URL with its canonical endpoint without duplicating
+/// the common `/v1` suffix. Profiles in the wild use both host roots and
+/// versioned roots (for example `https://api.anthropic.com/v1`).
+fn endpoint_url(base_url: &str, endpoint: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    let endpoint = endpoint.trim_start_matches('/');
+    if base.ends_with(endpoint) {
+        return base.to_string();
+    }
+    if let Some(after_version) = endpoint.strip_prefix("v1/") {
+        if base.ends_with("/v1") {
+            return format!("{base}/{after_version}");
+        }
+    }
+    format!("{base}/{endpoint}")
+}
+
 pub struct Client {
     http: reqwest::Client,
     api_key: Option<String>,
@@ -314,16 +331,13 @@ impl Client {
             ApiFormat::Anthropic => {
                 let body = serialize_body_anthropic(params)?;
                 dump_prompt_anthropic(params, &body);
-                let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+                let url = endpoint_url(&self.base_url, "v1/messages");
                 (url, body)
             }
             ApiFormat::OpenAI => {
                 let body = serialize_body_openai(params)?;
                 dump_prompt_openai(params, &body);
-                let url = format!(
-                    "{}/v1/chat/completions",
-                    self.base_url.trim_end_matches('/')
-                );
+                let url = endpoint_url(&self.base_url, "v1/chat/completions");
                 (url, body)
             }
         };
@@ -1614,6 +1628,33 @@ pub(crate) fn api_error_from_body(status: u16, text: &str) -> Error {
 mod tests {
     use super::*;
     use crate::sse::SseFrame;
+
+    #[test]
+    fn provider_endpoint_accepts_root_versioned_and_complete_base_urls() {
+        assert_eq!(
+            endpoint_url("https://api.anthropic.com", "v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            endpoint_url("https://api.anthropic.com/v1/", "v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            endpoint_url(
+                "https://gateway.example/anthropic/v1/messages",
+                "v1/messages"
+            ),
+            "https://gateway.example/anthropic/v1/messages"
+        );
+        assert_eq!(
+            endpoint_url("https://gateway.example/api/v1", "v1/chat/completions"),
+            "https://gateway.example/api/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("https://gateway.example/anthropic", "v1/messages"),
+            "https://gateway.example/anthropic/v1/messages"
+        );
+    }
 
     #[test]
     fn folds_text_and_tool_use_from_recorded_sse() {

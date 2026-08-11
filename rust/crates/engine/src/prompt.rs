@@ -9,17 +9,18 @@ use nonoclaw_api::SystemBlock;
 use nonoclaw_core::CacheControl;
 
 use crate::context::{SystemContext, UserContext};
-use crate::skills::SkillsManager;
+use crate::skills::{SkillDisclosure, SkillsManager};
 
 /// Which sections of the system prompt to include. `Full` reproduces the
 /// pre-refactor `BASE` prompt byte-for-byte (verified by test). `Minimal`
-/// keeps only identity + safety + task-completion, dropping ~60% of the
-/// prompt for cost-sensitive or compact models. `Custom` lets callers pick
-/// an explicit set of section names (see `SystemPromptSections::NAMES`).
+/// keeps identity + safety + task-completion. `Ultra` uses a purpose-built,
+/// compact agent contract and removes redundant tool prose. `Custom` lets
+/// callers pick an explicit set of section names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptProfile {
     Full,
     Minimal,
+    Ultra,
     Custom(std::collections::HashSet<String>),
 }
 
@@ -30,12 +31,12 @@ impl Default for PromptProfile {
 }
 
 impl PromptProfile {
-    /// Parse from a settings string ("full" | "minimal"). Unknown values
-    /// fall back to `Full` and log nothing — settings validation happens
-    /// upstream in `settings.rs`.
+    /// Parse from a validated settings string. Unknown values retain the
+    /// backwards-compatible `Full` fallback.
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "minimal" => Self::Minimal,
+            "ultra" => Self::Ultra,
             _ => Self::Full,
         }
     }
@@ -44,8 +45,13 @@ impl PromptProfile {
         match self {
             Self::Full => true,
             Self::Minimal => matches!(section, "identity" | "safety" | "task_completion"),
+            Self::Ultra => false,
             Self::Custom(set) => set.contains(section),
         }
+    }
+
+    fn is_ultra(&self) -> bool {
+        matches!(self, Self::Ultra)
     }
 }
 
@@ -89,6 +95,9 @@ impl SystemPromptSections {
 /// honouring the given profile. Sections are joined with a blank line in
 /// the canonical order from [`SystemPromptSections::NAMES`].
 pub fn build_system_prompt_sections(profile: &PromptProfile) -> String {
+    if profile.is_ultra() {
+        return ULTRA_BASE.to_string();
+    }
     let mut out = String::new();
     let mut first = true;
     for name in SystemPromptSections::NAMES {
@@ -142,6 +151,91 @@ pub struct ToolPromptEntry {
     pub guidelines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptBudgetBreakdown {
+    pub components: Vec<(String, usize)>,
+}
+
+impl PromptBudgetBreakdown {
+    fn push(&mut self, name: &str, text: &str) {
+        let chars = text.chars().count();
+        if chars > 0 {
+            self.components.push((name.to_string(), chars));
+        }
+    }
+}
+
+/// Hard character limits applied at prompt serialization boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptBuildLimits {
+    pub system_prompt_chars: usize,
+    pub skill_chars: usize,
+    pub project_context_chars: usize,
+    pub memory_chars: usize,
+    pub git_chars: usize,
+}
+
+impl Default for PromptBuildLimits {
+    fn default() -> Self {
+        Self {
+            system_prompt_chars: usize::MAX,
+            skill_chars: usize::MAX,
+            project_context_chars: usize::MAX,
+            memory_chars: usize::MAX,
+            git_chars: usize::MAX,
+        }
+    }
+}
+
+fn hard_limit_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        value.chars().take(max_chars).collect()
+    }
+}
+
+fn append_budgeted(
+    output: &mut String,
+    budget: &mut PromptBudgetBreakdown,
+    component: &str,
+    value: &str,
+    remaining: &mut usize,
+) {
+    if value.is_empty() || *remaining == 0 {
+        return;
+    }
+    let bounded = hard_limit_chars(value, *remaining);
+    let chars = bounded.chars().count();
+    budget.push(component, &bounded);
+    output.push_str(&bounded);
+    *remaining = remaining.saturating_sub(chars);
+}
+
+fn bounded_wrapped(prefix: &str, content: &str, suffix: &str, max_chars: usize) -> String {
+    let wrapper_chars = prefix.chars().count() + suffix.chars().count();
+    if content.is_empty() || max_chars < wrapper_chars {
+        return String::new();
+    }
+    let bounded = hard_limit_chars(content, max_chars - wrapper_chars);
+    format!("{prefix}{bounded}{suffix}")
+}
+
+fn bounded_project_context(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    const OPEN: &str = "<project_context>\n";
+    const CLOSE: &str = "</project_context>\n";
+    if let Some(inner) = value
+        .strip_prefix(OPEN)
+        .and_then(|value| value.strip_suffix(CLOSE))
+    {
+        return bounded_wrapped(OPEN, inner, CLOSE, max_chars);
+    }
+    hard_limit_chars(value, max_chars)
+}
+
 /// Build the `system` array for the API request. Returns two blocks:
 ///
 /// **Block 1 (cached):** identity, environment, tool guidance, tool prompts,
@@ -184,92 +278,207 @@ pub fn build_system_blocks_with_profile(
     skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
     profile: &PromptProfile,
 ) -> Vec<SystemBlock> {
-    // T6.3: SYSTEM.md fully replaces the BASE body when present (pi's
-    // customPrompt pattern). Environment, tool guidance, tool list, skills,
-    // and append sections are still appended on top.
-    let mut main = if let Some(custom) = &user.system_md_override {
-        custom.clone()
+    build_system_blocks_with_profile_measured(
+        cwd,
+        system,
+        user,
+        memory,
+        tool_prompts,
+        append,
+        skills_manager,
+        profile,
+        SkillDisclosure::All,
+        usize::MAX,
+    )
+    .0
+}
+
+/// Measured variant used by the engine's content-free token budget event.
+/// Every string appended to the system array is attributed to one component.
+pub fn build_system_blocks_with_profile_measured(
+    cwd: &std::path::Path,
+    system: &SystemContext,
+    user: &UserContext,
+    memory: &Option<String>,
+    tool_prompts: &[ToolPromptEntry],
+    append: &Option<String>,
+    skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
+    profile: &PromptProfile,
+    skill_disclosure: SkillDisclosure,
+    skill_index_max_chars: usize,
+) -> (Vec<SystemBlock>, PromptBudgetBreakdown) {
+    build_system_blocks_with_profile_measured_and_limits(
+        cwd,
+        system,
+        user,
+        memory,
+        tool_prompts,
+        append,
+        skills_manager,
+        profile,
+        skill_disclosure,
+        skill_index_max_chars,
+        PromptBuildLimits::default(),
+    )
+}
+
+/// Budget-aware prompt builder. All limits apply to the serialized text sent
+/// to the provider, not merely to source files before wrappers are added.
+#[allow(clippy::too_many_arguments)]
+pub fn build_system_blocks_with_profile_measured_and_limits(
+    cwd: &std::path::Path,
+    system: &SystemContext,
+    user: &UserContext,
+    memory: &Option<String>,
+    tool_prompts: &[ToolPromptEntry],
+    append: &Option<String>,
+    skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
+    profile: &PromptProfile,
+    skill_disclosure: SkillDisclosure,
+    skill_index_max_chars: usize,
+    limits: PromptBuildLimits,
+) -> (Vec<SystemBlock>, PromptBudgetBreakdown) {
+    let mut budget = PromptBudgetBreakdown::default();
+    let mut main = String::new();
+    let mut remaining = limits.system_prompt_chars;
+
+    // SYSTEM.md still replaces the built-in body, but the final serialized
+    // block is subject to the same hard system-prompt partition.
+    let base = user
+        .system_md_override
+        .clone()
+        .unwrap_or_else(|| build_system_prompt_sections(profile));
+    append_budgeted(&mut main, &mut budget, "base_prompt", &base, &mut remaining);
+
+    let environment = if profile.is_ultra() {
+        format!(
+            "\nEnvironment: cwd={}; platform={PLATFORM_HINT}.\n",
+            cwd.display()
+        )
     } else {
-        build_system_prompt_sections(profile)
+        format!(
+            "\n# Environment\n- Working directory: {}\n- Platform: {PLATFORM_HINT}\n",
+            cwd.display()
+        )
     };
-    main.push_str(&format!(
-        "\n# Environment\n- Working directory: {}\n",
-        cwd.display()
-    ));
-    main.push_str(&format!("- Platform: {PLATFORM_HINT}\n"));
-    main.push_str(TOOL_GUIDANCE);
-    // Compact tool listing: name + one-line snippet. The full prompt is
-    // available via the tool schema's `description` field. With MCP servers
-    // adding 30+ tools, embedding full prompts bloats the system block to
-    // millions of chars — fatal for OpenAI-format models (Kimi).
-    let tools_list: Vec<String> = tool_prompts
-        .iter()
-        .map(|t| format!("- **{}**: {}", t.name, t.snippet))
-        .collect();
-    main.push_str(&format!(
-        "\n## Available Tools ({})\n\n{}\n",
-        tool_prompts.len(),
-        tools_list.join("\n"),
-    ));
-    // Tool-registered guidelines (T3.5): collected across active tools and
-    // appended after the static TOOL_GUIDANCE, de-duplicated so MCP tools
-    // sharing a common hint do not spam the prompt.
-    let mut seen_guidelines = std::collections::HashSet::new();
-    let mut tool_guidelines: Vec<&str> = Vec::new();
-    for entry in tool_prompts {
-        for g in &entry.guidelines {
-            if seen_guidelines.insert(g.as_str()) {
-                tool_guidelines.push(g.as_str());
+    append_budgeted(
+        &mut main,
+        &mut budget,
+        "environment",
+        &environment,
+        &mut remaining,
+    );
+
+    let tool_guidance = if profile.is_ultra() {
+        ULTRA_TOOL_GUIDANCE
+    } else {
+        TOOL_GUIDANCE
+    };
+    append_budgeted(
+        &mut main,
+        &mut budget,
+        "tool_guidance",
+        tool_guidance,
+        &mut remaining,
+    );
+
+    // Schemas already carry names, descriptions, and parameter contracts.
+    // Ultra omits the duplicate markdown index and per-tool prose entirely.
+    if !profile.is_ultra() {
+        let tools_list: Vec<String> = tool_prompts
+            .iter()
+            .map(|tool| format!("- **{}**: {}", tool.name, tool.snippet))
+            .collect();
+        let tool_index = format!(
+            "\n## Available Tools ({})\n\n{}\n",
+            tool_prompts.len(),
+            tools_list.join("\n"),
+        );
+        append_budgeted(
+            &mut main,
+            &mut budget,
+            "tool_index",
+            &tool_index,
+            &mut remaining,
+        );
+
+        let mut seen_guidelines = std::collections::HashSet::new();
+        let mut guidance = String::new();
+        for entry in tool_prompts {
+            for guideline in &entry.guidelines {
+                if seen_guidelines.insert(guideline.as_str()) {
+                    if guidance.is_empty() {
+                        guidance.push_str("\n## Tool-specific guidance\n");
+                    }
+                    guidance.push_str(&format!("- {guideline}\n"));
+                }
             }
         }
+        append_budgeted(
+            &mut main,
+            &mut budget,
+            "tool_specific_guidance",
+            &guidance,
+            &mut remaining,
+        );
     }
-    if !tool_guidelines.is_empty() {
-        main.push_str("\n## Tool-specific guidance\n");
-        for g in tool_guidelines {
-            main.push_str(&format!("- {g}\n"));
-        }
-    }
-    // Inject STATIC skill metadata only. This keeps Block 1 byte-stable for the
-    // whole session — skill activations surface their metadata in the uncached
-    // Block 2 (see `refresh_context_block`) instead, so they never invalidate
-    // the cached prefix. Skill bodies are never embedded; they load on demand
-    // via the `Skill` tool.
-    if let Some(mgr) = skills_manager {
-        let skill_prompt = mgr.read().unwrap().render_static_skill_metadata();
+
+    if let Some(manager) = skills_manager {
+        let skill_prompt = manager.read().unwrap().render_static_skill_metadata_with(
+            skill_disclosure,
+            skill_index_max_chars.min(limits.skill_chars),
+        );
         if !skill_prompt.is_empty() {
-            main.push_str(&format!("\n{skill_prompt}\n"));
+            let rendered = format!("\n{skill_prompt}\n");
+            append_budgeted(
+                &mut main,
+                &mut budget,
+                "static_skills",
+                &rendered,
+                &mut remaining,
+            );
         }
     }
 
-    // T6.4: APPEND_SYSTEM.md (file-based) is appended after the static
-    // sections but before the CLI-supplied `append_system_prompt`. Both are
-    // supported; the file takes precedence in reading order.
     if let Some(file_append) = &user.append_system_md {
-        main.push_str(&format!("\n# Additional instructions (from APPEND_SYSTEM.md)\n{file_append}\n"));
+        let rendered =
+            format!("\n# Additional instructions (from APPEND_SYSTEM.md)\n{file_append}\n");
+        append_budgeted(
+            &mut main,
+            &mut budget,
+            "append_system_file",
+            &rendered,
+            &mut remaining,
+        );
     }
-
     if let Some(extra) = append {
-        main.push_str(&format!("\n# Additional instructions\n{extra}\n"));
+        let rendered = format!("\n# Additional instructions\n{extra}\n");
+        append_budgeted(
+            &mut main,
+            &mut budget,
+            "append_system_cli",
+            &rendered,
+            &mut remaining,
+        );
     }
 
     let mut blocks = Vec::new();
-    blocks.push(SystemBlock {
-        kind: "text".into(),
-        text: main,
-        cache_control: Some(CacheControl {
-            kind: nonoclaw_core::CacheControlKind::Ephemeral,
-        }),
-    });
-
-    // Block 2a (cached per-run): NONOCLAW.md content. Byte-stable within a
-    // run — it only changes between sessions. Splitting it into a separate
-    // cached block means the provider caches it after turn 1 instead of
-    // retransmitting on every turn. (Memory is kept uncached because it can
-    // change mid-run when the agent creates/updates facts and beads.)
-    if !user.nonoclaw_md.is_empty() {
+    if !main.is_empty() {
         blocks.push(SystemBlock {
             kind: "text".into(),
-            text: user.nonoclaw_md.clone(),
+            text: main,
+            cache_control: Some(CacheControl {
+                kind: nonoclaw_core::CacheControlKind::Ephemeral,
+            }),
+        });
+    }
+
+    let project_context = bounded_project_context(&user.nonoclaw_md, limits.project_context_chars);
+    if !project_context.is_empty() {
+        budget.push("project_context", &project_context);
+        blocks.push(SystemBlock {
+            kind: "text".into(),
+            text: project_context,
             cache_control: Some(CacheControl {
                 kind: nonoclaw_core::CacheControlKind::Ephemeral,
             }),
@@ -277,18 +486,31 @@ pub fn build_system_blocks_with_profile(
     }
 
     let mut context = String::new();
-    context.push_str(&format!("# Current date\n{}\n\n", user.date));
-    // Git summary goes here (uncached) so it doesn't invalidate the prompt
-    // cache on every tool-execution that changes the working tree.
-    if !system.git_summary.is_empty() {
-        context.push_str("# Git status (snapshot at conversation start)\n```\n");
-        context.push_str(&system.git_summary);
-        context.push_str("```\n\n");
+    let date = format!("# Current date\n{}\n\n", user.date);
+    budget.push("current_date", &date);
+    context.push_str(&date);
+
+    let git = if system.git_summary.is_empty() {
+        String::new()
+    } else {
+        bounded_wrapped(
+            "# Git status (snapshot at conversation start)\n```\n",
+            &system.git_summary,
+            "```\n\n",
+            limits.git_chars,
+        )
+    };
+    if !git.is_empty() {
+        budget.push("git_context", &git);
+        context.push_str(&git);
     }
-    if let Some(mem) = memory {
-        context.push_str("<memory>\n");
-        context.push_str(mem);
-        context.push_str("\n</memory>\n");
+
+    if let Some(memory) = memory {
+        let rendered = bounded_wrapped("<memory>\n", memory, "\n</memory>\n", limits.memory_chars);
+        if !rendered.is_empty() {
+            budget.push("memory", &rendered);
+            context.push_str(&rendered);
+        }
     }
     if !context.is_empty() {
         blocks.push(SystemBlock {
@@ -297,15 +519,10 @@ pub fn build_system_blocks_with_profile(
             cache_control: None,
         });
     }
-    blocks
+    (blocks, budget)
 }
 
-/// Rebuild only the uncached context block (Block 2b) with fresh git status.
-/// All blocks carrying `cache_control` are preserved verbatim — this includes
-/// Block 1 (identity + tools + static skills) and Block 2a (NONOCLAW.md +
-/// memory, stable across turns within a run). Dynamically activated skill
-/// metadata is rendered into the rebuilt uncached block, so activations are
-/// visible without touching the cached prefix.
+/// Rebuild only the uncached date/git/memory/dynamic-skill block.
 pub fn refresh_context_block(
     old_blocks: &[SystemBlock],
     system: &SystemContext,
@@ -313,33 +530,57 @@ pub fn refresh_context_block(
     memory: &Option<String>,
     skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
 ) -> Vec<SystemBlock> {
+    refresh_context_block_with_limits(
+        old_blocks,
+        system,
+        user,
+        memory,
+        skills_manager,
+        PromptBuildLimits::default(),
+    )
+}
+
+pub fn refresh_context_block_with_limits(
+    old_blocks: &[SystemBlock],
+    system: &SystemContext,
+    user: &UserContext,
+    memory: &Option<String>,
+    skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
+    limits: PromptBuildLimits,
+) -> Vec<SystemBlock> {
     let mut blocks = Vec::with_capacity(old_blocks.len());
-    // Preserve all cached blocks as-is (Block 1 + Block 2a).
-    for block in old_blocks.iter() {
-        if block.cache_control.is_some() {
-            blocks.push(block.clone());
-        }
+    for block in old_blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+    {
+        blocks.push(block.clone());
     }
-    // Rebuild the uncached block with fresh date + git + memory + dynamic skills.
-    let mut context = String::new();
-    context.push_str(&format!("# Current date\n{}\n\n", user.date));
+
+    let mut context = format!("# Current date\n{}\n\n", user.date);
     if !system.git_summary.is_empty() {
-        context.push_str("# Git status (live)\n```\n");
-        context.push_str(&system.git_summary);
-        context.push_str("```\n\n");
+        context.push_str(&bounded_wrapped(
+            "# Git status (live)\n```\n",
+            &system.git_summary,
+            "```\n\n",
+            limits.git_chars,
+        ));
     }
-    if let Some(mem) = memory {
-        context.push_str("<memory>\n");
-        context.push_str(mem);
-        context.push_str("\n</memory>\n");
+    if let Some(memory) = memory {
+        context.push_str(&bounded_wrapped(
+            "<memory>\n",
+            memory,
+            "\n</memory>\n",
+            limits.memory_chars,
+        ));
     }
-    // Dynamic skill metadata: surfaces activated skills without invalidating
-    // the cached Block 1. (Bodies still load on demand via the Skill tool.)
-    if let Some(mgr) = skills_manager {
-        let dyn_md = mgr.read().unwrap().render_dynamic_skill_metadata();
-        if !dyn_md.is_empty() {
-            context.push_str(&format!("<skills>\n{dyn_md}\n</skills>\n"));
-        }
+    if let Some(manager) = skills_manager {
+        let dynamic = manager.read().unwrap().render_dynamic_skill_metadata();
+        context.push_str(&bounded_wrapped(
+            "<skills>\n",
+            &dynamic,
+            "\n</skills>\n",
+            limits.skill_chars,
+        ));
     }
     if !context.is_empty() {
         blocks.push(SystemBlock {
@@ -359,6 +600,11 @@ pub fn refresh_context_block(
 // MUST stay in sync. `build_system_prompt_sections` composes them back in
 // the original order when `PromptProfile::Full` is selected.
 // ============================================================================
+
+const ULTRA_BASE: &str = r#"You are NonoClaw, an agentic software engineer. Follow user and project instructions, inspect real code before editing, make only necessary changes, and verify results with checks that exercise actual project behavior. Placeholder or no-op commands are not evidence. Never expose secrets or perform destructive/high-risk actions without explicit approval. Continue until the task is complete or genuinely blocked."#;
+
+const ULTRA_TOOL_GUIDANCE: &str =
+    "\nUse advertised tool schemas directly. Use ToolSearch for deferred capabilities.\n";
 
 const IDENTITY: &str = r#"You are NonoClaw, a powerful command-line coding agent. You help users with \
 software engineering tasks by reading, editing, searching, and running code, \
@@ -549,6 +795,7 @@ graph TD
 
 const TASK_COMPLETION: &str = r#"## Task completion
 - When the task is complete, summarise what was done and verify the outcome.
+- Validation must exercise actual project behavior; placeholder or no-op commands are not evidence.
 - Say what you did and why. Precision and honesty about uncertainty is always \
 better than overconfidence about correctness."#;
 
@@ -747,6 +994,7 @@ graph TD
 
 ## Task completion
 - When the task is complete, summarise what was done and verify the outcome.
+- Validation must exercise actual project behavior; placeholder or no-op commands are not evidence.
 - Say what you did and why. Precision and honesty about uncertainty is always \
 better than overconfidence about correctness."#;
 
@@ -833,11 +1081,33 @@ mod tests {
         let cwd = Path::new("/proj");
         let sys = SystemContext::default();
         let tools: Vec<ToolPromptEntry> = vec![];
-        let blocks_a = build_system_blocks(cwd, &sys, &make_user("2026/07/28"), &None, &tools, &None, &None);
-        let blocks_b = build_system_blocks(cwd, &sys, &make_user("2026/07/29"), &None, &tools, &None, &None);
+        let blocks_a = build_system_blocks(
+            cwd,
+            &sys,
+            &make_user("2026/07/28"),
+            &None,
+            &tools,
+            &None,
+            &None,
+        );
+        let blocks_b = build_system_blocks(
+            cwd,
+            &sys,
+            &make_user("2026/07/29"),
+            &None,
+            &tools,
+            &None,
+            &None,
+        );
         assert_eq!(blocks_a.len(), blocks_b.len());
-        assert_eq!(blocks_a[0].text, blocks_b[0].text, "Block 1 must be byte-stable across dates");
-        assert!(blocks_a[0].cache_control.is_some(), "Block 1 must be cached");
+        assert_eq!(
+            blocks_a[0].text, blocks_b[0].text,
+            "Block 1 must be byte-stable across dates"
+        );
+        assert!(
+            blocks_a[0].cache_control.is_some(),
+            "Block 1 must be cached"
+        );
     }
 
     #[test]
@@ -847,8 +1117,14 @@ mod tests {
         let tools: Vec<ToolPromptEntry> = vec![];
         let user = make_user("2099/12/31");
         let blocks = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
-        assert!(!blocks[0].text.contains("2099/12/31"), "Block 1 must not embed the date");
-        assert!(!blocks[0].text.contains("Today's date"), "Block 1 must not mention today's date");
+        assert!(
+            !blocks[0].text.contains("2099/12/31"),
+            "Block 1 must not embed the date"
+        );
+        assert!(
+            !blocks[0].text.contains("Today's date"),
+            "Block 1 must not mention today's date"
+        );
     }
 
     #[test]
@@ -860,12 +1136,25 @@ mod tests {
         let tools: Vec<ToolPromptEntry> = vec![];
         let user = make_user("2026/07/28");
         let blocks = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
-        assert_eq!(blocks.len(), 2, "Block 2 must be present when context is non-empty");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "Block 2 must be present when context is non-empty"
+        );
         let b2 = &blocks[1];
         assert!(b2.cache_control.is_none(), "Block 2 must NOT be cached");
-        assert!(b2.text.contains("# Current date"), "Block 2 must contain the date header");
-        assert!(b2.text.contains("2026/07/28"), "Block 2 must contain the actual date");
-        assert!(b2.text.contains("Current branch: main"), "Block 2 must contain git summary");
+        assert!(
+            b2.text.contains("# Current date"),
+            "Block 2 must contain the date header"
+        );
+        assert!(
+            b2.text.contains("2026/07/28"),
+            "Block 2 must contain the actual date"
+        );
+        assert!(
+            b2.text.contains("Current branch: main"),
+            "Block 2 must contain git summary"
+        );
     }
 
     #[test]
@@ -873,14 +1162,32 @@ mod tests {
         let cwd = Path::new("/proj");
         let sys = SystemContext::default();
         let tools: Vec<ToolPromptEntry> = vec![];
-        let initial = build_system_blocks(cwd, &sys, &make_user("2026/07/28"), &None, &tools, &None, &None);
+        let initial = build_system_blocks(
+            cwd,
+            &sys,
+            &make_user("2026/07/28"),
+            &None,
+            &tools,
+            &None,
+            &None,
+        );
         let block1_text = initial[0].text.clone();
 
         // Simulate a new day: refresh with a new UserContext carrying a new date.
-        let refreshed = refresh_context_block(&initial, &sys, &make_user("2026/07/29"), &None, &None);
-        assert_eq!(refreshed[0].text, block1_text, "refresh must preserve Block 1 verbatim");
-        assert!(refreshed[1].text.contains("2026/07/29"), "refresh must surface the new date in Block 2");
-        assert!(!refreshed[1].text.contains("2026/07/28"), "old date must not linger in Block 2");
+        let refreshed =
+            refresh_context_block(&initial, &sys, &make_user("2026/07/29"), &None, &None);
+        assert_eq!(
+            refreshed[0].text, block1_text,
+            "refresh must preserve Block 1 verbatim"
+        );
+        assert!(
+            refreshed[1].text.contains("2026/07/29"),
+            "refresh must surface the new date in Block 2"
+        );
+        assert!(
+            !refreshed[1].text.contains("2026/07/28"),
+            "old date must not linger in Block 2"
+        );
     }
 
     // ========================================================================
@@ -893,22 +1200,52 @@ mod tests {
         // BASE byte-for-byte. If this fails, the section constants have drifted
         // from the canonical BASE string.
         let composed = build_system_prompt_sections(&PromptProfile::Full);
-        assert_eq!(composed, BASE, "Full profile must match the legacy BASE prompt byte-for-byte");
+        assert_eq!(
+            composed, BASE,
+            "Full profile must match the legacy BASE prompt byte-for-byte"
+        );
     }
 
     #[test]
     fn minimal_profile_only_keeps_identity_safety_task_completion() {
         let composed = build_system_prompt_sections(&PromptProfile::Minimal);
         assert!(composed.contains("You are NonoClaw"), "identity missing");
-        assert!(composed.contains("## Safety and confirmation"), "safety missing");
-        assert!(composed.contains("## Task completion"), "task_completion missing");
-        assert!(!composed.contains("## Code quality"), "code_quality should be excluded");
-        assert!(!composed.contains("## Memory (Mneme"), "memory_guide should be excluded");
-        assert!(!composed.contains("## Wiki"), "wiki_guide should be excluded");
-        assert!(!composed.contains("## Diagrams"), "diagram_guide should be excluded");
-        assert!(!composed.contains("## Common failure modes"), "failure_modes should be excluded");
-        assert!(!composed.contains("## Parallelism"), "parallelism should be excluded");
-        assert!(!composed.contains("## Dependencies"), "dependencies should be excluded");
+        assert!(
+            composed.contains("## Safety and confirmation"),
+            "safety missing"
+        );
+        assert!(
+            composed.contains("## Task completion"),
+            "task_completion missing"
+        );
+        assert!(
+            !composed.contains("## Code quality"),
+            "code_quality should be excluded"
+        );
+        assert!(
+            !composed.contains("## Memory (Mneme"),
+            "memory_guide should be excluded"
+        );
+        assert!(
+            !composed.contains("## Wiki"),
+            "wiki_guide should be excluded"
+        );
+        assert!(
+            !composed.contains("## Diagrams"),
+            "diagram_guide should be excluded"
+        );
+        assert!(
+            !composed.contains("## Common failure modes"),
+            "failure_modes should be excluded"
+        );
+        assert!(
+            !composed.contains("## Parallelism"),
+            "parallelism should be excluded"
+        );
+        assert!(
+            !composed.contains("## Dependencies"),
+            "dependencies should be excluded"
+        );
     }
 
     #[test]
@@ -924,6 +1261,94 @@ mod tests {
             minimal.len(),
             full.len()
         );
+    }
+
+    #[test]
+    fn ultra_profile_omits_redundant_tool_index_and_guidelines() {
+        let mut read = tool("Read", "Reads a file.");
+        read.guidelines = vec!["verbose tool-specific rule".into()];
+        let blocks = build_system_blocks_with_profile(
+            Path::new("/proj"),
+            &SystemContext::default(),
+            &make_user("2026/08/10"),
+            &None,
+            &[read],
+            &None,
+            &None,
+            &PromptProfile::Ultra,
+        );
+        let main = &blocks[0].text;
+        assert!(main.contains("agentic software engineer"));
+        assert!(main.contains("Use ToolSearch for deferred capabilities"));
+        assert!(!main.contains("# Tool usage guide"));
+        assert!(!main.contains("## Available Tools"));
+        assert!(!main.contains("verbose tool-specific rule"));
+        assert!(
+            main.chars().count()
+                < build_system_prompt_sections(&PromptProfile::Minimal)
+                    .chars()
+                    .count()
+        );
+    }
+
+    #[test]
+    fn prompt_partitions_are_hard_bounded_and_fully_attributed() {
+        let mut user = make_user("2026/08/10");
+        user.nonoclaw_md = format!(
+            "<project_context>\n{}\n</project_context>\n",
+            "project-rule ".repeat(100)
+        );
+        let system = SystemContext {
+            git_summary: "git-data ".repeat(100),
+        };
+        let memory = Some("memory-data ".repeat(100));
+        let limits = PromptBuildLimits {
+            system_prompt_chars: 320,
+            skill_chars: 40,
+            project_context_chars: 120,
+            memory_chars: 80,
+            git_chars: 70,
+        };
+        let (blocks, budget) = build_system_blocks_with_profile_measured_and_limits(
+            Path::new("/proj"),
+            &system,
+            &user,
+            &memory,
+            &[tool("Read", "Reads a file.")],
+            &None,
+            &None,
+            &PromptProfile::Ultra,
+            SkillDisclosure::Search,
+            limits.skill_chars,
+            limits,
+        );
+
+        let component = |name: &str| {
+            budget
+                .components
+                .iter()
+                .find(|(component, _)| component == name)
+                .map(|(_, chars)| *chars)
+                .unwrap_or(0)
+        };
+        let main_chars: usize = budget
+            .components
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "project_context" | "current_date" | "git_context" | "memory"
+                )
+            })
+            .map(|(_, chars)| *chars)
+            .sum();
+        assert!(main_chars <= limits.system_prompt_chars);
+        assert!(component("project_context") <= limits.project_context_chars);
+        assert!(component("memory") <= limits.memory_chars);
+        assert!(component("git_context") <= limits.git_chars);
+        let actual: usize = blocks.iter().map(|block| block.text.chars().count()).sum();
+        let attributed: usize = budget.components.iter().map(|(_, chars)| chars).sum();
+        assert_eq!(actual, attributed);
     }
 
     #[test]
@@ -945,12 +1370,43 @@ mod tests {
         // in the declared order.
         let composed = build_system_prompt_sections(&PromptProfile::Full);
         let id_pos = composed.find("You are NonoClaw").expect("identity missing");
-        let cq_pos = composed.find("## Code quality").expect("code_quality missing");
+        let cq_pos = composed
+            .find("## Code quality")
+            .expect("code_quality missing");
         let sa_pos = composed.find("## Safety").expect("safety missing");
-        let tc_pos = composed.find("## Task completion").expect("task_completion missing");
+        let tc_pos = composed
+            .find("## Task completion")
+            .expect("task_completion missing");
         assert!(id_pos < cq_pos, "identity must precede code_quality");
         assert!(cq_pos < sa_pos, "code_quality must precede safety");
         assert!(sa_pos < tc_pos, "safety must precede task_completion");
+    }
+
+    #[test]
+    fn measured_prompt_components_equal_serialized_system_text() {
+        let cwd = Path::new("/proj");
+        let mut sys = SystemContext::default();
+        sys.git_summary = "clean\n".into();
+        let user = make_user("2026/07/28");
+        let tools = vec![tool("Read", "Reads a file.")];
+        let (blocks, budget) = build_system_blocks_with_profile_measured(
+            cwd,
+            &sys,
+            &user,
+            &Some("remember this".into()),
+            &tools,
+            &None,
+            &None,
+            &PromptProfile::Full,
+            SkillDisclosure::All,
+            usize::MAX,
+        );
+        let actual: usize = blocks.iter().map(|block| block.text.chars().count()).sum();
+        let attributed: usize = budget.components.iter().map(|(_, chars)| chars).sum();
+        assert_eq!(
+            attributed, actual,
+            "every system character must be attributed"
+        );
     }
 
     #[test]
@@ -963,7 +1419,14 @@ mod tests {
         let tools: Vec<ToolPromptEntry> = vec![tool("Read", "Reads a file.")];
         let a = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
         let b = build_system_blocks_with_profile(
-            cwd, &sys, &user, &None, &tools, &None, &None, &PromptProfile::Full,
+            cwd,
+            &sys,
+            &user,
+            &None,
+            &tools,
+            &None,
+            &None,
+            &PromptProfile::Full,
         );
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
@@ -981,7 +1444,14 @@ mod tests {
         let user = make_user("2026/07/28");
         let tools: Vec<ToolPromptEntry> = vec![tool("Read", "Reads a file.")];
         let blocks = build_system_blocks_with_profile(
-            cwd, &sys, &user, &None, &tools, &None, &None, &PromptProfile::Minimal,
+            cwd,
+            &sys,
+            &user,
+            &None,
+            &tools,
+            &None,
+            &None,
+            &PromptProfile::Minimal,
         );
         let b1 = &blocks[0].text;
         // Body sections excluded.
@@ -1011,10 +1481,14 @@ mod tests {
         }];
         let blocks = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
         let b1 = &blocks[0].text;
-        assert!(b1.contains("- **Read**: Read a file with optional offset/limit"),
-                "Available Tools must use snippet, got:\n{b1}");
-        assert!(!b1.contains("VERY LONG PROMPT BODY"),
-                "Full prompt body must not leak into Available Tools");
+        assert!(
+            b1.contains("- **Read**: Read a file with optional offset/limit"),
+            "Available Tools must use snippet, got:\n{b1}"
+        );
+        assert!(
+            !b1.contains("VERY LONG PROMPT BODY"),
+            "Full prompt body must not leak into Available Tools"
+        );
     }
 
     #[test]
@@ -1047,7 +1521,10 @@ mod tests {
         ];
         let blocks = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
         let b1 = &blocks[0].text;
-        assert!(b1.contains("## Tool-specific guidance"), "guidelines section missing:\n{b1}");
+        assert!(
+            b1.contains("## Tool-specific guidance"),
+            "guidelines section missing:\n{b1}"
+        );
         assert!(b1.contains("Use Grep instead of rg in Bash"));
         assert!(b1.contains("Quote paths with spaces"));
         assert!(b1.contains("Combine Grep with Read"));
@@ -1086,7 +1563,10 @@ mod tests {
         assert!(b2.contains("<memory>\n"), "must open <memory>: got\n{b2}");
         assert!(b2.contains("fact: user prefers Rust"));
         assert!(b2.contains("</memory>"), "must close </memory>");
-        assert!(!b2.contains("# Memory"), "legacy '# Memory' header must be gone");
+        assert!(
+            !b2.contains("# Memory"),
+            "legacy '# Memory' header must be gone"
+        );
     }
 
     #[test]
@@ -1141,8 +1621,14 @@ mod tests {
         assert!(b1.contains("You are CustomBot"));
         // Default BASE body gone.
         assert!(!b1.contains("You are NonoClaw"), "default identity leaked");
-        assert!(!b1.contains("## Code quality"), "default code_quality leaked");
-        assert!(!b1.contains("## Safety and confirmation"), "default safety leaked");
+        assert!(
+            !b1.contains("## Code quality"),
+            "default code_quality leaked"
+        );
+        assert!(
+            !b1.contains("## Safety and confirmation"),
+            "default safety leaked"
+        );
         // Environment + tool guidance + tools list still appended on top.
         assert!(b1.contains("# Environment"));
         assert!(b1.contains("Working directory: /proj"));
