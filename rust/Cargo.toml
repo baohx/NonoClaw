@@ -40,6 +40,10 @@ anyhow = "1"
 async-trait = "0.1"
 regex = "1"
 glob = "0.3"
+# Pure-Rust BPE tokenizer (OpenAI encodings + DeepSeek/Qwen/Kimi/GLM/Mistral).
+# Bundles all rank tables — no runtime download, exact token counts for known
+# model families.
+tiktoken = "3.8.3"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

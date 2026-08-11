@@ -100,6 +100,10 @@ pub struct RequestParams {
     pub thinking: Option<ThinkingConfig>,
     pub temperature: Option<f64>,
     pub betas: Vec<String>,
+    /// Provider-specific extra body fields, serialized into the OpenAI-format
+    /// payload only (e.g. cache hints such as DeepSeek `prompt_cache`). Never
+    /// contains prompt content — only static provider flags.
+    pub extra_body: Option<serde_json::Value>,
     /// Optional safe trace label used in redacted diagnostics (for example
     /// `sess-abc:turn-3`). It never enables raw prompt persistence.
     pub trace_label: Option<String>,
@@ -190,11 +194,14 @@ impl ApiFormat {
                 thinking: CapabilityStatus::Unsupported {
                     reason: "OpenAI Chat Completions does not expose Anthropic thinking blocks",
                 },
-                cache_usage: CapabilityStatus::Unsupported {
-                    reason: "OpenAI Chat Completions does not expose cache creation usage",
-                },
+                // We count cache hits from the provider's usage report
+                // (`cached_tokens` / DeepSeek `prompt_cache_hit_tokens`).
+                cache_usage: CapabilityStatus::Supported,
+                // No `cache_control` wire field in Chat Completions — caching
+                // is provider-managed (automatic prefix caches at DeepSeek /
+                // vLLM / GLM / Kimi), which our byte-stable payloads feed.
                 prompt_caching: CapabilityStatus::Unsupported {
-                    reason: "OpenAI Chat Completions does not accept Anthropic cache breakpoints",
+                    reason: "OpenAI Chat Completions relies on provider-managed prefix caching (no explicit breakpoints); payload prefixes are kept byte-stable to maximize hits",
                 },
                 images: CapabilityStatus::Supported,
                 tools: CapabilityStatus::Supported,
@@ -1001,6 +1008,13 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
     }
+    if let Some(extra) = &params.extra_body {
+        if let Some(extra_map) = extra.as_object() {
+            for (key, value) in extra_map {
+                body[key] = value.clone();
+            }
+        }
+    }
 
     Ok(serde_json::to_string(&body)?)
 }
@@ -1018,8 +1032,26 @@ struct OpenAiUsage {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct OpenAiPromptTokenDetails {
+    /// OpenAI / vLLM convention: tokens served from a provider-side cache.
     #[serde(default)]
     cached_tokens: u64,
+    /// DeepSeek convention: tokens served from its automatic context cache.
+    #[serde(default, rename = "prompt_cache_hit_tokens")]
+    prompt_cache_hit_tokens: u64,
+    /// DeepSeek convention: tokens that missed the cache (billed at full rate).
+    /// Kept for provider-diagnostic insight; not part of cache-read accounting.
+    #[serde(default, rename = "prompt_cache_miss_tokens")]
+    #[allow(dead_code)]
+    prompt_cache_miss_tokens: u64,
+}
+
+impl OpenAiPromptTokenDetails {
+    /// Tokens read from any provider-side cache, across the field-name
+    /// dialects (`cached_tokens` / `prompt_cache_hit_tokens`). The miss
+    /// counter is kept for budget insight; it is not part of cache reads.
+    fn cache_read_tokens(&self) -> u64 {
+        self.cached_tokens.max(self.prompt_cache_hit_tokens)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1178,7 +1210,7 @@ fn handle_openai_chunk(
             input_tokens: Some(usage.prompt_tokens),
             output_tokens: Some(usage.completion_tokens),
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: Some(usage.prompt_tokens_details.cached_tokens),
+            cache_read_input_tokens: Some(usage.prompt_tokens_details.cache_read_tokens()),
         };
         state.usage.update_from_part(&part);
         on_event(&StreamEvent::MessageDelta {
@@ -1813,6 +1845,7 @@ mod tests {
             thinking: None,
             temperature: None,
             betas: vec![],
+            extra_body: None,
             trace_label: Some("provider-fixture".into()),
         }
     }
@@ -1908,6 +1941,60 @@ mod tests {
         assert_eq!(anthropic["stream"], true);
         assert_eq!(anthropic["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(anthropic["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn openai_cache_strategy_counts_deepseek_hits_and_reports_usage() {
+        // OpenAI-format providers report cache hits under different field
+        // names. DeepSeek: prompt_cache_hit_tokens / prompt_cache_miss_tokens.
+        let mut state = OpenAiState::default();
+        let mut events = Vec::new();
+        let frame = r#"{"id":"x","model":"deepseek-chat","usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}},"choices":[]}"#;
+        let value: serde_json::Value = serde_json::from_str(frame).unwrap();
+        handle_openai_chunk(&value, &mut state, &mut |event| events.push(event.clone())).unwrap();
+        assert_eq!(state.usage.cache_read_input_tokens, 60);
+        assert_eq!(state.usage.input_tokens, 100);
+
+        // Standard OpenAI / vLLM name for the same quantity.
+        let mut state2 = OpenAiState::default();
+        let frame2 = r#"{"id":"y","model":"gpt-4o","usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":70}},"choices":[]}"#;
+        let value2: serde_json::Value = serde_json::from_str(frame2).unwrap();
+        handle_openai_chunk(&value2, &mut state2, &mut |_| {}).unwrap();
+        assert_eq!(state2.usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn openai_cache_strategy_injects_provider_hints_via_extra_body() {
+        let mut params = fixture_params();
+        // DeepSeek-style explicit cache hint (harmless on providers that
+        // ignore it; meaningful on those that honor it).
+        params.extra_body = Some(serde_json::json!({"prompt_cache": true}));
+        let openai: serde_json::Value =
+            serde_json::from_str(&serialize_body_openai(&params).unwrap()).unwrap();
+        assert_eq!(openai["prompt_cache"], true);
+        assert_eq!(openai["stream_options"]["include_usage"], true);
+
+        // The hint must never leak into the Anthropic payload.
+        let anthropic: serde_json::Value =
+            serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
+        assert!(anthropic.get("prompt_cache").is_none());
+    }
+
+    #[test]
+    fn openai_cache_usage_is_reported_as_supported() {
+        let client = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "http://127.0.0.1:1".into(),
+        )
+        .unwrap()
+        .with_format(ApiFormat::OpenAI);
+        assert!(
+            client.capabilities().cache_usage.is_supported(),
+            "cache_usage must be supported for OpenAI-format providers (we count cached tokens)"
+        );
+        // Breakpoints stay unsupported: no cache_control wire field.
+        assert!(!client.capabilities().prompt_caching.is_supported());
     }
 
     #[test]
@@ -2159,6 +2246,7 @@ mod security_tests {
             thinking: None,
             temperature: None,
             betas: vec![],
+            extra_body: None,
             trace_label: Some("fixture/../../trace".into()),
         };
         let encoded = redacted_prompt_metadata(&params).to_string();

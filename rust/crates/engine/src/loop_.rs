@@ -30,12 +30,13 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::SubagentLifecycle;
 use crate::compact::{compact_messages, KEEP_RECENT_TURNS};
 use crate::context::{
-    get_system_context_with_limit, get_user_context_with_limit, load_memory_prompt_with_limit,
+    get_system_context_with_limit, get_user_context_with_limit,
+    load_memory_prompt_with_partitions,
 };
 use crate::run::{RunContext, RunController, RunLimits, RunTerminalStatus};
 use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
 use crate::skills::SkillsManager;
-use crate::tokens::{estimate_total, message_char_len};
+use crate::tokens::{estimate_total_for_model, message_char_len};
 use nonoclaw_tools::BackgroundTaskRegistry;
 
 /// Ratio-based token estimate: scales a known real `tokens_before` by the
@@ -464,7 +465,63 @@ fn prepare_messages_for_request(
 ) -> Vec<Message> {
     let compatible = strip_unsupported_blocks(messages, supports_images);
     let attachment_bounded = limit_attachment_images(&compatible, attachment_max_chars);
-    history_window(&attachment_bounded, history_max_chars)
+    let windowed = history_window(&attachment_bounded, history_max_chars);
+    apply_cache_breakpoints(windowed)
+}
+
+/// Mark stable prefix breakpoints for Anthropic prompt caching.
+///
+/// Anthropic caches the longest matching prefix ending at a `cache_control`
+/// breakpoint. By placing breakpoints at ~50% and ~75% of the conversation
+/// (in addition to the implicit one at the end), we ensure that as the
+/// conversation grows, the older prefix stays cached even when new messages
+/// invalidate the most recent breakpoint.
+///
+/// Only affects Anthropic-format providers; the OpenAI serializer ignores
+/// `cache_control` on content blocks.
+const CACHE_BREAKPOINT_RATIOS: &[f64] = &[0.50, 0.75];
+
+fn apply_cache_breakpoints(mut messages: Vec<Message>) -> Vec<Message> {
+    let len = messages.len();
+    if len < 8 {
+        // Too few messages to benefit from prefix breakpoints.
+        return messages;
+    }
+    for &ratio in CACHE_BREAKPOINT_RATIOS {
+        let idx = (len as f64 * ratio) as usize;
+        if idx >= len {
+            continue;
+        }
+        mark_last_block_cache_control(&mut messages[idx]);
+    }
+    messages
+}
+
+/// Set `cache_control: ephemeral` on the last content block of a message.
+/// Converts `MessageContent::Text` to `Blocks` form so the cache marker
+/// can be attached.
+fn mark_last_block_cache_control(msg: &mut Message) {
+    // Ensure content is in Blocks form so we can tag the last block.
+    if let MessageContent::Text(s) = &msg.content {
+        msg.content = MessageContent::Blocks(vec![ContentBlock::Text {
+            text: s.clone(),
+            cache_control: None,
+        }]);
+    }
+    if let MessageContent::Blocks(blocks) = &mut msg.content {
+        if let Some(last) = blocks.last_mut() {
+            match last {
+                ContentBlock::Text { cache_control, .. } => {
+                    if cache_control.is_none() {
+                        *cache_control = Some(nonoclaw_core::CacheControl {
+                            kind: nonoclaw_core::CacheControlKind::Ephemeral,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn compaction_decision(
@@ -898,6 +955,13 @@ impl Drop for CancelChildrenOnDrop {
 /// semantics of the agent loop (Factor 12). Can be dropped and rebuilt from
 /// `messages` at any time without affecting correctness.
 struct EngineCache {
+    /// Cumulative token usage across all turns in this run. Rebuilt from
+    /// provider-reported per-turn data; does not participate in reducer state.
+    total_usage: Usage,
+    /// Last turn's provider-reported `input_tokens` (full prompt size).
+    /// Used as the primary compact-threshold signal; falls back to the
+    /// chars/4 heuristic when zero (e.g. before the first turn).
+    last_input_tokens: usize,
     /// Background compaction task spawned when tokens reach 80% threshold.
     pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
     /// Message count when background compact was spawned (for correct delta).
@@ -920,8 +984,14 @@ struct EngineCache {
     /// returns identical content to a previous call on the same resource, the
     /// duplicate is replaced with a compact reference to save context tokens.
     /// Keyed by tool-specific resource identifier (e.g. "Read:/path/to/file").
+    /// LRU-bounded by [`TOOL_RESULT_CACHE_MAX`].
     tool_result_cache: std::collections::HashMap<String, ToolResultCacheEntry>,
 }
+
+/// Maximum number of entries in the tool-result dedup cache. Each entry
+/// stores the full content string for comparison, so bounding prevents
+/// unbounded memory growth in very long sessions (200+ turns).
+const TOOL_RESULT_CACHE_MAX: usize = 50;
 
 /// Cached tool result entry for deduplication.
 struct ToolResultCacheEntry {
@@ -953,6 +1023,8 @@ fn tool_resource_key(tool_name: &str, input: &Value) -> Option<String> {
 impl Default for EngineCache {
     fn default() -> Self {
         EngineCache {
+            total_usage: Usage::default(),
+            last_input_tokens: 0,
             pending_compact: None,
             pending_compact_msg_count: 0,
             pending_compact_revision: 0,
@@ -970,11 +1042,6 @@ pub struct QueryEngine {
     todos: Arc<TodoStore>,
     options: EngineOptions,
     messages: Vec<Message>,
-    total_usage: Usage,
-    /// Last turn's provider-reported `input_tokens` (full prompt size).
-    /// Used as the primary compact-threshold signal; falls back to the
-    /// `estimate_total` heuristic when zero (e.g. before the first turn).
-    last_input_tokens: usize,
     session_id: String,
     session: Option<Session>,
     session_revision: u64,
@@ -998,8 +1065,6 @@ impl QueryEngine {
             todos,
             options,
             messages: Vec::new(),
-            total_usage: Usage::default(),
-            last_input_tokens: 0,
             session_id: new_session_id(),
             session: None,
             session_revision: 0,
@@ -1034,8 +1099,6 @@ impl QueryEngine {
             todos,
             options,
             messages,
-            total_usage: Usage::default(),
-            last_input_tokens: 0,
             session_id: session.id().to_string(),
             session: Some(session),
             session_revision: snapshot.revision,
@@ -1223,6 +1286,22 @@ impl QueryEngine {
                 context_budget.memory_tokens,
                 chars_per_token,
             ),
+            memory_beads_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_beads_tokens,
+                chars_per_token,
+            ),
+            memory_facts_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_facts_tokens,
+                chars_per_token,
+            ),
+            memory_wiki_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_wiki_tokens,
+                chars_per_token,
+            ),
+            memory_index_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_index_tokens,
+                chars_per_token,
+            ),
             git_chars: crate::budget::ContextBudget::chars(
                 context_budget.git_tokens,
                 chars_per_token,
@@ -1235,7 +1314,14 @@ impl QueryEngine {
             &self.options.add_dirs,
             prompt_limits.project_context_chars,
         );
-        let memory = load_memory_prompt_with_limit(cwd, prompt_limits.memory_chars);
+        let memory = load_memory_prompt_with_partitions(
+            cwd,
+            prompt_limits.memory_beads_chars,
+            prompt_limits.memory_facts_chars,
+            prompt_limits.memory_wiki_chars,
+            prompt_limits.memory_index_chars,
+            prompt_limits.memory_chars,
+        );
         let allow_filter = if self.options.allowed_tools.is_empty() {
             None
         } else {
@@ -1304,7 +1390,8 @@ impl QueryEngine {
             .collect();
         let (messages_chars, message_components) =
             message_budget_components(&self.messages, self.options.chars_per_token);
-        let estimated_tokens = estimate_total(
+        let estimated_tokens = estimate_total_for_model(
+            Some(&self.options.model),
             &self.messages,
             system_chars,
             tools_chars,
@@ -1735,10 +1822,11 @@ impl QueryEngine {
                 // Use the provider-reported last-turn input_tokens when available;
                 // falls back to the chars/4 heuristic for runs that haven't had
                 // a turn yet (e.g. initial compact check).
-                let est = if self.last_input_tokens > 0 {
-                    self.last_input_tokens
+                let est = if self.cache.last_input_tokens > 0 {
+                    self.cache.last_input_tokens
                 } else {
-                    estimate_total(
+                    estimate_total_for_model(
+                        Some(&self.options.model),
                         &self.messages,
                         system_chars,
                         tools_chars,
@@ -2020,6 +2108,7 @@ impl QueryEngine {
                 thinking: self.options.thinking.clone(),
                 temperature: None,
                 betas: Vec::new(),
+                extra_body: None,
                 trace_label: Some(format!(
                     "{}:{}",
                     &self.session_id[..8.min(self.session_id.len())],
@@ -2038,7 +2127,7 @@ impl QueryEngine {
                 turn: turns_made,
             });
             let requested_model = self.options.model.clone();
-            let usage_before_turn = self.total_usage;
+            let usage_before_turn = self.cache.total_usage;
             let turn = match self
                 .client
                 .run_turn_with_cancel(
@@ -2158,12 +2247,12 @@ impl QueryEngine {
                 }
             };
 
-            self.total_usage.accumulate(&turn.usage);
+            self.cache.total_usage.accumulate(&turn.usage);
             // Track the provider-reported prompt size for precise compact
             // threshold calibration. The per-turn `input_tokens` from Anthropic
             // (before cache deduction) is the full prompt token count — much
             // more accurate than the chars/4 heuristic (~20-30% off).
-            self.last_input_tokens = turn.usage.input_tokens as usize;
+            self.cache.last_input_tokens = turn.usage.input_tokens as usize;
             on_event(&RunEvent::UsageUpdated {
                 turn: turns_made,
                 turn_usage: UsagePart {
@@ -2172,7 +2261,7 @@ impl QueryEngine {
                     cache_creation_input_tokens: Some(turn.usage.cache_creation_input_tokens),
                     cache_read_input_tokens: Some(turn.usage.cache_read_input_tokens),
                 },
-                total: self.total_usage,
+                total: self.cache.total_usage,
                 max_budget_usd: self.options.max_budget_usd,
             });
             last_stop = turn.stop_reason.clone();
@@ -2451,6 +2540,18 @@ impl QueryEngine {
                                 }
                             }
                             // Cache this result for future dedup.
+                            // Evict oldest entry if at capacity (LRU by turn).
+                            if self.cache.tool_result_cache.len() >= TOOL_RESULT_CACHE_MAX {
+                                if let Some(evict_key) = self
+                                    .cache
+                                    .tool_result_cache
+                                    .iter()
+                                    .min_by_key(|(_, e)| e.turn)
+                                    .map(|(k, _)| k.clone())
+                                {
+                                    self.cache.tool_result_cache.remove(&evict_key);
+                                }
+                            }
                             self.cache.tool_result_cache.insert(
                                 key,
                                 ToolResultCacheEntry {
@@ -2545,11 +2646,11 @@ impl QueryEngine {
             reason: format!("{finish_reason:?}"),
             duration_ms: run_started_at.elapsed().as_millis() as u64,
             turns: turns_made,
-            usage: self.total_usage,
+            usage: self.cache.total_usage,
         });
         Ok(FinalResult {
             text: final_text,
-            usage: self.total_usage,
+            usage: self.cache.total_usage,
             turns: turns_made,
             stop_reason: last_stop,
             finish_reason,
@@ -2572,7 +2673,7 @@ impl QueryEngine {
 
     /// Cumulative token usage across the run so far (for `/cost`).
     pub fn total_usage(&self) -> Usage {
-        self.total_usage
+        self.cache.total_usage
     }
 
     /// Names of all registered tools (for `/tools`).
@@ -2953,6 +3054,16 @@ impl SubagentRunner for EngineSubagent {
                         Ok(result.text)
                     }
                     .await;
+
+                    // Persist a minimal subagent session log (Factor 8) so
+                    // child agent activity is auditable after the run. Written
+                    // to <project_dir>/subagent_logs.jsonl (append-only).
+                    let _ = log_subagent_session(
+                        &self.cwd,
+                        &request,
+                        &outcome,
+                        subagent_started.elapsed(),
+                    );
                     let visible_result = outcome
                         .as_deref()
                         .unwrap_or("subagent ended without a result");
@@ -3027,6 +3138,69 @@ impl GraphRunner for EngineSubagent {
             Ok(result.text)
         })
     }
+}
+
+/// Append a subagent session log entry to `<project_dir>/subagent_logs.jsonl`.
+/// Each line is a JSON object with description, prompt preview, result, status,
+/// and duration. Best-effort — failures are silently ignored.
+fn log_subagent_session(
+    cwd: &std::path::Path,
+    request: &SubagentRequest,
+    outcome: &std::result::Result<String, nonoclaw_core::Error>,
+    elapsed: std::time::Duration,
+) -> std::io::Result<()> {
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct LogEntry<'a> {
+        timestamp_ms: u64,
+        description: &'a str,
+        profile: Option<&'a str>,
+        prompt_preview: String,
+        result: &'a str,
+        status: &'static str,
+        error: Option<String>,
+        elapsed_ms: u64,
+        parent_session_id: String,
+    }
+
+    let Some(log_dir) = crate::session::project_dir(cwd) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("subagent_logs.jsonl");
+
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let prompt_preview: String = request.prompt.chars().take(500).collect();
+    let (result_text, status, error) = match outcome {
+        Ok(text) => (text.as_str(), "done", None),
+        Err(e) => ("", "error", Some(format!("{e}"))),
+    };
+
+    let entry = LogEntry {
+        timestamp_ms,
+        description: &request.description,
+        profile: request.profile.as_deref(),
+        prompt_preview,
+        result: result_text,
+        status,
+        error,
+        elapsed_ms: elapsed.as_millis() as u64,
+        parent_session_id: String::new(), // not available in this context
+    };
+
+    let line = serde_json::to_string(&entry).unwrap_or_default();
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
 }
 
 /// Strip `thinking` blocks from every message so they aren't sent back to
@@ -3617,6 +3791,22 @@ mod tests {
                 context_budget.memory_tokens,
                 chars_per_token,
             ),
+            memory_beads_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_beads_tokens,
+                chars_per_token,
+            ),
+            memory_facts_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_facts_tokens,
+                chars_per_token,
+            ),
+            memory_wiki_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_wiki_tokens,
+                chars_per_token,
+            ),
+            memory_index_chars: crate::budget::ContextBudget::chars(
+                context_budget.memory_index_tokens,
+                chars_per_token,
+            ),
             git_chars: crate::budget::ContextBudget::chars(
                 context_budget.git_tokens,
                 chars_per_token,
@@ -3646,7 +3836,7 @@ mod tests {
             .sum::<usize>();
         let messages = vec![Message::user(MessageContent::from_text("hello"))];
         let estimated_tokens =
-            estimate_total(&messages, system_chars, tools_chars, chars_per_token);
+            estimate_total_for_model(None, &messages, system_chars, tools_chars, chars_per_token);
         let static_skill_chars = breakdown
             .components
             .iter()
@@ -4565,5 +4755,51 @@ mod tests {
                       // Indirectly verify via QueryEngine::new: the cache starts empty.
                       // (Direct field access from tests is fine because they're in the same
                       // crate; see the struct definition for the field.)
+    }
+
+    #[test]
+    fn cache_breakpoints_added_for_long_conversations() {
+        use nonoclaw_core::ContentBlock;
+        // Build 20 messages (10 turns of user→assistant).
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let text = format!("message {i} from {role}");
+            messages.push(Message {
+                role: if i % 2 == 0 { Role::User } else { Role::Assistant },
+                content: MessageContent::from_text(text),
+            });
+        }
+        let result = apply_cache_breakpoints(messages);
+        // Should have breakpoints at 50% (idx 10) and 75% (idx 15).
+        let check_idx = |idx: usize| -> bool {
+            if let MessageContent::Blocks(blocks) = &result[idx].content {
+                if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
+                    return cache_control.is_some();
+                }
+            }
+            false
+        };
+        assert!(check_idx(10), "50% breakpoint at idx 10 must be cached");
+        assert!(check_idx(15), "75% breakpoint at idx 15 must be cached");
+        // Non-breakpoint messages should NOT have cache_control.
+        assert!(!check_idx(5), "idx 5 should not have cache_control");
+    }
+
+    #[test]
+    fn cache_breakpoints_skipped_for_short_conversations() {
+        // 4 messages — too short for breakpoints.
+        let messages: Vec<Message> = (0..4)
+            .map(|i| Message::user(MessageContent::from_text(format!("msg {i}"))))
+            .collect();
+        let result = apply_cache_breakpoints(messages);
+        // No message should have cache_control.
+        for msg in &result {
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
+                    assert!(cache_control.is_none(), "short conversation should not get breakpoints");
+                }
+            }
+        }
     }
 }

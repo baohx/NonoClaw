@@ -104,6 +104,16 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} />
 
         <Section
+          id="cache"
+          label="Cache"
+          count={null}
+          open={open.has("cache")}
+          onToggle={toggle}
+        >
+          <CacheSection />
+        </Section>
+
+        <Section
           id="skills"
           label="Skills"
           count={info?.skills.length ?? 0}
@@ -506,6 +516,66 @@ function ModelsSection({ open, onToggle }: { open: boolean; onToggle: () => void
         })}
       </div>
     </Section>
+  );
+}
+
+// ── Cache hit-rate visualization ─────────────────────────────────────────────
+
+function CacheSection() {
+  const input = useStore((s) => s.inputTokens);
+  const output = useStore((s) => s.outputTokens);
+  const cacheRead = useStore((s) => s.cacheReadTokens);
+  const cacheWrite = useStore((s) => s.cacheWriteTokens);
+
+  if (input <= 0 && output <= 0) {
+    return (
+      <div className="cache">
+        <div className="cache__empty">
+          No token data yet — run a query to see cache hit rate.
+        </div>
+      </div>
+    );
+  }
+
+  // Anthropic/OpenAI `input_tokens` includes tokens served from cache, so the
+  // hit rate is the fraction of input tokens read from cache.
+  const hit = Math.min(cacheRead, input);
+  const write = Math.min(cacheWrite, input - hit);
+  const miss = Math.max(input - hit - write, 0);
+  const total = Math.max(hit + write + miss, 1);
+  const hitRate = (hit / total) * 100;
+  const fmt = (n: number) => n.toLocaleString();
+  const seg = (n: number, cls: string) =>
+    n > 0 ? <div className={`cache__seg ${cls}`} style={{ width: `${(n / total) * 100}%` }} /> : null;
+
+  return (
+    <div className="cache">
+      <div className="cache__head">
+        <span className="cache__head-label">session totals</span>
+        <span className={`cache__pct${hitRate === 0 ? " zero" : ""}`}>
+          {hitRate.toFixed(1)}% hit
+        </span>
+      </div>
+      <div className="cache__bar">
+        {seg(hit, "cache__seg--hit")}
+        {seg(write, "cache__seg--write")}
+        {seg(miss, "cache__seg--miss")}
+      </div>
+      <div className="cache__legend">
+        <span className="cache__legend-item">
+          <i className="cache__legend-dot cache__legend-dot--hit" /> hit {fmt(hit)}
+        </span>
+        <span className="cache__legend-item">
+          <i className="cache__legend-dot cache__legend-dot--write" /> write {fmt(write)}
+        </span>
+        <span className="cache__legend-item">
+          <i className="cache__legend-dot cache__legend-dot--miss" /> miss {fmt(miss)}
+        </span>
+      </div>
+      <div className="insight-row__meta" style={{ marginTop: 2 }}>
+        in {fmt(input)} · out {fmt(output)} · cache r/w {fmt(cacheRead)}/{fmt(cacheWrite)}
+      </div>
+    </div>
   );
 }
 

@@ -231,9 +231,42 @@ pub fn load_memory_prompt(cwd: &Path) -> Option<String> {
 }
 
 /// Load memory in importance-first order under a hard character limit.
+/// The single `max_chars` budget is split into the legacy proportions
+/// (beads 20%, facts 20%, wiki 10%, index 50% — matching the pre-partition
+/// hard-coded 20K/20K/5K/25K allocation under the 50K cap).
 pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<String> {
     let max_chars = max_chars.min(LEGACY_MEMORY_MAX);
     if max_chars == 0 {
+        return None;
+    }
+    load_memory_prompt_with_partitions(
+        cwd,
+        max_chars * 2 / 10,
+        max_chars * 2 / 10,
+        max_chars / 10,
+        max_chars * 5 / 10,
+        max_chars,
+    )
+}
+
+/// Load memory under **independent per-partition budgets**, so a huge wiki
+/// index can never crowd out facts, or a fact dump the beads. Partitions:
+///
+/// - `beads_chars` — active-task beads (task continuity)
+/// - `facts_chars` — importance-ranked facts
+/// - `wiki_chars` — LLM-Wiki index preview
+/// - `index_chars` — legacy MEMORY.md + per-file entries
+/// - `total_chars` — hard cap over the whole rendered block (≤ 50K legacy cap)
+pub fn load_memory_prompt_with_partitions(
+    cwd: &Path,
+    beads_chars: usize,
+    facts_chars: usize,
+    wiki_chars: usize,
+    index_chars: usize,
+    total_chars: usize,
+) -> Option<String> {
+    let total_chars = total_chars.min(LEGACY_MEMORY_MAX);
+    if total_chars == 0 {
         return None;
     }
     let mem_dir = cwd.join(".nonoclaw/memory");
@@ -243,10 +276,11 @@ pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<Str
 
     let mut buf = String::new();
     let beads = nonoclaw_tools::memory::load_beads(cwd);
-    let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads)
-        .into_iter()
-        .take(5)
-        .collect();
+    let active: Vec<&nonoclaw_tools::memory::Bead> =
+        nonoclaw_tools::memory::active_beads(&beads)
+            .into_iter()
+            .take(5)
+            .collect();
     let facts = nonoclaw_tools::memory::load_facts(cwd);
     let mut top_facts: Vec<&nonoclaw_tools::memory::Fact> = facts.iter().collect();
     top_facts.sort_by(|left, right| {
@@ -258,10 +292,11 @@ pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<Str
     top_facts.truncate(10);
 
     if !active.is_empty() || !top_facts.is_empty() {
-        let context = nonoclaw_tools::memory::render_memory_context(
+        let context = nonoclaw_tools::memory::render_memory_partitioned(
             &active,
             &top_facts,
-            20_000.min(max_chars),
+            beads_chars,
+            facts_chars,
         );
         if !context.is_empty() {
             buf.push_str(&context);
@@ -269,57 +304,72 @@ pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<Str
         }
     }
 
-    if buf.chars().count() < max_chars {
+    if buf.chars().count() < total_chars && wiki_chars > 0 {
         if let Some(wiki_index) = nonoclaw_tools::memory::load_wiki_index(cwd) {
-            let preview = truncate_chars(&wiki_index, 5000.min(max_chars));
+            let preview = truncate_chars(&wiki_index, wiki_chars);
             buf.push_str("## Knowledge Base (Wiki Index)\n\n");
             buf.push_str(&preview);
             buf.push_str("\n\n---\n\n");
         }
     }
 
-    if buf.chars().count() < max_chars {
+    if buf.chars().count() < total_chars && index_chars > 0 {
+        // MEMORY.md and per-file entries share the `index_chars` partition.
+        let mut index_used = 0usize;
         let index_path = mem_dir.join("MEMORY.md");
         if let Some(index) = read_optional(&index_path) {
-            let trimmed = truncate_chars(&index, 25_000.min(max_chars));
+            let trimmed = truncate_chars(&index, index_chars);
             let lines: Vec<&str> = trimmed.lines().take(200).collect();
             if !lines.is_empty() {
-                buf.push_str(&lines.join("\n"));
-                buf.push_str("\n\n");
+                let block = format!("{}\n\n", lines.join("\n"));
+                let block_chars = block.chars().count();
+                if index_used + block_chars <= index_chars {
+                    buf.push_str(&block);
+                    index_used += block_chars;
+                } else if index_used < index_chars {
+                    buf.push_str(&truncate_chars(&block, index_chars - index_used));
+                    index_used = index_chars;
+                }
             }
         }
-    }
 
-    if buf.chars().count() < max_chars {
-        if let Ok(entries) = std::fs::read_dir(&mem_dir) {
-            let mut paths: Vec<std::path::PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| extension == "md")
-                        .unwrap_or(false)
-                        && path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map(|name| name != "MEMORY.md")
+        if index_used < index_chars {
+            if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+                let mut paths: Vec<std::path::PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .and_then(|extension| extension.to_str())
+                            .map(|extension| extension == "md")
                             .unwrap_or(false)
-                })
-                .collect();
-            paths.sort();
-            for path in &paths {
-                if buf.chars().count() >= max_chars {
-                    break;
-                }
-                if let Some(content) = read_optional(path) {
-                    let fact = strip_frontmatter(&content);
-                    if !fact.trim().is_empty() {
-                        let name = path
-                            .file_stem()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("fact");
-                        buf.push_str(&format!("**{name}**: {fact}\n\n"));
+                            && path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(|name| name != "MEMORY.md")
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                paths.sort();
+                for path in &paths {
+                    if buf.chars().count() >= total_chars || index_used >= index_chars {
+                        break;
+                    }
+                    if let Some(content) = read_optional(path) {
+                        let fact = strip_frontmatter(&content);
+                        if !fact.trim().is_empty() {
+                            let name = path
+                                .file_stem()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("fact");
+                            let line = format!("**{name}**: {fact}\n\n");
+                            let line_chars = line.chars().count();
+                            if index_used + line_chars > index_chars {
+                                break;
+                            }
+                            buf.push_str(&line);
+                            index_used += line_chars;
+                        }
                     }
                 }
             }
@@ -330,7 +380,7 @@ pub fn load_memory_prompt_with_limit(cwd: &Path, max_chars: usize) -> Option<Str
     if trimmed.is_empty() {
         None
     } else {
-        Some(hard_limit_chars(trimmed, max_chars))
+        Some(hard_limit_chars(trimmed, total_chars))
     }
 }
 
@@ -386,6 +436,101 @@ mod tests {
         let t = truncate_chars(&big, 5);
         assert!(t.contains("truncated"));
         assert!(t.starts_with("xxxxx"));
+    }
+
+    #[test]
+    fn memory_partitions_are_independent() {
+        let root = std::env::temp_dir().join(format!(
+            "nonoclaw-memory-partitions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join(".nonoclaw/memory")).unwrap();
+        std::fs::create_dir_all(root.join(".nonoclaw/wiki")).unwrap();
+        // A huge MEMORY.md index + huge wiki index that would crowd out the
+        // facts section if the budget were shared.
+        std::fs::write(
+            root.join(".nonoclaw/memory/MEMORY.md"),
+            format!("HUGELINE {}\n", "z".repeat(5000)),
+        )
+        .unwrap();
+        let fact_a = nonoclaw_tools::memory::Fact {
+            name: "fact-a".into(),
+            title: "Fact A".into(),
+            content: "Fact A body content that must survive a tiny wiki/index budget.".into(),
+            fact_type: nonoclaw_tools::memory::FactType::General,
+            importance: 0.9,
+            confidence: 0.9,
+            created: String::new(),
+            updated: String::new(),
+            sources: vec![],
+            supersedes: None,
+            tags: vec![],
+        };
+        fact_a.save(&root).unwrap();
+        std::fs::write(
+            root.join(".nonoclaw/wiki/index.md"),
+            "Wiki index line ".repeat(2000),
+        )
+        .unwrap();
+
+        // Facts partition gets its own budget even when wiki/index are tiny.
+        let loaded = load_memory_prompt_with_partitions(&root, 200, 4000, 50, 50, 20_000)
+            .unwrap_or_default();
+        assert!(
+            loaded.contains("Fact A"),
+            "facts partition must survive a tiny wiki/index budget: {}",
+            &loaded[..loaded.len().min(120)]
+        );
+
+        // And beads-only budget cannot be flooded by facts: with facts budget
+        // 0 the facts section is absent while beads still render.
+        let bead = nonoclaw_tools::memory::Bead {
+            id: "bead-1".into(),
+            title: "Fix timeout".into(),
+            status: nonoclaw_tools::memory::BeadStatus::InProgress,
+            priority: 8,
+            created: String::new(),
+            updated: String::new(),
+            session: "sess-1".into(),
+            content: "Investigating login timeout.".into(),
+        };
+        bead.save(&root).unwrap();
+        let no_facts =
+            load_memory_prompt_with_partitions(&root, 400, 0, 0, 0, 20_000).unwrap_or_default();
+        assert!(
+            no_facts.contains("Fix timeout") && !no_facts.contains("Fact A"),
+            "beads must render under their own partition: {}",
+            &no_facts[..no_facts.len().min(120)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_memory_limit_preserves_behaviour() {
+        // The single-limit wrapper still caps total size at `max_chars`.
+        let root = std::env::temp_dir().join(format!(
+            "nonoclaw-memory-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join(".nonoclaw/memory")).unwrap();
+        let fact_b = nonoclaw_tools::memory::Fact {
+            name: "fact-b".into(),
+            title: "Fact B".into(),
+            content: "b".repeat(2000),
+            fact_type: nonoclaw_tools::memory::FactType::General,
+            importance: 0.5,
+            confidence: 0.5,
+            created: String::new(),
+            updated: String::new(),
+            sources: vec![],
+            supersedes: None,
+            tags: vec![],
+        };
+        fact_b.save(&root).unwrap();
+        let loaded = load_memory_prompt_with_limit(&root, 512);
+        assert!(loaded.is_some());
+        assert!(loaded.unwrap().chars().count() <= 512);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

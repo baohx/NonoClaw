@@ -134,7 +134,7 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
     },
     ConfigFieldReference {
         name: "contextBudget",
-        description: "Per-partition token caps for system prompt, schemas, skills, project rules, memory, git, tool results, history, and attachments.",
+        description: "Per-partition token caps for system prompt, schemas, skills, project rules, memory (with independent beads/facts/wiki/index sub-partitions), git, tool results, history, and attachments.",
     },
     ConfigFieldReference {
         name: "promptProfile",
@@ -2920,6 +2920,10 @@ fn diagnose_unknown_fields(
             "skillIndexTokens",
             "projectRulesTokens",
             "memoryTokens",
+            "memoryBeadsTokens",
+            "memoryFactsTokens",
+            "memoryWikiTokens",
+            "memoryIndexTokens",
             "gitTokens",
             "singleToolResultTokens",
             "historyTokens",

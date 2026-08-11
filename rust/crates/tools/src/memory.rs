@@ -219,8 +219,9 @@ pub fn active_beads(beads: &[Bead]) -> Vec<&Bead> {
 
 // ── Retrieval ───────────────────────────────────────────────────────────────
 
-/// Simple BM25-ish search over facts.  Returns facts sorted by relevance.
-/// The model can then rank/select using its own intelligence.
+/// Hybrid search over facts: vector (trigram) similarity first, BM25 lexical
+/// score as a secondary signal, importance as a final tiebreak. Returns facts
+/// sorted by relevance.
 pub fn search_facts<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a Fact> {
     if query.trim().is_empty() {
         return facts.iter().take(limit).collect();
@@ -231,19 +232,23 @@ pub fn search_facts<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|t| !t.is_empty())
         .collect();
-    if terms.is_empty() {
-        return facts.iter().take(limit).collect();
-    }
+
+    let vector_hits: std::collections::HashMap<String, f64> = VectorIndex::build(facts)
+        .search(query, limit.saturating_mul(3))
+        .into_iter()
+        .collect();
+
     let mut scored: Vec<(f64, &Fact)> = facts
         .iter()
-        .map(|f| {
+        .filter_map(|f| {
             let text =
                 format!("{} {} {} {}", f.name, f.title, f.content, f.tags.join(" ")).to_lowercase();
-            let mut score = 0.0f64;
+            // Vector similarity (0 when the fact shares no trigrams with query).
+            let vec_score = vector_hits.get(&f.name).copied().unwrap_or(0.0);
+            // BM25-ish lexical score (TF × IDF approximation).
+            let mut lexical = 0.0f64;
             for term in &terms {
-                // Count occurrences of term in text (simple TF).
                 let count = text.matches(term.as_str()).count() as f64;
-                // IDF approximation: rarer terms score higher.
                 let df = facts
                     .iter()
                     .filter(|f2| {
@@ -259,13 +264,15 @@ pub fn search_facts<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a
                     })
                     .count() as f64;
                 let idf = ((facts.len() as f64 + 1.0) / (df + 0.5)).ln();
-                score += count * idf;
+                lexical += count * idf;
             }
-            // Boost by importance.
-            score *= 1.0 + f.importance;
-            (score, f)
+            let score = vec_score * 2.0 + lexical;
+            if score <= 0.0 {
+                return None;
+            }
+            // Importance boost breaks ties between near-identical relevance.
+            Some((score * (1.0 + f.importance), f))
         })
-        .filter(|(s, _)| *s > 0.0)
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().take(limit).map(|(_, f)| f).collect()
@@ -399,6 +406,212 @@ pub fn extract_facts_from_transcript() -> Vec<Fact> {
 /// Build beads from session state (v1: model-initiated).
 pub fn beads_from_session() -> Vec<Bead> {
     Vec::new()
+}
+
+// ── Vector store (local, deterministic, dependency-free) ───────────────────
+//
+// Facts (and wiki pages) are embedded into fixed-dimension vectors via feature
+// hashing over character trigrams, then searched by cosine similarity. This is
+// a real vector store: deterministic, offline, no embedding API, no external
+// crates. Persisted to `.nonoclaw/memory/.vector_index.json` and invalidated by
+// a content hash so edits to a fact are picked up on the next build.
+
+/// Embedding dimensionality. 256 dims is a good accuracy/size trade-off for
+/// short markdown facts (each trigram hashes into one of 256 slots).
+pub const VECTOR_DIM: usize = 256;
+
+/// Cosine floor below which a hit is treated as hashing noise. With sign
+/// hashing into 256 dims, unrelated texts land around 1/sqrt(256) ≈ 0.06;
+/// genuine trigram overlap clears 0.1 comfortably (measured ~0.46 for a
+/// 3-token query against a matching fact).
+pub const VECTOR_NOISE_FLOOR: f64 = 0.1;
+
+/// Stable FNV-1a 64-bit hash — deterministic across Rust versions (unlike
+/// `DefaultHasher`), so persisted vectors stay valid.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Character-trigram features of a padded string (2 spaces each side) so even
+/// 1-2 char queries produce at least one trigram.
+fn trigram_features(text: &str) -> Vec<String> {
+    let padded = format!("  {text}  ");
+    let chars: Vec<char> = padded.chars().collect();
+    (0..chars.len().saturating_sub(2))
+        .map(|i| chars[i..i + 3].iter().collect())
+        .collect()
+}
+
+/// Embed text into a fixed-dimension L2-normalized vector via hashed
+/// character-trigram features (bag-of-trigrams, sign hashing for ±1 weights).
+pub fn embed(text: &str) -> Vec<f64> {
+    let mut vec = vec![0.0f64; VECTOR_DIM];
+    let lower = text.to_lowercase();
+    if lower.is_empty() {
+        // No features — zero vector (cosine 0, never NaN). The padding in
+        // `trigram_features` would otherwise fabricate whitespace trigrams.
+        return vec;
+    }
+    for feature in trigram_features(&lower) {
+        let hash = fnv1a(feature.as_bytes());
+        let idx = (hash % VECTOR_DIM as u64) as usize;
+        let sign = if hash & 1 == 0 { 1.0 } else { -1.0 };
+        vec[idx] += sign;
+    }
+    // L2-normalize (empty text → zero vector stays zero).
+    let norm: f64 = vec.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for v in &mut vec {
+            *v /= norm;
+        }
+    }
+    vec
+}
+
+/// Cosine similarity between two L2-normalized vectors.
+pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// A persisted vector index over facts. Maps each fact name → embedding plus
+/// the content hash used for invalidation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorIndex {
+    pub dim: usize,
+    pub facts: Vec<IndexedVector>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedVector {
+    pub name: String,
+    /// FNV-1a of the embedded text — a fact whose content changed re-embeds.
+    pub content_hash: u64,
+    pub vector: Vec<f64>,
+}
+
+impl VectorIndex {
+    /// Build (or rebuild) an index from facts. The index includes all facts;
+    /// `superseded_by` facts are excluded by callers via `active_facts`.
+    pub fn build(facts: &[Fact]) -> Self {
+        let entries = facts
+            .iter()
+            .map(|f| {
+                let text = fact_embed_text(f);
+                IndexedVector {
+                    name: f.name.clone(),
+                    content_hash: fnv1a(text.as_bytes()),
+                    vector: embed(&text),
+                }
+            })
+            .collect();
+        VectorIndex {
+            dim: VECTOR_DIM,
+            facts: entries,
+        }
+    }
+
+    /// Cosine-search the index, returning `(fact_name, score)` descending.
+    /// Hits below [`VECTOR_NOISE_FLOOR`] are discarded as hashing noise.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<(String, f64)> {
+        let query_vec = embed(query);
+        let mut scored: Vec<(String, f64)> = self
+            .facts
+            .iter()
+            .map(|entry| {
+                let score = cosine_similarity(&query_vec, &entry.vector);
+                (entry.name.clone(), score)
+            })
+            .filter(|(_, score)| *score > VECTOR_NOISE_FLOOR)
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(limit).collect()
+    }
+}
+
+/// Text that gets embedded for a fact: name + title + body + tags.
+fn fact_embed_text(f: &Fact) -> String {
+    format!("{} {} {} {}", f.name, f.title, f.content, f.tags.join(" "))
+}
+
+/// Location of the persisted vector index.
+pub fn vector_index_path(cwd: &Path) -> std::path::PathBuf {
+    cwd.join(".nonoclaw/memory/.vector_index.json")
+}
+
+/// Load the persisted index, rebuilding + saving when stale or missing.
+///
+/// Invalidation is content-hash based: the stored per-fact hash must match
+/// the current text hash for every fact, otherwise the index is rebuilt.
+pub fn load_or_build_vector_index(cwd: &Path, facts: &[Fact]) -> VectorIndex {
+    let path = vector_index_path(cwd);
+    let mut expected: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for fact in facts {
+        expected.insert(fact.name.as_str(), fnv1a(fact_embed_text(fact).as_bytes()));
+    }
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(index) = serde_json::from_str::<VectorIndex>(&raw) {
+            let fresh = index.dim == VECTOR_DIM
+                && index.facts.len() == facts.len()
+                && index.facts.iter().all(|entry| {
+                    expected
+                        .get(entry.name.as_str())
+                        .map(|hash| *hash == entry.content_hash)
+                        .unwrap_or(false)
+                });
+            if fresh {
+                return index;
+            }
+        }
+    }
+    let index = VectorIndex::build(facts);
+    if std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).is_ok() {
+        if let Ok(json) = serde_json::to_string(&index) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+    index
+}
+
+/// Search facts by vector similarity, boosted by `importance` (mirrors the
+/// hybrid rank used by the BM25 path: relevance first, importance breaks ties).
+pub fn search_facts_vector<'a>(
+    facts: &'a [Fact],
+    query: &str,
+    limit: usize,
+) -> Vec<&'a Fact> {
+    if query.trim().is_empty() {
+        return facts.iter().take(limit).collect();
+    }
+    let index = VectorIndex::build(facts);
+    let by_name: std::collections::HashMap<&str, &Fact> =
+        facts.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut scored: Vec<(f64, &Fact)> = index
+        .search(query, limit.saturating_mul(3))
+        .into_iter()
+        .filter_map(|(name, score)| by_name.get(name.as_str()).map(|f| (score, *f)))
+        .map(|(score, f)| (score * (1.0 + f.importance), f))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(limit).map(|(_, f)| f).collect()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -606,18 +819,30 @@ pub fn search_wiki<'a>(pages: &'a [WikiPage], query: &str, limit: usize) -> Vec<
 // ── Context rendering ───────────────────────────────────────────────────────
 
 /// Render active beads + top facts as a compact context block suitable for
-/// injection into the system prompt. Capped at ~50 KB.
+/// injection into the system prompt. Capped at ~50 KB. Both sections share
+/// `max_chars` (beads get at most half).
 pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize) -> String {
+    render_memory_partitioned(beads, facts, max_chars / 2, max_chars)
+}
+
+/// Render beads and facts under **independent** character caps, so one section
+/// can never crowd out the other. Empty sections are skipped entirely.
+pub fn render_memory_partitioned(
+    beads: &[&Bead],
+    facts: &[&Fact],
+    beads_max_chars: usize,
+    facts_max_chars: usize,
+) -> String {
     let mut out = String::new();
     let mut chars = 0usize;
 
     // Active beads first — they're critical for task continuity.
-    if !beads.is_empty() {
+    if !beads.is_empty() && beads_max_chars > 0 {
         let header = "## Active Tasks (beads)\n\n";
         out.push_str(header);
         chars += header.len();
         for (i, b) in beads.iter().enumerate() {
-            if i >= 5 || chars >= max_chars / 2 {
+            if i >= 5 || chars >= beads_max_chars {
                 break;
             }
             let status_icon = match b.status {
@@ -633,7 +858,7 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
                 ctx = truncate_words(&b.content, 50),
             );
             chars += line.len();
-            if chars > max_chars {
+            if chars > beads_max_chars {
                 break;
             }
             out.push_str(&line);
@@ -647,12 +872,12 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
             .partial_cmp(&a.importance)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    if !sorted_facts.is_empty() {
+    if !sorted_facts.is_empty() && facts_max_chars > 0 {
         let header = "## Key Facts\n\n";
         out.push_str(header);
         chars += header.len();
         for (i, f) in sorted_facts.iter().enumerate() {
-            if i >= 10 || chars >= max_chars {
+            if i >= 10 || chars >= facts_max_chars {
                 break;
             }
             let line = format!(
@@ -662,7 +887,7 @@ pub fn render_memory_context(beads: &[&Bead], facts: &[&Fact], max_chars: usize)
                 body = truncate_words(&f.content, 30),
             );
             chars += line.len();
-            if chars > max_chars {
+            if chars > facts_max_chars {
                 break;
             }
             out.push_str(&line);
@@ -763,6 +988,131 @@ mod tests {
         let results = search_facts(&facts, "pip", 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "pip-mirror");
+    }
+
+    #[test]
+    fn vector_embed_is_deterministic_and_normalized() {
+        let a = embed("Always use tsinghua mirror for pip installs.");
+        let b = embed("Always use tsinghua mirror for pip installs.");
+        assert_eq!(a.len(), VECTOR_DIM);
+        assert_eq!(a, b, "same text must embed identically");
+        let norm: f64 = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-9, "L2 norm should be 1, got {norm}");
+        // Empty text → zero vector (cosine = 0, never NaN).
+        assert_eq!(embed("").iter().sum::<f64>(), 0.0);
+    }
+
+    #[test]
+    fn vector_index_ranks_semantic_neighbours() {
+        let facts = vec![
+            Fact {
+                name: "pip-mirror".into(),
+                title: "pip use tsinghua".into(),
+                content: "Always use tsinghua mirror for pip installs.".into(),
+                importance: 0.9,
+                tags: vec!["pip".into()],
+                ..default_fact()
+            },
+            Fact {
+                name: "rust-edition".into(),
+                title: "use 2024 edition".into(),
+                content: "Use Rust edition 2024 for new projects.".into(),
+                importance: 0.5,
+                tags: vec!["rust".into()],
+                ..default_fact()
+            },
+        ];
+        let index = VectorIndex::build(&facts);
+        let hits = index.search("mirror installs", 2);
+        assert_eq!(hits.len(), 1, "only the pip fact shares trigrams");
+        assert_eq!(hits[0].0, "pip-mirror");
+        assert!(hits[0].1 > 0.0);
+    }
+
+    #[test]
+    fn vector_search_handles_misspelled_query() {
+        // Trigram overlap tolerates a single typo better than exact BM25 match.
+        let facts = vec![
+            Fact {
+                name: "deployment".into(),
+                title: "deploy pipeline".into(),
+                content: "The deployment pipeline runs cargo test on every push.".into(),
+                importance: 0.6,
+                tags: vec!["ci".into()],
+                ..default_fact()
+            },
+            Fact {
+                name: "billing".into(),
+                title: "api billing".into(),
+                content: "Billing counters track tokens per provider.".into(),
+                importance: 0.4,
+                tags: vec!["cost".into()],
+                ..default_fact()
+            },
+        ];
+        let results = search_facts_vector(&facts, "deploment pipeline", 2);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "deployment");
+    }
+
+    #[test]
+    fn vector_index_roundtrip_via_disk() {
+        let tmp = test_dir();
+        let fact = Fact {
+            name: "mirror".into(),
+            title: "pip mirror".into(),
+            content: "Use the tsinghua mirror for pip.".into(),
+            importance: 0.8,
+            tags: vec![],
+            ..default_fact()
+        };
+        fact.save(&tmp).unwrap();
+        let facts = load_facts(&tmp);
+        let index = load_or_build_vector_index(&tmp, &facts);
+        assert_eq!(index.facts.len(), 1);
+        let path = vector_index_path(&tmp);
+        assert!(path.exists(), "index must be persisted to disk");
+        // Second load reuses the on-disk index (no rebuild drift).
+        let reloaded = load_or_build_vector_index(&tmp, &facts);
+        assert_eq!(reloaded.facts[0].vector, index.facts[0].vector);
+        // Query hits the loaded fact.
+        assert_eq!(reloaded.search("pip install", 1)[0].0, "mirror");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vector_index_rebuilds_when_fact_content_changes() {
+        let tmp = test_dir();
+        let mut fact = Fact {
+            name: "mirror".into(),
+            title: "pip mirror".into(),
+            content: "Use the tsinghua mirror for pip.".into(),
+            importance: 0.8,
+            tags: vec![],
+            ..default_fact()
+        };
+        fact.save(&tmp).unwrap();
+        let mut facts = load_facts(&tmp);
+        let index = load_or_build_vector_index(&tmp, &facts);
+        assert_eq!(index.facts.len(), 1);
+        // Edit the fact content → the persisted index is now stale.
+        fact.content = "Prefer the aliyun mirror for all package installs.".into();
+        fact.save(&tmp).unwrap();
+        facts = load_facts(&tmp);
+        let current_hash = fnv1a(fact_embed_text(&facts[0]).as_bytes());
+        assert_ne!(
+            index.facts[0].content_hash, current_hash,
+            "precondition: stale index must disagree with current content"
+        );
+        let rebuilt = load_or_build_vector_index(&tmp, &facts);
+        assert_eq!(
+            rebuilt.facts[0].content_hash, current_hash,
+            "stale index should have been rebuilt to match current content"
+        );
+        // The rebuilt index ranks the new content first.
+        let hits = rebuilt.search("aliyun installs", 1);
+        assert!(!hits.is_empty(), "new content must be searchable");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn default_fact() -> Fact {

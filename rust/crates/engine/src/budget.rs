@@ -37,6 +37,18 @@ pub struct ContextBudgetSettings {
     pub project_rules_tokens: Option<usize>,
     #[serde(rename = "memoryTokens", default)]
     pub memory_tokens: Option<usize>,
+    /// Beads (active tasks) budget inside the memory partition.
+    #[serde(rename = "memoryBeadsTokens", default)]
+    pub memory_beads_tokens: Option<usize>,
+    /// Facts budget inside the memory partition.
+    #[serde(rename = "memoryFactsTokens", default)]
+    pub memory_facts_tokens: Option<usize>,
+    /// LLM-Wiki index budget inside the memory partition.
+    #[serde(rename = "memoryWikiTokens", default)]
+    pub memory_wiki_tokens: Option<usize>,
+    /// Legacy MEMORY.md / per-file budget inside the memory partition.
+    #[serde(rename = "memoryIndexTokens", default)]
+    pub memory_index_tokens: Option<usize>,
     #[serde(rename = "gitTokens", default)]
     pub git_tokens: Option<usize>,
     #[serde(rename = "singleToolResultTokens", default)]
@@ -61,19 +73,27 @@ impl ContextBudgetSettings {
         replace_present!(skill_index_tokens);
         replace_present!(project_rules_tokens);
         replace_present!(memory_tokens);
+        replace_present!(memory_beads_tokens);
+        replace_present!(memory_facts_tokens);
+        replace_present!(memory_wiki_tokens);
+        replace_present!(memory_index_tokens);
         replace_present!(git_tokens);
         replace_present!(single_tool_result_tokens);
         replace_present!(history_tokens);
         replace_present!(attachment_tokens);
     }
 
-    pub fn fields(&self) -> [(&'static str, Option<usize>); 9] {
+    pub fn fields(&self) -> [(&'static str, Option<usize>); 13] {
         [
             ("systemPromptTokens", self.system_prompt_tokens),
             ("toolSchemaTokens", self.tool_schema_tokens),
             ("skillIndexTokens", self.skill_index_tokens),
             ("projectRulesTokens", self.project_rules_tokens),
             ("memoryTokens", self.memory_tokens),
+            ("memoryBeadsTokens", self.memory_beads_tokens),
+            ("memoryFactsTokens", self.memory_facts_tokens),
+            ("memoryWikiTokens", self.memory_wiki_tokens),
+            ("memoryIndexTokens", self.memory_index_tokens),
             ("gitTokens", self.git_tokens),
             ("singleToolResultTokens", self.single_tool_result_tokens),
             ("historyTokens", self.history_tokens),
@@ -92,6 +112,15 @@ pub struct ContextBudget {
     pub skill_index_tokens: usize,
     pub project_rules_tokens: usize,
     pub memory_tokens: usize,
+    /// Memory partition: active-task beads. Sums with the other memory
+    /// partitions to `memory_tokens` (the total memory cap).
+    pub memory_beads_tokens: usize,
+    /// Memory partition: importance-ranked facts.
+    pub memory_facts_tokens: usize,
+    /// Memory partition: LLM-Wiki index preview.
+    pub memory_wiki_tokens: usize,
+    /// Memory partition: legacy MEMORY.md + per-file entries.
+    pub memory_index_tokens: usize,
     pub git_tokens: usize,
     pub single_tool_result_tokens: usize,
     pub history_tokens: usize,
@@ -106,6 +135,10 @@ impl ContextBudget {
             skill_index_tokens: 500,
             project_rules_tokens: 8_000,
             memory_tokens: 12_500,
+            memory_beads_tokens: 2_500,
+            memory_facts_tokens: 4_000,
+            memory_wiki_tokens: 3_000,
+            memory_index_tokens: 3_000,
             git_tokens: 1_000,
             single_tool_result_tokens: 7_500,
             history_tokens: 150_000,
@@ -120,6 +153,10 @@ impl ContextBudget {
             skill_index_tokens: 128,
             project_rules_tokens: 800,
             memory_tokens: 400,
+            memory_beads_tokens: 100,
+            memory_facts_tokens: 100,
+            memory_wiki_tokens: 100,
+            memory_index_tokens: 100,
             git_tokens: 200,
             single_tool_result_tokens: 2_000,
             history_tokens: 12_000,
@@ -153,6 +190,10 @@ impl ContextBudget {
             apply!(skill_index_tokens);
             apply!(project_rules_tokens);
             apply!(memory_tokens);
+            apply!(memory_beads_tokens);
+            apply!(memory_facts_tokens);
+            apply!(memory_wiki_tokens);
+            apply!(memory_index_tokens);
             apply!(git_tokens);
             apply!(single_tool_result_tokens);
             apply!(history_tokens);
@@ -185,6 +226,10 @@ mod tests {
         assert!(ultra.skill_index_tokens < standard.skill_index_tokens);
         assert!(ultra.project_rules_tokens < standard.project_rules_tokens);
         assert!(ultra.memory_tokens < standard.memory_tokens);
+        assert!(ultra.memory_beads_tokens < standard.memory_beads_tokens);
+        assert!(ultra.memory_facts_tokens < standard.memory_facts_tokens);
+        assert!(ultra.memory_wiki_tokens < standard.memory_wiki_tokens);
+        assert!(ultra.memory_index_tokens < standard.memory_index_tokens);
         assert!(ultra.git_tokens < standard.git_tokens);
         assert!(ultra.single_tool_result_tokens < standard.single_tool_result_tokens);
         assert!(ultra.history_tokens < standard.history_tokens);
@@ -196,11 +241,17 @@ mod tests {
         let overlay = ContextBudgetSettings {
             system_prompt_tokens: Some(321),
             skill_index_tokens: Some(123),
+            memory_facts_tokens: Some(77),
             ..Default::default()
         };
         let resolved = ContextBudget::resolve(TokenMode::Ultra, Some(&overlay), Some(250));
         assert_eq!(resolved.system_prompt_tokens, 321);
         assert_eq!(resolved.skill_index_tokens, 123);
+        assert_eq!(resolved.memory_facts_tokens, 77);
+        assert_eq!(
+            resolved.memory_beads_tokens,
+            ContextBudget::ultra().memory_beads_tokens
+        );
         assert_eq!(resolved.memory_tokens, ContextBudget::ultra().memory_tokens);
     }
 }

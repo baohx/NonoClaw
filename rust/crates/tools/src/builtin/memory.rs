@@ -109,7 +109,25 @@ fn search_facts(cwd: &Path, input: &Value) -> Result<ToolResult> {
     let query = input["query"].as_str().unwrap_or("");
     let limit = input["limit"].as_u64().unwrap_or(10).min(20) as usize;
     let facts = crate::memory::load_facts(cwd);
-    let results = crate::memory::search_facts(&facts, query, limit);
+    if query.trim().is_empty() {
+        return Ok(ToolResult::ok("No matching facts found."));
+    }
+    // Vector-store path: content-hash-validated trigram-embedding index with
+    // cosine search, importance-boosted. Falls back to the in-memory hybrid
+    // (vector + BM25) when the index cannot be persisted (read-only cwd).
+    let results: Vec<&crate::memory::Fact> = {
+        let index = crate::memory::load_or_build_vector_index(cwd, &facts);
+        let by_name: std::collections::HashMap<&str, &crate::memory::Fact> =
+            facts.iter().map(|f| (f.name.as_str(), f)).collect();
+        let mut scored: Vec<(f64, &crate::memory::Fact)> = index
+            .search(query, limit.saturating_mul(3))
+            .into_iter()
+            .filter_map(|(name, score)| by_name.get(name.as_str()).map(|f| (score, *f)))
+            .map(|(score, f)| (score * (1.0 + f.importance), f))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(limit).map(|(_, f)| f).collect()
+    };
     if results.is_empty() {
         return Ok(ToolResult::ok("No matching facts found."));
     }

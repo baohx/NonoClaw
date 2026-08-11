@@ -25,6 +25,15 @@ function lastMatching(entries: TraceEntry[] | undefined, predicate: (entry: Trac
   return undefined;
 }
 
+/** Cache hit rate (%) for a usage trace entry, or null when no input was billed. */
+function cacheHitRateOf(usage: TraceEntry | undefined): number | null {
+  const input = usage?.details.total_in;
+  const cacheRead = usage?.details.total_cache_read;
+  if (typeof input !== "number" || input <= 0) return null;
+  const read = typeof cacheRead === "number" ? Math.min(cacheRead, input) : 0;
+  return (read / input) * 100;
+}
+
 export default function TechnicalTrace() {
   const entries = useStore((state) => state.traceEntries);
   const clearTrace = useStore((state) => state.clearTrace);
@@ -92,6 +101,7 @@ export default function TechnicalTrace() {
   const turnEntry = lastMatching(summaryRun?.entries, (entry) => typeof entry.details.turn === "number" || typeof entry.details.turns === "number");
   const turn = turnEntry?.details.turn ?? turnEntry?.details.turns;
   const contextPercent = contextUsagePercent(context?.details.estimated_tokens, context?.details.context_window);
+  const cacheHitRate = cacheHitRateOf(usage);
 
   return (
     <section className="trace" aria-label="Technical trace">
@@ -102,6 +112,7 @@ export default function TechnicalTrace() {
         <div title={context?.summary ?? "尚无数据"}><span>context</span><b>{context?.details.estimated_tokens?.toLocaleString?.() ?? "—"}{contextPercent !== null ? ` · ${contextPercent.toFixed(1)}%` : ""}</b></div>
         <div title={budget?.summary ?? "尚无分项数据"}><span>payload chars</span><b>{budget ? `sys ${budget.details.system_chars ?? 0} · tools ${budget.details.tools_chars ?? 0} · msg ${budget.details.messages_chars ?? 0}` : "—"}</b></div>
         <div title={usage ? undefined : "尚无数据"}><span>tokens</span><b>{usage ? `in ${usage.details.total_in ?? 0} · out ${usage.details.total_out ?? 0} · r ${usage.details.total_cache_read ?? 0} · w ${usage.details.total_cache_write ?? 0}` : "—"}</b></div>
+        <div title={cacheHitRate === null ? "尚无数据" : undefined}><span>cache</span><b>{cacheHitRate === null ? "—" : `${cacheHitRate.toFixed(1)}% hit`}</b></div>
       </div>
 
       <div className="trace__controls">

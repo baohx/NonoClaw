@@ -30,6 +30,7 @@ const MAX_IMAGES_PER_ATTACHMENT: usize = 8;
 
 pub(super) struct WsQuestionResolver {
     pub pending: Arc<QuestionMap>,
+    pub meta: super::permission_api::PendingQuestionMeta,
     pub tx: Tx,
 }
 
@@ -40,15 +41,35 @@ impl QuestionResolver for WsQuestionResolver {
     ) -> Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
+        let meta = Arc::clone(&self.meta);
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
-            // A fresh id per ask() call — parallel AskUserQuestion invocations
-            // share this resolver, so a fixed id would make concurrent frames
-            // overwrite each other's pending sender and hang every call but
-            // the last. The permission resolver (make_permission_resolver)
-            // does the same per-request uuid allocation.
             let request_id = Uuid::new_v4().to_string();
             pending.lock().await.insert(request_id.clone(), sender);
+            // Store metadata so REST API can list/resolve the question.
+            meta.lock().await.insert(
+                request_id.clone(),
+                super::permission_api::PendingQuestionInfo {
+                    request_id: request_id.clone(),
+                    prompt: redact_text(&req.prompt),
+                    context: req.context.as_deref().map(redact_text),
+                    options: req
+                        .options
+                        .iter()
+                        .map(|o| redact_text(o))
+                        .collect(),
+                    urgency: match req.urgency {
+                        QuestionUrgency::Low => "low".to_string(),
+                        QuestionUrgency::Medium => "medium".to_string(),
+                        QuestionUrgency::High => "high".to_string(),
+                    },
+                    format: match req.format {
+                        QuestionFormat::MultipleChoice => "multiple_choice".to_string(),
+                        QuestionFormat::YesNo => "yes_no".to_string(),
+                        QuestionFormat::FreeText => "free_text".to_string(),
+                    },
+                },
+            );
             send_msg(
                 &tx,
                 ServerMsg::QuestionRequired {

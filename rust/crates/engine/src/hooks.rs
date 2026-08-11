@@ -541,6 +541,7 @@ impl HookRuntime {
             thinking: None,
             temperature: Some(0.0),
             betas: Vec::new(),
+            extra_body: None,
             trace_label: Some(format!("hook-{hook_type}")),
         };
         let output = client

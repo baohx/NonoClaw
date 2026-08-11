@@ -172,6 +172,14 @@ pub struct PromptBuildLimits {
     pub skill_chars: usize,
     pub project_context_chars: usize,
     pub memory_chars: usize,
+    /// Memory partition: active-task beads.
+    pub memory_beads_chars: usize,
+    /// Memory partition: importance-ranked facts.
+    pub memory_facts_chars: usize,
+    /// Memory partition: LLM-Wiki index preview.
+    pub memory_wiki_chars: usize,
+    /// Memory partition: legacy MEMORY.md + per-file entries.
+    pub memory_index_chars: usize,
     pub git_chars: usize,
 }
 
@@ -182,6 +190,10 @@ impl Default for PromptBuildLimits {
             skill_chars: usize::MAX,
             project_context_chars: usize::MAX,
             memory_chars: usize::MAX,
+            memory_beads_chars: usize::MAX,
+            memory_facts_chars: usize::MAX,
+            memory_wiki_chars: usize::MAX,
+            memory_index_chars: usize::MAX,
             git_chars: usize::MAX,
         }
     }
@@ -239,9 +251,10 @@ fn bounded_project_context(value: &str, max_chars: usize) -> String {
 /// Build the `system` array for the API request. Returns two blocks:
 ///
 /// **Block 1 (cached):** identity, environment, tool guidance, tool prompts,
-///   active skills, append. Stable across turns.
-/// **Block 2 (uncached):** git status, NONOCLAW.md, memory. Changes at least
-///   once per conversation (git) and may change between runs (NONOCLAW.md).
+///   active skills, project context (NONOCLAW.md), memory, append.
+///   Stable across turns within a run.
+/// **Block 2 (uncached):** date, git status, dynamic skills. Changes at least
+///   once per conversation (git) and may change between runs.
 ///
 /// Backwards-compatible entry point: uses `PromptProfile::Full` so output
 /// matches the pre-refactor prompt byte-for-byte.
@@ -485,6 +498,21 @@ pub fn build_system_blocks_with_profile_measured_and_limits(
         });
     }
 
+    // Memory is stable within a run, so it gets its own cached block.
+    if let Some(memory) = memory {
+        let rendered = bounded_wrapped("<memory>\n", memory, "\n</memory>\n", limits.memory_chars);
+        if !rendered.is_empty() {
+            budget.push("memory", &rendered);
+            blocks.push(SystemBlock {
+                kind: "text".into(),
+                text: rendered,
+                cache_control: Some(CacheControl {
+                    kind: nonoclaw_core::CacheControlKind::Ephemeral,
+                }),
+            });
+        }
+    }
+
     let mut context = String::new();
     let date = format!("# Current date\n{}\n\n", user.date);
     budget.push("current_date", &date);
@@ -505,13 +533,6 @@ pub fn build_system_blocks_with_profile_measured_and_limits(
         context.push_str(&git);
     }
 
-    if let Some(memory) = memory {
-        let rendered = bounded_wrapped("<memory>\n", memory, "\n</memory>\n", limits.memory_chars);
-        if !rendered.is_empty() {
-            budget.push("memory", &rendered);
-            context.push_str(&rendered);
-        }
-    }
     if !context.is_empty() {
         blocks.push(SystemBlock {
             kind: "text".into(),
@@ -540,11 +561,13 @@ pub fn refresh_context_block(
     )
 }
 
+/// Rebuild only the uncached date/git/dynamic-skill block. Cached blocks
+/// (Block 1, project context, memory) are preserved verbatim.
 pub fn refresh_context_block_with_limits(
     old_blocks: &[SystemBlock],
     system: &SystemContext,
     user: &UserContext,
-    memory: &Option<String>,
+    _memory: &Option<String>,
     skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
     limits: PromptBuildLimits,
 ) -> Vec<SystemBlock> {
@@ -563,14 +586,6 @@ pub fn refresh_context_block_with_limits(
             &system.git_summary,
             "```\n\n",
             limits.git_chars,
-        ));
-    }
-    if let Some(memory) = memory {
-        context.push_str(&bounded_wrapped(
-            "<memory>\n",
-            memory,
-            "\n</memory>\n",
-            limits.memory_chars,
         ));
     }
     if let Some(manager) = skills_manager {
@@ -1307,6 +1322,10 @@ mod tests {
             skill_chars: 40,
             project_context_chars: 120,
             memory_chars: 80,
+            memory_beads_chars: 20,
+            memory_facts_chars: 20,
+            memory_wiki_chars: 20,
+            memory_index_chars: 20,
             git_chars: 70,
         };
         let (blocks, budget) = build_system_blocks_with_profile_measured_and_limits(
@@ -1559,12 +1578,20 @@ mod tests {
         let memory = Some("fact: user prefers Rust".to_string());
         let tools: Vec<ToolPromptEntry> = vec![];
         let blocks = build_system_blocks(cwd, &sys, &user, &memory, &tools, &None, &None);
-        let b2 = &blocks[1].text;
-        assert!(b2.contains("<memory>\n"), "must open <memory>: got\n{b2}");
-        assert!(b2.contains("fact: user prefers Rust"));
-        assert!(b2.contains("</memory>"), "must close </memory>");
+        // Memory is now a separate cached block — find it.
+        let mem_block = blocks
+            .iter()
+            .find(|b| b.text.contains("<memory>"))
+            .expect("memory block must exist");
+        assert!(mem_block.text.contains("<memory>\n"), "must open <memory>: got\n{}", mem_block.text);
+        assert!(mem_block.text.contains("fact: user prefers Rust"));
+        assert!(mem_block.text.contains("</memory>"), "must close </memory>");
         assert!(
-            !b2.contains("# Memory"),
+            mem_block.cache_control.is_some(),
+            "memory block must be cached"
+        );
+        assert!(
+            !mem_block.text.contains("# Memory"),
             "legacy '# Memory' header must be gone"
         );
     }
@@ -1587,18 +1614,27 @@ mod tests {
     }
 
     #[test]
-    fn refresh_context_block_wraps_memory_in_xml() {
+    fn refresh_context_block_preserves_memory_as_cached() {
+        // Memory is now cached: refresh must preserve it verbatim rather
+        // than re-rendering it in the uncached block.
         let cwd = Path::new("/proj");
         let sys = SystemContext::default();
         let user = make_user("2026/07/28");
         let tools: Vec<ToolPromptEntry> = vec![];
-        let initial = build_system_blocks(cwd, &sys, &user, &None, &tools, &None, &None);
         let memory = Some("bead: work in progress".to_string());
-        let refreshed = refresh_context_block(&initial, &sys, &user, &memory, &None);
-        let b2 = &refreshed[1].text;
-        assert!(b2.contains("<memory>"));
-        assert!(b2.contains("bead: work in progress"));
-        assert!(b2.contains("</memory>"));
+        let initial = build_system_blocks(cwd, &sys, &user, &memory, &tools, &None, &None);
+        // Memory block must exist and be cached in the initial build.
+        assert!(initial.iter().any(|b| b.text.contains("<memory>") && b.cache_control.is_some()));
+
+        // Refresh with different memory — cached blocks (including memory)
+        // must be preserved from initial, NOT re-rendered.
+        let new_memory = Some("bead: different content".to_string());
+        let refreshed = refresh_context_block(&initial, &sys, &user, &new_memory, &None);
+        // The cached memory block from initial must be preserved.
+        let mem_blocks: Vec<_> = refreshed.iter().filter(|b| b.text.contains("<memory>")).collect();
+        assert_eq!(mem_blocks.len(), 1, "exactly one memory block");
+        assert!(mem_blocks[0].text.contains("bead: work in progress"), "must preserve original memory");
+        assert!(!mem_blocks[0].text.contains("different content"), "must NOT pick up new memory on refresh");
     }
 
     // ========================================================================

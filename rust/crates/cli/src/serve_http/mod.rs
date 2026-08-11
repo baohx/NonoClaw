@@ -9,6 +9,7 @@ mod http_error;
 mod permission_api;
 mod project_service;
 mod protocol;
+mod run_api;
 mod run_handler;
 mod session_hub;
 mod speech_service;

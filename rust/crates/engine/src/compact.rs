@@ -31,7 +31,7 @@ Do NOT omit concrete technical details (paths, names, values, error messages). S
 
 /// Default cap on the summarizer's output. Overridable via the
 /// `compactMaxTokens` settings.json field.
-pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_SUMMARY_TOKENS: u32 = 8192;
 
 /// Compaction strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,6 +142,7 @@ pub async fn compact_messages(
         thinking: None,
         temperature: Some(0.0),
         betas: vec![],
+        extra_body: None,
         trace_label: Some("compact".into()),
     };
     let turn = client.run_turn(&params, |_| {}).await?;
@@ -381,9 +382,9 @@ mod tests {
     }
 
     #[test]
-    fn default_max_summary_tokens_is_4096() {
-        // T5.2 acceptance: the default stays at 4096; the constant is the
+    fn default_max_summary_tokens_is_8192() {
+        // T5.2 acceptance: the default is 8192; the constant is the
         // single source of truth referenced by settings resolution.
-        assert_eq!(DEFAULT_MAX_SUMMARY_TOKENS, 4096);
+        assert_eq!(DEFAULT_MAX_SUMMARY_TOKENS, 8192);
     }
 }

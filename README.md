@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.12.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, and **high-fidelity DOCX/PDF export**.
+> **Version**: v0.18.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, and **high-fidelity DOCX/PDF export**.
 
 ---
 
@@ -21,6 +21,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Prompt Templates](#prompt-templates)
 - [Project Context Files](#project-context-files)
 - [Configuration (settings.json)](#configuration-settingsjson)
+- [REST API](#rest-api)
 - [CLI Reference](#cli-reference)
 - [Architecture](#architecture)
 - [中文翻译](#中文翻译)
@@ -88,8 +89,8 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | Category | Details |
 |---|---|
 | **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **orphan repair** (auto-fix broken tool_use/tool_result pairs), **thinking-block strip** (Bedrock proxy compat), **batched parallel tool execution** (concurrency cap=10) |
-| **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). BM25 search with importance ranking. The `Memory` tool is part of the registry-derived core tool set and is auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
-| **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. No embeddings, no vector DB. |
+| **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). **Hybrid search** (BM25 + local vector store with character-trigram embeddings + cosine similarity), importance ranking. **Independent memory budget partitions** (beads/facts/wiki/index each have their own token cap). The `Memory` tool is part of the registry-derived core tool set and is auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
+| **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
 | **Subagent Delegation** | `Agent` tool spawns a full subagent (autonomous, depth=1, non-interactive); `Coordinator` fans out parallel tasks. Both inherit CancellationToken + hooks + events. Child toolset excludes Agent/Coordinator/Graph (no recursion). **Graph tool** runs declarative DAG pipelines. |
 | **Agent Graphs** | **Declarative DAG pipelines** in `.nonoclaw/graphs/<name>.md`: YAML frontmatter defines nodes (subagent / LLM router / human gate) and `next` edges; fan-out parallelism + fan-in gathering; router picks branches dynamically; gate pauses for human approval; **checkpoint resume** after interruption. `Graph` tool for dynamic invocation + `/graph` slash command. Covers all 5 Anthropic workflow patterns. |
@@ -101,7 +102,8 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
-| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session), **per-model token estimation** |
+| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session), **exact BPE tokenization** via bundled `tiktoken` (OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax; heuristic fallback for Claude), **independent memory budget partitions** (beads/facts/wiki/index) |
+| **Token Efficiency** | **Exact BPE tokenizer** (`tiktoken` 3.8.3, pure-Rust with bundled rank tables — no runtime downloads); **cache hit-rate tracking** (DeepSeek `prompt_cache_hit_tokens` + standard `cached_tokens`); **cache hit-rate visualization** in Insight rail (segmented bar + percentage); **`extra_body` field** for provider-specific cache hints (OpenAI payload only) |
 | **Goal Tracking** | Multi-step task plans in `memory/goals/*.md`. Agent self-manages steps, verification criteria, and progress. `Memory goal_create/goal_update/goal_list` actions. |
 | **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload, **progressive disclosure** (only metadata sits in the cached system prefix; the full body loads on demand via the `Skill` tool) |
 | **Plugins** | `--plugin-add`, hooks via `.nonoclaw/hooks.json` (**shell + prompt + HTTP**, 12 event types) |
@@ -846,6 +848,51 @@ Explicitly set paths when system PATH versions don't match requirements:
 
 ---
 
+## REST API
+
+NonoClaw exposes HTTP endpoints for external system integration (CI/CD, webhooks, external approval UIs). All endpoints are served on the same `--serve-http` address.
+
+### Run Management
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/run` | Start a headless run with a prompt; returns SSE stream of `RunEvent` envelopes. Accepts `model`, `permissionMode`, `maxTurns`, `allowedTools`, `disallowedTools`, `contextWindow`, `compactThreshold` overrides. |
+| `POST` | `/api/sessions/:id/cancel` | Cancel a running session. |
+
+**Example** — start a run via REST:
+```bash
+curl -N http://127.0.0.1:8765/api/run \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"explain Rust ownership","model":"deepseek-v4-pro"}'
+```
+
+The response is an SSE stream (`text/event-stream`) of JSON envelopes, one per `RunEvent`.
+
+### Permission Management
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/sessions/:id/permissions` | List pending permission requests (`request_id`, tool name, input, message). |
+| `POST` | `/api/sessions/:id/permissions/:request_id` | Approve or deny a pending request. Body: `{"decision":"allow"}` or `{"decision":"deny"}`. |
+
+Enables CI/CD pipelines and webhooks to manage agent permissions without an active WebSocket connection.
+
+**Example** — approve a pending permission:
+```bash
+curl -X POST http://127.0.0.1:8765/api/sessions/$SESSION_ID/permissions/$REQUEST_ID \
+  -H 'Content-Type: application/json' \
+  -d '{"decision":"allow"}'
+```
+
+### Session Info
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/sessions/:id` | Session metadata (model, turn count, token usage, status). |
+| `GET` | `/api/sessions/:id/trace` | Redacted technical trace export (safe to share). |
+
+---
+
 ## CLI Reference
 
 `nonoclaw --help` is authoritative. The examples below cover the supported operating modes without hard-coding a tool count; available core tools and schemas are derived from `ToolRegistry`, and MCP tools are discovered dynamically.
@@ -947,6 +994,8 @@ rust/crates/cli/src/serve_http/
 ├── protocol.rs         wire tags, envelopes, safe serialization
 ├── connection.rs       WebSocket lifecycle and dispatch
 ├── run_handler.rs      run construction/cancel/compact
+├── run_api.rs          REST API: POST /api/run (SSE), POST /api/sessions/:id/cancel
+├── permission_api.rs   REST API: GET/POST /api/sessions/:id/permissions
 ├── session_hub.rs      revisioned peer/session synchronization
 ├── project_service.rs  file tree, Git, ProjectInfo
 ├── upload_service.rs   bounded attachment processing
@@ -980,7 +1029,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.12.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**和**高保真 DOCX/PDF 导出**。
+> **版本**: v0.18.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**和**高保真 DOCX/PDF 导出**。
 
 ---
 
@@ -999,6 +1048,7 @@ NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI�
 - [提示词模板](#prompt-templates)
 - [项目上下文文件](#project-context-files)
 - [配置 (settings.json)](#configuration-settingsjson)
+- [REST API](#rest-api)
 - [CLI 参考](#cli-reference)
 - [架构](#architecture)
 
@@ -1065,8 +1115,8 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | 类别 | 详情 |
 |---|---|
 | **智能体循环** | 流式 SSE、自动重试、多轮 tool-use/tool-result 配对、**孤立修复**（自动修复断裂的 tool_use/tool_result 对）、**thinking 块过滤**（Bedrock 代理兼容）、**分批并行工具执行**（并发上限=10） |
-| **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。BM25 搜索 + 重要性排序。`Memory` 属于注册表生成的核心工具集合。每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。 |
-| **LLM Wiki** | Karpathy 风格的结构化知识编译：`wiki/` 目录含有 concepts、entities、comparisons、decisions、sources 页面。`raw/` 存放不可变的源文档。LLM 充当编译器——摄入原始资料，创建/更新互链的 wiki 页面。BM25 搜索 + `Memory` 工具操作（`wiki_search`、`wiki_ingest`、`wiki_lint`）。`wiki/index.md` 在会话启动时自动注入。无嵌入向量，无向量数据库。 |
+| **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。**混合搜索**（BM25 + 本地向量存储：字符三元组特征哈希嵌入 + 余弦相似度），重要性排序。**独立记忆预算分区**（beads/facts/wiki/index 各有独立 token 上限）。`Memory` 属于注册表生成的核心工具集合，每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。 |
+| **LLM Wiki** | Karpathy 风格的结构化知识编译：`wiki/` 目录含有 concepts、entities、comparisons、decisions、sources 页面。`raw/` 存放不可变的源文档。LLM 充当编译器——摄入原始资料，创建/更新互链的 wiki 页面。BM25 搜索 + `Memory` 工具操作（`wiki_search`、`wiki_ingest`、`wiki_lint`）。`wiki/index.md` 在会话启动时自动注入。 |
 | **系统提示词** | 增强型：手术级编辑规则、6 种命名失败模式、反过度工程规则、ToolSearch 使用指南、**Git 上下文在非缓存块中**（缓存跨轮次保持有效）、**记忆回写指令** |
 | **子委托与编排** | `Agent` 工具生成完整子代理（自主、depth=1、非交互）；`Coordinator` 并行扇出多任务。全部继承 CancellationToken + hooks + 事件。子级工具集排除 Agent/Coordinator/Graph（禁止递归）。**Graph 工具**执行声明式 DAG 管线。 |
 | **Agent 图** | **声明式 DAG 管线**（`.nonoclaw/graphs/<name>.md`）：YAML frontmatter 定义节点（子代理 / LLM 路由 / 人工审批）和 `next` 边；fan-out 并行 + fan-in 汇聚；路由动态选择分支；看门暂停等待人工审批；**checkpoint 断点续跑**。`Graph` 工具动态调用 + `/graph` 斜杠命令。覆盖 Anthropic 全部 5 种工作流模式。 |
@@ -1076,9 +1126,10 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接**，**会话级关键词选择**（每会话仅展示相关 MCP 工具子集，使 tools 数组缓存稳定；`autoSelectMcp`/`autoSelectMcpTopK`） |
 | **统一模型配置** | 所有模型集中在单一 `models[]` 数组，通过 `role` 标签（`main`/`doc`/`compact`）区分；`docModel` 和 `compactModel` 通过名称引用；**每模型专属 contextWindow / maxTokens / charsPerToken**；**compactModel** 独立的摘要压缩模型 |
 | **多模型切换** | 通过 UI 下拉框或 `/multi` 斜杠命令切换模型；`/multi` 语法错误时显示帮助提示 |
-| **权限** | 5 种模式：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过 UI 下拉框切换 |
+| **权限** | 5 种模式：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过 UI 下拉框切换。**REST API：`GET/POST /api/sessions/:id/permissions`** 用于外部系统异步审批。 |
 | **会话** | 按工作目录的 JSONL 持久化，`--resume` / `--continue` / `--list-sessions`，**会话命名**，渐进式元数据 |
-| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**（带**缓存稳定前缀**：技能正文按需经 `Skill` 工具加载；MCP 子集按会话固定）、**每模型 token 估算** |
+| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**（带**缓存稳定前缀**：技能正文按需经 `Skill` 工具加载；MCP 子集按会话固定）、**精确 BPE 分词**（内置 `tiktoken`，支持 OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax；Claude 使用启发式回退）、**独立记忆预算分区**（beads/facts/wiki/index） |
+| **Token 效率** | **精确 BPE 分词器**（`tiktoken` 3.8.3，纯 Rust 实现且内置 rank 表——无需运行时下载）；**缓存命中率追踪**（DeepSeek `prompt_cache_hit_tokens` + 标准 `cached_tokens`）；**Insight 栏缓存命中率可视化**（分段进度条 + 百分比）；**`extra_body` 字段**用于供应商特定缓存提示（仅 OpenAI 载荷） |
 | **目标追踪** | `memory/goals/*.md` 中的多步骤任务计划。Agent 自主管理步骤、验证标准和进度。`Memory goal_create/goal_update/goal_list` 操作。 |
 | **技能** | `/skill-name` 注入，**12 个内置技能**，通过路径/触发器/文件发现**动态激活**，参数替换，fork 上下文，使用追踪，热重载，**渐进式披露**（缓存系统前缀仅放元数据；完整正文按需经 `Skill` 工具加载） |
 | **插件** | `--plugin-add`，通过 `.nonoclaw/hooks.json` 配置钩子（**shell + prompt + HTTP**，12 种事件类型） |
@@ -1249,7 +1300,7 @@ session: abc123
 
 | 操作 | 描述 |
 |------|------|
-| `Memory search <query>` | 对所有事实进行 BM25 搜索，按相关性 × 重要性排序 |
+| `Memory search <query>` | **混合搜索**（向量余弦 ×2 + BM25 + 重要性排序），查询所有事实 |
 | `Memory save` | 创建或更新事实（name、title、type、importance、tags） |
 | `Memory forget <name>` | 将事实标记为已取代 |
 | `Memory beads` | 列出所有活跃（未完成）的 beads，按优先级排序 |
@@ -1363,6 +1414,8 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 ```
 
 **REST API**（v0.10+）：`GET /api/sessions/:id/permissions` 列出待处理权限请求；`POST /api/sessions/:id/permissions/:request_id` 审批或拒绝。支持 CI/CD 流水线和 webhook 在无 WebSocket 连接下管理 Agent 权限。
+
+**REST 运行 API**（v0.18+）：`POST /api/run` 通过 HTTP 启动 headless 运行并返回 SSE 事件流；`POST /api/sessions/:id/cancel` 取消运行。详见 [REST API](#rest-api) 章节。
 
 ---
 
@@ -1706,7 +1759,7 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw -p "并行运行独立检查"
 
 ## 架构
 
-根 README 是产品与架构的权威说明。当前唯一所有权边界为：`nonoclaw-core` 管领域类型和运行事件；`nonoclaw-api` 管 Provider 与 `ClientFactory`；`nonoclaw-tools` 管注册表、`ToolExecutor`、共享任务状态、后台进程和 MCP；`nonoclaw-engine` 管 `RunController`、`SessionService`、`ResolvedConfig`、扩展运行时与 trace；CLI crate 只负责 headless/remote/MCP/Web 适配，其中 `serve_http/` 已按 protocol、connection、run、session、project、upload、speech、static 拆分；React 前端消费 revision/sequence 协议、Technical Trace 与 BreathController。
+根 README 是产品与架构的权威说明。���前唯一所有权边界为：`nonoclaw-core` 管领域类型和运行事件；`nonoclaw-api` 管 Provider 与 `ClientFactory`；`nonoclaw-tools` 管注册表、`ToolExecutor`、共享任务状态、后台进程、MCP 和**本地向量存储**（字符三元组特征哈希 + 余弦相似度）；`nonoclaw-engine` 管 `RunController`、`SessionService`、`ResolvedConfig`、扩展运行时与 trace，以及**精确 BPE 分词**（`tiktoken`）；CLI crate 只负责 headless/remote/MCP/Web 适配，其中 `serve_http/` 已按 protocol、connection、run、run_api（REST `/api/run`）、permission_api（REST 权限审批）、session、project、upload、speech、static 拆分；React 前端消费 revision/sequence 协议、Technical Trace、BreathController 与**缓存命中率可视化**。
 
 现有 CLI flags、工具名/schema、HTTP routes、WebSocket tags、JSONL session、`.nonoclaw` 路径、Hooks、Skills、Profiles、Plugins、MCP、三主题、媒体与兼容入口均保留。
 

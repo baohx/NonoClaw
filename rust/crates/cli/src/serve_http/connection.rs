@@ -67,8 +67,8 @@ fn safe_provider_failure_message(reason: &str, status: Option<u16>) -> String {
 // ── Shared application state ────────────────────────────────────────────────
 
 pub(super) struct AppState {
-    registry: Arc<ToolRegistry>,
-    todos: Arc<TodoStore>,
+    pub(super) registry: Arc<ToolRegistry>,
+    pub(super) todos: Arc<TodoStore>,
     pub(super) cwd: PathBuf,
     /// Canonical immutable configuration snapshot shared by all Web paths.
     pub(super) config: Arc<ResolvedConfig>,
@@ -79,23 +79,25 @@ pub(super) struct AppState {
     /// The public URL shown in the QR code, or None.
     public_url: Option<String>,
     /// Currently active model name (switchable via SetModel client message + UI).
-    active_model: Arc<Mutex<String>>,
+    pub(super) active_model: Arc<Mutex<String>>,
     /// Canonical owner for session discovery and per-session writer actors.
-    session_service: SessionService,
+    pub(super) session_service: SessionService,
     /// Session peer registration and revisioned broadcast owner.
-    session_hub: SessionHub,
+    pub(super) session_hub: SessionHub,
     pub(super) pending_permissions: Arc<PermissionMap>,
-    pending_questions: Arc<QuestionMap>,
+    pub(super) pending_questions: Arc<QuestionMap>,
     /// Metadata for pending permission requests (for REST API inspection).
     pub(super) permission_meta: PendingPermissionMeta,
+    /// Metadata for pending questions (Factor 7 REST API).
+    pub(super) question_meta: super::permission_api::PendingQuestionMeta,
     /// Runtime-mutable permission mode (switchable via UI).
-    permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
+    pub(super) permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
     /// Skill manager: discovers, parses, and dynamically activates skills.
-    skills_manager: Arc<RwLock<SkillsManager>>,
+    pub(super) skills_manager: Arc<RwLock<SkillsManager>>,
     /// Deduplicated owner of git/config/skills ProjectInfo and file operations.
     project_service: Arc<ProjectService>,
     /// Background task registry for run_in_background bash commands.
-    background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
+    pub(super) background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
     /// Directory where uploaded attachments are stored.
     pub(super) upload_dir: PathBuf,
     /// Resolved path to the `markitdown` CLI, from the runtime probe.
@@ -111,6 +113,56 @@ impl AppState {
 
     pub(super) fn download_authorized(&self, supplied_token: Option<&str>) -> bool {
         supplied_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+    }
+
+    /// Path for persisting pending permission metadata across restarts.
+    fn pending_permissions_path(&self) -> Option<std::path::PathBuf> {
+        nonoclaw_engine::session::project_dir(&self.cwd)
+            .map(|d| d.join("pending_permissions.json"))
+    }
+
+    /// Persist current pending permissions to disk (best-effort).
+    pub(super) async fn persist_pending_permissions(&self) {
+        let Some(path) = self.pending_permissions_path() else {
+            return;
+        };
+        let metas = self.permission_meta.lock().await;
+        let entries: Vec<_> = metas.values().cloned().collect();
+        drop(metas);
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_vec(&entries).unwrap_or_default(),
+        ) {
+            tracing::warn!(kind = ?e.kind(), "failed to persist pending permissions");
+        }
+    }
+
+    /// Load persisted pending permissions from disk (best-effort).
+    pub(super) async fn load_pending_permissions(&self) {
+        let Some(path) = self.pending_permissions_path() else {
+            return;
+        };
+        let Ok(data) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(entries) = serde_json::from_slice::<
+            Vec<super::permission_api::PendingPermissionInfo>,
+        >(&data) else {
+            return;
+        };
+        if entries.is_empty() {
+            // Clean up stale file.
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        // Load metadata entries — the oneshot senders are gone, but the
+        // metadata is useful for audit/debugging. REST resolution will return
+        // 410 Gone (run no longer active) which is correct behavior.
+        let mut metas = self.permission_meta.lock().await;
+        for entry in entries {
+            metas.insert(entry.request_id.clone(), entry);
+        }
+        tracing::info!(count = metas.len(), "loaded persisted pending permissions");
     }
 
     fn websocket_authorized(
@@ -162,6 +214,7 @@ pub(super) fn upload_exploration_state(
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
+        question_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(initial_permission_mode(&config))),
         skills_manager,
         project_service,
@@ -330,6 +383,7 @@ pub async fn serve(
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
+        question_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(default_permission_mode)),
         skills_manager,
         project_service,
@@ -339,6 +393,9 @@ pub async fn serve(
         upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
     });
+
+    // Load persisted pending permissions (survives server restarts).
+    state.load_pending_permissions().await;
 
     // Spawn file watcher for hot-reloading skills.
     crate::skill_watcher::spawn_skill_watcher(Arc::clone(&state.skills_manager), cwd.clone());
@@ -378,6 +435,18 @@ pub async fn serve(
         .route(
             "/api/sessions/:session_id/permissions/:request_id",
             axum::routing::post(super::permission_api::resolve_permission),
+        )
+        .route(
+            "/api/run",
+            axum::routing::post(super::run_api::run_handler),
+        )
+        .route(
+            "/api/sessions/:session_id/questions",
+            axum::routing::get(super::permission_api::list_pending_questions),
+        )
+        .route(
+            "/api/sessions/:session_id/questions/:request_id",
+            axum::routing::post(super::permission_api::resolve_question),
         )
         .route("/manifest.json", get(super::static_service::serve_manifest))
         .route("/sw.js", get(super::static_service::serve_sw))
@@ -979,6 +1048,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     if let Some(body) = fork_body {
                         let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
                             pending: Arc::clone(&s.pending_questions),
+                            meta: Arc::clone(&s.question_meta),
                             tx: tx2.clone(),
                         });
                         let fork_opts = {
@@ -1176,6 +1246,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     // Question resolver (per-run to avoid oneshot key clashes).
                     let qr: Arc<dyn QuestionResolver> = Arc::new(WsQuestionResolver {
                         pending: Arc::clone(&s.pending_questions),
+                        meta: Arc::clone(&s.question_meta),
                         tx: tx2.clone(),
                     });
                     options.question_resolver = Some(qr);
@@ -1745,8 +1816,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     };
                     let _ = sender.send(decision);
                 }
+                state.persist_pending_permissions().await;
             }
             ClientMsg::QuestionAnswer { request_id, answer } => {
+                state.question_meta.lock().await.remove(&request_id);
                 let sender = state.pending_questions.lock().await.remove(&request_id);
                 if let Some(sender) = sender {
                     let _ = sender.send(answer);
