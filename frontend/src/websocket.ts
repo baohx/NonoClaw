@@ -309,7 +309,14 @@ export function dispatchServerMessage(message: ServerMsg): void {
           state.finishStreaming();
           break;
         case "model_info":
-          if (event.model) state.setModel(event.model);
+          // Only adopt a reported model name that actually exists in the
+          // configured profile list. A proxy/gateway may echo a truncated or
+          // alias name (e.g. "lark-aily" vs "lark-aily:app_xxx") which would
+          // otherwise silently corrupt the composer's model selector and the
+          // next run would fail with "model client configuration is invalid".
+          if (event.model && state.availableModels.some((m) => m.name === event.model)) {
+            state.setModel(event.model);
+          }
           break;
         case "task_changed":
           if (event.change) state.addTaskChange(event.change);

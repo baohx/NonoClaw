@@ -216,13 +216,14 @@ pub async fn run_handler(
         .client_for(ClientPurpose::Conversation, Some(&model_used))
     {
         Ok(client) => client,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(model = %model_used, error = %err, "rest run client build failed");
             return super::http_error::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                nonoclaw_core::AppError::new(
-                    nonoclaw_core::ErrorCode::Configuration,
-                    "model client configuration is invalid",
-                    false,
+                super::http_error::model_client_error(
+                    &state.config,
+                    &model_used,
+                    &err,
                     "rest_run_client",
                 ),
             );

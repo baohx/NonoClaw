@@ -1148,6 +1148,11 @@ async fn fold_openai_stream(
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
     let mut state = OpenAiState::default();
+    // `data: [DONE]` is the OpenAI SSE terminal sentinel. Stop reading as soon
+    // as we see it instead of waiting for the connection to close — many
+    // OpenAI-compatible proxies (e.g. keep-alive gateways) leave the socket
+    // open after `[DONE]`, which would otherwise hang the turn until timeout.
+    let mut done = false;
 
     loop {
         let chunk = tokio::select! {
@@ -1161,7 +1166,8 @@ async fn fold_openai_stream(
         while let Some(frame) = parser.next_frame() {
             if frame.data.trim() == "[DONE]" {
                 on_event(&StreamEvent::MessageStop);
-                continue;
+                done = true;
+                break;
             }
             let value: serde_json::Value = serde_json::from_str(&frame.data).map_err(|error| {
                 state.failure(ProviderError::invalid_response(format!(
@@ -1173,6 +1179,9 @@ async fn fold_openai_stream(
                 return Err(state.failure(ProviderError::from_core(&error, "read_stream")));
             }
             handle_openai_chunk(&value, &mut state, on_event)?;
+        }
+        if done {
+            break;
         }
     }
 

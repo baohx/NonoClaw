@@ -48,6 +48,7 @@ use crate::project_info::ProjectInfo;
 #[cfg(test)]
 use nonoclaw_engine::{EngineEvent, EventEnvelope};
 
+use super::http_error::model_client_error;
 use super::permission_api::PendingPermissionMeta;
 use super::project_service::ProjectService;
 use super::run_handler::{
@@ -1075,15 +1076,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             .client_for(ClientPurpose::Subagent, Some(&model_used))
                         {
                             Ok(client) => client,
-                            Err(_) => {
+                            Err(err) => {
+                                tracing::warn!(model = %model_used, error = %err, "subagent client build failed");
                                 send_msg(
                                     &tx2,
-                                    safe_error(
-                                        ErrorCode::Configuration,
-                                        "subagent client configuration is invalid",
-                                        false,
-                                        "build_subagent_client",
-                                    ),
+                                    ServerMsg::Error {
+                                        error: model_client_error(
+                                            &s.config,
+                                            &model_used,
+                                            &err,
+                                            "build_subagent_client",
+                                        ),
+                                    },
                                 )
                                 .await;
                                 return;
@@ -1259,16 +1263,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .client_for(ClientPurpose::Conversation, Some(&model_used))
                     {
                         Ok(client) => client,
-                        Err(_) => {
-                            tracing::warn!(model = %model_used, "resolved run client build failed (details redacted)");
+                        Err(err) => {
+                            tracing::warn!(model = %model_used, error = %err, "resolved run client build failed");
                             send_msg(
                                 &tx2,
-                                safe_error(
-                                    ErrorCode::Configuration,
-                                    "model client configuration is invalid",
-                                    false,
-                                    "build_model_client",
-                                ),
+                                ServerMsg::Error {
+                                    error: model_client_error(
+                                        &s.config,
+                                        &model_used,
+                                        &err,
+                                        "build_model_client",
+                                    ),
+                                },
                             )
                             .await;
                             return;
@@ -1700,15 +1706,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     .client_for(ClientPurpose::Conversation, Some(&compact_for_model))
                 {
                     Ok(client) => client,
-                    Err(_) => {
+                    Err(err) => {
+                        tracing::warn!(model = %compact_for_model, error = %err, "compact client build failed");
                         send_msg(
                             &tx,
-                            safe_error(
-                                ErrorCode::Configuration,
-                                "model client configuration is invalid",
-                                false,
-                                "build_model_client",
-                            ),
+                            ServerMsg::Error {
+                                error: model_client_error(
+                                    &state.config,
+                                    &compact_for_model,
+                                    &err,
+                                    "build_model_client",
+                                ),
+                            },
                         )
                         .await;
                         continue;
