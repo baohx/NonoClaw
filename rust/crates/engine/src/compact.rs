@@ -227,6 +227,91 @@ pub const PRUNE_HEAD_CHARS: usize = 4_096;
 pub const PRUNE_TAIL_CHARS: usize = 1_024;
 const PRUNE_MARKER: &str = "[middle pruned]";
 
+// ── Micro-compact (AutoDream P1) ────────────────────────────────────────────
+
+/// Micro threshold: results above this get aggressively trimmed even when no
+/// compaction threshold has fired, to keep long tool-heavy sessions lean.
+pub const MICRO_THRESHOLD_CHARS: usize = 2_048;
+/// Head chars kept by micro-compact (aggressive: a quarter of the threshold).
+pub const MICRO_HEAD_CHARS: usize = 512;
+pub const MICRO_TAIL_CHARS: usize = 256;
+const MICRO_MARKER: &str = "[micro-compact]";
+/// Messages at the tail (most recent) are never micro-compacted: the active
+/// turn's tool results are still being reasoned about.
+pub const MICRO_PROTECT_RECENT: usize = 8;
+
+/// Cache-aware aggressive trim of old tool results (AutoDream P1). Runs
+/// BEFORE the 80% compaction pre-fire check each turn. Unlike
+/// `prune_tool_results` (8K threshold, only on compaction), this uses a 2K
+/// threshold and skips the most recent `MICRO_PROTECT_RECENT` messages so
+/// active work is untouched. Idempotent via `MICRO_MARKER`. Returns rewritten
+/// messages and the number of results trimmed.
+pub fn micro_compact(messages: &[Message]) -> (Vec<Message>, usize) {
+    let protect_from = messages.len().saturating_sub(MICRO_PROTECT_RECENT);
+    let mut trimmed = 0usize;
+    let out: Vec<Message> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if i >= protect_from {
+                return m.clone();
+            }
+            let MessageContent::Blocks(blocks) = &m.content else {
+                return m.clone();
+            };
+            let mut new_blocks = Vec::with_capacity(blocks.len());
+            let mut msg_changed = false;
+            for block in blocks {
+                let new_block = match block {
+                    ContentBlock::ToolResult {
+                        content: ToolResultContent::Text(text),
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } => {
+                        let count = text.chars().count();
+                        if count > MICRO_THRESHOLD_CHARS
+                            && !text.contains(MICRO_MARKER)
+                            && !text.contains(PRUNE_MARKER)
+                        {
+                            msg_changed = true;
+                            trimmed += 1;
+                            ContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: ToolResultContent::Text(format!(
+                                    "{}\n…[{count} total chars; {MICRO_MARKER}]…\n{}",
+                                    text.chars().take(MICRO_HEAD_CHARS).collect::<String>(),
+                                    text.chars()
+                                        .rev()
+                                        .take(MICRO_TAIL_CHARS)
+                                        .collect::<String>()
+                                        .chars()
+                                        .rev()
+                                        .collect::<String>(),
+                                )),
+                                is_error: *is_error,
+                                cache_control: None,
+                            }
+                        } else {
+                            block.clone()
+                        }
+                    }
+                    _ => block.clone(),
+                };
+                new_blocks.push(new_block);
+            }
+            if msg_changed {
+                let mut new_msg = m.clone();
+                new_msg.content = MessageContent::Blocks(new_blocks);
+                new_msg
+            } else {
+                m.clone()
+            }
+        })
+        .collect();
+    (out, trimmed)
+}
+
 /// Trim oversized `ToolResult::Text` blocks to head + marker + tail, in-memory
 /// only. Idempotent: results already carrying the marker are left untouched.
 /// Returns the rewritten messages and the number of results pruned. The
@@ -618,6 +703,92 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&again).unwrap(),
             serde_json::to_string(&pruned).unwrap()
+        );
+    }
+
+    // ========================================================================
+    // Micro-compact (AutoDream P1)
+    // ========================================================================
+
+    fn many_messages(n: usize, big_size: usize) -> Vec<Message> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            v.push(big_tool_result(&format!("t{i}"), big_size));
+        }
+        v
+    }
+
+    #[test]
+    fn micro_compact_trims_old_and_protects_recent() {
+        // 20 messages of 3K chars each: only those older than the last 8
+        // are eligible.
+        let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
+        let (out, count) = micro_compact(&msgs);
+        assert_eq!(count, 12, "20 - 8 protected = 12 trimmed");
+        // Eligible ones now carry the marker and are far smaller.
+        for (i, m) in out.iter().take(12).enumerate() {
+            let MessageContent::Blocks(b) = &m.content else {
+                panic!("msg {i}");
+            };
+            if let ContentBlock::ToolResult {
+                content: ToolResultContent::Text(t),
+                ..
+            } = &b[0]
+            {
+                assert!(t.contains(MICRO_MARKER));
+                assert!(t.chars().count() < MICRO_THRESHOLD_CHARS + 1000);
+            }
+        }
+        // Protected tail is byte-identical to the input.
+        for (i, (a, b)) in out.iter().skip(12).zip(msgs.iter().skip(12)).enumerate() {
+            assert_eq!(
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap(),
+                "protected msg {i} must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn micro_compact_is_idempotent() {
+        let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
+        let (first, n1) = micro_compact(&msgs);
+        assert_eq!(n1, 12);
+        let (second, n2) = micro_compact(&first);
+        assert_eq!(n2, 0, "second pass trims nothing");
+        assert_eq!(
+            serde_json::to_string(&second).unwrap(),
+            serde_json::to_string(&first).unwrap()
+        );
+    }
+
+    #[test]
+    fn micro_compact_skips_prune_marked_results() {
+        // A result already pruned by the 8K pruner must not be re-trimmed
+        // (it carries PRUNE_MARKER and stays as-is).
+        let (pruned, _) = prune_tool_results(&[big_tool_result(
+            "t0",
+            PRUNE_THRESHOLD_CHARS + 10,
+        )]);
+        let msgs: Vec<Message> = pruned
+            .into_iter()
+            .chain(many_messages(10, MICRO_THRESHOLD_CHARS + 1000))
+            .collect();
+        // 11 total messages, protect last 8 → 3 eligible: the prune-marked
+        // one is skipped, only the 2 new big ones in that window get trimmed.
+        let (_, count) = micro_compact(&msgs);
+        assert_eq!(count, 2, "prune-marked skipped, 2 eligible trimmed");
+    }
+
+    #[test]
+    fn micro_compact_noop_on_short_history() {
+        // Fewer than the protect window: nothing is ever trimmed.
+        let msgs = many_messages(5, MICRO_THRESHOLD_CHARS + 1000);
+        let (out, count) = micro_compact(&msgs);
+        assert_eq!(count, 0);
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            serde_json::to_string(&msgs).unwrap()
         );
     }
 }

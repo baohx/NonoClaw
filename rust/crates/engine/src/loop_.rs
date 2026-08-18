@@ -1845,6 +1845,29 @@ impl QueryEngine {
             // Auto-compact: if the estimated prompt exceeds the threshold,
             // summarize the older transcript before the next turn.
             if self.options.auto_compact {
+                // Micro-compact (AutoDream P1): aggressively trim OLD tool
+                // results every turn, before any compaction threshold fires.
+                // Protected: the most recent MICRO_PROTECT_RECENT messages,
+                // and anything already marked by either pruner (idempotent).
+                // Cache-awareness: trims only alter old turns, so the rolling
+                // last-message cache breakpoint stays meaningful; prefix
+                // reuse after micro is a partial hit, strictly better than
+                // the full re-read a compaction summary would cause.
+                {
+                    let (microd, micro_count) =
+                        crate::compact::micro_compact(&self.messages);
+                    if micro_count > 0 {
+                        self.messages = microd;
+                        self.cache.last_input_tokens = 0;
+                        on_event(&EngineEvent::Compacted {
+                            removed: 0,
+                            kept: self.messages.len(),
+                            tokens_before: 0,
+                            tokens_after: 0,
+                            pruned_results: micro_count,
+                        });
+                    }
+                }
                 // Use the provider-reported last-turn input_tokens when available;
                 // falls back to the chars/4 heuristic for runs that haven't had
                 // a turn yet (e.g. initial compact check).
