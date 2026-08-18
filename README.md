@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.18.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, and **high-fidelity DOCX/PDF export**.
+> **Version**: v0.19.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, **high-fidelity DOCX/PDF export**, **AutoDream background memory consolidation**, and **adversarial verification agents**.
 
 ---
 
@@ -89,12 +89,14 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | Category | Details |
 |---|---|
 | **Agent Loop** | Streaming SSE, auto-retry, multi-turn tool-use/tool-result pairing, **orphan repair** (auto-fix broken tool_use/tool_result pairs), **thinking-block strip** (Bedrock proxy compat), **batched parallel tool execution** (concurrency cap=10) |
-| **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). **Hybrid search** (BM25 + local vector store with character-trigram embeddings + cosine similarity), importance ranking. **Independent memory budget partitions** (beads/facts/wiki/index each have their own token cap). The `Memory` tool is part of the registry-derived core tool set and is auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
+| **Cross-Session Memory (Mneme)** | Three-layer: **Facts** (immutable knowledge in `memory/facts/*.md`), **Beads** (task continuity in `memory/beads/*.md`), **Transcript** (per-session JSONL). **Hybrid search** (BM25 + local vector store with character-trigram embeddings + cosine similarity), importance ranking. **Independent memory budget partitions** (beads/facts/wiki/index each have their own token cap). **Session vector index (Layer 3)**: full session transcripts vectorized (i8-quantized, incremental by file fingerprint) for cross-session recall via `Memory session_search`. The `Memory` tool is part of the registry-derived core tool set and is auto-injected into SystemBlock #2 each session. Git-friendly markdown files. Inspired by agentmemory. |
+| **AutoDream** | **Idle background memory consolidation** (v0.19): when the user is idle (default ≥10 min), no runs/pending approvals are in flight, and new session material exists, the server launches a headless "dream" run that walks recent transcripts (`session_search`), correlates fragments, distills reusable knowledge into `memory/facts/`, and refreshes the session vector index — the Mneme memory goes from passive recording to active consolidation. Config: `dreamEnabled` (default `true`) / `dreamIdleMinutes` (default `10`). |
 | **LLM Wiki** | Karpathy-style structured knowledge compilation: `wiki/` directory with concepts, entities, comparisons, decisions, sources. `raw/` for immutable source documents. LLM acts as compiler — ingests raw sources, creates/updates interlinked wiki pages. BM25 search + `Memory` tool actions (`wiki_search`, `wiki_ingest`, `wiki_lint`). `wiki/index.md` auto-injected at session start. |
 | **System Prompt** | Enhanced with surgical editing rules, 6 named failure modes, anti-overengineering patterns, ToolSearch guidance, **git context in uncached block** (cache survives per-turn), **memory write-back instructions** |
 | **Subagent Delegation** | `Agent` tool spawns a full subagent (autonomous, depth=1, non-interactive); `Coordinator` fans out parallel tasks. Both inherit CancellationToken + hooks + events. Child toolset excludes Agent/Coordinator/Graph (no recursion). **Graph tool** runs declarative DAG pipelines. |
 | **Agent Graphs** | **Declarative DAG pipelines** in `.nonoclaw/graphs/<name>.md`: YAML frontmatter defines nodes (subagent / LLM router / human gate) and `next` edges; fan-out parallelism + fan-in gathering; router picks branches dynamically; gate pauses for human approval; **checkpoint resume** after interruption. `Graph` tool for dynamic invocation + `/graph` slash command. Covers all 5 Anthropic workflow patterns. |
-| **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts (`systemPromptAppend` or **`systemPromptOverride`**), tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. |
+| **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts (`systemPromptAppend` or **`systemPromptOverride`**), tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. Bundled **verifier profile** (v0.19): an adversarial verification agent whose job is to *break* the implementation — every conclusion must be backed by executed command output (no read-code-PASS), attack-vector checklist (boundaries / concurrency / idempotency / orphan operations), write tools denied, structured VERDICT (PASS/FAIL/INCONCLUSIVE). |
+| **Sandbox & ACP** | **Landlock sandbox** (v0.19): Linux LSM backstop for Bash (workspace-write / read-only modes) with kernel probe + graceful fallback. **ACP server** (v0.19): Agent Client Protocol over stdio (`initialize`/`session`/`new`/`prompt`/`cancel`) — Zed and other ACP clients can drive NonoClaw directly. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
 | **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge**, **session-pinned keyword selection** (advertise only the relevant MCP-tool subset per session so the tools array stays cache-stable; `autoSelectMcp`/`autoSelectMcpTopK`) |
@@ -102,7 +104,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
 | **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
-| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session), **exact BPE tokenization** via bundled `tiktoken` (OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax; heuristic fallback for Claude), **independent memory budget partitions** (beads/facts/wiki/index) |
+| **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), **microCompact** (v0.19: cache-aware aggressive trim of old tool results — 2K threshold, head/tail kept, last 8 messages protected byte-for-byte; pushes autoCompact later without breaking the rolling cache breakpoint), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session) and **rolling `cache_control` breakpoints** (v0.19: last-message marker, 4-breakpoint cap, tool blocks marked directly — high cache hit rates on Anthropic-compatible providers), **exact BPE tokenization** via bundled `tiktoken` (OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax; heuristic fallback for Claude), **independent memory budget partitions** (beads/facts/wiki/index) |
 | **Token Efficiency** | **Exact BPE tokenizer** (`tiktoken` 3.8.3, pure-Rust with bundled rank tables — no runtime downloads); **cache hit-rate tracking** (DeepSeek `prompt_cache_hit_tokens` + standard `cached_tokens`); **cache hit-rate visualization** in Insight rail (segmented bar + percentage); **`extra_body` field** for provider-specific cache hints (OpenAI payload only) |
 | **Goal Tracking** | Multi-step task plans in `memory/goals/*.md`. Agent self-manages steps, verification criteria, and progress. `Memory goal_create/goal_update/goal_list` actions. |
 | **Skills** | `/skill-name` injection, **12 bundled built-in skills**, **dynamic activation** via paths/triggers/file discovery, argument substitution, fork context, usage tracking, hot reload, **progressive disclosure** (only metadata sits in the cached system prefix; the full body loads on demand via the `Skill` tool) |
@@ -809,6 +811,8 @@ Full example at `~/.nonoclaw/settings.json`:
 | `autoCompact` | Enable/disable auto-compaction (default `true`) |
 | `autoSelectMcp` | Narrow advertised MCP tools to a keyword-relevant subset, pinned per session for a cache-stable tools array (default `true`) |
 | `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `15`) |
+| `dreamEnabled` | Enable the AutoDream idle memory consolidation run (default `true`) |
+| `dreamIdleMinutes` | Idle minutes before a dream run may start (default `10`) |
 | `thinking` | Provider thinking configuration: `true` or `{"type":"enabled","budget_tokens":16000}` |
 | `executables` | Explicit rust/node/python executable paths and versions (see below) |
 | `elevenlabsApiKey` | ElevenLabs speech-to-text API key |
@@ -905,6 +909,9 @@ nonoclaw --serve-http 127.0.0.1:8765
 nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 nonoclaw --serve-http 127.0.0.1:8765 --tunnel
 
+# Agent Client Protocol server (drive NonoClaw from Zed etc.)
+nonoclaw --acp
+
 # Headless and piped input
 nonoclaw -p "summarize README"
 printf '%s\n' "review this workspace" | nonoclaw -p
@@ -996,6 +1003,7 @@ rust/crates/cli/src/serve_http/
 ├── run_handler.rs      run construction/cancel/compact
 ├── run_api.rs          REST API: POST /api/run (SSE), POST /api/sessions/:id/cancel
 ├── permission_api.rs   REST API: GET/POST /api/sessions/:id/permissions
+├── dream.rs            AutoDream idle scheduler + headless dream runs (v0.19)
 ├── session_hub.rs      revisioned peer/session synchronization
 ├── project_service.rs  file tree, Git, ProjectInfo
 ├── upload_service.rs   bounded attachment processing
@@ -1029,7 +1037,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.18.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**和**高保真 DOCX/PDF 导出**。
+> **版本**: v0.19.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**、**高保真 DOCX/PDF 导出**、**AutoDream 后台记忆整理**和**对抗性验证 agent**。
 
 ---
 
@@ -1115,12 +1123,14 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | 类别 | 详情 |
 |---|---|
 | **智能体循环** | 流式 SSE、自动重试、多轮 tool-use/tool-result 配对、**孤立修复**（自动修复断裂的 tool_use/tool_result 对）、**thinking 块过滤**（Bedrock 代理兼容）、**分批并行工具执行**（并发上限=10） |
-| **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。**混合搜索**（BM25 + 本地向量存储：字符三元组特征哈希嵌入 + 余弦相似度），重要性排序。**独立记忆预算分区**（beads/facts/wiki/index 各有独立 token 上限）。`Memory` 属于注册表生成的核心工具集合，每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。 |
+| **跨会话记忆 (Mneme)** | 三层架构：**Facts**（`memory/facts/*.md` 中的不可变知识）、**Beads**（`memory/beads/*.md` 中的任务连续性）、**Transcript**（每次会话的 JSONL 记录）。**混合搜索**（BM25 + 本地向量存储：字符三元组特征哈希嵌入 + 余弦相似度），重要性排序。**独立记忆预算分区**（beads/facts/wiki/index 各有独立 token 上限）。**会话向量索引（Layer 3）**：全会话记录向量化（i8 量化、按文件指纹增量），经 `Memory session_search` 实现跨会话回忆。`Memory` 属于注册表生成的核心工具集合，每次会话自动注入 SystemBlock #2。Git 友好的 Markdown 文件。 |
+| **AutoDream** | **闲置后台记忆整理**（v0.19）：用户闲置（默认 ≥10 分钟）、无运行中任务/待审批、且有新会话素材时，服务器自动发起 headless "dream" run——检索近期会话（`session_search`）、关联分析、把可复用知识萃取进 `memory/facts/`，并刷新会话向量索引——记忆从被动记录升级为主动整理。配置：`dreamEnabled`（默认 `true`）/ `dreamIdleMinutes`（默认 `10`）。 |
 | **LLM Wiki** | Karpathy 风格的结构化知识编译：`wiki/` 目录含有 concepts、entities、comparisons、decisions、sources 页面。`raw/` 存放不可变的源文档。LLM 充当编译器——摄入原始资料，创建/更新互链的 wiki 页面。BM25 搜索 + `Memory` 工具操作（`wiki_search`、`wiki_ingest`、`wiki_lint`）。`wiki/index.md` 在会话启动时自动注入。 |
 | **系统提示词** | 增强型：手术级编辑规则、6 种命名失败模式、反过度工程规则、ToolSearch 使用指南、**Git 上下文在非缓存块中**（缓存跨轮次保持有效）、**记忆回写指令** |
 | **子委托与编排** | `Agent` 工具生成完整子代理（自主、depth=1、非交互）；`Coordinator` 并行扇出多任务。全部继承 CancellationToken + hooks + 事件。子级工具集排除 Agent/Coordinator/Graph（禁止递归）。**Graph 工具**执行声明式 DAG 管线。 |
 | **Agent 图** | **声明式 DAG 管线**（`.nonoclaw/graphs/<name>.md`）：YAML frontmatter 定义节点（子代理 / LLM 路由 / 人工审批）和 `next` 边；fan-out 并行 + fan-in 汇聚；路由动态选择分支；看门暂停等待人工审批；**checkpoint 断点续跑**。`Graph` 工具动态调用 + `/graph` 斜杠命令。覆盖 Anthropic 全部 5 种工作流模式。 |
-| **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。 |
+| **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。内置 **verifier profile**（v0.19）：对抗性验证 agent——任务不是确认实现能工作，而是想方设法搞崩它；所有结论必须有实际执行的命令输出（禁止读码写 PASS）、攻击向量清单（边界/并发/幂等/孤儿操作）、禁用写工具、结构化 VERDICT（PASS/FAIL/INCONCLUSIVE）。 |
+| **沙箱与 ACP** | **Landlock 沙箱**（v0.19）：Linux LSM 为 Bash 提供兜底限制（workspace-write / read-only 模式），内核探测 + 不支持时优雅回退。**ACP 服务端**（v0.19）：Agent Client Protocol over stdio（`initialize`/`session`/`new`/`prompt`/`cancel`）——Zed 等 ACP 客户端可直接驱动 NonoClaw。 |
 | **文件附件** | 通过纸夹按钮、拖拽或粘贴上传 PDF/DOCX/DOC/TXT/MD/PNG/JPG；通过可配置的 Mistral/DeepSeek 文档模型**自动 OCR**；**直接文本提取**（pdftotext + ZIP XML）尽可能跳过 OCR；**嵌入图片提取**（pdfimages + word/media）并为每张图片生成 OCR 描述；多模态模型的 **ContentBlock::Image 注入** |
 | **Bash 后台任务** | `run_in_background: true` 启动分离进程，输出持久化到磁盘，完成时注入 `<task_notification>` |
 | **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接**，**会话级关键词选择**（每会话仅展示相关 MCP 工具子集，使 tools 数组缓存稳定；`autoSelectMcp`/`autoSelectMcpTopK`） |
@@ -1128,7 +1138,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **多模型切换** | 通过 UI 下拉框或 `/multi` 斜杠命令切换模型；`/multi` 语法错误时显示帮助提示 |
 | **权限** | 5 种模式：Default / AcceptEdits / Auto / BypassPermissions / Plan——通过 UI 下拉框切换。**REST API：`GET/POST /api/sessions/:id/permissions`** 用于外部系统异步审批。 |
 | **会话** | 按工作目录的 JSONL 持久化，`--resume` / `--continue` / `--list-sessions`，**会话命名**，渐进式元数据 |
-| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、可配置 `contextWindow`、**Prompt Cache**（带**缓存稳定前缀**：技能正文按需经 `Skill` 工具加载；MCP 子集按会话固定）、**精确 BPE 分词**（内置 `tiktoken`，支持 OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax；Claude 使用启发式回退）、**独立记忆预算分区**（beads/facts/wiki/index） |
+| **上下文** | **Segments 压缩**（保留最近 3 轮完整对话）、**two-pass 预压缩**（达 80% 阈值时后台异步压缩）、**microCompact**（v0.19：缓存感知的旧工具结果激进裁剪——2K 阈值、保头尾、最近 8 条消息字节级不动；推迟 autoCompact 且不破坏滚动缓存断点）、可配置 `contextWindow`、**Prompt Cache**（带**缓存稳定前缀** + **滚动 `cache_control` 断点**（v0.19：末消息标记、4 断点上限、tool 块直接标记——Anthropic 兼容供应商高缓存命中率）：技能正文按需经 `Skill` 工具加载；MCP 子集按会话固定）、**精确 BPE 分词**（内置 `tiktoken`，支持 OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax；Claude 使用启发式回退）、**独立记忆预算分区**（beads/facts/wiki/index） |
 | **Token 效率** | **精确 BPE 分词器**（`tiktoken` 3.8.3，纯 Rust 实现且内置 rank 表——无需运行时下载）；**缓存命中率追踪**（DeepSeek `prompt_cache_hit_tokens` + 标准 `cached_tokens`）；**Insight 栏缓存命中率可视化**（分段进度条 + 百分比）；**`extra_body` 字段**用于供应商特定缓存提示（仅 OpenAI 载荷） |
 | **目标追踪** | `memory/goals/*.md` 中的多步骤任务计划。Agent 自主管理步骤、验证标准和进度。`Memory goal_create/goal_update/goal_list` 操作。 |
 | **技能** | `/skill-name` 注入，**12 个内置技能**，通过路径/触发器/文件发现**动态激活**，参数替换，fork 上下文，使用追踪，热重载，**渐进式披露**（缓存系统前缀仅放元数据；完整正文按需经 `Skill` 工具加载） |
@@ -1671,6 +1681,8 @@ nonoclaw --plugin-add https://github.com/... # Git URL
 | `autoCompact` | 启用/禁用自动压缩 |
 | `autoSelectMcp` | 将展示的 MCP 工具收窄为关键词相关子集，并按会话固定以保持 tools 数组缓存稳定（默认 `true`） |
 | `autoSelectMcpTopK` | 收窄时展示的 MCP 工具数量上限（默认 `15`） |
+| `dreamEnabled` | 启用 AutoDream 闲置记忆整理 run（默认 `true`） |
+| `dreamIdleMinutes` | 触发 dream run 所需的闲置分钟数（默认 `10`） |
 
 ---
 
@@ -1685,6 +1697,9 @@ nonoclaw --plugin-add https://github.com/... # Git URL
 nonoclaw --serve-http 127.0.0.1:8765
 nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+
+# Agent Client Protocol 服务端（供 Zed 等编辑器驱动���
+nonoclaw --acp
 
 # Headless 与管道输入
 nonoclaw -p "总结 README"
