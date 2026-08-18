@@ -25,13 +25,23 @@ function lastMatching(entries: TraceEntry[] | undefined, predicate: (entry: Trac
   return undefined;
 }
 
-/** Cache hit rate (%) for a usage trace entry, or null when no input was billed. */
+/**
+ * Cache hit rate (%) for a usage trace entry, or null when nothing was billed.
+ * Anthropic semantics: `input_tokens` EXCLUDES cache reads/writes (sibling
+ * fields), so the billable base is the SUM — dividing by input alone yields
+ * rates above 100% on well-cached sessions (observed 532%), which the old
+ * Math.min clamp then froze at a misleading "100% hit".
+ */
 function cacheHitRateOf(usage: TraceEntry | undefined): number | null {
   const input = usage?.details.total_in;
   const cacheRead = usage?.details.total_cache_read;
+  const cacheWrite = usage?.details.total_cache_write;
   if (typeof input !== "number" || input <= 0) return null;
-  const read = typeof cacheRead === "number" ? Math.min(cacheRead, input) : 0;
-  return (read / input) * 100;
+  const base = input
+    + (typeof cacheRead === "number" ? cacheRead : 0)
+    + (typeof cacheWrite === "number" ? cacheWrite : 0);
+  if (base <= 0) return null;
+  return ((typeof cacheRead === "number" ? cacheRead : 0) / base) * 100;
 }
 
 export default function TechnicalTrace() {

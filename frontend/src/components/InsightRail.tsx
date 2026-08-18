@@ -537,16 +537,15 @@ function CacheSection() {
     );
   }
 
-  // Anthropic/OpenAI `input_tokens` includes tokens served from cache, so the
-  // hit rate is the fraction of input tokens read from cache.
-  const hit = Math.min(cacheRead, input);
-  const write = Math.min(cacheWrite, input - hit);
-  const miss = Math.max(input - hit - write, 0);
-  const total = Math.max(hit + write + miss, 1);
-  const hitRate = (hit / total) * 100;
+  // Cache hit-rate formula: Anthropic `input_tokens` EXCLUDES cache reads/writes
+  // (they are sibling fields), so the billable base = input + cache_read + cache_write.
+  // OpenAI `prompt_tokens` already includes cached tokens, but the frontend receives
+  // Anthropic format from both paths (backend normalizes), so always sum.
+  const base = input + cacheRead + cacheWrite;
+  const hitRate = base > 0 ? (cacheRead / base) * 100 : 0;
   const fmt = (n: number) => n.toLocaleString();
   const seg = (n: number, cls: string) =>
-    n > 0 ? <div className={`cache__seg ${cls}`} style={{ width: `${(n / total) * 100}%` }} /> : null;
+    n > 0 ? <div className={`cache__seg ${cls}`} style={{ width: `${(n / base) * 100}%` }} /> : null;
 
   return (
     <div className="cache">
@@ -557,19 +556,19 @@ function CacheSection() {
         </span>
       </div>
       <div className="cache__bar">
-        {seg(hit, "cache__seg--hit")}
-        {seg(write, "cache__seg--write")}
-        {seg(miss, "cache__seg--miss")}
+        {seg(cacheRead, "cache__seg--hit")}
+        {seg(cacheWrite, "cache__seg--write")}
+        {seg(input, "cache__seg--miss")}
       </div>
       <div className="cache__legend">
         <span className="cache__legend-item">
-          <i className="cache__legend-dot cache__legend-dot--hit" /> hit {fmt(hit)}
+          <i className="cache__legend-dot cache__legend-dot--hit" /> hit {fmt(cacheRead)}
         </span>
         <span className="cache__legend-item">
-          <i className="cache__legend-dot cache__legend-dot--write" /> write {fmt(write)}
+          <i className="cache__legend-dot cache__legend-dot--write" /> write {fmt(cacheWrite)}
         </span>
         <span className="cache__legend-item">
-          <i className="cache__legend-dot cache__legend-dot--miss" /> miss {fmt(miss)}
+          <i className="cache__legend-dot cache__legend-dot--miss" /> miss {fmt(input)}
         </span>
       </div>
       <div className="insight-row__meta" style={{ marginTop: 2 }}>

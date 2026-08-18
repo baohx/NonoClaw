@@ -223,6 +223,14 @@ export default function Markdown({ content }: Props) {
               {children}
             </a>
           ),
+          img: ({ src, alt, ...props }: ComponentPropsWithoutRef<"img">) => (
+            <img
+              src={src}
+              alt={alt}
+              style={{ maxWidth: "100%", height: "auto", borderRadius: 8 }}
+              {...props}
+            />
+          ),
           td: ({ children, ...props }: ComponentPropsWithoutRef<"td">) => (
             <td {...props}>{restorePipes(children)}</td>
           ),
