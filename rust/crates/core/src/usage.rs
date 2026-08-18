@@ -54,6 +54,11 @@ impl Usage {
 
 /// A streaming usage fragment as it appears in `message_start` / `message_delta`.
 /// All fields optional — only the relevant subset is present in each event.
+///
+/// `cache_read_input_tokens` also accepts DeepSeek's `prompt_cache_hit_tokens`
+/// alias: DeepSeek's Anthropic-compatible endpoint may pass through its native
+/// field name instead of translating to Anthropic's `cache_read_input_tokens`.
+/// Both mean "tokens served from the provider-side cache".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsagePart {
     #[serde(default)]
@@ -62,7 +67,7 @@ pub struct UsagePart {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "prompt_cache_hit_tokens")]
     pub cache_read_input_tokens: Option<u64>,
 }
 
@@ -101,5 +106,19 @@ mod tests {
         });
         assert_eq!(a.input_tokens, 13);
         assert_eq!(a.output_tokens, 12);
+    }
+
+    #[test]
+    fn cache_read_accepts_deepseek_prompt_cache_hit_alias() {
+        // DeepSeek's Anthropic-compatible endpoint may pass through its native
+        // field name instead of translating to Anthropic's cache_read_input_tokens.
+        let part: UsagePart =
+            serde_json::from_str(r#"{"prompt_cache_hit_tokens": 60}"#).unwrap();
+        assert_eq!(part.cache_read_input_tokens, Some(60));
+
+        // The canonical Anthropic name still works.
+        let part2: UsagePart =
+            serde_json::from_str(r#"{"cache_read_input_tokens": 42}"#).unwrap();
+        assert_eq!(part2.cache_read_input_tokens, Some(42));
     }
 }

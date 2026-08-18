@@ -50,6 +50,12 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Prompt-cache breakpoint. Valid on tool blocks per the Anthropic
+        /// Messages API (`cache_control` is accepted on every content block
+        /// type); `None` on nearly all blocks so existing constructors stay
+        /// untouched — set only by the engine's rolling breakpoint pass.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// Emitted by us (as a `user` message) to return a tool's result.
     ToolResult {
@@ -57,6 +63,9 @@ pub enum ContentBlock {
         content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        /// Prompt-cache breakpoint; see [`ContentBlock::ToolUse::cache_control`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// Model reasoning block (extended thinking). Carries a signature so the
     /// API can verify the chain across turns.
@@ -80,6 +89,7 @@ impl ContentBlock {
             tool_use_id,
             content: ToolResultContent::Text(content.into()),
             is_error: Some(is_error),
+            cache_control: None,
         }
     }
 
@@ -159,7 +169,7 @@ impl Message {
             MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         Some((id.clone(), name.clone(), input.clone()))
                     }
                     _ => None,
@@ -244,6 +254,7 @@ mod tests {
             id: "tu_1".into(),
             name: "Read".into(),
             input: serde_json::json!({"file_path": "/a"}),
+            cache_control: None,
         };
         let j = serde_json::to_value(&b).unwrap();
         assert_eq!(j["type"], "tool_use");

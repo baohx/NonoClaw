@@ -1096,6 +1096,7 @@ mod tests {
                 ContentBlock::ToolUse {
                     id: "tool-1".into(),
                     name: "Read".into(),
+                    cache_control: None,
                     input: serde_json::json!({}),
                 },
             ])))

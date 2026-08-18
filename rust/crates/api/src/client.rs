@@ -179,6 +179,14 @@ pub enum ApiFormat {
 }
 
 impl ApiFormat {
+    /// Short label for raw API logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            ApiFormat::Anthropic => "anthropic",
+            ApiFormat::OpenAI => "openai",
+        }
+    }
+
     pub fn capabilities(self) -> ProviderCapabilities {
         match self {
             ApiFormat::Anthropic => ProviderCapabilities {
@@ -333,7 +341,10 @@ impl Client {
         self
     }
 
-    fn build_request(&self, params: &RequestParams) -> Result<reqwest::RequestBuilder> {
+    fn build_request(
+        &self,
+        params: &RequestParams,
+    ) -> Result<(reqwest::RequestBuilder, Option<RawApiLogger>)> {
         let (url, body) = match self.format {
             ApiFormat::Anthropic => {
                 let body = serialize_body_anthropic(params)?;
@@ -350,6 +361,8 @@ impl Client {
         };
         // Write full raw context to .nonoclaw/logs/ for inspection.
         write_prompt_log(params, &body, &url);
+        // Raw API logging is a separate, unredacted, opt-in channel.
+        let logger = RawApiLogger::create(params, &url, &body, self.format.label());
         let mut req = self
             .http
             .post(url)
@@ -373,20 +386,26 @@ impl Client {
                 }
             }
         }
-        Ok(req.body(body))
+        Ok((req.body(body), logger))
     }
 
     /// Build + send one streaming request, returning the live response on 2xx
     /// or a classified [`Error`] otherwise. Retried by [`Self::run_turn`].
-    async fn send_request(&self, params: &RequestParams) -> Result<reqwest::Response> {
-        let req = self.build_request(params)?;
+    /// On success, an optional raw-API logger is attached (only when
+    /// `NONOCLAW_RAW_API_LOG` is enabled) so the stream fold can capture the
+    /// raw SSE frames and final usage.
+    async fn send_request(
+        &self,
+        params: &RequestParams,
+    ) -> Result<(reqwest::Response, Option<RawApiLogger>)> {
+        let (req, logger) = self.build_request(params)?;
         let resp = req
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
         let status = resp.status();
         if status.is_success() {
-            Ok(resp)
+            Ok((resp, logger))
         } else {
             let code = status.as_u16();
             let text = resp.text().await.unwrap_or_default();
@@ -448,8 +467,12 @@ impl Client {
         };
 
         let result = match self.format {
-            ApiFormat::Anthropic => fold_anthropic_stream(response, &mut on_event, &cancel).await,
-            ApiFormat::OpenAI => fold_openai_stream(response, &mut on_event, &cancel).await,
+            ApiFormat::Anthropic => {
+                fold_anthropic_stream(response.0, response.1, &mut on_event, &cancel).await
+            }
+            ApiFormat::OpenAI => {
+                fold_openai_stream(response.0, response.1, &mut on_event, &cancel).await
+            }
         };
         if let Err(failure) = &result {
             on_event(&StreamEvent::StreamError {
@@ -488,6 +511,7 @@ fn message_has_cache_control(message: &Message) -> bool {
 /// Fold an Anthropic SSE response stream into a [`TurnOutput`].
 async fn fold_anthropic_stream(
     response: reqwest::Response,
+    raw_log: Option<RawApiLogger>,
     on_event: &mut impl FnMut(&StreamEvent),
     cancel: &CancellationToken,
 ) -> std::result::Result<TurnOutput, StreamFailure> {
@@ -505,6 +529,9 @@ async fn fold_anthropic_stream(
         let Some(chunk) = chunk else { break };
         let bytes =
             chunk.map_err(|error| state.failure(ProviderError::stream(error.to_string(), true)))?;
+        if let Some(log) = &raw_log {
+            log.append_frame(&bytes);
+        }
         parser.feed_bytes(&bytes);
         while let Some(frame) = parser.next_frame() {
             if let Err(error) = handle_frame(
@@ -521,7 +548,30 @@ async fn fold_anthropic_stream(
         }
     }
 
-    state.finish()
+    let result = state.finish();
+    if let Some(log) = &raw_log {
+        let summary = match &result {
+            Ok(output) => serde_json::json!({
+                "outcome": "ok",
+                "message_id": output.message_id,
+                "model": output.model,
+                "stop_reason": format!("{:?}", output.stop_reason),
+                "usage": usage_json_with_base(
+                    &output.usage,
+                    // Anthropic: input_tokens excludes cache read/write siblings.
+                    output.usage.input_tokens
+                        + output.usage.cache_read_input_tokens
+                        + output.usage.cache_creation_input_tokens,
+                ),
+            }),
+            Err(failure) => serde_json::json!({
+                "outcome": "error",
+                "error": format!("{:?}", failure.error.code),
+            }),
+        };
+        log.write_summary("anthropic", summary);
+    }
+    result
 }
 
 #[derive(Debug, Default)]
@@ -608,7 +658,7 @@ impl BlockBuilder {
                         ))
                     })?
                 };
-                Ok(ContentBlock::ToolUse { id, name, input })
+                Ok(ContentBlock::ToolUse { id, name, input, cache_control: None })
             }
             BlockBuilder::Thinking {
                 thinking,
@@ -635,6 +685,7 @@ impl BlockBuilder {
                 name: name.clone(),
                 input: serde_json::from_str(input_json)
                     .unwrap_or_else(|_| serde_json::json!({"_partial_json": input_json})),
+                cache_control: None,
             },
             BlockBuilder::Thinking {
                 thinking,
@@ -837,6 +888,90 @@ fn handle_frame(
 }
 
 /// Build the streaming request body JSON.
+/// Anthropic caps prompt-cache breakpoints at 4 per request (5 for some
+/// beta tiers); exceeding the cap is a hard 400. The engine emits system
+/// breakpoints (Block 1, project context, memory), a tool-list breakpoint,
+/// and a rolling message breakpoint — that can reach 5. Enforce the cap at
+/// serialization time.
+///
+/// The provider builds its cache prefix in the order **tools → system →
+/// messages**, so the tool-list breakpoint (end of tools) is fully subsumed
+/// by ANY system breakpoint — it is the most redundant marker and the first
+/// to drop. When more cuts are needed, drop progressively deeper-into-system
+/// markers (Block 1 first); the rolling message breakpoint and the deepest
+/// surviving system marker are always kept last.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+fn enforce_cache_breakpoint_cap(body: &mut serde_json::Value) {
+    // Count breakpoints across the whole payload (tools, system, messages).
+    let count_breakpoints = |body: &serde_json::Value| -> usize {
+        let arrays = [
+            body["tools"].as_array(),
+            body["system"].as_array(),
+            body["messages"].as_array(),
+        ];
+        arrays
+            .into_iter()
+            .flatten()
+            .flat_map(|items| items.iter().map(|item| {
+                let own = item.get("cache_control").is_some() as usize;
+                let blocks = item
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|block| block.get("cache_control").is_some())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                own + blocks
+            }))
+            .sum()
+    };
+    let total = count_breakpoints(body);
+    let mut to_drop = total.saturating_sub(MAX_CACHE_BREAKPOINTS);
+    if to_drop == 0 {
+        return;
+    }
+    // Drop oldest-first in prefix order: tools, then system front-to-back,
+    // then message blocks oldest-first. The rolling (last-message)
+    // breakpoint is the deepest and is kept.
+    let mut drop_next = |value: &mut serde_json::Value| -> bool {
+        if to_drop == 0 {
+            return false;
+        }
+        value.as_object_mut().map(|map| map.remove("cache_control"));
+        to_drop -= 1;
+        true
+    };
+    if let Some(tools) = body["tools"].as_array_mut() {
+        for tool in tools.iter_mut() {
+            if tool.get("cache_control").is_some() && !drop_next(tool) {
+                return;
+            }
+        }
+    }
+    if let Some(system) = body["system"].as_array_mut() {
+        for block in system.iter_mut() {
+            if block.get("cache_control").is_some() && !drop_next(block) {
+                return;
+            }
+        }
+    }
+    if let Some(messages) = body["messages"].as_array_mut() {
+        for message in messages.iter_mut() {
+            if let Some(blocks) = message["content"].as_array_mut() {
+                for block in blocks.iter_mut() {
+                    if block.get("cache_control").is_some() && !drop_next(block) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     let mut body = serde_json::json!({
         "model": params.model,
@@ -850,6 +985,7 @@ fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     if !params.tools.is_empty() {
         body["tools"] = serde_json::to_value(&params.tools)?;
     }
+    enforce_cache_breakpoint_cap(&mut body);
     if let Some(tc) = &params.tool_choice {
         body["tool_choice"] = serde_json::to_value(tc)?;
     }
@@ -910,7 +1046,7 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
                                 "image_url":{"url": format!("data:{};base64,{}", source.media_type, source.data)}
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse { id, name, input, .. } => {
                             tool_calls.push(serde_json::json!({
                                 "id": id, "type": "function",
                                 "function": {"name": name, "arguments": serde_json::to_string(input).unwrap_or_default()}
@@ -1028,14 +1164,9 @@ struct OpenAiUsage {
     completion_tokens: u64,
     #[serde(default)]
     prompt_tokens_details: OpenAiPromptTokenDetails,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct OpenAiPromptTokenDetails {
-    /// OpenAI / vLLM convention: tokens served from a provider-side cache.
-    #[serde(default)]
-    cached_tokens: u64,
-    /// DeepSeek convention: tokens served from its automatic context cache.
+    /// DeepSeek "Context Caching on Disk" convention: tokens served from its
+    /// automatic context cache. Reported at the `usage` level (a sibling of
+    /// `prompt_tokens_details`), NOT nested inside it.
     #[serde(default, rename = "prompt_cache_hit_tokens")]
     prompt_cache_hit_tokens: u64,
     /// DeepSeek convention: tokens that missed the cache (billed at full rate).
@@ -1045,12 +1176,21 @@ struct OpenAiPromptTokenDetails {
     prompt_cache_miss_tokens: u64,
 }
 
-impl OpenAiPromptTokenDetails {
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiPromptTokenDetails {
+    /// OpenAI / vLLM convention: tokens served from a provider-side cache.
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl OpenAiUsage {
     /// Tokens read from any provider-side cache, across the field-name
-    /// dialects (`cached_tokens` / `prompt_cache_hit_tokens`). The miss
-    /// counter is kept for budget insight; it is not part of cache reads.
+    /// dialects (`cached_tokens` / DeepSeek `prompt_cache_hit_tokens`). The
+    /// miss counter is kept for budget insight; it is not part of cache reads.
     fn cache_read_tokens(&self) -> u64 {
-        self.cached_tokens.max(self.prompt_cache_hit_tokens)
+        self.prompt_tokens_details
+            .cached_tokens
+            .max(self.prompt_cache_hit_tokens)
     }
 }
 
@@ -1088,6 +1228,7 @@ impl OpenAiState {
                 name: tool.name.clone(),
                 input: serde_json::from_str(&tool.arguments)
                     .unwrap_or_else(|_| serde_json::json!({"_partial_json": tool.arguments})),
+                cache_control: None,
             }
         }));
         TurnOutput {
@@ -1134,6 +1275,7 @@ impl OpenAiState {
                 id: tool.id,
                 name: tool.name,
                 input,
+                cache_control: None,
             });
         }
         Ok(TurnOutput { content, ..partial })
@@ -1142,6 +1284,7 @@ impl OpenAiState {
 
 async fn fold_openai_stream(
     response: reqwest::Response,
+    raw_log: Option<RawApiLogger>,
     on_event: &mut impl FnMut(&StreamEvent),
     cancel: &CancellationToken,
 ) -> std::result::Result<TurnOutput, StreamFailure> {
@@ -1162,6 +1305,9 @@ async fn fold_openai_stream(
         let Some(chunk) = chunk else { break };
         let bytes =
             chunk.map_err(|error| state.failure(ProviderError::stream(error.to_string(), true)))?;
+        if let Some(log) = &raw_log {
+            log.append_frame(&bytes);
+        }
         parser.feed_bytes(&bytes);
         while let Some(frame) = parser.next_frame() {
             if frame.data.trim() == "[DONE]" {
@@ -1185,7 +1331,28 @@ async fn fold_openai_stream(
         }
     }
 
-    state.finish()
+    let result = state.finish();
+    if let Some(log) = &raw_log {
+        let summary = match &result {
+            Ok(output) => serde_json::json!({
+                "outcome": "ok",
+                "message_id": output.message_id,
+                "model": output.model,
+                "stop_reason": format!("{:?}", output.stop_reason),
+                "usage": usage_json_with_base(
+                    &output.usage,
+                    // OpenAI/DeepSeek: prompt_tokens already includes cached tokens.
+                    output.usage.input_tokens,
+                ),
+            }),
+            Err(failure) => serde_json::json!({
+                "outcome": "error",
+                "error": format!("{:?}", failure.error.code),
+            }),
+        };
+        log.write_summary("openai", summary);
+    }
+    result
 }
 
 #[allow(clippy::result_large_err)]
@@ -1219,7 +1386,7 @@ fn handle_openai_chunk(
             input_tokens: Some(usage.prompt_tokens),
             output_tokens: Some(usage.completion_tokens),
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: Some(usage.prompt_tokens_details.cache_read_tokens()),
+            cache_read_input_tokens: Some(usage.cache_read_tokens()),
         };
         state.usage.update_from_part(&part);
         on_event(&StreamEvent::MessageDelta {
@@ -1304,6 +1471,152 @@ fn openai_stop_reason(reason: &str) -> StopReason {
 /// attachment bytes are never written, even when diagnostics are enabled.
 fn prompt_log_requested(value: Option<&str>) -> bool {
     value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+// ── Raw API traffic logging (opt-in, full fidelity) ─────────────────────────
+//
+// Unlike the redacted prompt metadata log above, this captures EVERYTHING:
+// full request bodies, raw SSE frames, and per-turn usage summaries. It is the
+// diagnostic channel for provider quirks (cache-hit accounting dialects,
+// unexpected usage field shapes). Strictly opt-in via `--log-raw-api` (which
+// sets `NONOCLAW_RAW_API_LOG=1`) because payloads include prompts and keys
+// are the only thing excluded (keys live in headers, never logged).
+
+fn raw_api_log_enabled() -> bool {
+    std::env::var_os("NONOCLAW_RAW_API_LOG")
+        .map(|value| {
+            matches!(
+                value.to_string_lossy().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn sanitize_trace_label(trace: &str) -> String {
+    trace
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(96)
+        .collect()
+}
+
+/// One logged API attempt: request JSON + raw SSE response + usage summary.
+struct RawApiLogger {
+    response_path: std::path::PathBuf,
+    summary_path: std::path::PathBuf,
+}
+
+impl RawApiLogger {
+    fn create(params: &RequestParams, url: &str, body: &str, api_format: &str) -> Option<Self> {
+        if !raw_api_log_enabled() {
+            return None;
+        }
+        static WARNING: std::sync::Once = std::sync::Once::new();
+        WARNING.call_once(|| {
+            tracing::warn!(
+                "raw API logging enabled — full unredacted request/response payloads are being written to .nonoclaw/logs/api/"
+            );
+        });
+        let cwd =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let dir = cwd.join(".nonoclaw/logs/api");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let trace = sanitize_trace_label(params.trace_label.as_deref().unwrap_or("unknown"));
+        let stem = format!("{ms}-{trace}");
+        let payload = serde_json::json!({
+            "format": "nonoclaw-raw-api-request-v1",
+            "api_format": api_format,
+            "trace": params.trace_label,
+            "model": params.model,
+            "url": url,
+            "body": serde_json::from_str::<serde_json::Value>(body)
+                .unwrap_or(serde_json::Value::String(body.to_string())),
+        });
+        let request_path = dir.join(format!("{stem}.request.json"));
+        let pretty = serde_json::to_string_pretty(&payload).ok()?;
+        write_private_file(&request_path, pretty.as_bytes())?;
+        Some(Self {
+            response_path: dir.join(format!("{stem}.resp.sse")),
+            summary_path: dir.join(format!("{stem}.summary.json")),
+        })
+    }
+
+    /// Append raw SSE bytes exactly as received (diagnostics need fidelity).
+    fn append_frame(&self, bytes: &[u8]) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.response_path)
+        {
+            let _ = file.write_all(bytes);
+        }
+    }
+
+    /// Final per-turn accounting, including the folded usage the UI sees.
+    fn write_summary(&self, status: &str, summary: serde_json::Value) {
+        let payload = serde_json::json!({
+            "format": "nonoclaw-raw-api-summary-v1",
+            "status": status,
+            "summary": summary,
+        });
+        if let Ok(pretty) = serde_json::to_string_pretty(&payload) {
+            let _ = write_private_file(&self.summary_path, pretty.as_bytes());
+        }
+    }
+}
+
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).ok()?;
+    use std::io::Write;
+    file.write_all(bytes).ok()
+}
+
+/// Same as [`usage_json`] but with an explicit input-token base (use the
+/// provider-reported total prompt size when the format embeds cached tokens
+/// inside it, e.g. OpenAI `prompt_tokens`). Anthropic callers pass
+/// `input + cache_read + cache_write`; OpenAI callers pass `input_tokens`
+/// alone (`prompt_tokens` already includes cached tokens, so the sum would
+/// double-count).
+fn usage_json_with_base(usage: &nonoclaw_core::Usage, input_base: u64) -> serde_json::Value {
+    let hit_rate = if input_base > 0 {
+        Some((usage.cache_read_input_tokens as f64 / input_base as f64) * 100.0)
+    } else {
+        None
+    };
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "cache_hit_rate_pct": hit_rate,
+    })
 }
 
 fn write_prompt_log(params: &RequestParams, _body: &str, _url: &str) {
@@ -1788,7 +2101,7 @@ mod tests {
             _ => panic!("expected text block"),
         }
         match &content[1] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "Read");
                 assert_eq!(input["file_path"], "/a");
@@ -1857,6 +2170,42 @@ mod tests {
             extra_body: None,
             trace_label: Some("provider-fixture".into()),
         }
+    }
+
+    #[test]
+    fn anthropic_breakpoint_cap_drops_oldest_system_markers_first() {
+        // Engine worst case: 3 system breakpoints + 1 tool breakpoint + 1
+        // rolling message breakpoint = 5 > the provider cap of 4. The cap
+        // enforcer must keep the deepest (rolling) markers and drop the
+        // oldest system marker.
+        let cc = || Some(CacheControl { kind: nonoclaw_core::CacheControlKind::Ephemeral });
+        let mut params = fixture_params();
+        params.system = vec![
+            SystemBlock { kind: "text".into(), text: "identity".into(), cache_control: cc() },
+            SystemBlock { kind: "text".into(), text: "project".into(), cache_control: cc() },
+            SystemBlock { kind: "text".into(), text: "memory".into(), cache_control: cc() },
+        ];
+        params.tools[0].cache_control = cc();
+        params.messages = vec![Message {
+            role: nonoclaw_core::Role::User,
+            content: nonoclaw_core::MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "rolling tail".into(),
+                cache_control: cc(),
+            }]),
+        }];
+        let body: serde_json::Value =
+            serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
+        let count = serde_json::to_string(&body).unwrap().matches("cache_control").count();
+        assert_eq!(count, 4, "exactly the cap of 4 breakpoints must survive");
+        // The rolling message breakpoint survives...
+        assert!(!body["messages"][0]["content"][0]["cache_control"].is_null());
+        // ...all three system markers survive (tools→system→messages prefix
+        // order means every system marker subsumes the tool marker)...
+        assert!(!body["system"][0]["cache_control"].is_null());
+        assert!(!body["system"][1]["cache_control"].is_null());
+        assert!(!body["system"][2]["cache_control"].is_null());
+        // ...so the redundant TOOL breakpoint is the one dropped.
+        assert!(body["tools"][0]["cache_control"].is_null());
     }
 
     #[test]
@@ -1955,10 +2304,12 @@ mod tests {
     #[test]
     fn openai_cache_strategy_counts_deepseek_hits_and_reports_usage() {
         // OpenAI-format providers report cache hits under different field
-        // names. DeepSeek: prompt_cache_hit_tokens / prompt_cache_miss_tokens.
+        // names. DeepSeek "Context Caching on Disk": prompt_cache_hit_tokens /
+        // prompt_cache_miss_tokens at the `usage` level (siblings of
+        // prompt_tokens_details), where hit + miss == prompt_tokens.
         let mut state = OpenAiState::default();
         let mut events = Vec::new();
-        let frame = r#"{"id":"x","model":"deepseek-chat","usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}},"choices":[]}"#;
+        let frame = r#"{"id":"x","model":"deepseek-chat","usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40},"choices":[]}"#;
         let value: serde_json::Value = serde_json::from_str(frame).unwrap();
         handle_openai_chunk(&value, &mut state, &mut |event| events.push(event.clone())).unwrap();
         assert_eq!(state.usage.cache_read_input_tokens, 60);
@@ -1970,6 +2321,54 @@ mod tests {
         let value2: serde_json::Value = serde_json::from_str(frame2).unwrap();
         handle_openai_chunk(&value2, &mut state2, &mut |_| {}).unwrap();
         assert_eq!(state2.usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn cache_hit_rate_uses_billable_base_per_provider_semantics() {
+        // Real GLM-5.3 traffic captured 2026-08-16 (raw API log, turn 1):
+        // message_delta reports input_tokens=116380 EXCLUDING the sibling
+        // cache_read_input_tokens=9216. The naive cache_read/input formula
+        // yields 7.9% here — but for high-hit sessions it EXCEEDS 100%
+        // (observed 532% in persisted cumulative_usage), which the frontend
+        // then clamps to a permanent "100% hit". The billable base for
+        // Anthropic semantics is input + cache_read + cache_write.
+        let glm_turn = nonoclaw_core::Usage {
+            input_tokens: 116_380,
+            output_tokens: 196,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 9_216,
+        };
+        let anthropic = usage_json_with_base(
+            &glm_turn,
+            glm_turn.input_tokens + glm_turn.cache_read_input_tokens + glm_turn.cache_creation_input_tokens,
+        );
+        let expected = 9_216_f64 / (116_380 + 9_216) as f64 * 100.0;
+        assert_eq!(anthropic["cache_hit_rate_pct"].as_f64().unwrap(), expected);
+        assert!(expected < 8.0);
+
+        // A hypothetical high-hit Anthropic turn: 90% of the prompt served
+        // from cache must give ~90%, never >100%.
+        let high_hit = nonoclaw_core::Usage {
+            input_tokens: 10_000,
+            output_tokens: 100,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 90_000,
+        };
+        let rate = usage_json_with_base(
+            &high_hit,
+            high_hit.input_tokens + high_hit.cache_read_input_tokens + high_hit.cache_creation_input_tokens,
+        )["cache_hit_rate_pct"]
+            .as_f64()
+            .unwrap();
+        assert!((rate - 90.0).abs() < 0.01, "got {rate}");
+
+        // OpenAI semantics: prompt_tokens already includes cached tokens, so
+        // the base is input_tokens alone (no sum, no double-count).
+        let openai = usage_json_with_base(&glm_turn, glm_turn.input_tokens);
+        assert_eq!(
+            openai["cache_hit_rate_pct"].as_f64().unwrap(),
+            9_216_f64 / 116_380.0 * 100.0
+        );
     }
 
     #[test]
@@ -1987,6 +2386,31 @@ mod tests {
         let anthropic: serde_json::Value =
             serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
         assert!(anthropic.get("prompt_cache").is_none());
+    }
+
+    #[test]
+    fn openai_serializer_strips_anthropic_cache_markers_from_tool_blocks() {
+        // The engine's rolling breakpoint lands on tool_use / tool_result
+        // blocks (Anthropic accepts cache_control on every block kind).
+        // OpenAI-compatible endpoints have no such field — automatic prefix
+        // caching needs no markers — so the serializer must not leak the
+        // Anthropic field into the OpenAI payload.
+        let mut params = fixture_params();
+        let cc = Some(CacheControl { kind: nonoclaw_core::CacheControlKind::Ephemeral });
+        params.messages = vec![Message {
+            role: nonoclaw_core::Role::Assistant,
+            content: nonoclaw_core::MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "tu_x".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+                cache_control: cc,
+            }]),
+        }];
+        let openai_str = serialize_body_openai(&params).unwrap();
+        assert!(
+            !openai_str.contains("cache_control"),
+            "cache_control must not leak into OpenAI payloads: {openai_str}"
+        );
     }
 
     #[test]
@@ -2269,5 +2693,102 @@ mod security_tests {
         ] {
             assert!(!encoded.contains(forbidden), "leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn raw_api_logger_writes_request_frames_and_summary_when_enabled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let params = RequestParams {
+            model: "fixture-model".into(),
+            max_tokens: 42,
+            system: vec![SystemBlock {
+                kind: "text".into(),
+                text: "system prompt body".into(),
+                cache_control: None,
+            }],
+            messages: vec![Message::user(MessageContent::from_text(
+                "raw user prompt",
+            ))],
+            tools: vec![],
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            trace_label: Some("sess-abc:turn-3".into()),
+        };
+
+        let original_cwd = std::env::current_dir().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "nonoclaw-raw-api-log-test-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Restore cwd and remove ONLY the temp dir on drop — never the original
+        // cwd (a previous version removed `original_cwd`, deleting the crate).
+        struct DirGuard {
+            original: std::path::PathBuf,
+            tmp: std::path::PathBuf,
+        }
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.original);
+                let _ = std::fs::remove_dir_all(&self.tmp);
+            }
+        }
+        let _guard = DirGuard {
+            original: original_cwd,
+            tmp: tmp.clone(),
+        };
+        std::env::set_current_dir(&tmp).unwrap();
+        std::env::set_var("NONOCLAW_RAW_API_LOG", "1");
+
+        let logger = RawApiLogger::create(
+            &params,
+            "https://fixture.example/v1/chat/completions",
+            &serialize_body_openai(&params).unwrap(),
+            "openai",
+        )
+        .expect("logger should be created when env var is set");
+
+        logger.append_frame(b"data: {\"usage\":{}}\n\n");
+        logger.write_summary(
+            "openai",
+            serde_json::json!({"outcome": "ok", "usage": usage_json_with_base(&Default::default(), 0)}),
+        );
+
+        let log_dir = tmp.join(".nonoclaw/logs/api");
+        let names: Vec<String> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "request + resp + summary: {names:?}");
+        let request_file = names.iter().find(|n| n.ends_with(".request.json")).unwrap();
+        let request_text =
+            std::fs::read_to_string(log_dir.join(request_file)).unwrap();
+        // Full-fidelity diagnostics: prompt content IS present (that is the point).
+        assert!(request_text.contains("raw user prompt"));
+        assert!(request_text.contains("fixture-model"));
+        assert!(!request_text.contains("Bearer"), "keys never logged");
+
+        let summary_file = names.iter().find(|n| n.ends_with(".summary.json")).unwrap();
+        let summary_text = std::fs::read_to_string(log_dir.join(summary_file)).unwrap();
+        assert!(summary_text.contains("nonoclaw-raw-api-summary-v1"));
+        assert!(summary_text.contains("cache_hit_rate_pct"));
+
+        let sse_file = names.iter().find(|n| n.ends_with(".resp.sse")).unwrap();
+        let sse_text = std::fs::read_to_string(log_dir.join(sse_file)).unwrap();
+        assert!(sse_text.contains("data: {\"usage\":{}}"));
+
+        // Trace label sanitized into the file stem.
+        assert!(request_file.contains("sess-abc-turn-3"));
+
+        std::env::remove_var("NONOCLAW_RAW_API_LOG");
+        assert!(RawApiLogger::create(&params, "https://x", "{}", "openai").is_none());
     }
 }

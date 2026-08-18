@@ -7,6 +7,7 @@
 //! history so a `--resume` gets maximum fidelity (and may re-compact).
 
 use nonoclaw_api::{Client, RequestParams, SystemBlock};
+
 use nonoclaw_core::{ContentBlock, Message, MessageContent, Result, ToolResultContent};
 use serde_json::Value;
 
@@ -28,6 +29,36 @@ const SUMMARY_SYSTEM: &str = r#"You are a summarization assistant. Produce a con
 </open_questions>
 
 Do NOT omit concrete technical details (paths, names, values, error messages). Skip sections that have nothing to record (e.g. no commands run → omit <commands_run> entirely)."#;
+
+/// User instruction appended after a raw prefix replay (KV-cache reuse path).
+/// Kept short so it does not disturb the byte-identical prefix that precedes it.
+const SUMMARY_USER_INSTRUCTION: &str = "Summarize the conversation above so work can continue with only your summary plus the most recent messages. Preserve concrete technical details (paths, names, values, error messages). Use the XML structure: <goal>, <decisions>, <files_modified>, <commands_run>, <current_state>, <open_questions>. Omit empty sections.";
+
+/// Approximate on-the-wire character count for a message slice. Serialized JSON
+/// is a conservative upper bound on the provider payload; used only to decide
+/// whether the summarizer can safely replay the raw prefix within budget.
+fn wire_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|s| s.chars().count()).unwrap_or(0))
+        .sum()
+}
+
+/// Decide whether the summarizer can replay the live request's raw prefix for
+/// KV-cache reuse: the compact model must match the live model, a prior request
+/// must exist, and the raw prefix must fit the input budget.
+fn can_reuse_prefix(
+    prefix_template: Option<&RequestParams>,
+    model: &str,
+    to_compact: &[Message],
+    max_input_chars: usize,
+) -> bool {
+    match prefix_template {
+        Some(tpl) => tpl.model == model && wire_chars(to_compact) <= max_input_chars,
+        None => false,
+    }
+}
+
 
 /// Default cap on the summarizer's output. Overridable via the
 /// `compactMaxTokens` settings.json field.
@@ -94,6 +125,7 @@ pub async fn compact_messages(
     mode: CompactMode,
     max_input_chars: usize,
     max_summary_tokens: u32,
+    prefix_template: Option<&RequestParams>,
 ) -> Result<Vec<Message>> {
     // In segments mode, `keep_recent` counts turns, not messages.
     let effective_keep = match mode {
@@ -122,21 +154,43 @@ pub async fn compact_messages(
     let to_compact = &messages[..split];
     let keep = &messages[split..];
 
-    let transcript = bound_summary_transcript(&render_for_summary(to_compact), max_input_chars);
-    let user_text = format!(
-        "Summarize the following conversation so work can continue with only your summary plus \
-         the most recent messages. Preserve concrete technical details.\n\n<conversation>\n\
-         {transcript}\n</conversation>"
-    );
+    // KV-cache reuse: replay the raw prefix (identical to the live request's
+    // history prefix) so provider prefix caching (DeepSeek automatic,
+    // Anthropic cache_control) hits. Requires the same model and a prefix that
+    // fits the input budget; otherwise fall back to the flattened, bounded
+    // rendering (which is cheaper to build but never shares a cache prefix).
+    let reuse_prefix = can_reuse_prefix(prefix_template, model, to_compact, max_input_chars);
+
+    let (system_blocks, request_messages) = if reuse_prefix {
+        let tpl = prefix_template.expect("reuse_prefix implies Some");
+        let mut msgs = to_compact.to_vec();
+        msgs.push(Message::user(MessageContent::from_text(
+            SUMMARY_USER_INSTRUCTION,
+        )));
+        (tpl.system.clone(), msgs)
+    } else {
+        let transcript =
+            bound_summary_transcript(&render_for_summary(to_compact), max_input_chars);
+        let user_text = format!(
+            "Summarize the following conversation so work can continue with only your summary plus \
+             the most recent messages. Preserve concrete technical details.\n\n<conversation>\n\
+             {transcript}\n</conversation>"
+        );
+        (
+            vec![SystemBlock {
+                kind: "text".into(),
+                text: SUMMARY_SYSTEM.into(),
+                cache_control: None,
+            }],
+            vec![Message::user(MessageContent::from_text(user_text))],
+        )
+    };
+
     let params = RequestParams {
         model: model.to_string(),
         max_tokens: max_summary_tokens,
-        system: vec![SystemBlock {
-            kind: "text".into(),
-            text: SUMMARY_SYSTEM.into(),
-            cache_control: None,
-        }],
-        messages: vec![Message::user(MessageContent::from_text(user_text))],
+        system: system_blocks,
+        messages: request_messages,
         tools: vec![],
         tool_choice: None,
         thinking: None,
@@ -163,6 +217,80 @@ pub async fn compact_messages(
     ))));
     out.extend(keep.iter().cloned());
     Ok(out)
+}
+
+// ── Tool-result pruning (P0-2) ──────────────────────────────────────────────
+
+/// Tool results larger than this many chars are head/tail trimmed in-memory.
+pub const PRUNE_THRESHOLD_CHARS: usize = 8_192;
+pub const PRUNE_HEAD_CHARS: usize = 4_096;
+pub const PRUNE_TAIL_CHARS: usize = 1_024;
+const PRUNE_MARKER: &str = "[middle pruned]";
+
+/// Trim oversized `ToolResult::Text` blocks to head + marker + tail, in-memory
+/// only. Idempotent: results already carrying the marker are left untouched.
+/// Returns the rewritten messages and the number of results pruned. The
+/// persisted session transcript is never modified — pruning only shrinks the
+/// in-memory projection fed to the next provider request.
+pub fn prune_tool_results(messages: &[Message]) -> (Vec<Message>, usize) {
+    let mut pruned_count = 0usize;
+    let out: Vec<Message> = messages
+        .iter()
+        .map(|m| {
+            let MessageContent::Blocks(blocks) = &m.content else {
+                return m.clone();
+            };
+            let mut new_blocks = Vec::with_capacity(blocks.len());
+            let mut msg_changed = false;
+            for block in blocks {
+                let new_block = match block {
+                    ContentBlock::ToolResult {
+                        content: ToolResultContent::Text(text),
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } => {
+                        let count = text.chars().count();
+                        if count > PRUNE_THRESHOLD_CHARS && !text.contains(PRUNE_MARKER) {
+                            msg_changed = true;
+                            pruned_count += 1;
+                            ContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: ToolResultContent::Text(prune_text(text, count)),
+                                is_error: *is_error,
+                                cache_control: None,
+                            }
+                        } else {
+                            block.clone()
+                        }
+                    }
+                    _ => block.clone(),
+                };
+                new_blocks.push(new_block);
+            }
+            if msg_changed {
+                let mut new_msg = m.clone();
+                new_msg.content = MessageContent::Blocks(new_blocks);
+                new_msg
+            } else {
+                m.clone()
+            }
+        })
+        .collect();
+    (out, pruned_count)
+}
+
+fn prune_text(text: &str, total: usize) -> String {
+    let head: String = text.chars().take(PRUNE_HEAD_CHARS).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(PRUNE_TAIL_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}\n…[{total} total chars; {PRUNE_MARKER}]…\n{tail}")
 }
 
 /// Render messages into a readable transcript for the summarizer.
@@ -268,6 +396,7 @@ mod tests {
             id: id.into(),
             name: "Read".into(),
             input: serde_json::json!({"file_path": "/a"}),
+            cache_control: None,
         }]))
     }
     fn tool_result(id: &str) -> Message {
@@ -386,5 +515,109 @@ mod tests {
         // T5.2 acceptance: the default is 8192; the constant is the
         // single source of truth referenced by settings resolution.
         assert_eq!(DEFAULT_MAX_SUMMARY_TOKENS, 8192);
+    }
+
+    // ========================================================================
+    // KV-cache prefix reuse (P0-1)
+    // ========================================================================
+
+    fn live_request(model: &str) -> RequestParams {
+        RequestParams {
+            model: model.to_string(),
+            max_tokens: 1024,
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            trace_label: None,
+        }
+    }
+
+    #[test]
+    fn wire_chars_counts_serialized_messages() {
+        let msgs = vec![user("hello world")];
+        let n = wire_chars(&msgs);
+        assert!(n >= "hello world".len(), "wire chars must be at least the text length");
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn prefix_reuse_requires_matching_model_and_budget() {
+        let msgs = vec![user("short")];
+        let tpl = live_request("deepseek-chat");
+        // Matching model + fits budget → reuse.
+        assert!(can_reuse_prefix(Some(&tpl), "deepseek-chat", &msgs, 1_000_000));
+        // Different model → no reuse (cache prefix not portable across models).
+        assert!(!can_reuse_prefix(Some(&tpl), "other-model", &msgs, 1_000_000));
+        // Budget too small → no reuse (would truncate and break the prefix).
+        assert!(!can_reuse_prefix(Some(&tpl), "deepseek-chat", &msgs, 1));
+        // No prior request → no reuse.
+        assert!(!can_reuse_prefix(None, "deepseek-chat", &msgs, 1_000_000));
+    }
+
+    // ========================================================================
+    // Tool-result pruning (P0-2)
+    // ========================================================================
+
+    fn big_tool_result(id: &str, size: usize) -> Message {
+        let text = "x".repeat(size);
+        Message::user(MessageContent::from_blocks(vec![
+            ContentBlock::tool_result(id.into(), text, false),
+        ]))
+    }
+
+    #[test]
+    fn prune_trims_only_oversized_tool_results() {
+        let small = tool_result("t1");
+        let big = big_tool_result("t2", PRUNE_THRESHOLD_CHARS + 10);
+        let msgs = vec![small.clone(), big.clone(), user("plain prompt")];
+        let (pruned, pruned_count) = prune_tool_results(&msgs);
+        assert_eq!(pruned_count, 1);
+
+        // Small result and plain prompt are untouched.
+        assert_eq!(
+            serde_json::to_string(&pruned[0]).unwrap(),
+            serde_json::to_string(&small).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&pruned[2]).unwrap(),
+            serde_json::to_string(&user("plain prompt")).unwrap()
+        );
+
+        // Oversized result is trimmed to head + marker + tail.
+        let MessageContent::Blocks(blocks) = &pruned[1].content else {
+            panic!("expected block content");
+        };
+        match &blocks[0] {
+            ContentBlock::ToolResult {
+                content: ToolResultContent::Text(t),
+                ..
+            } => {
+                assert!(t.contains(PRUNE_MARKER));
+                assert!(t.chars().count() < (PRUNE_THRESHOLD_CHARS + 10));
+                assert!(t.starts_with('x'));
+                assert!(t.ends_with('x'));
+            }
+            _ => panic!("expected text tool result"),
+        }
+    }
+
+    #[test]
+    fn prune_is_idempotent_and_ignores_small_results() {
+        let small = tool_result("t1");
+        let big = big_tool_result("t2", PRUNE_THRESHOLD_CHARS + 10);
+        let (pruned, pruned_count) = prune_tool_results(&[small.clone(), big]);
+        assert_eq!(pruned_count, 1);
+        // Second pass: no further change.
+        let (again, second_count) = prune_tool_results(&pruned);
+        assert_eq!(second_count, 0, "pruning must be idempotent");
+        assert_eq!(
+            serde_json::to_string(&again).unwrap(),
+            serde_json::to_string(&pruned).unwrap()
+        );
     }
 }

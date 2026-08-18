@@ -195,6 +195,7 @@ mod tests {
         let m = Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
             id: "tu_1".into(),
             name: "Read".into(),
+            cache_control: None,
             input: serde_json::json!({"file_path": "/a/very/long/path/to/some/file.rs"}),
         }]));
         assert!(estimate_message_tokens(&m) > 0);

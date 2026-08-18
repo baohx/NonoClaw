@@ -243,17 +243,19 @@ fn bounded_history_block(block: &ContentBlock, max_chars: usize) -> Option<Conte
                 source: source.clone(),
             })
         }
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse { id, name, input, .. } => {
             let mut bounded = ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+                cache_control: None,
             };
             if block_payload_chars(&bounded) > max_chars {
                 bounded = ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: serde_json::json!({"history": "input omitted"}),
+                    cache_control: None,
                 };
             }
             (block_payload_chars(&bounded) <= max_chars).then_some(bounded)
@@ -262,6 +264,7 @@ fn bounded_history_block(block: &ContentBlock, max_chars: usize) -> Option<Conte
             tool_use_id,
             content,
             is_error,
+            ..
         } => {
             let content = match content {
                 ToolResultContent::Text(text) => {
@@ -281,6 +284,7 @@ fn bounded_history_block(block: &ContentBlock, max_chars: usize) -> Option<Conte
                 tool_use_id: tool_use_id.clone(),
                 content,
                 is_error: *is_error,
+                cache_control: None,
             })
         }
         // Signed thinking cannot be modified without invalidating its
@@ -469,37 +473,39 @@ fn prepare_messages_for_request(
     apply_cache_breakpoints(windowed)
 }
 
-/// Mark stable prefix breakpoints for Anthropic prompt caching.
+/// Mark prefix breakpoints for Anthropic prompt caching.
 ///
-/// Anthropic caches the longest matching prefix ending at a `cache_control`
-/// breakpoint. By placing breakpoints at ~50% and ~75% of the conversation
-/// (in addition to the implicit one at the end), we ensure that as the
-/// conversation grows, the older prefix stays cached even when new messages
-/// invalidate the most recent breakpoint.
+/// Anthropic (and compatible endpoints such as GLM `/api/anthropic` and
+/// DeepSeek `/anthropic`) cache the longest matching prefix that ends at a
+/// `cache_control: ephemeral` breakpoint, up to **4 breakpoints per request**.
+/// The system prompt already spends 2–3 (Block 1, project context, memory)
+/// and the tool list spends 1 more (see `select_tools`), so at most ONE
+/// message-level breakpoint fits inside the provider quota.
+///
+/// That one breakpoint is spent on the **last message** (the rolling
+/// breakpoint): everything sent this turn becomes the cacheable prefix that
+/// the next turn hits. Without it, only the system+tools prefix (~9k tokens
+/// observed on GLM) is ever cached while the whole conversation history is
+/// re-billed at full input price every turn.
 ///
 /// Only affects Anthropic-format providers; the OpenAI serializer ignores
-/// `cache_control` on content blocks.
-const CACHE_BREAKPOINT_RATIOS: &[f64] = &[0.50, 0.75];
-
+/// `cache_control` on content blocks (OpenAI-compatible endpoints use
+/// automatic prefix caching with no request-side breakpoints).
 fn apply_cache_breakpoints(mut messages: Vec<Message>) -> Vec<Message> {
-    let len = messages.len();
-    if len < 8 {
-        // Too few messages to benefit from prefix breakpoints.
-        return messages;
-    }
-    for &ratio in CACHE_BREAKPOINT_RATIOS {
-        let idx = (len as f64 * ratio) as usize;
-        if idx >= len {
-            continue;
-        }
-        mark_last_block_cache_control(&mut messages[idx]);
+    // Rolling breakpoint on the final message: the prefix up to and including
+    // this message is what the NEXT turn will read from cache.
+    if let Some(last) = messages.last_mut() {
+        mark_last_block_cache_control(last);
     }
     messages
 }
 
 /// Set `cache_control: ephemeral` on the last content block of a message.
 /// Converts `MessageContent::Text` to `Blocks` form so the cache marker
-/// can be attached.
+/// can be attached. Works on ALL block kinds — agent conversations
+/// overwhelmingly end in `tool_result` (user) / `tool_use` (assistant)
+/// blocks, not text: a text-only marker silently covers ~9% of messages
+/// and the breakpoint never lands (observed in production raw-API logs).
 fn mark_last_block_cache_control(msg: &mut Message) {
     // Ensure content is in Blocks form so we can tag the last block.
     if let MessageContent::Text(s) = &msg.content {
@@ -511,12 +517,23 @@ fn mark_last_block_cache_control(msg: &mut Message) {
     if let MessageContent::Blocks(blocks) = &mut msg.content {
         if let Some(last) = blocks.last_mut() {
             match last {
+                // Anthropic accepts `cache_control` on every content block
+                // type, so tool blocks carry the breakpoint directly — no
+                // synthetic text blocks (they would pollute the prefix).
                 ContentBlock::Text { cache_control, .. } => {
-                    if cache_control.is_none() {
-                        *cache_control = Some(nonoclaw_core::CacheControl {
-                            kind: nonoclaw_core::CacheControlKind::Ephemeral,
-                        });
-                    }
+                    *cache_control = Some(nonoclaw_core::CacheControl {
+                        kind: nonoclaw_core::CacheControlKind::Ephemeral,
+                    });
+                }
+                ContentBlock::ToolUse { cache_control, .. } => {
+                    *cache_control = Some(nonoclaw_core::CacheControl {
+                        kind: nonoclaw_core::CacheControlKind::Ephemeral,
+                    });
+                }
+                ContentBlock::ToolResult { cache_control, .. } => {
+                    *cache_control = Some(nonoclaw_core::CacheControl {
+                        kind: nonoclaw_core::CacheControlKind::Ephemeral,
+                    });
                 }
                 _ => {}
             }
@@ -980,6 +997,10 @@ struct EngineCache {
     /// Cached git context from the last `get_system_context` call. Reused on
     /// turns that follow read-only tools; refreshed after Bash/Edit/Write.
     cached_git_context: Option<crate::context::SystemContext>,
+    /// Snapshot of the last live provider request. Compaction reuses its system
+    /// blocks and raw history prefix so provider prefix caching (DeepSeek
+    /// automatic, Anthropic `cache_control`) hits on the summarizer call.
+    last_request: Option<Arc<RequestParams>>,
     /// Per-run cache of tool results for deduplication. When a Read/Bash/Grep
     /// returns identical content to a previous call on the same resource, the
     /// duplicate is replaced with a compact reference to save context tokens.
@@ -1032,6 +1053,7 @@ impl Default for EngineCache {
             pending_compact_chars_before: 0,
             cached_git_context: None,
             tool_result_cache: std::collections::HashMap::new(),
+            last_request: None,
         }
     }
 }
@@ -1757,6 +1779,7 @@ impl QueryEngine {
                                 kept,
                                 tokens_before: tokens_at_spawn,
                                 tokens_after,
+                                pruned_results: 0,
                             });
                             hook_runtime
                                 .run(
@@ -1792,6 +1815,7 @@ impl QueryEngine {
                                 kept,
                                 tokens_before: tokens_at_spawn,
                                 tokens_after,
+                                pruned_results: 0,
                             });
                         }
                     }
@@ -1802,6 +1826,7 @@ impl QueryEngine {
                             kept: self.messages.len(),
                             tokens_before: tokens_at_spawn,
                             tokens_after: tokens_at_spawn,
+                            pruned_results: 0,
                         });
                     }
                     Err(e) => {
@@ -1811,6 +1836,7 @@ impl QueryEngine {
                             kept: self.messages.len(),
                             tokens_before: tokens_at_spawn,
                             tokens_after: tokens_at_spawn,
+                            pruned_results: 0,
                         });
                     }
                 }
@@ -1822,7 +1848,7 @@ impl QueryEngine {
                 // Use the provider-reported last-turn input_tokens when available;
                 // falls back to the chars/4 heuristic for runs that haven't had
                 // a turn yet (e.g. initial compact check).
-                let est = if self.cache.last_input_tokens > 0 {
+                let mut est = if self.cache.last_input_tokens > 0 {
                     self.cache.last_input_tokens
                 } else {
                     estimate_total_for_model(
@@ -1836,7 +1862,7 @@ impl QueryEngine {
                 let history_est = payload_history_chars(&self.messages)
                     .div_ceil(chars_per_token)
                     .saturating_add(self.messages.len().saturating_mul(4));
-                let (should_prefire, should_compact) = compaction_decision(
+                let (mut should_prefire, mut should_compact) = compaction_decision(
                     est,
                     self.options.compact_threshold_tokens,
                     history_est,
@@ -1846,6 +1872,49 @@ impl QueryEngine {
                     context_budget.history_tokens,
                     chars_per_token,
                 );
+                // P0-2: prune oversized tool results before summarizing. When
+                // pruning alone brings both the total and history estimates back
+                // under their thresholds, skip the summarizer call entirely.
+                let mut pruned_results = 0usize;
+                if should_prefire || should_compact {
+                    let (pruned, pruned_count) = crate::compact::prune_tool_results(&self.messages);
+                    if pruned_count > 0 {
+                        let est_after = estimate_total_for_model(
+                            Some(&self.options.model),
+                            &pruned,
+                            system_chars,
+                            tools_chars,
+                            self.options.chars_per_token,
+                        );
+                        let history_after = payload_history_chars(&pruned)
+                            .div_ceil(chars_per_token)
+                            .saturating_add(pruned.len().saturating_mul(4));
+                        let (_, still_force) = compaction_decision(
+                            est_after,
+                            self.options.compact_threshold_tokens,
+                            history_after,
+                            context_budget.history_tokens,
+                        );
+                        self.messages = pruned;
+                        // Messages changed: the provider-reported token cache no
+                        // longer reflects this transcript, so clear it.
+                        self.cache.last_input_tokens = 0;
+                        pruned_results = pruned_count;
+                        if !still_force {
+                            should_prefire = false;
+                            should_compact = false;
+                            on_event(&EngineEvent::Compacted {
+                                removed: 0,
+                                kept: self.messages.len(),
+                                tokens_before: est,
+                                tokens_after: est_after,
+                                pruned_results,
+                            });
+                        } else {
+                            est = est_after;
+                        }
+                    }
+                }
                 // Pre-fire at 80% of either the model context threshold or the
                 // dedicated history partition. This makes compaction
                 // incremental in Ultra mode instead of waiting for ~80K+.
@@ -1864,6 +1933,7 @@ impl QueryEngine {
                     let keep = KEEP_RECENT_TURNS;
                     let m = model.clone();
                     let max_summary_tokens = self.options.compact_max_tokens;
+                    let prefix_template = self.cache.last_request.clone();
                     self.cache.pending_compact_msg_count = messages.len();
                     self.cache.pending_compact_revision = self.session_revision;
                     self.cache.pending_compact_tokens_est = est;
@@ -1900,6 +1970,7 @@ impl QueryEngine {
                                 crate::compact::CompactMode::Segments,
                                 max_compact_input_chars,
                                 max_summary_tokens,
+                                prefix_template.as_ref().map(|p| p.as_ref()),
                             ) => result,
                         }
                     });
@@ -1952,6 +2023,7 @@ impl QueryEngine {
                             crate::compact::CompactMode::Segments,
                             max_compact_input_chars,
                             self.options.compact_max_tokens,
+                            self.cache.last_request.as_ref().map(|p| p.as_ref()),
                         ) => result?,
                     };
                     let tokens_after = {
@@ -1972,6 +2044,7 @@ impl QueryEngine {
                             kept,
                             tokens_before,
                             tokens_after,
+                            pruned_results,
                         });
                         // PostCompact hook
                         hook_runtime
@@ -1997,6 +2070,7 @@ impl QueryEngine {
                             kept: before,
                             tokens_before,
                             tokens_after: tokens_before,
+                            pruned_results,
                         });
                     }
                 }
@@ -2115,6 +2189,10 @@ impl QueryEngine {
                     turn_label
                 )),
             };
+
+            // Snapshot the live request so a later compaction summarizer can
+            // replay its system blocks + raw history prefix for KV-cache reuse.
+            self.cache.last_request = Some(Arc::new(params.clone()));
 
             let provider = format!("{:?}", self.client.api_format()).to_lowercase();
             on_event(&RunEvent::ModelRequestStarted {
@@ -2288,7 +2366,7 @@ impl QueryEngine {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         Some((id.clone(), name.clone(), input.clone()))
                     }
                     _ => None,
@@ -2743,6 +2821,7 @@ impl QueryEngine {
                 self.options.chars_per_token,
             ),
             self.options.compact_max_tokens,
+            self.cache.last_request.as_ref().map(|p| p.as_ref()),
         )
         .await?;
         let kept = compacted.len();
@@ -3486,6 +3565,7 @@ mod tests {
                 id: "tool-1".into(),
                 name: "Read".into(),
                 input: serde_json::json!({"file_path": "x".repeat(1000)}),
+                cache_control: None,
             }])),
             Message::user(MessageContent::from_blocks(vec![
                 ContentBlock::tool_result("tool-1".into(), "result ".repeat(1000), false),
@@ -3534,6 +3614,7 @@ mod tests {
                     id: "tool-signed-1".into(),
                     name: "Read".into(),
                     input: tool_input.clone(),
+                    cache_control: None,
                 },
             ])),
             Message::user(MessageContent::from_blocks(vec![
@@ -3593,6 +3674,7 @@ mod tests {
                 id: "tool-1".into(),
                 name: "Read".into(),
                 input: serde_json::json!({"file_path": "large".repeat(100)}),
+                cache_control: None,
             }])),
             Message::user(MessageContent::from_blocks(vec![
                 ContentBlock::tool_result("tool-1".into(), "large result".repeat(100), false),
@@ -4006,6 +4088,7 @@ mod tests {
                 ContentBlock::ToolUse {
                     id: "tu_1".into(),
                     name: "Read".into(),
+                    cache_control: None,
                     input: serde_json::json!({"file_path": "/tmp/a"}),
                 },
             ])),
@@ -4035,6 +4118,7 @@ mod tests {
             Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
                 id: "tu_2".into(),
                 name: "Read".into(),
+                cache_control: None,
                 input: serde_json::json!({"file_path": "/tmp/b"}),
             }])),
             // User message with only tool_result blocks that are ALSO orphans.
@@ -4043,6 +4127,7 @@ mod tests {
                     tool_use_id: "tu_2".into(),
                     content: nonoclaw_core::ToolResultContent::Text("result".into()),
                     is_error: Some(false),
+                    cache_control: None,
                 },
             ])),
         ];
@@ -4060,6 +4145,7 @@ mod tests {
             Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
                 id: "tu_3".into(),
                 name: "Read".into(),
+                cache_control: None,
                 input: serde_json::json!({"file_path": "/tmp/x"}),
             }])),
             Message::user(MessageContent::from_blocks(vec![
@@ -4067,6 +4153,7 @@ mod tests {
                     tool_use_id: "tu_3".into(),
                     content: nonoclaw_core::ToolResultContent::Text("content here".into()),
                     is_error: Some(false),
+                    cache_control: None,
                 },
             ])),
         ];
@@ -4094,6 +4181,7 @@ mod tests {
                 ContentBlock::ToolUse {
                     id: "tu_cancel".into(),
                     name: "Read".into(),
+                    cache_control: None,
                     input: serde_json::json!({"file_path": "/tmp/x"}),
                 },
             ])),
@@ -4125,6 +4213,7 @@ mod tests {
             Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
                 id: "tu_no_text".into(),
                 name: "Read".into(),
+                cache_control: None,
                 input: serde_json::json!({"file_path": "/tmp/y"}),
             }])),
         ];
@@ -4758,7 +4847,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_breakpoints_added_for_long_conversations() {
+    fn cache_breakpoint_lands_on_last_message_of_long_conversations() {
         use nonoclaw_core::ContentBlock;
         // Build 20 messages (10 turns of user→assistant).
         let mut messages = Vec::new();
@@ -4771,7 +4860,7 @@ mod tests {
             });
         }
         let result = apply_cache_breakpoints(messages);
-        // Should have breakpoints at 50% (idx 10) and 75% (idx 15).
+        // The single rolling breakpoint must be on the LAST message.
         let check_idx = |idx: usize| -> bool {
             if let MessageContent::Blocks(blocks) = &result[idx].content {
                 if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
@@ -4780,26 +4869,78 @@ mod tests {
             }
             false
         };
-        assert!(check_idx(10), "50% breakpoint at idx 10 must be cached");
-        assert!(check_idx(15), "75% breakpoint at idx 15 must be cached");
-        // Non-breakpoint messages should NOT have cache_control.
-        assert!(!check_idx(5), "idx 5 should not have cache_control");
+        assert!(check_idx(19), "rolling breakpoint must be on the last message");
+        // No other message may carry a breakpoint (4-breakpoint provider cap;
+        // system+tools already spend the rest).
+        for idx in 0..19 {
+            assert!(!check_idx(idx), "idx {idx} should not have cache_control");
+        }
     }
 
     #[test]
-    fn cache_breakpoints_skipped_for_short_conversations() {
-        // 4 messages — too short for breakpoints.
-        let messages: Vec<Message> = (0..4)
-            .map(|i| Message::user(MessageContent::from_text(format!("msg {i}"))))
-            .collect();
-        let result = apply_cache_breakpoints(messages);
-        // No message should have cache_control.
-        for msg in &result {
-            if let MessageContent::Blocks(blocks) = &msg.content {
-                if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
-                    assert!(cache_control.is_none(), "short conversation should not get breakpoints");
+    fn cache_breakpoint_covers_tool_ending_messages() {
+        use nonoclaw_core::ContentBlock;
+        // Agent conversations overwhelmingly end in tool_result / tool_use
+        // blocks. The breakpoint must land directly on the tool block —
+        // Anthropic accepts cache_control on every block type, and synthetic
+        // text markers would pollute the prefix for the next turn.
+        let mk = |block: ContentBlock, role: Role| Message {
+            role,
+            content: MessageContent::Blocks(vec![block]),
+        };
+        let tool_result = mk(
+            ContentBlock::tool_result("t1".to_string(), "result text".to_string(), false),
+            Role::User,
+        );
+        let result = apply_cache_breakpoints(vec![tool_result]);
+        match &result[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1, "no synthetic blocks: {blocks:?}");
+                match blocks.last() {
+                    Some(ContentBlock::ToolResult { cache_control, .. }) => {
+                        assert!(cache_control.is_some(), "tool_result carries the breakpoint");
+                    }
+                    other => panic!("expected tool_result, got {other:?}"),
                 }
             }
+            other => panic!("expected blocks, got {other:?}"),
         }
+
+        // Assistant turn ending in tool_use: same treatment.
+        let tool_use = mk(
+            ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            },
+            Role::Assistant,
+        );
+        let result2 = apply_cache_breakpoints(vec![tool_use]);
+        match &result2[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert!(matches!(
+                    blocks.last(),
+                    Some(ContentBlock::ToolUse { cache_control: Some(_), .. })
+                ));
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_breakpoint_lands_even_on_short_conversations() {
+        // Even a single-message conversation gets the rolling breakpoint —
+        // there is no minimum length for "this turn's prefix should be
+        // cached for the next turn".
+        let messages = vec![Message::user(MessageContent::from_text("hi"))];
+        let result = apply_cache_breakpoints(messages);
+        if let MessageContent::Blocks(blocks) = &result[0].content {
+            if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
+                assert!(cache_control.is_some(), "single message must carry the rolling breakpoint");
+                return;
+            }
+        }
+        panic!("expected the last message to carry a breakpoint");
     }
 }

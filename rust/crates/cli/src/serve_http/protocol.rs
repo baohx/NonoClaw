@@ -509,7 +509,7 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
             "type": "text",
             "text": "[attachment image kept server-side]",
         })),
-        ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
+        ContentBlock::ToolUse { id, name, input, .. } => Some(serde_json::json!({
             "type": "tool_use",
             "id": id,
             "name": name,
@@ -519,6 +519,7 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
             tool_use_id,
             content,
             is_error,
+            ..
         } => Some(serde_json::json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -668,6 +669,7 @@ mod tests {
                         "api_key": "sk-proj-tool",
                         "content": "private tool prompt"
                     }),
+                    cache_control: None,
                 },
                 ContentBlock::text("visible answer"),
             ]),
