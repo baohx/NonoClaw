@@ -23,3 +23,7 @@ glob = { workspace = true }
 uuid = { workspace = true }
 serde_yaml = "0.9"
 reqwest = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux Landlock LSM sandbox for Bash commands (workspace-write / read-only).
+landlock = "0.4"

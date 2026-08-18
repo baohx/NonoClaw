@@ -3,6 +3,7 @@
 //! positional prompt) or starts the web UI (`--serve-http`).
 
 mod attachments;
+mod acp;
 mod billing;
 mod project_info;
 mod remote;
@@ -109,6 +110,12 @@ struct Cli {
     #[arg(long)]
     no_auto_compact: bool,
 
+    /// Log full unredacted API traffic (requests + raw SSE responses +
+    /// usage summaries) to .nonoclaw/logs/api/. Diagnostics only: payloads
+    /// contain complete prompts. API keys are never logged (headers only).
+    #[arg(long)]
+    log_raw_api: bool,
+
     /// Estimated-token threshold above which auto-compact fires.
     #[arg(long)]
     compact_threshold: Option<usize>,
@@ -150,6 +157,15 @@ struct Cli {
     #[arg(long)]
     mcp_serve: bool,
 
+    /// Run as an Agent Client Protocol (ACP) server over stdio (Zed editor).
+    #[arg(long)]
+    acp: bool,
+
+    /// Run as an MCP server exposing only the Mneme memory system
+    /// (facts/beads/wiki/goals) so an external harness can mount it.
+    #[arg(long)]
+    mcp_serve_memory: bool,
+
     /// Install a plugin from SOURCE (local dir or git URL) into .nonoclaw/plugins.
     #[arg(long, value_name = "SOURCE")]
     plugin_add: Option<String>,
@@ -165,6 +181,12 @@ async fn main() -> Result<()> {
     // `--print` is a preserved explicit-headless compatibility flag. All
     // non-server local invocations are headless, so reading it is sufficient.
     let _explicit_headless = cli.print;
+
+    // Must run before any Client is built: the api crate reads this env var
+    // once per request to decide whether to open raw traffic log files.
+    if cli.log_raw_api {
+        std::env::set_var("NONOCLAW_RAW_API_LOG", "1");
+    }
 
     // `--verbose` shows NonoClaw debug logs but keeps the noisy HTTP stack
     // (rustls/hyper/reqwest) at warn: these emit benign TLS teardown warnings
@@ -211,6 +233,18 @@ async fn main() -> Result<()> {
     // MCP server mode: speak JSON-RPC over stdio, expose built-in tools.
     if cli.mcp_serve {
         let (registry, _todos) = register_all();
+        let cwd = std::env::current_dir().context("no current directory")?;
+        return Ok(nonoclaw_tools::mcp_server::serve_stdin(&registry, &cwd).await?);
+    }
+
+    // Memory-only MCP server: expose just the Mneme memory system + Read (for
+    // spill retrieval) so an external harness can mount cross-session memory.
+    if cli.mcp_serve_memory {
+        let mut registry = nonoclaw_tools::ToolRegistry::new();
+        registry.register(std::sync::Arc::new(
+            nonoclaw_tools::builtin::MemoryTool,
+        ));
+        registry.register(std::sync::Arc::new(nonoclaw_tools::builtin::ReadTool));
         let cwd = std::env::current_dir().context("no current directory")?;
         return Ok(nonoclaw_tools::mcp_server::serve_stdin(&registry, &cwd).await?);
     }
@@ -281,7 +315,7 @@ async fn main() -> Result<()> {
         })
         .options;
     options.skills_manager = Some(Arc::clone(&skills_manager));
-    options.background_registry = Some(background_registry);
+    options.background_registry = Some(Arc::clone(&background_registry));
 
     let (context_window, compact_threshold_tokens) = resolved.model_budget(&model);
     tracing::info!(
@@ -308,6 +342,21 @@ async fn main() -> Result<()> {
         skill_source,
     )));
     let registry = Arc::new(registry);
+
+    // ACP server mode: speak Agent Client Protocol over stdio (Zed editor).
+    if cli.acp {
+        tracing::info!("ACP server over stdio");
+        return acp::serve_stdin(
+            registry,
+            todos,
+            cwd,
+            Arc::clone(&resolved),
+            skills_manager,
+            background_registry,
+        )
+        .await
+        .map_err(anyhow::Error::from);
+    }
 
     // Web UI server: HTTP + WebSocket. All model, compact, document, media,
     // permission, and MCP values are derived from this same resolved snapshot.
@@ -556,10 +605,11 @@ fn handle_event(json: bool, envelope: &EventEnvelope) {
             kept,
             tokens_before,
             tokens_after,
+            pruned_results,
         } => {
             if json {
                 emit_json(
-                    &json!({"type":"compacted","removed":removed,"kept":kept,"tokens_before":tokens_before,"tokens_after":tokens_after}),
+                    &json!({"type":"compacted","removed":removed,"kept":kept,"tokens_before":tokens_before,"tokens_after":tokens_after,"pruned_results":pruned_results}),
                 );
             } else {
                 eprintln!(

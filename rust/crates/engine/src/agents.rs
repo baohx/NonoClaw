@@ -241,10 +241,12 @@ pub(crate) fn apply_subagent_profile(
 fn permission_strictness(mode: nonoclaw_core::PermissionMode) -> u8 {
     match mode {
         nonoclaw_core::PermissionMode::Plan => 0,
+        nonoclaw_core::PermissionMode::SandboxReadOnly => 0,
         nonoclaw_core::PermissionMode::Default => 1,
         nonoclaw_core::PermissionMode::AcceptEdits => 2,
-        nonoclaw_core::PermissionMode::Auto => 3,
-        nonoclaw_core::PermissionMode::BypassPermissions => 4,
+        nonoclaw_core::PermissionMode::SandboxWorkspaceWrite => 3,
+        nonoclaw_core::PermissionMode::Auto => 4,
+        nonoclaw_core::PermissionMode::BypassPermissions => 5,
     }
 }
 

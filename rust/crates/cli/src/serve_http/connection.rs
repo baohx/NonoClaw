@@ -401,6 +401,36 @@ pub async fn serve(
     // Spawn file watcher for hot-reloading skills.
     crate::skill_watcher::spawn_skill_watcher(Arc::clone(&state.skills_manager), cwd.clone());
 
+    // Build vector indexes in the background so the first Memory search of a
+    // session is already warm: facts index + full-transcript session index.
+    {
+        let cwd = cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            let facts = nonoclaw_tools::memory::load_facts(&cwd);
+            nonoclaw_tools::memory::load_or_build_vector_index(&cwd, &facts);
+            let root = nonoclaw_engine::session::home_root();
+            let sessions_dir = root.map(|r| {
+                r.join("projects")
+                    .join(
+                        cwd.to_string_lossy()
+                            .trim_start_matches('/')
+                            .replace('/', "-"),
+                    )
+                    .join("sessions")
+            });
+            if let Some(dir) = sessions_dir {
+                if dir.is_dir() {
+                    let index = nonoclaw_tools::session_index::build_index(&cwd, &dir);
+                    tracing::info!(
+                        sessions = index.stamps.len(),
+                        chunks = index.chunks.len(),
+                        "session vector index ready"
+                    );
+                }
+            }
+        });
+    }
+
     // This explicit operator-facing startup message is the only terminal output
     // that includes the Web credential. Keep tracing and ProjectInfo limited to
     // the token-free public origin so routine logs and browser metadata do not
@@ -1382,6 +1412,28 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             // Accumulate real API token usage for the session so
                             // the frontend can restore it after a page refresh.
                             s.session_hub.accumulate_usage(&session_id, &r.usage).await;
+                            // Incrementally refresh the session vector index
+                            // (fingerprints make unchanged files a no-op).
+                            {
+                                let cwd = s.cwd.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let root = nonoclaw_engine::session::home_root();
+                                    let Some(dir) = root.map(|r| {
+                                        r.join("projects")
+                                            .join(
+                                                cwd.to_string_lossy()
+                                                    .trim_start_matches('/')
+                                                    .replace('/', "-"),
+                                            )
+                                            .join("sessions")
+                                    }) else {
+                                        return;
+                                    };
+                                    if dir.is_dir() {
+                                        nonoclaw_tools::session_index::build_index(&cwd, &dir);
+                                    }
+                                });
+                            }
                             let msg = ServerMsg::Done {
                                 protocol_version,
                                 run_id,
@@ -1518,6 +1570,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     }
                     "plan" => nonoclaw_core::PermissionMode::Plan,
                     "acceptEdits" => nonoclaw_core::PermissionMode::AcceptEdits,
+                    "sandboxWorkspaceWrite" | "sandbox-workspace-write" => {
+                        nonoclaw_core::PermissionMode::SandboxWorkspaceWrite
+                    }
+                    "sandboxReadOnly" | "sandbox-read-only" => {
+                        nonoclaw_core::PermissionMode::SandboxReadOnly
+                    }
                     _ => nonoclaw_core::PermissionMode::Default,
                 };
                 *state.permission_mode.lock().await = new_mode;
@@ -1751,6 +1809,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                     kept,
                                     tokens_before: 0,
                                     tokens_after: 0,
+                                    pruned_results: 0,
                                 },
                             ),
                         )
@@ -1772,6 +1831,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                     kept: original_count,
                                     tokens_before: 0,
                                     tokens_after: 0,
+                                    pruned_results: 0,
                                 },
                             ),
                         )
@@ -1793,6 +1853,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                     kept: original_count,
                                     tokens_before: 0,
                                     tokens_after: 0,
+                                    pruned_results: 0,
                                 },
                             ),
                         )

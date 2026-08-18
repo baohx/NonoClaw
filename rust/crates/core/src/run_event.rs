@@ -92,6 +92,10 @@ pub enum RunEvent {
         kept: usize,
         tokens_before: usize,
         tokens_after: usize,
+        /// Number of oversized tool results pruned in-memory before this
+        /// compaction (P0-2). Pruning never touches the persisted transcript.
+        #[serde(default)]
+        pruned_results: usize,
     },
     ModelInfo {
         model: String,

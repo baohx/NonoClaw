@@ -17,6 +17,11 @@ pub enum PermissionMode {
     AcceptEdits,
     /// Auto-approve everything the rule engine / classifier permits.
     Auto,
+    /// Auto-approve writes within the workspace under a Linux Landlock sandbox;
+    /// writes outside the workspace still require approval.
+    SandboxWorkspaceWrite,
+    /// Read-only posture under a Linux Landlock sandbox: no writes are allowed.
+    SandboxReadOnly,
     /// Skip all permission prompts (the `--dangerously-skip-permissions` flag).
     BypassPermissions,
     /// Read-only planning posture.
@@ -29,6 +34,10 @@ impl PermissionMode {
             "default" => PermissionMode::Default,
             "acceptEdits" | "accept-edits" => PermissionMode::AcceptEdits,
             "auto" => PermissionMode::Auto,
+            "sandboxWorkspaceWrite" | "sandbox-workspace-write" => {
+                PermissionMode::SandboxWorkspaceWrite
+            }
+            "sandboxReadOnly" | "sandbox-read-only" => PermissionMode::SandboxReadOnly,
             "bypassPermissions" | "bypass-permissions" => PermissionMode::BypassPermissions,
             "plan" => PermissionMode::Plan,
             _ => return None,

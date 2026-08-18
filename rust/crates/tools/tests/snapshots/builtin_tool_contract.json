@@ -282,6 +282,7 @@
           "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
           "enum": [
             "search",
+            "session_search",
             "save",
             "forget",
             "beads",
@@ -321,7 +322,7 @@
           "type": "integer"
         },
         "query": {
-          "description": "Search query (for action: search)",
+          "description": "Search query (for actions: search, session_search)",
           "type": "string"
         },
         "status": {

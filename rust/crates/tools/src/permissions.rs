@@ -65,6 +65,22 @@ impl PermissionGate {
             };
         }
 
+        // 4b. Sandbox read-only: reads allowed, writes denied (Landlock-backed).
+        if self.mode == PermissionMode::SandboxReadOnly {
+            return if is_read_only {
+                PermissionDecision::allow()
+            } else {
+                PermissionDecision::deny("write blocked in sandbox read-only mode")
+            };
+        }
+
+        // 4c. Sandbox workspace-write: auto-approve writes; the Linux Landlock
+        //     sandbox enforces the workspace boundary at the OS level (writes
+        //     outside the workspace are rejected by the kernel, not approved).
+        if self.mode == PermissionMode::SandboxWorkspaceWrite {
+            return PermissionDecision::allow();
+        }
+
         // 5. AcceptEdits auto-approves reads + file edits (Write, Edit).
         //    Other tools (Bash, Agent, WebFetch, etc.) still prompt.
         if self.mode == PermissionMode::AcceptEdits {

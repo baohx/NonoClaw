@@ -30,9 +30,9 @@ impl Tool for MemoryTool {
                 "action": {
                     "type": "string",
                     "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
-                    "enum": ["search", "save", "forget", "beads", "bead_save", "bead_done", "wiki_search", "wiki_ingest", "wiki_lint", "goal_create", "goal_update", "goal_list"]
+                    "enum": ["search", "session_search", "save", "forget", "beads", "bead_save", "bead_done", "wiki_search", "wiki_ingest", "wiki_lint", "goal_create", "goal_update", "goal_list"]
                 },
-                "query": { "type": "string", "description": "Search query (for action: search)" },
+                "query": { "type": "string", "description": "Search query (for actions: search, session_search)" },
                 "name": { "type": "string", "description": "Fact name/slug (for actions: save, forget)" },
                 "title": { "type": "string", "description": "Fact or bead title" },
                 "content": { "type": "string", "description": "Fact or bead body content" },
@@ -60,6 +60,7 @@ impl Tool for MemoryTool {
         matches!(
             input["action"].as_str(),
             Some("search")
+                | Some("session_search")
                 | Some("beads")
                 | Some("wiki_search")
                 | Some("wiki_lint")
@@ -86,6 +87,7 @@ impl Tool for MemoryTool {
 
         match action {
             "search" => search_facts(ctx.cwd, &input),
+            "session_search" => session_search(ctx.cwd, &input),
             "save" => save_fact_impl(ctx.cwd, &input),
             "forget" => forget_fact(ctx.cwd, &input),
             "beads" => list_beads(ctx.cwd),
@@ -103,6 +105,51 @@ impl Tool for MemoryTool {
             }),
         }
     }
+}
+
+/// Search past session transcripts by vector similarity (Layer 3 recall).
+fn session_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
+    let query = input["query"].as_str().unwrap_or("");
+    let limit = input["limit"].as_u64().unwrap_or(10).min(20) as usize;
+    if query.trim().is_empty() {
+        return Ok(ToolResult::ok("No query provided for session_search."));
+    }
+    // Sessions live under the nonoclaw data dir, not the project; resolve the
+    // per-project directory the same way `nonoclaw_engine::session` does.
+    let Some(root) = nonoclaw_core::nonoclaw_data_dir() else {
+        return Ok(ToolResult::ok("No session transcripts found (no data dir)."));
+    };
+    let sanitized = cwd
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-");
+    let sessions_dir = root.join("projects").join(sanitized).join("sessions");
+    if !sessions_dir.is_dir() {
+        return Ok(ToolResult::ok("No session transcripts found for this project."));
+    }
+    // Incremental build/refresh (cheap when fingerprints are unchanged), then search.
+    let index = crate::session_index::build_index(cwd, &sessions_dir);
+    let hits = crate::session_index::search(&index, query, limit);
+    if hits.is_empty() {
+        return Ok(ToolResult::ok(
+            "No matching session transcripts found. The index may be empty — it builds on first search or server startup.",
+        ));
+    }
+    let mut out = String::from("## Session transcript matches (most relevant first)\n\n");
+    for hit in &hits {
+        let preview: String = hit.chunk.text.chars().take(400).collect();
+        out.push_str(&format!(
+            "- session `{sid}` #{index} [{role}] score {score:.2}\n  > {preview}\n\n",
+            sid = hit.chunk.session_id,
+            index = hit.chunk.index,
+            role = hit.chunk.role,
+            score = hit.score,
+        ));
+    }
+    out.push_str(
+        "Use `Read` on `~/.nonoclaw/projects/<project>/sessions/<session_id>.jsonl` for the full context.",
+    );
+    Ok(ToolResult::ok(out))
 }
 
 fn search_facts(cwd: &Path, input: &Value) -> Result<ToolResult> {

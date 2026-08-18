@@ -642,7 +642,10 @@ async fn normalize_result(
         Ok(()) => (
             Some(relative.clone()),
             None,
-            format!("[full result saved locally: {}]\n", relative.display()),
+            format!(
+                "[full result saved locally: {} — use Read with offset/limit to inspect specific sections; do not re-run the tool]\n",
+                relative.display()
+            ),
         ),
         Err(error) => {
             let detail = format!("failed to persist oversized result: {error}");
@@ -1064,6 +1067,7 @@ mod tests {
 
         let reference = result.local_reference.expect("large result reference");
         assert!(result.content.contains("full result saved locally"));
+        assert!(result.content.contains("use Read with offset/limit"), "notice must guide the model to retrieve the spilled result with Read");
         assert!(result.content.chars().count() <= 160);
         assert_eq!(
             tokio::fs::read_to_string(cwd.join(reference))

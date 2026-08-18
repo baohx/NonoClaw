@@ -6,10 +6,11 @@
 //! The ML command classifier remains conservative and local; permission mode
 //! and configured rules are composed by the shared permission gate.
 
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nonoclaw_core::{Error, PermissionDecision, PermissionResult, Result};
+use nonoclaw_core::{Error, PermissionDecision, PermissionMode, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -133,6 +134,8 @@ impl Tool for BashTool {
         // should use non-interactive flags (-n, --yes, --non-interactive) or
         // inline input via heredoc/piping instead.
         cmd.stdin(std::process::Stdio::null());
+        // OS-level sandbox backstop for sandboxed permission modes (Linux only).
+        apply_sandbox(&mut cmd, ctx.options.permission_mode, ctx.cwd);
 
         let mut child = cmd
             .current_dir(ctx.cwd)
@@ -218,6 +221,32 @@ fn ensure_sudo_noninteractive(cmd: &str) -> String {
     let after_sudo = trimmed.strip_prefix("sudo").unwrap();
     format!("{indent}sudo -n{after_sudo}")
 }
+
+/// Install a Linux Landlock ruleset in the Bash child when the run is in a
+/// sandboxed permission mode. No-op on non-Linux platforms or when the kernel
+/// lacks Landlock (falls back to approval-only gating).
+#[cfg(target_os = "linux")]
+fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
+    use crate::sandbox::{self, SandboxMode};
+    let sandbox_mode = match mode {
+        PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
+        PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        _ => None,
+    };
+    let Some(sandbox_mode) = sandbox_mode else {
+        return;
+    };
+    if !sandbox::probe() {
+        return;
+    }
+    let workspace = cwd.to_path_buf();
+    unsafe {
+        cmd.pre_exec(move || sandbox::apply(sandbox_mode, &workspace, &[]));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_sandbox(_cmd: &mut Command, _mode: PermissionMode, _cwd: &Path) {}
 
 /// Very small read-only heuristic for common harmless commands. Not a security
 /// boundary — the real classifier is deferred. Conservative: any shell
