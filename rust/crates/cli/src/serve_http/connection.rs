@@ -105,6 +105,8 @@ pub(super) struct AppState {
     /// `None` before the probe completes or when MarkItDown is absent.
     /// Updated atomically by the probe updater via `Arc<Mutex<..>>`.
     pub(super) markitdown_path: Arc<Mutex<Option<String>>>,
+    /// Last observed client activity (AutoDream idle detection).
+    pub(super) last_activity: Arc<Mutex<std::time::SystemTime>>,
 }
 
 impl AppState {
@@ -224,6 +226,7 @@ pub(super) fn upload_exploration_state(
         )),
         upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
+        last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
     })
 }
 
@@ -393,10 +396,14 @@ pub async fn serve(
         )),
         upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
+        last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
     });
 
     // Load persisted pending permissions (survives server restarts).
     state.load_pending_permissions().await;
+
+    // AutoDream: consolidate memory while the user is idle.
+    super::dream::spawn_dream_scheduler(Arc::clone(&state), Arc::clone(&state.last_activity));
 
     // Spawn file watcher for hot-reloading skills.
     crate::skill_watcher::spawn_skill_watcher(Arc::clone(&state.skills_manager), cwd.clone());
@@ -691,6 +698,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             WsMessage::Close(_) => break,
             _ => continue,
         };
+        // Any inbound client message counts as user activity for the
+        // AutoDream idle watcher (cheapest signal — one Mutex write).
+        *state.last_activity.lock().await = std::time::SystemTime::now();
 
         let parsed: ClientMsg = match serde_json::from_str(&text) {
             Ok(m) => m,

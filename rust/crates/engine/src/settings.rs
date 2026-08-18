@@ -243,6 +243,14 @@ pub struct SettingsFile {
     /// 4096. Increase (e.g. 8192) for long, dense conversations.
     #[serde(rename = "compactMaxTokens", default)]
     pub compact_max_tokens: Option<u32>,
+    /// Enable the AutoDream idle background memory consolidation run.
+    /// Default true.
+    #[serde(rename = "dreamEnabled", default)]
+    pub dream_enabled: Option<bool>,
+    /// Idle minutes (no client activity) before a dream run may start.
+    /// Default 10.
+    #[serde(rename = "dreamIdleMinutes", default)]
+    pub dream_idle_minutes: Option<u64>,
     #[serde(rename = "elevenlabsApiKey", default)]
     pub elevenlabs_api_key: Option<String>,
     #[serde(rename = "charsPerToken", default = "default_chars_per_token")]
@@ -456,6 +464,8 @@ impl Default for SettingsFile {
             models: None,
             compact_model: None,
             compact_max_tokens: None,
+            dream_enabled: None,
+            dream_idle_minutes: None,
             elevenlabs_api_key: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,

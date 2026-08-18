@@ -94,7 +94,22 @@ pub async fn run_handler(
             ),
         );
     }
+    run_handler_inner(state, req).await
+}
 
+/// Programmatic entry for the in-process AutoDream scheduler: same path as
+/// `POST /api/run` but without axum extraction or auth (the caller is the
+/// server itself). Returns the NDJSON streaming response.
+pub async fn run_handler_for_dream(
+    state: Arc<AppState>,
+    req: RunRequest,
+) -> Result<Response, String> {
+    Ok(run_handler_inner(state, req).await)
+}
+
+async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
+    // External REST runs count as user activity (AutoDream idle watcher).
+    *state.last_activity.lock().await = std::time::SystemTime::now();
     // Resolve or create a session.
     let session_handle = if let Some(ref id) = req.session_id {
         match resume_session(&state.session_service, &state.cwd, id) {

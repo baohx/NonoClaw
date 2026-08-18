@@ -5,6 +5,7 @@
 
 mod connection;
 mod download_service;
+mod dream;
 mod http_error;
 mod permission_api;
 mod project_service;
