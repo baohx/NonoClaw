@@ -26,6 +26,9 @@ pub struct SseParser {
     buf: String,
     /// Start index in `buf` of the next unscanned frame boundary search.
     cursor: usize,
+    /// Leftover bytes from a previous chunk that end in an incomplete UTF-8
+    /// sequence; prepended to the next chunk before decoding.
+    pending_bytes: Vec<u8>,
 }
 
 impl SseParser {
@@ -33,12 +36,35 @@ impl SseParser {
         Self::default()
     }
 
-    /// Append a chunk of bytes (interpreted as UTF-8, replacing invalid bytes).
-    /// CR characters are stripped so CRLF and lone-CR line endings normalize to
-    /// LF, per the SSE spec.
+    /// Append a chunk of bytes. A chunk may end in the middle of a multi-byte
+    /// UTF-8 character (network reads have no respect for char boundaries);
+    /// the incomplete tail is buffered and completed by the next chunk instead
+    /// of being corrupted into U+FFFD replacement chars. CR characters are
+    /// stripped so CRLF and lone-CR line endings normalize to LF, per the SSE
+    /// spec.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
-        let s = String::from_utf8_lossy(bytes);
-        self.push_strip_cr(&s);
+        // Prepend any incomplete UTF-8 tail held back from the previous chunk.
+        let owned;
+        let bytes: &[u8] = if self.pending_bytes.is_empty() {
+            bytes
+        } else {
+            let mut joined = std::mem::take(&mut self.pending_bytes);
+            joined.extend_from_slice(bytes);
+            owned = joined;
+            &owned
+        };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                self.push_strip_cr(s);
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // SAFETY: valid_up_to() guarantees this prefix is valid UTF-8.
+                let s = unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) };
+                self.push_strip_cr(s);
+                self.pending_bytes = bytes[valid..].to_vec();
+            }
+        }
     }
 
     pub fn feed_str(&mut self, s: &str) {
@@ -114,6 +140,23 @@ fn parse_frame(raw: &str) -> SseFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multibyte_char_split_across_chunks_survives() {
+        // Regression: feed_bytes used from_utf8_lossy per chunk, so a UTF-8
+        // char (here '═' U+2550, 3 bytes) split across chunk boundaries was
+        // corrupted into two U+FFFD replacement chars.
+        let frame = "event: content_block\ndata: ════════════════\n\n";
+        let bytes = frame.as_bytes();
+        // Split at every possible position to exercise all boundaries.
+        for split in 1..bytes.len() {
+            let mut p = SseParser::new();
+            p.feed_bytes(&bytes[..split]);
+            p.feed_bytes(&bytes[split..]);
+            let f = p.next_frame().unwrap();
+            assert_eq!(f.data, "════════════════", "corrupted at split {split}");
+        }
+    }
 
     #[test]
     fn parses_single_frame() {
