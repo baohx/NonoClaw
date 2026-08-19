@@ -156,6 +156,9 @@ export interface RunSlice {
   addTraceEntry: (entry: TraceEntry) => void;
   clearTrace: () => void;
   addUsage: (run: { input: number; output: number; cacheRead: number; cacheWrite: number }) => void;
+  /** Overwrite all four token totals (engine sends cumulative `total` in
+   * UsageUpdated every turn — additive would double-count). */
+  setUsageTotal: (t: { input: number; output: number; cacheRead: number; cacheWrite: number }) => void;
 }
 
 export interface ToolSlice {
@@ -497,6 +500,12 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
   addTraceEntry: (entry) => set((state) => ({ traceEntries: appendTraceEntry(state.traceEntries, entry) })),
   clearTrace: () => set({ traceEntries: [] }),
   addUsage: (run) => set((state) => accumulateUsage(state, run)),
+  setUsageTotal: (t) => set({
+    inputTokens: t.input,
+    outputTokens: t.output,
+    cacheReadTokens: t.cacheRead,
+    cacheWriteTokens: t.cacheWrite,
+  }),
 });
 
 export const createToolSlice: Slice<ToolSlice> = (set, get) => ({

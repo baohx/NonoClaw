@@ -82,7 +82,18 @@ export default function TrajectoryReplay() {
             key={msg.id}
             className={`traj-node traj-node--${msg.role}`}
             title={`#${msg.srcIndex ?? "?"} ${msg.role}: ${msg.content.slice(0, 80)}`}
-            onClick={() => setLocatedMessage(msg.id)}
+            onClick={() => {
+              // In toolsHidden mode a whole group of tool messages collapses into
+              // one placeholder anchored at the group's FIRST tool id — jump there.
+              if (msg.role === "tool") {
+                const idx = messages.indexOf(msg);
+                let first = idx;
+                while (first > 0 && messages[first - 1].role === "tool") first--;
+                setLocatedMessage(messages[first].id);
+              } else {
+                setLocatedMessage(msg.id);
+              }
+            }}
           >
             <span
               className="traj-node__dot"

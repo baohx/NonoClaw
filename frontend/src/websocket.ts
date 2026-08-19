@@ -338,6 +338,20 @@ export function dispatchServerMessage(message: ServerMsg): void {
             });
           }
           break;
+        case "usage_updated": {
+          // Engine sends cumulative totals every turn — overwrite (not add).
+          const total = event.total;
+          if (total && typeof total === "object") {
+            const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+            state.setUsageTotal({
+              input: n((total as Record<string, unknown>).input_tokens),
+              output: n((total as Record<string, unknown>).output_tokens),
+              cacheRead: n((total as Record<string, unknown>).cache_read_input_tokens),
+              cacheWrite: n((total as Record<string, unknown>).cache_creation_input_tokens),
+            });
+          }
+          break;
+        }
       }
       break;
     }

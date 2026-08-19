@@ -60,11 +60,13 @@ export default function ChatView({ messages, toolsHidden, send }: Props) {
   // toolsHidden: group consecutive tool messages into a single placeholder.
   const rendered: React.ReactNode[] = [];
   let toolGroupCount = 0;
+  let toolGroupFirstId = "";
   let groupKeyIndex = 0;
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role !== "tool") {
       toolGroupCount = 0;
+      toolGroupFirstId = "";
       rendered.push(
         <MessageCard
           key={msg.id}
@@ -77,12 +79,17 @@ export default function ChatView({ messages, toolsHidden, send }: Props) {
     }
     // This is a tool message — count it in the current group.
     toolGroupCount++;
+    if (toolGroupFirstId === "") toolGroupFirstId = msg.id;
     // Peek ahead: if the next message is also a tool, skip rendering the placeholder.
     const nextMsg = messages[i + 1];
     if (nextMsg && nextMsg.role === "tool") continue;
     // This is the last tool in a consecutive group — render a single placeholder.
     rendered.push(
-      <div className="msg msg-enter tool-hidden-placeholder" key={`tool-group-${groupKeyIndex++}`}>
+      <div
+        id={`msg-${toolGroupFirstId}`}
+        className="msg msg-enter tool-hidden-placeholder"
+        key={`tool-group-${groupKeyIndex++}`}
+      >
         <span className="tool-hidden-placeholder__icon">◇</span>
         <span className="tool-hidden-placeholder__text">
           {toolGroupCount === 1

@@ -127,3 +127,76 @@ function terminalFramesReleaseTheComposer(): void {
 }
 
 terminalFramesReleaseTheComposer();
+
+/** F2/F4 regression: token_budget_breakdown populates xrayBudget, and
+ *  usage_updated overwrites (not accumulates) the four token totals. */
+function xrayAndUsageRealTime(): void {
+  resetStore();
+  establishSession();
+  dispatchServerMessage({
+    type: "event",
+    protocol_version: 1,
+    run_id: "run-x",
+    session_id: "session-1",
+    session_revision: 1,
+    sequence: 1,
+    event: {
+      kind: "token_budget_breakdown",
+      chars_per_token: 4,
+      estimated_tokens: 30,
+      system_chars: 80,
+      tools_chars: 30,
+      messages_chars: 10,
+      system: [{ name: "base_prompt", chars: 80, estimated_tokens: 20 }],
+      tools: [{ name: "builtin:read", chars: 30, estimated_tokens: 8 }],
+      messages: [{ name: "history", chars: 10, estimated_tokens: 2 }],
+    },
+  } satisfies ServerMsg);
+  const xray = useStore.getState().xrayBudget;
+  assert(xray !== null && xray.kind === "token_budget_breakdown", "xrayBudget captures the breakdown");
+  assert(Array.isArray(xray.system) && xray.system.length === 1, "xrayBudget keeps verbatim arrays");
+
+  // usage_updated: cumulative total overwrites the counters.
+  dispatchServerMessage({
+    type: "event",
+    protocol_version: 1,
+    run_id: "run-x",
+    session_id: "session-1",
+    session_revision: 1,
+    sequence: 2,
+    event: {
+      kind: "usage_updated",
+      turn: 1,
+      turn_usage: { input_tokens: 5, output_tokens: 5 },
+      total: {
+        input_tokens: 100, output_tokens: 200,
+        cache_read_input_tokens: 50, cache_creation_input_tokens: 25,
+      },
+    },
+  } satisfies ServerMsg);
+  const st = useStore.getState();
+  assert(st.inputTokens === 100, "usage_updated sets input total");
+  assert(st.outputTokens === 200, "usage_updated sets output total");
+  assert(st.cacheReadTokens === 50, "usage_updated sets cache read");
+  assert(st.cacheWriteTokens === 25, "usage_updated sets cache write");
+
+  // A second usage_updated must overwrite, not double.
+  dispatchServerMessage({
+    type: "event",
+    protocol_version: 1,
+    run_id: "run-x",
+    session_id: "session-1",
+    session_revision: 1,
+    sequence: 3,
+    event: {
+      kind: "usage_updated",
+      turn: 2,
+      turn_usage: { input_tokens: 5, output_tokens: 5 },
+      total: { input_tokens: 105, output_tokens: 205, cache_read_input_tokens: 55, cache_creation_input_tokens: 30 },
+    },
+  } satisfies ServerMsg);
+  assert(useStore.getState().inputTokens === 105, "usage_updated overwrites (no double count)");
+  console.log("✓ x-ray data + usage totals update in real time");
+}
+
+xrayAndUsageRealTime();
