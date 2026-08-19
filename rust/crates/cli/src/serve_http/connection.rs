@@ -297,6 +297,8 @@ fn list_sessions_wire(state: &AppState) -> Vec<SessionInfoWire> {
             started: s.started,
             message_count: s.message_count,
             summary: s.summary,
+            title: s.title,
+            tag: s.tag,
         })
         .collect()
 }

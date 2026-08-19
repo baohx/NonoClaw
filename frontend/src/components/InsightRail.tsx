@@ -3,6 +3,7 @@ import { useStore } from "../store";
 import type { ProjectInfo, ToolInfo } from "../types";
 import TechnicalTrace from "./TechnicalTrace";
 import ContextXray from "./ContextXray";
+import TrajectoryReplay from "./TrajectoryReplay";
 
 interface Props {
   info: ProjectInfo | null;
@@ -54,6 +55,15 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
           onToggle={toggle}
         >
           <ContextXray />
+        </Section>
+        <Section
+          id="trajectory"
+          label="Trajectory"
+          count={null}
+          open={open.has("trajectory")}
+          onToggle={toggle}
+        >
+          <TrajectoryReplay />
         </Section>
         <Section
           id="tools"

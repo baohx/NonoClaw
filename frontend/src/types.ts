@@ -247,6 +247,10 @@ export interface SessionInfoWire {
   started: string | null;
   message_count: number;
   summary: string;
+  /** Custom title (optional, newer servers). */
+  title?: string;
+  /** Metadata tag; forks carry "fork:<sid>#<index>" lineage. */
+  tag?: string | null;
 }
 
 export interface SessionListMsg {

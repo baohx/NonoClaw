@@ -115,6 +115,12 @@ pub(super) struct SessionInfoWire {
     pub started: Option<String>,
     pub message_count: usize,
     pub summary: String,
+    /// Custom title (if any). Used by the session rail display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Metadata tag; forks carry "fork:<source>#<index>" lineage (F3/F4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

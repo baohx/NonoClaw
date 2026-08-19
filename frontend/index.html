@@ -2296,6 +2296,23 @@
       .xray-doctor { border: 1px solid #ffd60a66; background: #ffd60a14; border-radius: 6px; padding: 8px 10px; font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
       .xray-doctor strong { font-size: 10px; letter-spacing: .04em; }
       .xray-doctor__item { color: var(--text-muted); }
+
+      /* ===== F4 Trajectory Replay ===== */
+      .traj-root { display: flex; flex-direction: column; gap: 8px; }
+      .traj-empty { padding: 14px 10px; color: var(--text-muted); font-size: 11px; }
+      .traj-lineage { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: 10px;
+        border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; background: var(--surface); }
+      .traj-lineage strong { font-size: 10px; letter-spacing: .04em; }
+      .traj-lineage__hop { color: var(--text-muted); }
+      .traj-lineage__cur { color: var(--accent, #0071e3); }
+      .traj-axis { display: flex; flex-wrap: wrap; gap: 3px; padding: 4px 0; max-height: 120px; overflow: auto; }
+      .traj-node { border: 0; background: transparent; padding: 2px; cursor: pointer; border-radius: 4px; }
+      .traj-node:hover { background: var(--surface-hover, rgba(127,127,127,.14)); }
+      .traj-node__dot { display: block; width: 9px; height: 9px; border-radius: 50%; }
+      .traj-node--user .traj-node__dot { border-radius: 2px; }
+      .traj-legend { display: flex; gap: 8px; font-size: 10px; color: var(--text-muted); align-items: center; }
+      .traj-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; vertical-align: -1px; }
+      .traj-legend__hint { margin-left: auto; opacity: .7; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
