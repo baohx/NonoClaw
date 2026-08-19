@@ -238,6 +238,9 @@ export interface UiSlice {
   permissionMode: PermissionMode;
   /** Chat message id to scroll into view and highlight (rail session jump). */
   locatedMessageId: string | null;
+  /** F2 Context X-Ray: latest token_budget_breakdown payload verbatim. */
+  xrayBudget: import("../types").EngineEvent | null;
+  setXrayBudget: (event: import("../types").EngineEvent | null) => void;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
   toggleLeftRail: () => void;
@@ -641,6 +644,8 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   theme: initialTheme(),
   permissionMode: "auto",
   locatedMessageId: null,
+  xrayBudget: null,
+  setXrayBudget: (event) => set({ xrayBudget: event }),
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),

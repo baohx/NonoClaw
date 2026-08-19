@@ -2250,6 +2250,52 @@
       .echarts-block figcaption button { border: 1px solid var(--border); border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
       .echarts-block details { padding: 6px 10px 10px; border-top: 1px solid var(--border); }
       .echarts-block details pre { max-height: 240px; overflow: auto; }
+
+      /* ===== F1 状态宠物（BreathController 驱动的像素猫爪） ===== */
+      .pet-corner { position: fixed; right: 18px; bottom: 18px; z-index: 40; pointer-events: none;
+        opacity: .92; transition: transform .25s ease; }
+      .pet-corner:hover { transform: scale(1.12); }
+      .pet-svg { filter: drop-shadow(0 2px 6px rgba(0,0,0,.18)); }
+      .pet-zzz-1 { animation: pet-zzz 1.6s ease-in-out infinite; }
+      .pet-zzz-2 { animation: pet-zzz 1.6s ease-in-out .4s infinite; }
+      @keyframes pet-zzz { 0%,100% { opacity: .2; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-1.5px); } }
+      .pet-yarn-paw { animation: pet-pawbat .5s ease-in-out infinite; transform-origin: 11px 12px; }
+      .pet-yarn-ball { animation: pet-ballroll .9s linear infinite; transform-origin: 18px 16px; }
+      @keyframes pet-pawbat { 0%,100% { transform: rotate(-8deg); } 50% { transform: rotate(10deg); } }
+      @keyframes pet-ballroll { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      .pet-raise { animation: pet-wave 1.2s ease-in-out infinite; transform-origin: 17px 9px; }
+      @keyframes pet-wave { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(-18deg); } }
+      .pet-blow-body { animation: pet-shake .3s linear infinite; transform-origin: 11px 12px; }
+      .pet-spike { animation: pet-spiketwitch .5s ease-in-out infinite; }
+      @keyframes pet-shake { 0%,100% { transform: translateX(-.5px); } 50% { transform: translateX(.5px); } }
+      @keyframes pet-spiketwitch { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+      .pet-jump { animation: pet-hop .55s ease-in-out infinite; transform-origin: 11px 22px; }
+      @keyframes pet-hop { 0%,100% { transform: translateY(0) scaleY(1); } 40% { transform: translateY(-2.5px) scaleY(1.04); } 60% { transform: translateY(0) scaleY(.96); } }
+      @media (prefers-reduced-motion: reduce) {
+        .pet-corner *, .pet-corner { animation: none !important; }
+      }
+
+      /* ===== F2 Context X-Ray ===== */
+      .xray-root { display: flex; flex-direction: column; gap: 10px; }
+      .xray-empty { padding: 14px 10px; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
+      .xray-total { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-muted); }
+      .xray-total__legend { display: inline-flex; gap: 8px; }
+      .xray-total__legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: -1px; }
+      .xray-stack { display: flex; height: 12px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+      .xray-stack__seg { display: block; min-width: 2px; }
+      .xray-section { display: flex; flex-direction: column; gap: 3px; }
+      .xray-section__head { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 4px 0 2px; }
+      .xray-section__head strong { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; color: var(--text-muted); }
+      .xray-section__dot { width: 8px; height: 8px; border-radius: 50%; }
+      .xray-section__sum { margin-left: auto; color: var(--text-muted); font-size: 10px; }
+      .xray-row { display: grid; grid-template-columns: minmax(70px, 38%) 1fr 42px; gap: 6px; align-items: center; font-size: 10px; }
+      .xray-row__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+      .xray-row__bar { height: 8px; background: var(--surface-hover, rgba(127,127,127,.12)); border-radius: 4px; overflow: hidden; }
+      .xray-row__fill { display: block; height: 100%; border-radius: 4px; transition: width .3s ease; }
+      .xray-row__val { text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+      .xray-doctor { border: 1px solid #ffd60a66; background: #ffd60a14; border-radius: 6px; padding: 8px 10px; font-size: 11px; display: flex; flex-direction: column; gap: 3px; }
+      .xray-doctor strong { font-size: 10px; letter-spacing: .04em; }
+      .xray-doctor__item { color: var(--text-muted); }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>

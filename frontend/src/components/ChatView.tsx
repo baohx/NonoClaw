@@ -1,16 +1,46 @@
 import { memo, useEffect, useRef, useState } from "react";
-import type { ChatMessage, SubagentRun, SubagentTool } from "../types";
+import type { ChatMessage, ClientMsg, SubagentRun, SubagentTool } from "../types";
 import { useStore } from "../store";
 import Markdown from "./Markdown";
 import { createRenderedExportArtifact, type ExportFormat } from "../export";
+
+/** F3 Message Fork: branch the session before this user message via the
+ * REST fork endpoint, then switch to the new session. */
+async function forkAtMessage(msg: ChatMessage, send: (m: ClientMsg) => void) {
+  const state = useStore.getState();
+  const sessionId = state.sessionId;
+  if (!sessionId || msg.srcIndex === undefined) return;
+  if (!window.confirm("Fork：将在此消息前分支新会话（复制之前的对话），并切换过去？")) return;
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/fork`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ at_index: msg.srcIndex, title: `fork @${msg.srcIndex}` }),
+      },
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `fork failed (${res.status})`);
+    }
+    const body = await res.json() as { session_id: string };
+    state.prepareSessionSwitch(body.session_id);
+    // Same resume path as the session rail; messages arrive via MessagesLoaded.
+    send({ type: "resume_session", id: body.session_id });
+  } catch (reason) {
+    window.alert(reason instanceof Error ? reason.message : "fork failed");
+  }
+}
 
 interface Props {
   messages: ChatMessage[];
   streamingIdx: number | null;
   toolsHidden: boolean;
+  send: (message: ClientMsg) => void;
 }
 
-export default function ChatView({ messages, toolsHidden }: Props) {
+export default function ChatView({ messages, toolsHidden, send }: Props) {
   if (!toolsHidden) {
     return (
       <div>
@@ -19,6 +49,7 @@ export default function ChatView({ messages, toolsHidden }: Props) {
           <MessageCard
             key={msg.id}
             msg={msg}
+            send={send}
             isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
           />
         ))}
@@ -38,6 +69,7 @@ export default function ChatView({ messages, toolsHidden }: Props) {
         <MessageCard
           key={msg.id}
           msg={msg}
+          send={send}
           isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
         />
       );
@@ -130,9 +162,11 @@ function downloadBlob(blob: Blob, filename: string) {
 const MessageCard = memo(function MessageCard({
   msg,
   isLastAssistant,
+  send,
 }: {
   msg: ChatMessage;
   isLastAssistant: boolean;
+  send: (m: ClientMsg) => void;
 }) {
   const [showExport, setShowExport] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
@@ -173,15 +207,24 @@ const MessageCard = memo(function MessageCard({
         <span className="msg__role-mark" />
         {isUser ? "you" : "Nono"}
         {time && <span className="msg__time">{time}</span>}
-        {/* User message: copy button */}
+        {/* User message: copy + fork buttons */}
         {isUser && (
-          <button
-            className="msg-action"
-            title="Copy"
-            onClick={() => copyText(msg.content)}
-          >
-            ⧉
-          </button>
+          <>
+            <button
+              className="msg-action"
+              title="Copy"
+              onClick={() => copyText(msg.content)}
+            >
+              ⧉
+            </button>
+            <button
+              className="msg-action"
+              title="Fork: 从这条消息之前分支一个新会话（不含此消息），可改写后重发"
+              onClick={() => forkAtMessage(msg, send)}
+            >
+              ⟲
+            </button>
+          </>
         )}
         {/* Last assistant message: copy + export md */}
         {!isUser && isLastAssistant && (

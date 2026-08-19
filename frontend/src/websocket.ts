@@ -293,6 +293,9 @@ export function dispatchServerMessage(message: ServerMsg): void {
       if (!acceptRunMessage(message, false)) break;
       const traceEntry = traceEntryFromEvent(message);
       if (traceEntry) state.addTraceEntry(traceEntry);
+      // F2 Context X-Ray: keep the verbatim component arrays; the trace entry
+      // only retains a top-5 stringified digest.
+      if (event.kind === "token_budget_breakdown") state.setXrayBudget(event);
       breathController.consume(event);
       switch (event.kind) {
         case "text_delta":

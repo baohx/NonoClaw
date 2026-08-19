@@ -479,6 +479,10 @@ pub async fn serve(
             axum::routing::post(super::run_api::run_handler),
         )
         .route(
+            "/api/sessions/:session_id/fork",
+            axum::routing::post(super::fork_api::fork_session),
+        )
+        .route(
             "/api/sessions/:session_id/questions",
             axum::routing::get(super::permission_api::list_pending_questions),
         )

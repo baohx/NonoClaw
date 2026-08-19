@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useStore } from "../store";
 import type { ProjectInfo, ToolInfo } from "../types";
 import TechnicalTrace from "./TechnicalTrace";
+import ContextXray from "./ContextXray";
 
 interface Props {
   info: ProjectInfo | null;
@@ -45,6 +46,15 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
       </div>
       <TechnicalTrace />
       <div className="acc">
+        <Section
+          id="xray"
+          label="Context X-Ray"
+          count={null}
+          open={open.has("xray")}
+          onToggle={toggle}
+        >
+          <ContextXray />
+        </Section>
         <Section
           id="tools"
           label="Tools"
