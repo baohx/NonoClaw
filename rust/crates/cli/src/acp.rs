@@ -91,11 +91,14 @@ where
                 }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    line.clear();
                     continue;
                 }
                 let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
+                    line.clear();
                     continue;
                 };
+                line.clear();
                 let id = msg.get("id").cloned();
                 let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -402,5 +405,51 @@ mod tests {
     #[test]
     fn acp_update_ignores_technical_events() {
         assert!(acp_update(&RunEvent::Compacting).is_none());
+    }
+
+    /// Regression: the read loop must clear its line buffer between requests.
+    /// Before the fix, every request after the first was appended to the
+    /// previous line, failed JSON parsing, and was silently dropped — Zed
+    /// would hang forever waiting for `session/new` after `initialize`.
+    #[tokio::test]
+    async fn serve_io_answers_multiple_requests_per_connection() {
+        let cwd = std::env::temp_dir();
+        let state = Arc::new(AcpState {
+            cwd: cwd.clone(),
+            resolved: Arc::new(nonoclaw_engine::load_resolved_config(&cwd, None, None)),
+            registry: Arc::new(ToolRegistry::new()),
+            todos: Arc::new(TodoStore::new()),
+            skills_manager: Arc::new(RwLock::new(SkillsManager::new(&cwd))),
+            background_registry: Arc::new(std::sync::Mutex::new(BackgroundTaskRegistry::new())),
+            session_service: SessionService::new(),
+            sessions: Mutex::new(HashMap::new()),
+            controllers: Mutex::new(HashMap::new()),
+        });
+
+        let (a, b) = tokio::io::duplex(4096);
+        let (server_r, server_w) = tokio::io::split(a);
+        let (test_r, mut test_w) = tokio::io::split(b);
+        let mut test_r = tokio::io::BufReader::new(test_r);
+        let io_task = tokio::spawn(serve_io(state, server_r, server_w));
+
+        test_w
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"nope/method\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+
+        for expected_id in [1u64, 2u64] {
+            let mut buf = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), test_r.read_line(&mut buf))
+                .await
+                .expect("serve_io stopped answering after the first request")
+                .unwrap();
+            let parsed: Value = serde_json::from_str(&buf).unwrap();
+            assert_eq!(parsed["id"], expected_id, "unexpected response: {buf}");
+        }
+
+        io_task.abort();
     }
 }
