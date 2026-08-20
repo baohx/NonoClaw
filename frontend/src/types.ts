@@ -441,6 +441,10 @@ export interface ProjectInfo {
   extensions: ExtensionDescriptor[];
   extension_diagnostics: ExtensionDiagnostic[];
   hooks: HookEntry[];
+  /** Mneme memory facts, importance desc. */
+  facts: FactInfo[];
+  /** Active (non-done) beads, priority desc. */
+  beads: BeadInfo[];
   docs: PathLayer[];
   settings: PathLayer[];
   /** Generated from the executable's Clap command definition. */
@@ -467,6 +471,23 @@ export interface ProviderBalance {
   summary: string;
   ok: boolean;
   error?: string;
+}
+
+export interface FactInfo {
+  name: string;
+  title: string;
+  fact_type: string;
+  importance: number;
+  confidence: number;
+  path: string;
+}
+
+export interface BeadInfo {
+  id: string;
+  title: string;
+  status: string;
+  priority: number;
+  path: string;
 }
 
 export interface ModelProviderMapping {

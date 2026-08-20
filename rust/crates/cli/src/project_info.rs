@@ -31,6 +31,10 @@ pub struct ProjectInfo {
     /// Non-fatal load and deterministic name-conflict diagnostics.
     pub extension_diagnostics: Vec<ExtensionDiagnostic>,
     pub hooks: Vec<HookEntry>,
+    /// Mneme memory facts, sorted by importance desc (all facts — panel is collapsible).
+    pub facts: Vec<FactInfo>,
+    /// Active (non-done) beads, priority desc — mirrors `active_beads` semantics.
+    pub beads: Vec<BeadInfo>,
     pub docs: Vec<PathLayer>,
     pub settings: Vec<PathLayer>,
     /// Generated from the Clap command definition used by the executable.
@@ -95,6 +99,28 @@ pub struct HookEntry {
     pub hook_type: String,
     pub matcher: String,
     pub command: String,
+}
+
+/// One Mneme memory fact, surfaced in the Insight rail for human inspection
+/// (what the agent has distilled across sessions). Click-to-open via `path`.
+#[derive(Debug, Serialize, Clone)]
+pub struct FactInfo {
+    pub name: String,
+    pub title: String,
+    pub fact_type: String,
+    pub importance: f64,
+    pub confidence: f64,
+    pub path: String, // absolute .md path for click-to-open
+}
+
+/// One task bead (active unless done), surfaced like facts.
+#[derive(Debug, Serialize, Clone)]
+pub struct BeadInfo {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub priority: u8,
+    pub path: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -280,6 +306,45 @@ pub async fn gather(
         .collect();
 
     let docs = collect_doc_layers(cwd);
+
+    // Mneme memory: facts by importance desc, beads active-only by priority desc.
+    let mut facts = nonoclaw_tools::memory::load_facts(cwd);
+    facts.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let fact_infos: Vec<FactInfo> = facts
+        .iter()
+        .map(|f| FactInfo {
+            name: f.name.clone(),
+            title: f.title.clone(),
+            fact_type: format!("{:?}", f.fact_type).to_lowercase(),
+            importance: f.importance,
+            confidence: f.confidence,
+            path: cwd
+                .join(".nonoclaw/memory/facts")
+                .join(format!("{}.md", f.name))
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .collect();
+    let beads: Vec<BeadInfo> =
+        nonoclaw_tools::memory::active_beads(&nonoclaw_tools::memory::load_beads(cwd))
+            .into_iter()
+            .map(|b| BeadInfo {
+                id: b.id.clone(),
+                title: b.title.clone(),
+                status: format!("{:?}", b.status).to_lowercase(),
+                priority: b.priority,
+                path: cwd
+                    .join(".nonoclaw/memory/beads")
+                    .join(format!("{}.md", b.id))
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect();
+
     let settings = collect_settings_layers(cwd);
     let config_diagnostics = config
         .diagnostics
@@ -300,6 +365,8 @@ pub async fn gather(
         extensions: discovery.descriptors,
         extension_diagnostics: discovery.diagnostics,
         hooks,
+        facts: fact_infos,
+        beads,
         docs,
         settings,
         cli_reference: cli_reference(),

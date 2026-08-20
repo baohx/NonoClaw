@@ -2136,6 +2136,8 @@ mod characterization_tests {
             extensions: vec![],
             extension_diagnostics: vec![],
             hooks: vec![],
+            facts: vec![],
+            beads: vec![],
             docs: vec![],
             settings: vec![],
             cli_reference: vec![],

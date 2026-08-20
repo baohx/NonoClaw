@@ -233,6 +233,62 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
         </Section>
 
         <Section
+          id="facts"
+          label="Memory facts"
+          count={info?.facts.length ?? 0}
+          open={open.has("facts")}
+          onToggle={toggle}
+        >
+          {(info?.facts.length ?? 0) === 0 ? (
+            <div className="acc-empty">none — facts land in .nonoclaw/memory/facts/</div>
+          ) : (
+            info?.facts.map((f) => (
+              <button
+                key={f.path}
+                className="insight-row"
+                onClick={(ev) => onOpen(f.path, ev.shiftKey)}
+                title={`${f.path} — click to open`}
+              >
+                <div className="insight-row__top">
+                  <span className="tag">{f.fact_type}</span>
+                  <span className="insight-row__name">{f.title || f.name}</span>
+                </div>
+                <div className="insight-row__meta">
+                  imp {f.importance.toFixed(2)} · conf {f.confidence.toFixed(2)}
+                </div>
+              </button>
+            ))
+          )}
+        </Section>
+
+        <Section
+          id="beads"
+          label="Active beads"
+          count={info?.beads.length ?? 0}
+          open={open.has("beads")}
+          onToggle={toggle}
+        >
+          {(info?.beads.length ?? 0) === 0 ? (
+            <div className="acc-empty">none — beads land in .nonoclaw/memory/beads/</div>
+          ) : (
+            info?.beads.map((b) => (
+              <button
+                key={b.path}
+                className="insight-row"
+                onClick={(ev) => onOpen(b.path, ev.shiftKey)}
+                title={`${b.path} — click to open`}
+              >
+                <div className="insight-row__top">
+                  <span className="tag">{b.status}</span>
+                  <span className="insight-row__name">{b.title}</span>
+                </div>
+                <div className="insight-row__meta">priority {b.priority}</div>
+              </button>
+            ))
+          )}
+        </Section>
+
+        <Section
           id="docs"
           label="Docs & config"
           count={(info?.docs.length ?? 0) + (info?.settings.length ?? 0)}
