@@ -455,45 +455,56 @@ impl Tool for McpTool {
 
 /// Spawn each configured server, discover its tools, and register them.
 /// Per-server spawn/list failures are logged and skipped (non-fatal).
+///
+/// The expensive part (child process spawn + `initialize` handshake +
+/// `tools/list`) runs concurrently across all servers — npx/python startup
+/// dominates ACP/web boot time. Registry mutations stay sequential because
+/// `ToolRegistry::register` takes `&mut self`.
 pub async fn register(registry: &mut ToolRegistry, configs: &[(String, McpServerConfig)]) {
-    for (name, cfg) in configs {
-        let source = format!("mcp-config:{name}");
-        let mut descriptor = ExtensionDescriptor::new(
-            ExtensionKind::Mcp,
-            name.clone(),
-            source.clone(),
-            ExtensionSourceKind::Explicit,
-            100,
-        );
-        match McpClient::spawn(name, cfg).await {
-            Ok(client) => match client.list_tools().await {
-                Ok(defs) => {
-                    let n = defs.len();
-                    for d in defs {
-                        registry.register(std::sync::Arc::new(McpTool::new(
-                            name,
-                            d,
-                            std::sync::Arc::clone(&client),
-                        )));
-                    }
-                    descriptor.detail = Some(format!("connected; {n} tool(s)"));
-                    registry.add_extension_descriptor(descriptor);
-                    tracing::info!("MCP server `{name}`: registered {n} tool(s)");
+    let results = futures::future::join_all(configs.iter().map(|(name, cfg)| {
+        let name = name.clone();
+        let cfg = cfg.clone();
+        async move {
+            let source = format!("mcp-config:{name}");
+            let descriptor = ExtensionDescriptor::new(
+                ExtensionKind::Mcp,
+                name.clone(),
+                source.clone(),
+                ExtensionSourceKind::Explicit,
+                100,
+            );
+            let outcome = match McpClient::spawn(&name, &cfg).await {
+                Ok(client) => match client.list_tools().await {
+                    Ok(defs) => Ok(defs
+                        .into_iter()
+                        .map(|d| (name.clone(), d, std::sync::Arc::clone(&client)))
+                        .collect::<Vec<_>>()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            (name, source, descriptor, outcome)
+        }
+    }))
+    .await;
+
+    for (name, source, mut descriptor, outcome) in results {
+        match outcome {
+            Ok(tools) => {
+                let n = tools.len();
+                for (name, d, client) in tools {
+                    registry.register(std::sync::Arc::new(McpTool::new(&name, d, client)));
                 }
-                Err(error) => {
-                    descriptor.status = ExtensionStatus::Failed;
-                    descriptor.detail = Some(error.to_string());
-                    registry.add_extension_descriptor(descriptor);
-                    registry.add_extension_diagnostic(mcp_failure(name, &source, &error));
-                    tracing::warn!("MCP server `{name}` tools/list failed: {error}");
-                }
-            },
+                descriptor.detail = Some(format!("connected; {n} tool(s)"));
+                registry.add_extension_descriptor(descriptor);
+                tracing::info!("MCP server `{name}`: registered {n} tool(s)");
+            }
             Err(error) => {
                 descriptor.status = ExtensionStatus::Failed;
                 descriptor.detail = Some(error.to_string());
                 registry.add_extension_descriptor(descriptor);
-                registry.add_extension_diagnostic(mcp_failure(name, &source, &error));
-                tracing::warn!("MCP server `{name}` spawn failed: {error}");
+                registry.add_extension_diagnostic(mcp_failure(&name, &source, &error));
+                tracing::warn!("MCP server `{name}` failed: {error}");
             }
         }
     }
