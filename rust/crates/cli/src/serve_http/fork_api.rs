@@ -131,7 +131,9 @@ mod tests {
         use nonoclaw_engine::SessionService;
 
         let dir = tempfile::tempdir().unwrap();
-        // Home-relative storage: point HOME at the tempdir.
+        // Home-relative storage: point HOME at the tempdir, restoring the
+        // original afterwards so concurrent tests can still resolve home.
+        let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", dir.path());
         let service = SessionService::new();
 
@@ -167,6 +169,9 @@ mod tests {
         // Source is untouched.
         let source_snap = source.snapshot().await.unwrap();
         assert_eq!(source_snap.messages.len(), 4);
-        std::env::remove_var("HOME");
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
