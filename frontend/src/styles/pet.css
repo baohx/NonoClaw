@@ -1,0 +1,160 @@
+/* Pet (Claw) animations — bound to BreathController's visual sample.
+ * The Pet component injects CSS variables for live energy/flare/velocity,
+ * which these animations use to scale speed and intensity.
+ */
+
+.pet-corner {
+  --pet-flare: 0;
+  --pet-velocity: 0;
+  --pet-frequency: 1;
+  --pet-amplitude: 1;
+  --pet-warmth: 0.5;
+  transition: transform 0.25s ease, filter 0.25s ease;
+  will-change: transform, filter;
+}
+
+/* Idle: slow, gentle breathing. */
+.pet-idle .pet-svg {
+  animation: pet-breathe 3s ease-in-out infinite;
+  animation-duration: calc(3s / var(--pet-frequency, 1));
+  filter: drop-shadow(0 0 0 transparent);
+}
+
+/* Sleep: Zzz float upward, speed tied to text-stream velocity. */
+.pet-sleep .pet-svg {
+  animation: pet-sleep-rock 2.4s ease-in-out infinite;
+  animation-duration: calc(2.4s / var(--pet-frequency, 1));
+}
+
+.pet-sleep .pet-zzz-1 {
+  animation: pet-zzz-float 1.6s ease-out infinite;
+  animation-duration: calc(1.6s / max(0.3, var(--pet-velocity, 0.4)));
+  opacity: 0.7;
+}
+
+.pet-sleep .pet-zzz-2 {
+  animation: pet-zzz-float 1.6s ease-out infinite 0.5s;
+  animation-duration: calc(1.6s / max(0.3, var(--pet-velocity, 0.4)));
+  opacity: 0.5;
+}
+
+/* Yarn: paw bats at a ball. */
+.pet-yarn .pet-yarn-paw {
+  transform-origin: 11px 12px;
+  animation: pet-bat 0.8s ease-in-out infinite alternate;
+  animation-duration: calc(0.8s / var(--pet-frequency, 1));
+}
+
+.pet-yarn .pet-yarn-ball {
+  transform-origin: 18px 16px;
+  animation: pet-roll 1.2s linear infinite;
+  animation-duration: calc(1.2s / var(--pet-velocity, 0.5));
+}
+
+/* Ask: paw waves with a question mark. */
+.pet-ask .pet-raise {
+  transform-origin: 17px 12px;
+  animation: pet-wave 0.9s ease-in-out infinite alternate;
+  animation-duration: calc(0.9s / var(--pet-frequency, 1));
+}
+
+/* Blow: error — tremble and flash. */
+.pet-blow .pet-svg {
+  animation: pet-shake 0.25s ease-in-out infinite;
+}
+
+.pet-blow .pet-spike {
+  transform-origin: 11px 12px;
+  animation: pet-spike-extend 0.3s ease-in-out infinite alternate;
+}
+
+.pet-blow .pet-blow-body {
+  filter: drop-shadow(0 0 calc(2px + var(--pet-flare, 0) * 8px) #ef4444);
+}
+
+/* Happy: success — small bounce. */
+.pet-happy .pet-jump {
+  transform-origin: 11px 12px;
+  animation: pet-jump 0.6s ease-out infinite;
+  animation-duration: calc(0.6s / var(--pet-frequency, 1));
+}
+
+/* Flare pulse: additive intensity on top of all states. */
+.pet-corner[data-flare="1"] .pet-svg {
+  filter: drop-shadow(0 0 calc(2px + var(--pet-flare, 0) * 10px)
+    rgba(250, 204, 21, calc(0.3 + var(--pet-flare, 0) * 0.4)));
+}
+
+/* Warmth subtly scales the whole pet. */
+.pet-svg {
+  transform: scale(calc(0.92 + var(--pet-amplitude, 0.5) * 0.16));
+}
+
+/* Reduced motion: keep static states but disable continuous animation. */
+@media (prefers-reduced-motion: reduce) {
+  .pet-corner .pet-svg,
+  .pet-corner .pet-zzz-1,
+  .pet-corner .pet-zzz-2,
+  .pet-corner .pet-yarn-paw,
+  .pet-corner .pet-yarn-ball,
+  .pet-corner .pet-raise,
+  .pet-corner .pet-blow-body,
+  .pet-corner .pet-spike,
+  .pet-corner .pet-jump {
+    animation: none !important;
+    transform: none !important;
+  }
+}
+
+@keyframes pet-breathe {
+  0%, 100% { transform: scale(1) translateY(0); }
+  50% { transform: scale(1.04) translateY(-1px); }
+}
+
+@keyframes pet-sleep-rock {
+  0%, 100% { transform: rotate(-1.5deg) scale(1); }
+  50% { transform: rotate(1.5deg) scale(1.02); }
+}
+
+@keyframes pet-zzz-float {
+  0% { transform: translateY(0) translateX(0) scale(0.7); opacity: 0.6; }
+  60% { opacity: 0.9; }
+  100% { transform: translateY(-7px) translateX(2px) scale(1); opacity: 0; }
+}
+
+@keyframes pet-bat {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(-18deg); }
+}
+
+@keyframes pet-roll {
+  0% { transform: translate(0, 0) rotate(0deg); }
+  25% { transform: translate(0.5px, -1px) rotate(90deg); }
+  50% { transform: translate(0, 0) rotate(180deg); }
+  75% { transform: translate(-0.5px, -1px) rotate(270deg); }
+  100% { transform: translate(0, 0) rotate(360deg); }
+}
+
+@keyframes pet-wave {
+  0% { transform: rotate(-10deg); }
+  100% { transform: rotate(25deg); }
+}
+
+@keyframes pet-shake {
+  0%, 100% { transform: translateX(0) rotate(0deg); }
+  20% { transform: translateX(-1.5px) rotate(-2deg); }
+  40% { transform: translateX(1.5px) rotate(2deg); }
+  60% { transform: translateX(-1.5px) rotate(-1deg); }
+  80% { transform: translateX(1.5px) rotate(1deg); }
+}
+
+@keyframes pet-spike-extend {
+  0% { transform: scale(0.85); }
+  100% { transform: scale(1.1); }
+}
+
+@keyframes pet-jump {
+  0%, 100% { transform: translateY(0) scale(1); }
+  40% { transform: translateY(-4px) scale(1.08); }
+  60% { transform: translateY(0) scale(0.95); }
+}

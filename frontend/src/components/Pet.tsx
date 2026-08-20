@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { breathController, type BreathPhase } from "../breath";
+import { useEffect, useRef, useState } from "react";
+import { breathController, type BreathPhase, type BreathVisualState } from "../breath";
 
 /**
  * F1 状态宠物（DSH dsh-digipet/dsh-clippy 思路）：右下角像素猫爪，
@@ -115,6 +115,16 @@ export default function Pet() {
   const [theme, setTheme] = useState<string>(
     () => document.documentElement.dataset.theme ?? "light"
   );
+  const visualRef = useRef<BreathVisualState>({
+    amplitude: 0.5,
+    frequency: 1,
+    turbulence: 0,
+    warmth: 0.5,
+    flare: 0,
+    velocity: 0,
+    paused: false,
+  });
+  const [, setTick] = useState(0); // force re-render when visual changes
 
   useEffect(() => {
     const unsub = breathController.subscribe((snap) => {
@@ -125,10 +135,36 @@ export default function Pet() {
     return unsub;
   }, []);
 
+  useEffect(() => {
+    let raf = 0;
+    const frame = () => {
+      visualRef.current = breathController.sample();
+      setTick((n) => (n + 1) % 1000);
+      if (!visualRef.current.paused) {
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   const pet = PHASE_TO_PET[phase] ?? "pet-idle";
+  const v = visualRef.current;
 
   return (
-    <div className={`pet-corner pet-${pet}`} title={`paw says: ${pet}`} aria-hidden>
+    <div
+      className={`pet-corner pet-${pet}`}
+      data-flare={v.flare > 0.15 ? 1 : 0}
+      style={{
+        ["--pet-flare" as string]: String(v.flare.toFixed(3)),
+        ["--pet-velocity" as string]: String(v.velocity.toFixed(3)),
+        ["--pet-frequency" as string]: String(v.frequency.toFixed(3)),
+        ["--pet-amplitude" as string]: String(v.amplitude.toFixed(3)),
+        ["--pet-warmth" as string]: String(v.warmth.toFixed(3)),
+      }}
+      title={`paw says: ${pet}`}
+      aria-hidden
+    >
       <svg viewBox="0 0 26 26" width="56" height="56" className="pet-svg">
         <PetFrame pet={pet} theme={theme} />
       </svg>
