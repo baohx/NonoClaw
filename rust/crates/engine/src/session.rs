@@ -48,6 +48,21 @@ pub enum SessionEntry {
     Mode {
         mode: String,
     },
+    /// Outcome metadata for one completed run — the trajectory-level reward
+    /// label (Level-1 RL data): terminal status, heuristic reward score,
+    /// turn count, and a human-readable finish detail. Appended exactly once
+    /// per run, right after the terminal event.
+    RunOutcome {
+        run_id: String,
+        /// "done" | "cancelled" | "error"
+        status: String,
+        /// Heuristic reward: done=1.0, cancelled=-0.3, error=-1.0,
+        /// with reductions for max_turns/budget/context-limit exhaustion.
+        reward: f64,
+        turns: u32,
+        /// Short finish detail (completed message / cancel reason / error kind).
+        detail: String,
+    },
     /// Running total of real API token usage (accumulated across all
     /// completed runs). Used to restore the frontend right-rail in/out
     /// display across server restarts.
@@ -98,6 +113,8 @@ pub struct SessionInfo {
     pub title: Option<String>,
     pub tag: Option<String>,
     pub mtime: std::time::SystemTime,
+    /// Number of completed runs with a persisted reward label (RunOutcome).
+    pub run_outcomes: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +221,25 @@ impl Session {
     pub async fn write_mode(&self, mode: impl Into<String>) -> SessionResult<u64> {
         self.append_metadata(SessionEntry::Mode { mode: mode.into() })
             .await
+    }
+
+    /// Append a Level-1 RL reward label for one completed run.
+    pub async fn write_run_outcome(
+        &self,
+        run_id: &str,
+        status: &str,
+        reward: f64,
+        turns: u32,
+        detail: &str,
+    ) -> SessionResult<u64> {
+        self.append_metadata(SessionEntry::RunOutcome {
+            run_id: run_id.to_string(),
+            status: status.to_string(),
+            reward,
+            turns,
+            detail: detail.to_string(),
+        })
+        .await
     }
 
     pub async fn write_usage(&self, usage: &CumulativeUsageWire) -> SessionResult<u64> {
@@ -396,6 +432,11 @@ impl SessionService {
                 state.summary.clone()
             };
             let title = state.title();
+            let run_outcomes = state
+                .preserved
+                .iter()
+                .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("run_outcome"))
+                .count();
             out.push(SessionInfo {
                 id,
                 started: state.started,
@@ -404,6 +445,7 @@ impl SessionService {
                 title,
                 tag: state.tag,
                 mtime,
+                run_outcomes,
             });
         }
         out.sort_by_key(|session| std::cmp::Reverse(session.mtime));
@@ -419,6 +461,32 @@ impl SessionService {
             .into_iter()
             .find(|info| info.tag.as_deref() != Some(DREAM_SESSION_TAG))
             .map(|info| info.id))
+    }
+}
+
+/// Heuristic trajectory reward for one completed run (Level-1 RL label).
+///
+/// Signals: terminal status is authoritative (done > cancelled > error);
+/// exhaustion finishes (max-turns / budget / context-limit) reduce a "done"
+/// run because the agent stalled instead of converging.
+pub fn run_reward(status: &str, finish_detail: &str) -> f64 {
+    const DONE: f64 = 1.0;
+    const CANCELLED: f64 = -0.3;
+    const ERROR: f64 = -1.0;
+    let d = finish_detail.to_lowercase();
+    let exhaustion_penalty = if d.contains("max turns") || d.contains("max_turns") {
+        0.4
+    } else if d.contains("budget") {
+        0.3
+    } else if d.contains("context limit") || d.contains("context_limit") {
+        0.2
+    } else {
+        0.0
+    };
+    match status {
+        "done" => DONE - exhaustion_penalty,
+        "cancelled" => CANCELLED - exhaustion_penalty * 0.5,
+        _ => ERROR,
     }
 }
 
@@ -572,6 +640,11 @@ impl SessionState {
                     preserved.push(value);
                     revision += 1;
                 }
+                SessionEntry::RunOutcome { .. } => {
+                    // Trajectory reward labels are append-only history: keep
+                    // them in `preserved` verbatim; list_sessions counts them.
+                    preserved.push(value);
+                }
                 SessionEntry::CumulativeUsage {
                     input_tokens,
                     output_tokens,
@@ -690,6 +763,9 @@ impl SessionState {
             SessionEntry::LastPrompt { prompt } => self.last_prompt = Some(prompt.clone()),
             SessionEntry::Tag { tag } => self.tag = Some(tag.clone()),
             SessionEntry::Mode { mode } => self.mode = Some(mode.clone()),
+            // RunOutcome entries are already pushed verbatim by the caller's
+            // in-memory state; nothing to fold into snapshot fields.
+            SessionEntry::RunOutcome { .. } => {}
             SessionEntry::CumulativeUsage {
                 input_tokens,
                 output_tokens,
@@ -915,8 +991,38 @@ mod tests {
         );
     }
 
-    /// Regression: auto-resume must skip background dream sessions and land on
-    /// the user's last working session even when a dream ran more recently.
+    /// Level-1 RL labels: run outcomes persist as metadata entries, are
+    /// counted by list_sessions, and reward scoring matches the documented
+    /// heuristic (done=1, exhaustion penalties, cancelled=-0.3, error=-1).
+    #[tokio::test]
+    async fn run_outcome_persists_and_scores() {
+        let cwd = tempdir();
+        let service = SessionService::new();
+        let s = service.create(&cwd, "rl-session", "model-x").unwrap();
+        s.append(Message::user(MessageContent::from_text("task")))
+            .await
+            .unwrap();
+
+        s.write_run_outcome("run-1", "done", 1.0, 4, "all good")
+            .await
+            .unwrap();
+        s.write_run_outcome("run-2", "error", -1.0, 0, "provider 500")
+            .await
+            .unwrap();
+
+        let infos = service.list_sessions(&cwd).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].run_outcomes, 2, "both outcome labels counted");
+
+        // Reward heuristic anchors.
+        assert_eq!(run_reward("done", "completed"), 1.0);
+        assert_eq!(run_reward("done", "max turns reached"), 0.6);
+        assert_eq!(run_reward("done", "budget exceeded"), 0.7);
+        assert_eq!(run_reward("done", "context limit"), 0.8);
+        assert_eq!(run_reward("cancelled", "user pressed stop"), -0.3);
+        assert_eq!(run_reward("error", "boom"), -1.0);
+    }
+
     #[tokio::test]
     async fn most_recent_session_skips_dream_tagged_sessions() {
         let cwd = tempdir();

@@ -1387,6 +1387,48 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .await
                         .map(|snapshot| snapshot.revision)
                         .unwrap_or_default();
+                    // Level-1 RL label: persist the terminal outcome + heuristic reward.
+                    {
+                        let (status, detail, turns) = match (&terminal.status, &terminal.reason) {
+                            (RunTerminalStatus::Done, reason) => {
+                                let turns =
+                                    terminal.result.as_ref().map(|r| r.turns).unwrap_or(0);
+                                let detail = match reason {
+                                    nonoclaw_engine::RunFinishReason::Completed { detail } => {
+                                        detail.clone()
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                ("done", detail, turns)
+                            }
+                            (RunTerminalStatus::Cancelled, reason) => {
+                                let detail = match reason {
+                                    nonoclaw_engine::RunFinishReason::Cancelled { reason } => {
+                                        reason.clone()
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                ("cancelled", detail, 0)
+                            }
+                            (RunTerminalStatus::Error, reason) => {
+                                let detail = match reason {
+                                    nonoclaw_engine::RunFinishReason::Error { message, .. } => {
+                                        nonoclaw_core::redact_text(message)
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                ("error", detail, 0)
+                            }
+                        };
+                        let reward =
+                            nonoclaw_engine::session::run_reward(status, &detail);
+                        if let Err(e) = session_for_wire
+                            .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to persist run outcome");
+                        }
+                    }
                     let (
                         protocol_version,
                         run_id,

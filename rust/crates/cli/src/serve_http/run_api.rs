@@ -303,6 +303,44 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             .map(|s| s.revision)
             .unwrap_or_default();
 
+        // Level-1 RL label: persist the terminal outcome + heuristic reward.
+        {
+            let (status, detail, turns) = match (&terminal.status, &terminal.reason) {
+                (RunTerminalStatus::Done, reason) => {
+                    let turns = terminal.result.as_ref().map(|r| r.turns).unwrap_or(0);
+                    let detail = match reason {
+                        nonoclaw_engine::RunFinishReason::Completed { detail } => detail.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    ("done", detail, turns)
+                }
+                (RunTerminalStatus::Cancelled, reason) => {
+                    let detail = match reason {
+                        nonoclaw_engine::RunFinishReason::Cancelled { reason } => reason.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    ("cancelled", detail, 0)
+                }
+                (RunTerminalStatus::Error, reason) => {
+                    let detail = match reason {
+                        nonoclaw_engine::RunFinishReason::Error { message, .. } => {
+                            nonoclaw_core::redact_text(message)
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    ("error", detail, 0)
+                }
+            };
+            let reward =
+                nonoclaw_engine::session::run_reward(status, &detail);
+            if let Err(e) = session_for_run
+                .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to persist run outcome");
+            }
+        }
+
         match terminal.status {
             RunTerminalStatus::Done => {
                 if let Some(r) = terminal.result {
