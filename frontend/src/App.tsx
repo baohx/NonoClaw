@@ -406,7 +406,7 @@ export default function App() {
             <div className={`rail__git${railSections.git ? "" : " rail__section--collapsed"}`}>
               <GitPane
                 git={projectInfo?.git ?? null}
-                onRefresh={() => send({ type: "project_info_refresh" })}
+                onRefresh={() => { useStore.getState().beginInsightRefresh(); send({ type: "project_info_refresh" }); }}
                 onShow={(sha) => send({ type: "git_show", sha })}
                 collapsed={!railSections.git}
                 onToggleCollapsed={() => toggleRailSection("git")}
@@ -445,7 +445,7 @@ export default function App() {
             <InsightRail
               info={projectInfo}
               onOpen={handleOpenFile}
-              onRefresh={() => send({ type: "project_info_refresh" })}
+              onRefresh={() => { useStore.getState().beginInsightRefresh(); send({ type: "project_info_refresh" }); }}
             />
           </aside>
         </div>

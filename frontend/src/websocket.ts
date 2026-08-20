@@ -294,8 +294,14 @@ export function dispatchServerMessage(message: ServerMsg): void {
       const traceEntry = traceEntryFromEvent(message);
       if (traceEntry) state.addTraceEntry(traceEntry);
       // F2 Context X-Ray: keep the verbatim component arrays; the trace entry
-      // only retains a top-5 stringified digest.
-      if (event.kind === "token_budget_breakdown") state.setXrayBudget(event);
+      // only retains a top-5 stringified digest. The engine emits two
+      // breakdowns per turn — the component-detailed one (base_prompt etc.)
+      // and the merged provider-request view (single provider_request_system
+      // entry). Prefer the detailed view so X-Ray always shows components.
+      if (event.kind === "token_budget_breakdown") {
+        const isDetailed = Array.isArray(event.system) && event.system.length > 1;
+        if (isDetailed || !state.xrayBudget) state.setXrayBudget(event);
+      }
       breathController.consume(event);
       switch (event.kind) {
         case "text_delta":

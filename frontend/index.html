@@ -1060,6 +1060,9 @@
         transition: color 0.15s, background 0.15s;
       }
       .iconbtn:hover { color: var(--accent); background: var(--accent-softer); }
+      .iconbtn:disabled { opacity: 0.5; cursor: default; }
+      .iconbtn .spin { display: inline-block; animation: iconbtn-spin 0.9s linear infinite; }
+      @keyframes iconbtn-spin { to { transform: rotate(360deg); } }
 
       .tree-row {
         appearance: none;

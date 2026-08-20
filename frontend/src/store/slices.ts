@@ -178,10 +178,13 @@ export interface ProjectSlice {
   fileTreeRoot: string;
   fileTree: FileEntry[];
   projectInfo: ProjectInfo | null;
+  /** Insight refresh in flight — drives the spin/disabled state on the button. */
+  insightRefreshing: boolean;
   /** Run-boundary prompts per session id, lazily fetched from the server. */
   sessionPrompts: Record<string, SessionRunPrompt[]>;
   setFileTree: (root: string, entries: FileEntry[]) => void;
   setProjectInfo: (info: ProjectInfo) => void;
+  beginInsightRefresh: () => void;
   setSessionPrompts: (sessionId: string, prompts: SessionRunPrompt[]) => void;
 }
 
@@ -547,9 +550,11 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
   fileTreeRoot: "",
   fileTree: [],
   projectInfo: null,
+  insightRefreshing: false,
   sessionPrompts: {},
   setFileTree: (fileTreeRoot, fileTree) => set({ fileTreeRoot, fileTree }),
-  setProjectInfo: (projectInfo) => set({ projectInfo: sanitizeProjectInfo(projectInfo) }),
+  beginInsightRefresh: () => set({ insightRefreshing: true }),
+  setProjectInfo: (projectInfo) => set({ projectInfo: sanitizeProjectInfo(projectInfo), insightRefreshing: false }),
   setSessionPrompts: (sessionId, prompts) => set((state) => ({
     sessionPrompts: { ...state.sessionPrompts, [sessionId]: prompts },
   })),

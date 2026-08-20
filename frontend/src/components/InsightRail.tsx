@@ -20,6 +20,7 @@ function isFsPath(source: string): boolean {
 
 export default function InsightRail({ info, onOpen, onRefresh }: Props) {
   const [open, setOpen] = useState<Set<string>>(DEFAULT_OPEN);
+  const refreshing = useStore((s) => s.insightRefreshing);
   const toggle = (id: string) =>
     setOpen((prev) => {
       const next = new Set(prev);
@@ -40,8 +41,13 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
           insight
         </span>
         <span className="filetree__actions">
-          <button className="iconbtn" title="Refresh" onClick={onRefresh}>
-            ↻
+          <button
+            className="iconbtn"
+            title={refreshing ? "Refreshing…" : "Refresh project info"}
+            onClick={onRefresh}
+            disabled={refreshing}
+          >
+            <span className={refreshing ? "spin" : undefined}>↻</span>
           </button>
         </span>
       </div>
@@ -106,7 +112,11 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
             </div>
           ) : (
             info?.mcp_servers.map((s) => (
-              <div key={s.name} className="insight-row">
+              <div
+                key={s.name}
+                className="insight-row"
+                title={`${s.name} — $ ${s.command}${s.config_source ? ` (src: ${s.config_source})` : ""} — ${s.tool_count} tool${s.tool_count === 1 ? "" : "s"}, ${s.connected ? "connected" : "disconnected"}`}
+              >
                 <div className="insight-row__top">
                   <span className={`dot ${s.connected ? "on" : "bad"}`} />
                   <span className="insight-row__name">{s.name}</span>
@@ -153,11 +163,11 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
                 className="insight-row"
                 disabled={!canOpen}
                 onClick={canOpen ? (ev) => onOpen(s.source, ev.shiftKey) : undefined}
-                title={canOpen ? `${s.source} — click to open` : `${s.source} (bundled — cannot open)`}
+                title={canOpen ? `${s.description || s.name}\n${s.source} — click to open` : `${s.description || s.name}\n${s.source} (bundled — cannot open)`}
               >
                 <div className="insight-row__top">
                   <span className="tag">/{s.name}</span>
-                  <span className="insight-row__name">{s.description || s.name}</span>
+                  <span className="insight-row__name" title={s.description || s.name}>{s.description || s.name}</span>
                 </div>
                 <div className="insight-row__meta">{s.source}</div>
               </button>
@@ -181,11 +191,11 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
                 key={p.dir}
                 className="insight-row"
                 onClick={(ev) => onOpen(p.dir, ev.shiftKey)}
-                title={`${p.dir} — click to open`}
+                title={`${p.name} — ${p.skill_count} skill${p.skill_count === 1 ? "" : "s"}\n${p.dir} — click to open`}
               >
                 <div className="insight-row__top">
                   <span className="tag">{p.skill_count} skill{p.skill_count === 1 ? "" : "s"}</span>
-                  <span className="insight-row__name">{p.name}</span>
+                  <span className="insight-row__name" title={p.name}>{p.name}</span>
                 </div>
                 <div className="insight-row__meta">{p.dir}</div>
               </button>
@@ -204,7 +214,11 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
             <div className="acc-empty">no extension conflicts or load failures</div>
           ) : (
             info?.extension_diagnostics.map((diagnostic, index) => (
-              <div className="insight-row" key={`${diagnostic.code}-${diagnostic.source}-${index}`}>
+              <div
+                className="insight-row"
+                key={`${diagnostic.code}-${diagnostic.source}-${index}`}
+                title={`${diagnostic.name ?? diagnostic.code} (${diagnostic.kind})\n${diagnostic.message}\nfix: ${diagnostic.suggestion}`}
+              >
                 <div className="insight-row__top">
                   <span className={`dot ${diagnostic.severity === "error" ? "bad" : "off"}`} />
                   <span className="tag">{diagnostic.kind}</span>
@@ -251,9 +265,9 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
               >
                 <div className="insight-row__top">
                   <span className="tag">{f.fact_type}</span>
-                  <span className="insight-row__name">{f.title || f.name}</span>
+                  <span className="insight-row__name" title={f.title || f.name}>{f.title || f.name}</span>
                 </div>
-                <div className="insight-row__meta">
+                <div className="insight-row__meta" title={`importance ${f.importance} · confidence ${f.confidence} · ${f.path}`}>
                   imp {f.importance.toFixed(2)} · conf {f.confidence.toFixed(2)}
                 </div>
               </button>
@@ -280,9 +294,9 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
               >
                 <div className="insight-row__top">
                   <span className="tag">{b.status}</span>
-                  <span className="insight-row__name">{b.title}</span>
+                  <span className="insight-row__name" title={b.title}>{b.title}</span>
                 </div>
-                <div className="insight-row__meta">priority {b.priority}</div>
+                <div className="insight-row__meta" title={`status ${b.status} · priority ${b.priority} · ${b.path}`}>priority {b.priority}</div>
               </button>
             ))
           )}
