@@ -109,13 +109,17 @@ where
                             "protocolVersion": 1,
                             "agentCapabilities": {
                                 "promptTurn": true,
-                                "loadSession": false,
+                                "loadSession": true,
                             },
                             "authMethods": [],
                         }))).await;
                     }
                     "session/new" => {
                         let result = new_session(&state, &params).await;
+                        respond(&writer, id, result).await;
+                    }
+                    "session/load" => {
+                        let result = load_session(&state, &params).await;
                         respond(&writer, id, result).await;
                     }
                     "session/prompt" => {
@@ -209,6 +213,47 @@ async fn new_session(
         .map_err(|e| json!({"code": -32000, "message": format!("session create failed: {e}")}))?;
     state.sessions.lock().await.insert(id.clone(), session);
     Ok(json!({"sessionId": id, "cwd": cwd.to_string_lossy()}))
+}
+
+/// ACP `session/load`: resume a previously persisted session (the client —
+/// e.g. Zed — keeps the thread→sessionId mapping and calls this when
+/// reopening a thread). Mirrors `new_session`'s shape on success.
+async fn load_session(
+    state: &AcpState,
+    params: &Value,
+) -> std::result::Result<Value, Value> {
+    let Some(session_id) = params.get("sessionId").and_then(|s| s.as_str()) else {
+        return Err(json!({"code": -32602, "message": "missing sessionId"}));
+    };
+    let cwd = params
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.cwd.clone());
+    // Reject ids that would escape the sessions directory.
+    if session_id.contains('/') || session_id.contains("..") {
+        return Err(json!({"code": -32602, "message": "invalid sessionId"}));
+    }
+    let Some(path) = nonoclaw_engine::session::session_path(&cwd, session_id) else {
+        return Err(json!({"code": -32000, "message": "cannot determine session storage"}));
+    };
+    if !path.exists() {
+        return Err(json!({
+            "code": -32000,
+            "message": format!("session not found: {session_id}"),
+        }));
+    }
+    let model = state.resolved.active_model.value.clone();
+    let session = state
+        .session_service
+        .resume(&cwd, session_id)
+        .map_err(|e| json!({"code": -32000, "message": format!("session load failed: {e}")}))?;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.to_string(), session);
+    Ok(json!({"sessionId": session_id, "cwd": cwd.to_string_lossy(), "model": model}))
 }
 
 async fn cancel_session(state: &AcpState, params: &Value) {
@@ -451,5 +496,68 @@ mod tests {
         }
 
         io_task.abort();
+    }
+
+    /// `session/load` must resume a persisted session and reject unknown /
+    /// path-traversing ids. The persisted session lives under the cwd's
+    /// project sessions dir, same store the Web UI and CLI share.
+    #[tokio::test]
+    async fn session_load_resumes_persisted_session_and_rejects_bad_ids() {
+        let cwd = std::env::temp_dir().join("acp_load_test");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let state = Arc::new(AcpState {
+            cwd: cwd.clone(),
+            resolved: Arc::new(nonoclaw_engine::load_resolved_config(&cwd, None, None)),
+            registry: Arc::new(ToolRegistry::new()),
+            todos: Arc::new(TodoStore::new()),
+            skills_manager: Arc::new(RwLock::new(SkillsManager::new(&cwd))),
+            background_registry: Arc::new(std::sync::Mutex::new(BackgroundTaskRegistry::new())),
+            session_service: SessionService::new(),
+            sessions: Mutex::new(HashMap::new()),
+            controllers: Mutex::new(HashMap::new()),
+        });
+
+        // Seed a persisted session the client would reference. Persistence is
+        // lazy (the writer actor flushes on the first mutation), so append a
+        // message to force the file to land.
+        let seeded = state
+            .session_service
+            .create(&cwd, "acp-seed-1", "model-x")
+            .unwrap();
+        let append = seeded
+            .append(nonoclaw_core::Message::user(
+                nonoclaw_core::MessageContent::from_text("seed"),
+            ))
+            .await
+            .unwrap();
+        assert!(append >= 1);
+        let seed_path = nonoclaw_engine::session::session_path(&cwd, "acp-seed-1").unwrap();
+        assert!(seed_path.exists(), "seeded session must be persisted");
+
+        // Unknown id → error.
+        let err = load_session(&state, &json!({"sessionId": "no-such-id"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err["code"], -32000);
+
+        // Path traversal → rejected before touching the filesystem.
+        let err = load_session(
+            &state,
+            &json!({"sessionId": "../../etc/passwd"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err["code"], -32602);
+
+        // Valid id → resumed and registered.
+        let ok = load_session(&state, &json!({"sessionId": "acp-seed-1"}))
+            .await
+            .unwrap();
+        assert_eq!(ok["sessionId"], "acp-seed-1");
+        assert!(
+            state.sessions.lock().await.contains_key("acp-seed-1"),
+            "loaded session must be registered for later session/prompt calls"
+        );
+        drop(seeded);
     }
 }
