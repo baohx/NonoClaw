@@ -1385,7 +1385,12 @@ fn handle_openai_chunk(
         let part = UsagePart {
             input_tokens: Some(usage.prompt_tokens),
             output_tokens: Some(usage.completion_tokens),
-            cache_creation_input_tokens: None,
+            // OpenAI-style providers cache automatically: the uncached share
+            // of the prompt is what entered the cache this turn, which maps
+            // to Anthropic's cache_creation semantics for the UI bars.
+            cache_creation_input_tokens: Some(
+                usage.prompt_tokens.saturating_sub(usage.cache_read_tokens()),
+            ),
             cache_read_input_tokens: Some(usage.cache_read_tokens()),
         };
         state.usage.update_from_part(&part);
