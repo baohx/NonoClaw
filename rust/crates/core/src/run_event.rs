@@ -423,8 +423,17 @@ fn redact_value_inner(value: Value, depth: usize) -> Value {
     }
 }
 
+/// Numeric budget/rate fields that merely END with "token" (e.g.
+/// `chars_per_token`) are measurement metadata, not credentials. Redacting
+/// them to a string breaks deserialization (usize field) and silently drops
+/// whole events (observed with TokenBudgetBreakdown → Context X-Ray dead).
+const SAFE_TOKEN_SUFFIX_FIELDS: &[&str] = &["charspertoken", "pertoken"];
+
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_'], "");
+    if SAFE_TOKEN_SUFFIX_FIELDS.iter().any(|safe| key.ends_with(safe)) {
+        return false;
+    }
     [
         "apikey",
         "authtoken",
@@ -575,6 +584,42 @@ mod tests {
         assert_eq!(value["system"][0]["name"], "base_prompt");
         assert_eq!(value["tools"][0]["chars"], 30);
         assert!(value.to_string().len() < 1_000);
+    }
+
+    /// Regression: `chars_per_token` (usize) used to be redacted to a string
+    /// by the `ends_with("token")` sensitive-key rule, breaking round-trip
+    /// deserialization — `redacted()` then replaced the whole event with a
+    /// run_error, so the UI never received the X-Ray breakdown.
+    #[test]
+    fn token_budget_breakdown_survives_redaction_round_trip() {
+        let event = RunEvent::TokenBudgetBreakdown {
+            chars_per_token: 4,
+            estimated_tokens: 30,
+            system_chars: 80,
+            tools_chars: 30,
+            messages_chars: 10,
+            system: vec![TokenBudgetComponent {
+                name: "base_prompt".into(),
+                chars: 80,
+                estimated_tokens: 20,
+            }],
+            tools: vec![],
+            messages: vec![],
+        };
+        let redacted = event.redacted();
+        let RunEvent::TokenBudgetBreakdown {
+            chars_per_token,
+            estimated_tokens,
+            ..
+        } = &redacted
+        else {
+            panic!("redaction must not drop the event, got {redacted:?}");
+        };
+        assert_eq!(*chars_per_token, 4);
+        assert_eq!(*estimated_tokens, 30);
+        // The exemption must not leak real credentials: api-token keys still redact.
+        assert!(is_sensitive_key("api_token"));
+        assert!(!is_sensitive_key("chars_per_token"));
     }
 
     #[test]
