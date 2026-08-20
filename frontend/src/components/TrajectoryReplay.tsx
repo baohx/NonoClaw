@@ -51,6 +51,7 @@ export default function TrajectoryReplay() {
   const sessions = useStore((s) => s.sessions);
   const sessionId = useStore((s) => s.sessionId);
   const setLocatedMessage = useStore((s) => s.setLocatedMessage);
+  const toolsHidden = useStore((s) => s.toolsHidden);
 
   const lineage = useMemo(
     () => (sessionId ? ancestry(sessionId, sessions) : []),
@@ -85,7 +86,8 @@ export default function TrajectoryReplay() {
             onClick={() => {
               // In toolsHidden mode a whole group of tool messages collapses into
               // one placeholder anchored at the group's FIRST tool id — jump there.
-              if (msg.role === "tool") {
+              // With tool cards visible each tool has its own msg- anchor.
+              if (msg.role === "tool" && toolsHidden) {
                 const idx = messages.indexOf(msg);
                 let first = idx;
                 while (first > 0 && messages[first - 1].role === "tool") first--;

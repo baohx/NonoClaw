@@ -187,8 +187,9 @@ const MessageCard = memo(function MessageCard({
     );
   }
   if (msg.role === "tool") {
+    const located = useStore((s) => s.locatedMessageId === msg.id);
     return (
-      <div className="msg msg-enter">
+      <div id={`msg-${msg.id}`} className={`msg msg-enter${located ? " msg--located" : ""}`}>
         <ToolCard msg={msg} />
       </div>
     );

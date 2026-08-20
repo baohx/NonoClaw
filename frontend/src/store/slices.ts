@@ -243,6 +243,8 @@ export interface UiSlice {
   locatedMessageId: string | null;
   /** F2 Context X-Ray: latest token_budget_breakdown payload verbatim. */
   xrayBudget: import("../types").EngineEvent | null;
+  /** Tool cards collapsed into group placeholders (ChatView toolsHidden). */
+  toolsHidden: boolean;
   setXrayBudget: (event: import("../types").EngineEvent | null) => void;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
@@ -251,6 +253,7 @@ export interface UiSlice {
   setTheme: (theme: Theme) => void;
   setPermissionMode: (mode: PermissionMode) => void;
   setLocatedMessage: (id: string | null) => void;
+  setToolsHidden: (hidden: boolean) => void;
 }
 
 export type AppState = ConnectionSlice & SessionSlice & RunSlice & ToolSlice & SubagentSlice & ProjectSlice & DialogSlice & MediaSlice & BreathSlice & UiSlice;
@@ -654,7 +657,9 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   permissionMode: "auto",
   locatedMessageId: null,
   xrayBudget: null,
+  toolsHidden: false,
   setXrayBudget: (event) => set({ xrayBudget: event }),
+  setToolsHidden: (toolsHidden) => set({ toolsHidden }),
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),

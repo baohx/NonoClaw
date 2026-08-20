@@ -55,7 +55,8 @@ export default function App() {
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
-  const [toolsHidden, setToolsHidden] = useState(false);
+  const toolsHidden = useStore((s) => s.toolsHidden);
+  const setToolsHidden = useStore((s) => s.setToolsHidden);
   const [railSections, setRailSections] = useState<{ files: boolean; sessions: boolean; git: boolean }>(() => {
     try {
       const raw = localStorage.getItem("nonoclaw:rail-sections");
@@ -415,7 +416,7 @@ export default function App() {
           <main className="stage">
             <button
               className="chat-refresh"
-              onClick={() => setToolsHidden((v) => !v)}
+              onClick={() => setToolsHidden(!toolsHidden)}
               title={toolsHidden ? "Show tool boxes" : "Hide tool boxes"}
               aria-label="Toggle tool boxes"
             >
