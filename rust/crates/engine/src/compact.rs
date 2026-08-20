@@ -239,6 +239,13 @@ const MICRO_MARKER: &str = "[micro-compact]";
 /// Messages at the tail (most recent) are never micro-compacted: the active
 /// turn's tool results are still being reasoned about.
 pub const MICRO_PROTECT_RECENT: usize = 8;
+/// Aging threshold: messages older than this many positions get their already
+/// micro-compacted tool results folded further to a stub, because distant
+/// history rarely needs more than a hint of what the tool returned.
+pub const AGING_FOLD_FROM: usize = 40;
+/// Head chars kept by the aging fold (stub-sized).
+pub const AGING_FOLD_HEAD_CHARS: usize = 200;
+const AGING_MARKER_TEXT: &str = "[aged]";
 
 /// Cache-aware aggressive trim of old tool results (AutoDream P1). Runs
 /// BEFORE the 80% compaction pre-fire check each turn. Unlike
@@ -288,6 +295,25 @@ pub fn micro_compact(messages: &[Message]) -> (Vec<Message>, usize) {
                                         .chars()
                                         .rev()
                                         .collect::<String>(),
+                                )),
+                                is_error: *is_error,
+                                cache_control: None,
+                            }
+                        } else if i + AGING_FOLD_FROM <= protect_from
+                            && count > AGING_FOLD_HEAD_CHARS
+                            && text.contains(MICRO_MARKER)
+                            && !text.contains(AGING_MARKER_TEXT)
+                        {
+                            // Aged history: already micro-compacted, now far
+                            // enough back that a stub suffices. Idempotent via
+                            // the aged marker.
+                            msg_changed = true;
+                            trimmed += 1;
+                            ContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: ToolResultContent::Text(format!(
+                                    "{}\n…[{AGING_MARKER_TEXT}]…",
+                                    text.chars().take(AGING_FOLD_HEAD_CHARS).collect::<String>(),
                                 )),
                                 is_error: *is_error,
                                 cache_control: None,
@@ -789,6 +815,29 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&out).unwrap(),
             serde_json::to_string(&msgs).unwrap()
+        );
+    }
+
+    #[test]
+    fn aging_fold_stubborn_distant_micro_compacted_results() {
+        // Long history: the first micro-compact trims big results everywhere
+        // outside the protect window; a second pass folds the aged tail of
+        // that window (distance ≥ AGING_FOLD_FROM) down to a 200-char stub.
+        let msgs = many_messages(60, MICRO_THRESHOLD_CHARS + 1000);
+        let (first, n1) = micro_compact(&msgs);
+        assert_eq!(n1, 52, "all messages outside protect window trimmed");
+        let (second, n2) = micro_compact(&first);
+        // protect_from = 52; aged window = indices 0..=12 (distance ≥ 40) → 13 stubs.
+        assert_eq!(n2, 13, "aged results folded to stubs");
+        let aged = serde_json::to_string(&second[0]).unwrap();
+        assert!(aged.contains(AGING_MARKER_TEXT));
+        assert!(!aged.contains(MICRO_MARKER), "stub replaces micro-compact text");
+        // Third pass is fully idempotent.
+        let (third, n3) = micro_compact(&second);
+        assert_eq!(n3, 0);
+        assert_eq!(
+            serde_json::to_string(&third).unwrap(),
+            serde_json::to_string(&second).unwrap()
         );
     }
 }
