@@ -201,6 +201,7 @@ async fn run_dream(state: Arc<AppState>) -> bool {
         // Read-mostly autonomy: the dream writes facts via the Write tool,
         // which `auto` permits after the standard edit gate.
         permission_mode: Some("auto".into()),
+        dream: true,
     };
     // Drive the NDJSON stream to completion; we only care that it finishes.
     let resp = match super::run_api::run_handler_for_dream(Arc::clone(&state), req).await {

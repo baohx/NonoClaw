@@ -13,6 +13,11 @@ use nonoclaw_core::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+/// Tag stamped on background AutoDream consolidation sessions. Lets the UI and
+/// `most_recent_session` distinguish machine-generated transcripts from the
+/// user's working sessions.
+pub const DREAM_SESSION_TAG: &str = "dream";
+
 /// One JSONL line in a session file. The wire representation is retained for
 /// compatibility with all existing session files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,11 +410,14 @@ impl SessionService {
         Ok(out)
     }
 
+    /// The most recent session to auto-resume, skipping background-generated
+    /// ones (AutoDream consolidation) so the Web UI lands on the user's last
+    /// working session, not a dream transcript.
     pub fn most_recent_session(&self, cwd: &Path) -> std::io::Result<Option<String>> {
         Ok(self
             .list_sessions(cwd)?
             .into_iter()
-            .next()
+            .find(|info| info.tag.as_deref() != Some(DREAM_SESSION_TAG))
             .map(|info| info.id))
     }
 }
@@ -904,6 +912,52 @@ mod tests {
         assert_eq!(
             sanitize_cwd(Path::new("/home/baohx/NonoClaw")),
             "home-baohx-NonoClaw"
+        );
+    }
+
+    /// Regression: auto-resume must skip background dream sessions and land on
+    /// the user's last working session even when a dream ran more recently.
+    #[tokio::test]
+    async fn most_recent_session_skips_dream_tagged_sessions() {
+        let cwd = tempdir();
+        let service = SessionService::new();
+
+        let work = service.create(&cwd, "work-session", "model-x").unwrap();
+        work.append(Message::user(MessageContent::from_text("day job")))
+            .await
+            .unwrap();
+
+        // Dream runs later (newer mtime) but is machine-generated.
+        let dream = service.create(&cwd, "dream-session", "model-x").unwrap();
+        dream
+            .append(Message::user(MessageContent::from_text("consolidating")))
+            .await
+            .unwrap();
+        dream
+            .write_tag(DREAM_SESSION_TAG)
+            .await
+            .unwrap();
+
+        let picked = service.most_recent_session(&cwd).unwrap();
+        assert_eq!(
+            picked.as_deref(),
+            Some("work-session"),
+            "auto-resume must not land on a dream transcript"
+        );
+
+        // All-dream projects (fresh install, dream ran before any work)
+        // resolve to None so the UI falls through to a new session.
+        let only_dream_cwd = tempdir();
+        let only = service
+            .create(&only_dream_cwd, "dream-only", "model-x")
+            .unwrap();
+        only.append(Message::user(MessageContent::from_text("z")))
+            .await
+            .unwrap();
+        only.write_tag(DREAM_SESSION_TAG).await.unwrap();
+        assert_eq!(
+            service.most_recent_session(&only_dream_cwd).unwrap(),
+            None
         );
     }
 

@@ -51,6 +51,11 @@ pub struct RunRequest {
     /// Use "auto" or "bypassPermissions" for fully autonomous REST runs.
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Internal: mark this run as a background AutoDream consolidation so the
+    /// created session is tagged and skipped by auto-resume. Not part of the
+    /// public REST contract (the dream scheduler sets it in-process).
+    #[serde(default)]
+    pub dream: bool,
 }
 
 /// Individual NDJSON line emitted by the streaming endpoint.
@@ -145,6 +150,15 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
 
     let session = session_handle.session.clone();
     let session_id = session.id().to_string();
+    // Tag freshly created dream sessions so auto-resume skips them.
+    if req.dream && req.session_id.is_none() {
+        if let Err(e) = session
+            .write_tag(nonoclaw_engine::session::DREAM_SESSION_TAG)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to tag dream session");
+        }
+    }
     let session_snapshot = match session.snapshot().await {
         Ok(s) => s,
         Err(_) => {
