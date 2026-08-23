@@ -22,6 +22,13 @@ const CHARS_PER_TOKEN_CODE: usize = 3;
 const PER_MESSAGE_OVERHEAD: usize = 5;
 const IMAGE_TOKENS: usize = 1200;
 
+/// Char-denominated budget cost of one image block, shared by the attachment
+/// enrichment (cli) and history limiting (engine) passes so both account for
+/// images at the same fixed token estimate instead of raw base64 length.
+pub const fn image_budget_chars() -> usize {
+    IMAGE_TOKENS * CHARS_PER_TOKEN_PROSE
+}
+
 /// Real BPE encoding for a model family, when known.
 ///
 /// Wraps `tiktoken::encoding_for_model` (bundled rank tables). `None` for

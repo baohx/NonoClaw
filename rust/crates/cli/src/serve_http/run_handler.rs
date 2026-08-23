@@ -163,35 +163,53 @@ pub(super) fn enrich_prompt_with_attachments(
             &mut file_remaining,
             false,
         );
-        // Prefer extracted/OCR text. It is cheaper and works for every
-        // provider; raw base64 images consume only leftover budget.
+
+        // Images are the primary content for vision-capable models and cost a
+        // fixed ~1200 tokens regardless of encoded size (see
+        // `nonoclaw_engine::tokens::IMAGE_TOKENS`), so they are budgeted by a
+        // token estimate instead of raw base64 chars. Reserve image slots
+        // BEFORE text when the model supports images — OCR text is a cheaper
+        // complement, not a replacement, and text would otherwise starve the
+        // images out of the budget entirely (base64 of even a small image is
+        // ~250k chars, dwarfing any attachment budget).
+        let mut images_included = 0usize;
+        if include_images {
+            for image in images.iter().take(MAX_IMAGES_PER_ATTACHMENT) {
+                if image.data.len() >= 2_000_000 {
+                    continue;
+                }
+                let image_cost = attachment_image_cost_chars();
+                if image_cost > file_remaining {
+                    break;
+                }
+                file_remaining -= image_cost;
+                images_included += 1;
+                blocks.push(ContentBlock::Image {
+                    source: ImageSource {
+                        kind: "base64".into(),
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    },
+                });
+            }
+        }
+
+        // Extracted/OCR text fills the remaining budget. For non-vision models
+        // this is the only representation of the attachment.
         let text_was_truncated = text.chars().count() > file_remaining;
         push_attachment_text(&mut blocks, text, &mut file_remaining, text_was_truncated);
         push_attachment_text(&mut blocks, "\n\n", &mut file_remaining, false);
 
-        if include_images {
-            for image in images.iter().take(MAX_IMAGES_PER_ATTACHMENT) {
-                let image_chars = image.data.chars().count()
-                    + image.media_type.chars().count()
-                    + "base64".chars().count();
-                if image_chars <= file_remaining && image.data.len() < 2_000_000 {
-                    blocks.push(ContentBlock::Image {
-                        source: ImageSource {
-                            kind: "base64".into(),
-                            media_type: image.media_type.clone(),
-                            data: image.data.clone(),
-                        },
-                    });
-                    file_remaining -= image_chars;
-                } else {
-                    push_attachment_text(
-                        &mut blocks,
-                        "[image omitted by attachment token budget]\n",
-                        &mut file_remaining,
-                        false,
-                    );
-                }
-            }
+        if include_images && images_included == 0 && !images.is_empty() {
+            // Model supports images but every image was too large or the
+            // budget was already exhausted — say so explicitly instead of
+            // silently dropping the visual content.
+            push_attachment_text(
+                &mut blocks,
+                "[image omitted by attachment token budget]\n",
+                &mut file_remaining,
+                false,
+            );
         }
         remaining = remaining.saturating_sub(share - file_remaining);
     }
@@ -202,13 +220,20 @@ pub(super) fn enrich_prompt_with_attachments(
     MessageContent::from_blocks(blocks)
 }
 
+/// Budget cost (in chars, the unit used by `attachment_max_chars`) of one
+/// embedded image. Matches `nonoclaw_engine::tokens`: an image costs a fixed
+/// ~1200 tokens ≈ 4800 chars at prose density — NOT its raw base64 length,
+/// which is meaningless to the provider's token accounting.
+fn attachment_image_cost_chars() -> usize {
+    nonoclaw_engine::tokens::image_budget_chars()
+}
+
 fn push_attachment_text(
     blocks: &mut Vec<ContentBlock>,
     text: &str,
     remaining: &mut usize,
     mark_truncated: bool,
-) {
-    if text.is_empty() || *remaining == 0 {
+) {    if text.is_empty() || *remaining == 0 {
         return;
     }
     const MARKER: &str = "\n[attachment content truncated]\n";

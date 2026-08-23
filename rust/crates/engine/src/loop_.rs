@@ -434,7 +434,10 @@ fn limit_attachment_images(messages: &[Message], max_chars: usize) -> Vec<Messag
                     let mut kept = Vec::with_capacity(blocks.len());
                     for block in blocks {
                         if matches!(block, ContentBlock::Image { .. }) {
-                            let chars = block_payload_chars(block);
+                            // Images cost a fixed ~1200 tokens regardless of
+                            // base64 length (see `tokens::estimate_message`);
+                            // budget by that estimate, not raw chars.
+                            let chars = crate::tokens::image_budget_chars();
                             if chars <= remaining {
                                 remaining -= chars;
                                 kept.push(block.clone());
@@ -3730,39 +3733,45 @@ mod tests {
                 data: data.into(),
             },
         };
-        let messages = vec![Message::user(MessageContent::from_blocks(vec![
-            ContentBlock::text("inspect"),
-            image(&"a".repeat(100)),
-            image(&"b".repeat(100)),
-        ]))];
-        let projected = prepare_messages_for_request(&messages, true, 10_000, 120);
-        let image_chars: usize = projected
-            .iter()
-            .flat_map(|message| match &message.content {
-                MessageContent::Blocks(blocks) => blocks.as_slice(),
-                MessageContent::Text(_) => &[],
-            })
-            .filter(|block| matches!(block, ContentBlock::Image { .. }))
-            .map(block_payload_chars)
-            .sum();
-        assert!(image_chars <= 120);
-        assert_eq!(
-            projected
+        let count_images = |messages: &[Message]| {
+            messages
                 .iter()
                 .flat_map(|message| match &message.content {
                     MessageContent::Blocks(blocks) => blocks.as_slice(),
                     MessageContent::Text(_) => &[],
                 })
                 .filter(|block| matches!(block, ContentBlock::Image { .. }))
-                .count(),
-            1
+                .count()
+        };
+        // Images are budgeted at a fixed token estimate (4800 chars), NOT raw
+        // base64 length. A budget below one image's cost keeps none.
+        let messages = vec![Message::user(MessageContent::from_blocks(vec![
+            ContentBlock::text("inspect"),
+            image(&"a".repeat(100)),
+            image(&"b".repeat(100)),
+        ]))];
+        let projected = prepare_messages_for_request(&messages, true, 10_000, 120);
+        assert_eq!(count_images(&projected), 0);
+
+        // A budget covering two image estimates keeps both — image count is
+        // the budget dimension now, not base64 size.
+        let projected = prepare_messages_for_request(
+            &messages,
+            true,
+            10_000,
+            crate::tokens::image_budget_chars() * 2,
         );
+        assert_eq!(count_images(&projected), 2);
+
+        // Actual accounting (for history compaction) still measures REAL
+        // base64 chars so the context estimate never undercounts payloads.
         let (measured_chars, _) = message_budget_components(&projected, 4);
         assert_eq!(measured_chars, payload_history_chars(&projected));
-        assert!(
-            measured_chars < 4_800,
-            "must measure real base64, not a fixed image estimate"
-        );
+        // Real base64 chars: 2 × 100 data + "inspect" (+ anything the
+        // projection itself appends, e.g. omission markers).
+        let expected = payload_history_chars(&projected);
+        assert_eq!(measured_chars, expected);
+        assert!(expected >= 200 + "inspect".chars().count());
     }
 
     #[test]
