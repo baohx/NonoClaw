@@ -2027,6 +2027,43 @@
       }
       [data-color-scheme="dark"] .dialog__pre { background: rgba(0, 0, 0, 0.25); }
       .dialog__actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+      /* ── API Log drawer ────────────────────────────────────────────── */
+      .api-log-drawer { overflow: hidden; }
+      .api-log-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+      .api-log-header__actions { display: flex; gap: 8px; }
+      .api-log-body { display: flex; flex: 1; min-height: 0; gap: 12px; margin-top: 10px; }
+      .api-log-list { flex: 0 0 240px; min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px; }
+      .api-log-entry {
+        display: flex; align-items: center; gap: 8px; width: 100%;
+        padding: 7px 8px; margin-bottom: 4px; border: 1px solid transparent;
+        border-radius: var(--radius-sm); background: transparent; text-align: left;
+        cursor: pointer; color: var(--text); font-family: var(--font-mono); font-size: 11px;
+      }
+      .api-log-entry:hover { background: var(--accent-softer); }
+      .api-log-entry--active { border-color: var(--accent); background: var(--accent-softer); }
+      .api-log-kind {
+        flex: 0 0 auto; font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em;
+        padding: 2px 5px; border-radius: 4px; color: var(--muted); background: rgba(0,0,0,0.08);
+      }
+      .api-log-kind--request { color: var(--accent); }
+      .api-log-kind--resp { color: #ff6b6b; }
+      .api-log-kind--summary { color: var(--amber); }
+      .api-log-entry__meta { display: flex; flex-direction: column; min-width: 0; }
+      .api-log-entry__trace { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+      .api-log-entry__time { color: var(--faint); font-size: 10px; }
+      .api-log-entry__size { color: var(--faint); font-size: 10px; }
+      .api-log-view { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 14px; }
+      .api-log-pre {
+        margin: 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.55;
+        color: var(--muted); white-space: pre-wrap; word-break: break-all;
+      }
+      .api-log-note { color: var(--faint); font-size: 13px; padding: 14px; line-height: 1.6; }
+      .api-log-note code { font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+      .api-log-empty { border: 1px dashed var(--border); border-radius: var(--radius-md); padding: 14px; margin-top: 10px; color: var(--text); font-size: 13.5px; line-height: 1.6; }
+      .api-log-empty strong { display: block; margin-bottom: 4px; }
+      .api-log-empty code { font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+      .api-log-empty__dir { margin-top: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--faint); }
+      .api-log-error { margin-top: 10px; padding: 10px 12px; border-radius: var(--radius-md); background: rgba(255, 107, 107, 0.12); color: #ff6b6b; font-size: 13px; }
       .btn {
         appearance: none;
         font-family: var(--font-sans);
@@ -2256,27 +2293,11 @@
 
       /* ===== F1 状态宠物（BreathController 驱动的像素猫爪） ===== */
       .pet-corner { position: fixed; right: 18px; bottom: 18px; z-index: 40; pointer-events: none;
-        opacity: .92; transition: transform .25s ease; }
+        opacity: .92; }
+      /* Pet animations live in styles/pet.css (bound to BreathController
+         visual CSS variables) — keep only positioning/shadow here. */
       .pet-corner:hover { transform: scale(1.12); }
       .pet-svg { filter: drop-shadow(0 2px 6px rgba(0,0,0,.18)); }
-      .pet-zzz-1 { animation: pet-zzz 1.6s ease-in-out infinite; }
-      .pet-zzz-2 { animation: pet-zzz 1.6s ease-in-out .4s infinite; }
-      @keyframes pet-zzz { 0%,100% { opacity: .2; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-1.5px); } }
-      .pet-yarn-paw { animation: pet-pawbat .5s ease-in-out infinite; transform-origin: 11px 12px; }
-      .pet-yarn-ball { animation: pet-ballroll .9s linear infinite; transform-origin: 18px 16px; }
-      @keyframes pet-pawbat { 0%,100% { transform: rotate(-8deg); } 50% { transform: rotate(10deg); } }
-      @keyframes pet-ballroll { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-      .pet-raise { animation: pet-wave 1.2s ease-in-out infinite; transform-origin: 17px 9px; }
-      @keyframes pet-wave { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(-18deg); } }
-      .pet-blow-body { animation: pet-shake .3s linear infinite; transform-origin: 11px 12px; }
-      .pet-spike { animation: pet-spiketwitch .5s ease-in-out infinite; }
-      @keyframes pet-shake { 0%,100% { transform: translateX(-.5px); } 50% { transform: translateX(.5px); } }
-      @keyframes pet-spiketwitch { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
-      .pet-jump { animation: pet-hop .55s ease-in-out infinite; transform-origin: 11px 22px; }
-      @keyframes pet-hop { 0%,100% { transform: translateY(0) scaleY(1); } 40% { transform: translateY(-2.5px) scaleY(1.04); } 60% { transform: translateY(0) scaleY(.96); } }
-      @media (prefers-reduced-motion: reduce) {
-        .pet-corner *, .pet-corner { animation: none !important; }
-      }
 
       /* ===== F2 Context X-Ray ===== */
       .xray-root { display: flex; flex-direction: column; gap: 10px; }

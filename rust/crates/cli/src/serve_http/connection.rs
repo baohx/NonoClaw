@@ -492,6 +492,14 @@ pub async fn serve(
             "/api/sessions/:session_id/questions/:request_id",
             axum::routing::post(super::permission_api::resolve_question),
         )
+        .route(
+            "/api/logs/raw",
+            axum::routing::get(super::api_log_service::list_raw_logs),
+        )
+        .route(
+            "/api/logs/raw/:file",
+            axum::routing::get(super::api_log_service::get_raw_log),
+        )
         .route("/manifest.json", get(super::static_service::serve_manifest))
         .route("/sw.js", get(super::static_service::serve_sw))
         .with_state(state);

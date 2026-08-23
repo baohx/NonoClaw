@@ -3,6 +3,7 @@
 //! The public [`serve`] entrypoint is preserved while implementation details
 //! are owned by responsibility-focused submodules.
 
+mod api_log_service;
 mod connection;
 mod download_service;
 mod dream;

@@ -248,11 +248,14 @@ export interface UiSlice {
   xrayBudget: import("../types").EngineEvent | null;
   /** Tool cards collapsed into group placeholders (ChatView toolsHidden). */
   toolsHidden: boolean;
+  /** Whether the raw API log viewer drawer is open. */
+  showApiLog: boolean;
   setXrayBudget: (event: import("../types").EngineEvent | null) => void;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
   toggleLeftRail: () => void;
   toggleInsight: () => void;
+  setShowApiLog: (show: boolean) => void;
   setTheme: (theme: Theme) => void;
   setPermissionMode: (mode: PermissionMode) => void;
   setLocatedMessage: (id: string | null) => void;
@@ -663,8 +666,10 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   locatedMessageId: null,
   xrayBudget: null,
   toolsHidden: false,
+  showApiLog: false,
   setXrayBudget: (event) => set({ xrayBudget: event }),
   setToolsHidden: (toolsHidden) => set({ toolsHidden }),
+  setShowApiLog: (showApiLog) => set({ showApiLog }),
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),

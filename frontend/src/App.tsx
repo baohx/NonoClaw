@@ -5,6 +5,7 @@ import { THEME_IS_DARK } from "./store/slices";
 import { useWebSocket } from "./websocket";
 import BreathField from "./components/BreathField";
 import ChatView from "./components/ChatView";
+import ApiLogDrawer from "./components/ApiLogDrawer";
 import CommitDialog from "./components/CommitDialog";
 import FileTree from "./components/FileTree";
 import GitPane from "./components/GitPane";
@@ -31,6 +32,8 @@ export default function App() {
   const sessions = useStore((s) => s.sessions);
   const showSessionPicker = useStore((s) => s.showSessionPicker);
   const setShowSessionPicker = useStore((s) => s.setShowSessionPicker);
+  const showApiLog = useStore((s) => s.showApiLog);
+  const setShowApiLog = useStore((s) => s.setShowApiLog);
   const compacting = useStore((s) => s.compacting);
   const pendingPermission = useStore((s) => s.pendingPermission);
   // Questions queue in FIFO order (parallel AskUserQuestion calls must not
@@ -380,6 +383,7 @@ export default function App() {
           insightCollapsed={insightCollapsed}
           onToggleLeftRail={toggleLeftRail}
           onToggleInsight={toggleInsight}
+          onToggleApiLog={() => setShowApiLog(true)}
           onShowQr={() => setShowQr(true)}
         />
         <div className={bodyClass}>
@@ -489,6 +493,7 @@ export default function App() {
         />
       )}
       {showQr && <QrDialog onClose={() => setShowQr(false)} />}
+      {showApiLog && <ApiLogDrawer onClose={() => setShowApiLog(false)} />}
     </>
   );
 }

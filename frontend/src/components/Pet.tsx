@@ -153,7 +153,7 @@ export default function Pet() {
 
   return (
     <div
-      className={`pet-corner pet-${pet}`}
+      className={`pet-corner ${pet}`}
       data-flare={v.flare > 0.15 ? 1 : 0}
       style={{
         ["--pet-flare" as string]: String(v.flare.toFixed(3)),

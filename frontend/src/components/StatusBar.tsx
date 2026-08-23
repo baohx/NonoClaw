@@ -14,6 +14,7 @@ interface Props {
   insightCollapsed: boolean;
   onToggleLeftRail: () => void;
   onToggleInsight: () => void;
+  onToggleApiLog: () => void;
 }
 
 const ALL_THEMES = Object.keys(THEME_COLORS) as Theme[];
@@ -28,6 +29,7 @@ export default function StatusBar({
   insightCollapsed,
   onToggleLeftRail,
   onToggleInsight,
+  onToggleApiLog,
   onShowQr,
 }: Props) {
   const inputTokens = useStore((s) => s.inputTokens);
@@ -162,6 +164,14 @@ export default function StatusBar({
           aria-label="Toggle insight rail"
         >
           {insightCollapsed ? "«" : "»"}
+        </button>
+        <button
+          className="iconbtn"
+          onClick={onToggleApiLog}
+          title="Show / hide raw API log viewer"
+          aria-label="Toggle API log viewer"
+        >
+          &#x1f4dd;
         </button>
         {hasMobileAccessToken && (
           <button
