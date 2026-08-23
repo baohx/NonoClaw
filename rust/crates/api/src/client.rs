@@ -176,6 +176,12 @@ pub enum ApiFormat {
     #[default]
     Anthropic,
     OpenAI,
+    /// OpenAI Responses API (`/v1/responses`). Used by OpenCode Zen for
+    /// GPT / Grok / Muse model families.
+    Responses,
+    /// Google Gemini native API (`/v1/models/<id>:streamGenerateContent`).
+    /// Used by OpenCode Zen for Gemini model families.
+    Gemini,
 }
 
 impl ApiFormat {
@@ -184,6 +190,8 @@ impl ApiFormat {
         match self {
             ApiFormat::Anthropic => "anthropic",
             ApiFormat::OpenAI => "openai",
+            ApiFormat::Responses => "responses",
+            ApiFormat::Gemini => "gemini",
         }
     }
 
@@ -210,6 +218,30 @@ impl ApiFormat {
                 // vLLM / GLM / Kimi), which our byte-stable payloads feed.
                 prompt_caching: CapabilityStatus::Unsupported {
                     reason: "OpenAI Chat Completions relies on provider-managed prefix caching (no explicit breakpoints); payload prefixes are kept byte-stable to maximize hits",
+                },
+                images: CapabilityStatus::Supported,
+                tools: CapabilityStatus::Supported,
+            },
+            ApiFormat::Responses => ProviderCapabilities {
+                streaming: CapabilityStatus::Supported,
+                thinking: CapabilityStatus::Supported,
+                // Responses API reports cached input tokens in
+                // `usage.input_tokens_details.cached_tokens`.
+                cache_usage: CapabilityStatus::Supported,
+                prompt_caching: CapabilityStatus::Unsupported {
+                    reason: "Responses API caching is provider-managed (no explicit breakpoints); payload prefixes are kept byte-stable to maximize hits",
+                },
+                images: CapabilityStatus::Supported,
+                tools: CapabilityStatus::Supported,
+            },
+            ApiFormat::Gemini => ProviderCapabilities {
+                streaming: CapabilityStatus::Supported,
+                thinking: CapabilityStatus::Supported,
+                cache_usage: CapabilityStatus::Unsupported {
+                    reason: "Gemini streamGenerateContent does not report cached token counts",
+                },
+                prompt_caching: CapabilityStatus::Unsupported {
+                    reason: "Gemini implicit caching is provider-managed (no explicit breakpoints); payload prefixes are kept byte-stable to maximize hits",
                 },
                 images: CapabilityStatus::Supported,
                 tools: CapabilityStatus::Supported,
@@ -297,9 +329,17 @@ impl Client {
                 host.eq_ignore_ascii_case("deepseek.com")
                     || host.to_ascii_lowercase().ends_with(".deepseek.com")
             });
-        if deepseek_model || deepseek_endpoint {
+        // DeepSeek's *OpenAI Chat Completions* endpoint (`/chat/completions`)
+        // supports image_url parts for its vision models (e.g.
+        // `deepseek-v4-flash-vision-exp`). Only DeepSeek's *Anthropic-compatible*
+        // Messages endpoint (`/v1/messages`) rejects image content blocks.
+        // So disable images only when this is a deepseek endpoint routed over
+        // the Anthropic wire format; keep them for openai/responses/gemini.
+        let deepseek_anthropic_only = (deepseek_model || deepseek_endpoint)
+            && matches!(self.format, ApiFormat::Anthropic);
+        if deepseek_anthropic_only {
             capabilities.images = CapabilityStatus::Unsupported {
-                reason: "DeepSeek APIs do not accept image content blocks",
+                reason: "DeepSeek Anthropic-compatible endpoint does not accept image content blocks",
             };
         }
         capabilities
@@ -358,6 +398,26 @@ impl Client {
                 let url = endpoint_url(&self.base_url, "v1/chat/completions");
                 (url, body)
             }
+            ApiFormat::Responses => {
+                let body = serialize_body_responses(params)?;
+                dump_prompt_openai(params, &body);
+                let url = endpoint_url(&self.base_url, "v1/responses");
+                (url, body)
+            }
+            ApiFormat::Gemini => {
+                let body = serialize_body_gemini(params)?;
+                dump_prompt_openai(params, &body);
+                // Gemini native: POST /v1/models/<model>:streamGenerateContent
+                let base = self.base_url.trim().trim_end_matches('/');
+                let url = if base.contains("streamGenerateContent") {
+                    base.to_string()
+                } else if base.ends_with("/v1") || base.contains("/v1/") {
+                    format!("{}/models/{}:streamGenerateContent", base, params.model)
+                } else {
+                    format!("{}/v1/models/{}:streamGenerateContent", base, params.model)
+                };
+                (url, body)
+            }
         };
         // Write full raw context to .nonoclaw/logs/ for inspection.
         write_prompt_log(params, &body, &url);
@@ -383,6 +443,16 @@ impl Client {
             ApiFormat::OpenAI => {
                 if let Some(key) = &self.api_key {
                     req = req.header("Authorization", format!("Bearer {key}"));
+                }
+            }
+            ApiFormat::Responses => {
+                if let Some(key) = &self.api_key {
+                    req = req.header("Authorization", format!("Bearer {key}"));
+                }
+            }
+            ApiFormat::Gemini => {
+                if let Some(key) = &self.api_key {
+                    req = req.header("x-goog-api-key", key);
                 }
             }
         }
@@ -472,6 +542,12 @@ impl Client {
             }
             ApiFormat::OpenAI => {
                 fold_openai_stream(response.0, response.1, &mut on_event, &cancel).await
+            }
+            ApiFormat::Responses => {
+                fold_responses_stream(response.0, response.1, &mut on_event, &cancel).await
+            }
+            ApiFormat::Gemini => {
+                fold_gemini_stream(response.0, response.1, &mut on_event, &cancel).await
             }
         };
         if let Err(failure) = &result {
@@ -1263,13 +1339,12 @@ impl OpenAiState {
             let input = if tool.arguments.is_empty() {
                 serde_json::json!({})
             } else {
-                serde_json::from_str(&tool.arguments).map_err(|error| StreamFailure {
-                    error: ProviderError::invalid_response(format!(
-                        "invalid incremental tool arguments for {}: {error}",
-                        tool.name
-                    )),
-                    partial: partial.clone(),
-                })?
+                // A truncated stream can leave partial JSON arguments. Degrade
+                // to a `_partial_json` passthrough (matching `partial()`)
+                // instead of failing the whole turn.
+                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
+                    serde_json::json!({"_partial_json": tool.arguments})
+                })
             };
             content.push(ContentBlock::ToolUse {
                 id: tool.id,
@@ -1413,6 +1488,17 @@ fn handle_openai_chunk(
             });
         }
         let delta = &choice["delta"];
+        // DeepSeek-style reasoning stream: thinking models (e.g. DeepSeek R1,
+        // Zen's ox-alpha/x-preview-f) emit `delta.reasoning_content` before the
+        // visible `content`. Surface it as ThinkingDelta so the UI shows the
+        // thought process and the turn doesn't look stalled.
+        if let Some(thinking) = delta.get("reasoning_content").and_then(|value| value.as_str()) {
+            if !thinking.is_empty() {
+                on_event(&StreamEvent::ThinkingDelta {
+                    thinking: thinking.to_string(),
+                });
+            }
+        }
         if let Some(text) = delta.get("content").and_then(|value| value.as_str()) {
             if !text.is_empty() {
                 state.text.push_str(text);
@@ -1469,6 +1555,833 @@ fn openai_stop_reason(reason: &str) -> StopReason {
         "content_filter" => StopReason::Refusal,
         other => StopReason::Other(other.to_string()),
     }
+}
+
+// ── OpenAI Responses API (`/v1/responses`) ──────────────────────────────────
+
+fn responses_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "max_output_tokens" | "length" => StopReason::MaxTokens,
+        "tool_use" | "function_call" => StopReason::ToolUse,
+        "content_filter" => StopReason::Refusal,
+        _ => StopReason::EndTurn,
+    }
+}
+
+/// Serialize a request for the OpenAI Responses API (used by Zen for
+/// GPT / Grok / Muse families). Multimodal input uses `input_image` items.
+fn serialize_body_responses(params: &RequestParams) -> Result<String> {
+    use nonoclaw_core::ContentBlock;
+    use nonoclaw_core::MessageContent;
+
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for message in &params.messages {
+        let role = if message.role == nonoclaw_core::Role::Assistant {
+            "assistant"
+        } else {
+            "user"
+        };
+        match &message.content {
+            MessageContent::Text(text) => {
+                input.push(serde_json::json!({
+                    "role": role,
+                    "content": [{"type": if role == "assistant" { "output_text" } else { "input_text" }, "text": text}],
+                }));
+            }
+            MessageContent::Blocks(blocks) => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            parts.push(serde_json::json!({
+                                "type": if role == "assistant" { "output_text" } else { "input_text" },
+                                "text": text,
+                            }));
+                        }
+                        ContentBlock::Image { source } => {
+                            parts.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                            }));
+                        }
+                        ContentBlock::ToolUse { id, name, input: tool_input, .. } => {
+                            let call_args = tool_input.to_string();
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": call_args,
+                            }));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            let output = match content {
+                                nonoclaw_core::ToolResultContent::Text(text) => text.clone(),
+                                nonoclaw_core::ToolResultContent::Blocks(blocks) => {
+                                    let mut text = String::new();
+                                    for block in blocks {
+                                        if let ContentBlock::Text { text: t, .. } = block {
+                                            text.push_str(t);
+                                        }
+                                    }
+                                    text
+                                }
+                            };
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": output,
+                            }));
+                        }
+                        ContentBlock::Thinking { .. } => {
+                            // Reasoning blocks are provider-managed in the
+                            // Responses API; replaying them is not supported.
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    input.push(serde_json::json!({"role": role, "content": parts}));
+                }
+            }
+        }
+    }
+
+    let tools: Vec<serde_json::Value> = params
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            })
+        })
+        .collect();
+
+    let system_text: String = params
+        .system
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut body = serde_json::json!({
+        "model": params.model,
+        "max_output_tokens": params.max_tokens,
+        "stream": true,
+        "input": input,
+    });
+    if !system_text.is_empty() {
+        body["instructions"] = serde_json::json!(system_text);
+    }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::json!(tools);
+        body["tool_choice"] = match params.tool_choice.as_ref() {
+            None | Some(ToolChoice::Auto) => serde_json::json!("auto"),
+            Some(ToolChoice::Any) => serde_json::json!("required"),
+            Some(ToolChoice::Tool { name }) => serde_json::json!({"type": "function", "name": name}),
+            Some(ToolChoice::None) => serde_json::json!("none"),
+        };
+    }
+    if let Some(thinking) = &params.thinking {
+        // Map thinking config onto the Responses `reasoning.effort` dial.
+        let effort = match thinking {
+            ThinkingConfig::Enabled { budget_tokens } => {
+                if *budget_tokens >= 8000 { "high" } else { "medium" }
+            }
+            ThinkingConfig::Adaptive { .. } => "medium",
+        };
+        body["reasoning"] = serde_json::json!({"effort": effort});
+    }
+    if let Some(t) = params.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(extra) = &params.extra_body {
+        if let Some(extra_map) = extra.as_object() {
+            for (key, value) in extra_map {
+                body[key] = value.clone();
+            }
+        }
+    }
+    Ok(serde_json::to_string(&body)?)
+}
+
+#[derive(Debug, Default)]
+struct ResponsesState {
+    message_id: String,
+    model: String,
+    text: String,
+    tools: BTreeMap<usize, OpenAiToolBuilder>,
+    usage: Usage,
+    stop_reason: Option<StopReason>,
+    message_started: bool,
+}
+
+impl ResponsesState {
+    fn partial(&self) -> TurnOutput {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: self.text.clone(),
+                cache_control: None,
+            });
+        }
+        content.extend(self.tools.values().map(|tool| {
+            ContentBlock::ToolUse {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                input: serde_json::from_str(&tool.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"_partial_json": tool.arguments})),
+                cache_control: None,
+            }
+        }));
+        TurnOutput {
+            message_id: self.message_id.clone(),
+            model: self.model.clone(),
+            content,
+            stop_reason: self.stop_reason.clone(),
+            usage: self.usage,
+        }
+    }
+
+    fn failure(&self, error: ProviderError) -> StreamFailure {
+        StreamFailure {
+            error,
+            partial: self.partial(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn finish(self) -> std::result::Result<TurnOutput, StreamFailure> {
+        let partial = self.partial();
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: self.text,
+                cache_control: None,
+            });
+        }
+        for tool in self.tools.into_values() {
+            let input = if tool.arguments.is_empty() {
+                serde_json::json!({})
+            } else {
+                // A truncated stream can leave partial JSON arguments. Degrade
+                // to a `_partial_json` passthrough (matching `partial()`)
+                // instead of failing the whole turn.
+                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
+                    serde_json::json!({"_partial_json": tool.arguments})
+                })
+            };
+            content.push(ContentBlock::ToolUse {
+                id: tool.id,
+                name: tool.name,
+                input,
+                cache_control: None,
+            });
+        }
+        Ok(TurnOutput { content, ..partial })
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn handle_responses_chunk(
+    value: &serde_json::Value,
+    state: &mut ResponsesState,
+    on_event: &mut impl FnMut(&StreamEvent),
+) -> std::result::Result<(), StreamFailure> {
+    let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "response.created" | "response.in_progress" => {
+            let response = &value["response"];
+            if let Some(id) = response.get("id").and_then(|v| v.as_str()) {
+                state.message_id = id.to_string();
+            }
+            if let Some(model) = response.get("model").and_then(|v| v.as_str()) {
+                state.model = model.to_string();
+            }
+            if !state.message_started {
+                state.message_started = true;
+                on_event(&StreamEvent::MessageStart {
+                    message_id: state.message_id.clone(),
+                    model: state.model.clone(),
+                    usage: UsagePart::default(),
+                });
+            }
+        }
+        "response.output_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                if !delta.is_empty() {
+                    state.text.push_str(delta);
+                    on_event(&StreamEvent::TextDelta {
+                        text: delta.to_string(),
+                    });
+                }
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                if !delta.is_empty() {
+                    on_event(&StreamEvent::ThinkingDelta {
+                        thinking: delta.to_string(),
+                    });
+                }
+            }
+        }
+        "response.output_item.added" => {
+            let item = &value["item"];
+            if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                let index = value.get("output_index").and_then(|v| v.as_u64()).unwrap_or_default()
+                    as usize;
+                let tool = state.tools.entry(index).or_default();
+                if let Some(id) = item.get("call_id").and_then(|v| v.as_str()) {
+                    tool.id.push_str(id);
+                }
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    tool.name.push_str(name);
+                }
+                if !tool.start_emitted && !tool.id.is_empty() {
+                    tool.start_emitted = true;
+                    on_event(&StreamEvent::ToolUseStart {
+                        index,
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                    });
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let index = value.get("output_index").and_then(|v| v.as_u64()).unwrap_or_default()
+                as usize;
+            if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                let tool = state.tools.entry(index).or_default();
+                tool.arguments.push_str(delta);
+                on_event(&StreamEvent::ToolUseInputDelta {
+                    index,
+                    partial_json: delta.to_string(),
+                });
+            }
+        }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            let response = &value["response"];
+            if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let cached = usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let part = UsagePart {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    cache_creation_input_tokens: Some(input_tokens.saturating_sub(cached)),
+                    cache_read_input_tokens: Some(cached),
+                };
+                state.usage.update_from_part(&part);
+                on_event(&StreamEvent::MessageDelta {
+                    stop_reason: None,
+                    usage: part,
+                });
+            }
+            let reason = response
+                .pointer("/status_details/reason")
+                .or_else(|| response.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed");
+            let stop_reason = if event_type == "response.completed" && state.tools.values().any(|t| !t.id.is_empty()) {
+                StopReason::ToolUse
+            } else {
+                responses_stop_reason(reason)
+            };
+            state.stop_reason = Some(stop_reason.clone());
+            on_event(&StreamEvent::MessageDelta {
+                stop_reason: Some(stop_reason),
+                usage: UsagePart::default(),
+            });
+            on_event(&StreamEvent::MessageStop);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn fold_responses_stream(
+    response: reqwest::Response,
+    raw_log: Option<RawApiLogger>,
+    on_event: &mut impl FnMut(&StreamEvent),
+    cancel: &CancellationToken,
+) -> std::result::Result<TurnOutput, StreamFailure> {
+    let mut parser = SseParser::new();
+    let mut stream = response.bytes_stream();
+    let mut state = ResponsesState::default();
+    let mut done = false;
+
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Err(state.failure(ProviderError::cancelled())),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else { break };
+        let bytes =
+            chunk.map_err(|error| state.failure(ProviderError::stream(error.to_string(), true)))?;
+        if let Some(log) = &raw_log {
+            log.append_frame(&bytes);
+        }
+        parser.feed_bytes(&bytes);
+        while let Some(frame) = parser.next_frame() {
+            if frame.data.trim() == "[DONE]" {
+                on_event(&StreamEvent::MessageStop);
+                done = true;
+                break;
+            }
+            let value: serde_json::Value = serde_json::from_str(&frame.data).map_err(|error| {
+                state.failure(ProviderError::invalid_response(format!(
+                    "invalid Responses SSE JSON: {error}"
+                )))
+            })?;
+            if value.get("error").is_some() {
+                let error = api_error_from_body(0, &frame.data);
+                return Err(state.failure(ProviderError::from_core(&error, "read_stream")));
+            }
+            handle_responses_chunk(&value, &mut state, on_event)?;
+            if matches!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some("response.completed") | Some("response.failed") | Some("response.incomplete")
+            ) {
+                done = true;
+                break;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+
+    let result = state.finish();
+    if let Some(log) = &raw_log {
+        let summary = match &result {
+            Ok(output) => serde_json::json!({
+                "outcome": "ok",
+                "message_id": output.message_id,
+                "model": output.model,
+                "stop_reason": format!("{:?}", output.stop_reason),
+                "usage": usage_json_with_base(&output.usage, output.usage.input_tokens),
+            }),
+            Err(failure) => serde_json::json!({
+                "outcome": "error",
+                "error": format!("{:?}", failure.error.code),
+            }),
+        };
+        log.write_summary("responses", summary);
+    }
+    result
+}
+
+// ── Google Gemini native API (`streamGenerateContent`) ──────────────────────
+
+fn gemini_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "MAX_TOKENS" => StopReason::MaxTokens,
+        "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" => StopReason::Refusal,
+        "STOP" => StopReason::EndTurn,
+        other => StopReason::Other(other.to_string()),
+    }
+}
+
+/// Serialize a request for the Gemini native API. Multimodal input uses
+/// `inline_data` parts. Tool results map to `functionResponse` parts keyed by
+/// the tool *name* (Gemini matches by name, not id), resolved from preceding
+/// assistant `functionCall` blocks.
+fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
+    use nonoclaw_core::ContentBlock;
+    use nonoclaw_core::MessageContent;
+
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+    // call_id → function name, resolved from assistant functionCall blocks.
+    let mut call_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for message in &params.messages {
+        let role = if message.role == nonoclaw_core::Role::Assistant { "model" } else { "user" };
+        match &message.content {
+            MessageContent::Text(text) => {
+                contents.push(serde_json::json!({"role": role, "parts": [{"text": text}]}));
+            }
+            MessageContent::Blocks(blocks) => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            parts.push(serde_json::json!({"text": text}));
+                        }
+                        ContentBlock::Image { source } => {
+                            parts.push(serde_json::json!({
+                                "inline_data": {
+                                    "mime_type": source.media_type,
+                                    "data": source.data,
+                                }
+                            }));
+                        }
+                        ContentBlock::ToolUse { id, name, input, .. } => {
+                            call_names.insert(id.clone(), name.clone());
+                            parts.push(serde_json::json!({
+                                "functionCall": {"name": name, "args": input}
+                            }));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            ..
+                        } => {
+                            let response = match content {
+                                nonoclaw_core::ToolResultContent::Text(text) => {
+                                    serde_json::json!({"result": text, "isError": is_error.unwrap_or(false)})
+                                }
+                                nonoclaw_core::ToolResultContent::Blocks(blocks) => {
+                                    let mut text = String::new();
+                                    for block in blocks {
+                                        if let ContentBlock::Text { text: t, .. } = block {
+                                            text.push_str(t);
+                                        }
+                                    }
+                                    serde_json::json!({"result": text, "isError": is_error.unwrap_or(false)})
+                                }
+                            };
+                            let name = call_names.get(tool_use_id).cloned().unwrap_or_else(|| {
+                                tool_use_id.split('_').next().unwrap_or(tool_use_id).to_string()
+                            });
+                            parts.push(serde_json::json!({
+                                "functionResponse": {"name": name, "response": response}
+                            }));
+                        }
+                        ContentBlock::Thinking { .. } => {
+                            // Gemini manages its own thought chain server-side.
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(serde_json::json!({"role": role, "parts": parts}));
+                }
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": params.model,
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": params.max_tokens,
+        },
+    });
+    let system_text: String = params
+        .system
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !system_text.is_empty() {
+        body["systemInstruction"] = serde_json::json!({"parts": [{"text": system_text}]});
+    }
+    if !params.tools.is_empty() {
+        let declarations: Vec<serde_json::Value> = params
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::json!([{"functionDeclarations": declarations}]);
+        body["toolConfig"] = serde_json::json!({
+            "functionCallingConfig": {"mode": "AUTO"}
+        });
+    }
+    if let Some(t) = params.temperature {
+        body["generationConfig"]["temperature"] = serde_json::json!(t);
+    }
+    if let Some(thinking) = &params.thinking {
+        body["generationConfig"]["thinkingConfig"] =
+            serde_json::json!({"includeThoughts": true});
+        if let ThinkingConfig::Enabled { budget_tokens } = thinking {
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"] =
+                serde_json::json!(budget_tokens);
+        }
+    }
+    if let Some(extra) = &params.extra_body {
+        if let Some(extra_map) = extra.as_object() {
+            for (key, value) in extra_map {
+                body[key] = value.clone();
+            }
+        }
+    }
+    Ok(serde_json::to_string(&body)?)
+}
+
+#[derive(Debug, Default)]
+struct GeminiState {
+    message_id: String,
+    model: String,
+    text: String,
+    tools: BTreeMap<usize, OpenAiToolBuilder>,
+    tool_call_counter: usize,
+    usage: Usage,
+    stop_reason: Option<StopReason>,
+    message_started: bool,
+}
+
+impl GeminiState {
+    fn partial(&self) -> TurnOutput {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: self.text.clone(),
+                cache_control: None,
+            });
+        }
+        content.extend(self.tools.values().map(|tool| {
+            ContentBlock::ToolUse {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                input: serde_json::from_str(&tool.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"_partial_json": tool.arguments})),
+                cache_control: None,
+            }
+        }));
+        TurnOutput {
+            message_id: self.message_id.clone(),
+            model: self.model.clone(),
+            content,
+            stop_reason: self.stop_reason.clone(),
+            usage: self.usage,
+        }
+    }
+
+    fn failure(&self, error: ProviderError) -> StreamFailure {
+        StreamFailure {
+            error,
+            partial: self.partial(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn finish(self) -> std::result::Result<TurnOutput, StreamFailure> {
+        let partial = self.partial();
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: self.text,
+                cache_control: None,
+            });
+        }
+        for tool in self.tools.into_values() {
+            // Gemini function calls arrive whole (no incremental deltas), so
+            // the stored arguments are the direct JSON serialization.
+            let input = if tool.arguments.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
+                    serde_json::json!({"_gemini_raw": tool.arguments})
+                })
+            };
+            content.push(ContentBlock::ToolUse {
+                id: tool.id,
+                name: tool.name,
+                input,
+                cache_control: None,
+            });
+        }
+        Ok(TurnOutput { content, ..partial })
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn handle_gemini_chunk(
+    value: &serde_json::Value,
+    state: &mut GeminiState,
+    on_event: &mut impl FnMut(&StreamEvent),
+) -> std::result::Result<(), StreamFailure> {
+    if !state.message_started {
+        state.message_started = true;
+        if state.message_id.is_empty() {
+            state.message_id = format!("gemini-{}", uuid_timestamp());
+        }
+        if state.model.is_empty() {
+            state.model = value
+                .get("modelVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+        on_event(&StreamEvent::MessageStart {
+            message_id: state.message_id.clone(),
+            model: state.model.clone(),
+            usage: UsagePart::default(),
+        });
+    }
+    if let Some(model) = value.get("modelVersion").and_then(|v| v.as_str()) {
+        if state.model.is_empty() {
+            state.model = model.to_string();
+        }
+    }
+
+    if let Some(usage) = value.get("usageMetadata").filter(|u| !u.is_null()) {
+        let input_tokens = usage
+            .get("promptTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        let output_tokens = usage
+            .get("candidatesTokenCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        let part = UsagePart {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_creation_input_tokens: Some(input_tokens),
+            cache_read_input_tokens: Some(0),
+        };
+        state.usage.update_from_part(&part);
+        on_event(&StreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: part,
+        });
+    }
+
+    let Some(candidates) = value.get("candidates").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for candidate in candidates {
+        if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+            let reason = gemini_stop_reason(reason);
+            state.stop_reason = Some(reason.clone());
+            on_event(&StreamEvent::MessageDelta {
+                stop_reason: Some(reason),
+                usage: UsagePart::default(),
+            });
+        }
+        let parts = &candidate["content"]["parts"];
+        let Some(parts) = parts.as_array() else { continue };
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                        on_event(&StreamEvent::ThinkingDelta {
+                            thinking: text.to_string(),
+                        });
+                    } else {
+                        state.text.push_str(text);
+                        on_event(&StreamEvent::TextDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(call) = part.get("functionCall") {
+                let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let id = format!("call_{}_{}", uuid_timestamp(), state.tool_call_counter);
+                state.tool_call_counter += 1;
+                let args = call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let index = state.tools.len();
+                let tool = state.tools.entry(index).or_default();
+                tool.id = id.clone();
+                tool.name = name.to_string();
+                tool.arguments = args.to_string();
+                tool.start_emitted = true;
+                on_event(&StreamEvent::ToolUseStart {
+                    index,
+                    id,
+                    name: name.to_string(),
+                });
+                on_event(&StreamEvent::ToolUseInputDelta {
+                    index,
+                    partial_json: args.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn uuid_timestamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
+async fn fold_gemini_stream(
+    response: reqwest::Response,
+    raw_log: Option<RawApiLogger>,
+    on_event: &mut impl FnMut(&StreamEvent),
+    cancel: &CancellationToken,
+) -> std::result::Result<TurnOutput, StreamFailure> {
+    let mut parser = SseParser::new();
+    let mut stream = response.bytes_stream();
+    let mut state = GeminiState::default();
+
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Err(state.failure(ProviderError::cancelled())),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else { break };
+        let bytes =
+            chunk.map_err(|error| state.failure(ProviderError::stream(error.to_string(), true)))?;
+        if let Some(log) = &raw_log {
+            log.append_frame(&bytes);
+        }
+        parser.feed_bytes(&bytes);
+        while let Some(frame) = parser.next_frame() {
+            let value: serde_json::Value = serde_json::from_str(&frame.data).map_err(|error| {
+                state.failure(ProviderError::invalid_response(format!(
+                    "invalid Gemini SSE JSON: {error}"
+                )))
+            })?;
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .pointer("/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Gemini API error");
+                let status = error.get("status").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+                return Err(state.failure(ProviderError::invalid_response(format!(
+                    "{status}: {message}"
+                ))));
+            }
+            handle_gemini_chunk(&value, &mut state, on_event)?;
+        }
+    }
+    on_event(&StreamEvent::MessageStop);
+
+    let result = state.finish();
+    if let Some(log) = &raw_log {
+        let summary = match &result {
+            Ok(output) => serde_json::json!({
+                "outcome": "ok",
+                "message_id": output.message_id,
+                "model": output.model,
+                "stop_reason": format!("{:?}", output.stop_reason),
+                "usage": usage_json_with_base(&output.usage, output.usage.input_tokens),
+            }),
+            Err(failure) => serde_json::json!({
+                "outcome": "error",
+                "error": format!("{:?}", failure.error.code),
+            }),
+        };
+        log.write_summary("gemini", summary);
+    }
+    result
 }
 
 /// Prompt diagnostics are opt-in and contain structure/size metadata only.
@@ -1989,6 +2902,164 @@ mod tests {
     use crate::sse::SseFrame;
 
     #[test]
+    fn responses_serialization_and_stream_folding() {
+        // Serialization: system → instructions, user text + image, tool defs.
+        let params = RequestParams {
+            model: "gpt-5.6-sol".into(),
+            max_tokens: 1024,
+            system: vec![SystemBlock {
+                kind: "text".into(),
+                text: "You are helpful.".into(),
+                cache_control: None,
+            }],
+            messages: vec![Message {
+                role: nonoclaw_core::Role::User,
+                content: nonoclaw_core::MessageContent::Blocks(vec![
+                    ContentBlock::text("describe"),
+                    ContentBlock::Image {
+                        source: nonoclaw_core::ImageSource {
+                            kind: "base64".into(),
+                            media_type: "image/png".into(),
+                            data: "aGk=".into(),
+                        },
+                    },
+                ]),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            trace_label: None,
+        };
+        let body = serialize_body_responses(&params).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], "gpt-5.6-sol");
+        assert_eq!(parsed["instructions"], "You are helpful.");
+        assert_eq!(parsed["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            parsed["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,aGk="
+        );
+
+        // Stream folding: created → text delta → function call → completed.
+        let mut state = ResponsesState::default();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"Hi"}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"/a\"}"}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":4}}}}"#,
+        ];
+        for frame in frames {
+            let value: serde_json::Value = serde_json::from_str(frame).unwrap();
+            handle_responses_chunk(&value, &mut state, &mut |e| events.push(e.clone())).unwrap();
+        }
+        let output = state.finish().unwrap();
+        assert_eq!(output.message_id, "resp_1");
+        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.cache_read_input_tokens, 4);
+        match &output.content[0] {
+            ContentBlock::Text { text, .. } => assert_eq!(text, "Hi"),
+            _ => panic!("expected text"),
+        }
+        match &output.content[1] {
+            ContentBlock::ToolUse { id, name, input, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "Read");
+                assert_eq!(input["path"], "/a");
+            }
+            _ => panic!("expected tool_use"),
+        }
+    }
+
+    #[test]
+    fn gemini_serialization_and_stream_folding() {
+        // Serialization: role mapping, inline_data images, functionResponse names.
+        let params = RequestParams {
+            model: "gemini-3-pro".into(),
+            max_tokens: 512,
+            system: vec![SystemBlock {
+                kind: "text".into(),
+                text: "sys".into(),
+                cache_control: None,
+            }],
+            messages: vec![
+                Message {
+                    role: nonoclaw_core::Role::Assistant,
+                    content: nonoclaw_core::MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: "call_9".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"path": "/a"}),
+                        cache_control: None,
+                    }]),
+                },
+                Message {
+                    role: nonoclaw_core::Role::User,
+                    content: nonoclaw_core::MessageContent::Blocks(vec![
+                        ContentBlock::tool_result("call_9".to_string(), "file body".to_string(), false),
+                        ContentBlock::Image {
+                            source: nonoclaw_core::ImageSource {
+                                kind: "base64".into(),
+                                media_type: "image/jpeg".into(),
+                                data: "aGk=".into(),
+                            },
+                        },
+                    ]),
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            trace_label: None,
+        };
+        let body = serialize_body_gemini(&params).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["contents"][0]["role"], "model");
+        assert_eq!(parsed["contents"][0]["parts"][0]["functionCall"]["name"], "Read");
+        // functionResponse must resolve name via the preceding call_id map.
+        assert_eq!(
+            parsed["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "Read"
+        );
+        assert_eq!(parsed["contents"][1]["parts"][1]["inline_data"]["mime_type"], "image/jpeg");
+
+        // Stream folding: text + functionCall + finishReason.
+        let mut state = GeminiState::default();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "Hello"},
+                    {"functionCall": {"name": "Bash", "args": {"cmd": "ls"}}}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3}
+        });
+        handle_gemini_chunk(&chunk, &mut state, &mut |e| events.push(e.clone())).unwrap();
+        let output = state.finish().unwrap();
+        assert_eq!(output.usage.input_tokens, 7);
+        assert_eq!(output.usage.output_tokens, 3);
+        match &output.content[0] {
+            ContentBlock::Text { text, .. } => assert_eq!(text, "Hello"),
+            _ => panic!("expected text"),
+        }
+        match &output.content[1] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "Bash");
+                assert_eq!(input["cmd"], "ls");
+            }
+            _ => panic!("expected tool_use"),
+        }
+    }
+
+    #[test]
     fn provider_endpoint_accepts_root_versioned_and_complete_base_urls() {
         assert_eq!(
             endpoint_url("https://api.anthropic.com", "v1/messages"),
@@ -2246,6 +3317,44 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_reasoning_content_and_truncated_tool_arguments() {
+        // Zen ox-alpha (x-preview-f-free) streams `delta.reasoning_content`
+        // before the visible content, and a truncated stream can leave partial
+        // tool-call JSON. Both must degrade gracefully, not kill the turn.
+        let frames = [
+            r#"{"id":"1","model":"x-preview-f-free","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user asks"}}]}"#,
+            r#"{"id":"1","model":"x-preview-f-free","choices":[{"index":0,"delta":{"content":"北京晴"}}]}"#,
+            r#"{"id":"1","model":"x-preview-f-free","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#,
+            // stream cut here — arguments JSON is incomplete
+        ];
+        let mut state = OpenAiState::default();
+        let mut events = Vec::new();
+        for frame in frames {
+            let value: serde_json::Value = serde_json::from_str(frame).unwrap();
+            handle_openai_chunk(&value, &mut state, &mut |e| events.push(e.clone())).unwrap();
+        }
+        // reasoning_content surfaced as ThinkingDelta
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ThinkingDelta { thinking } if thinking == "The user asks"
+        )));
+        // finish() no longer fails on truncated arguments
+        let output = state.finish().unwrap();
+        assert!(matches!(
+            &output.content[0],
+            ContentBlock::Text { text, .. } if text == "北京晴"
+        ));
+        match &output.content[1] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "get_weather");
+                // degraded to _partial_json passthrough instead of an error
+                assert!(input.get("_partial_json").is_some());
+            }
+            _ => panic!("expected tool_use"),
+        }
+    }
+
+    #[test]
     fn openai_fixture_streams_text_incremental_tool_arguments_and_usage() {
         let mut parser = SseParser::new();
         parser.feed_str(include_str!("../tests/fixtures/openai_stream.sse"));
@@ -2451,6 +3560,38 @@ mod tests {
         let error = client.validate_capabilities(&params).unwrap_err();
         assert_eq!(error.code, crate::ProviderErrorCode::Capability);
         assert_eq!(error.feature, Some(ProviderFeature::Thinking));
+    }
+
+    #[test]
+    fn deepseek_vision_over_openai_format_supports_images() {
+        // `deepseek-v4-flash-vision-exp` is a vision model exposed over the
+        // OpenAI Chat Completions endpoint (`/chat/completions`), which accepts
+        // `image_url` parts. The old name/domain hardcode wrongly disabled
+        // images for ANY deepseek model; the fix keeps images for the OpenAI
+        // wire format and only disables them on DeepSeek's Anthropic endpoint.
+        let deepseek_openai = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://api.deepseek.com".into(),
+        )
+        .unwrap()
+        .with_format(ApiFormat::OpenAI);
+        assert!(deepseek_openai
+            .capabilities_for_model("deepseek-v4-flash-vision-exp")
+            .images
+            .is_supported());
+
+        // DeepSeek routed over the Anthropic wire format must still drop images.
+        let deepseek_anthropic = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://api.deepseek.com/anthropic".into(),
+        )
+        .unwrap();
+        assert!(!deepseek_anthropic
+            .capabilities_for_model("deepseek-v4-pro")
+            .images
+            .is_supported());
     }
 
     #[test]

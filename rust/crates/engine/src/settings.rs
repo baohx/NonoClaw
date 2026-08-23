@@ -543,6 +543,8 @@ fn parse_model_api_format(value: &str) -> Option<ApiFormat> {
     match normalized.as_str() {
         "anthropic" | "anthropiccompatible" => Some(ApiFormat::Anthropic),
         "openai" | "openaicompatible" => Some(ApiFormat::OpenAI),
+        "responses" | "openairesponses" => Some(ApiFormat::Responses),
+        "gemini" | "google" | "googleai" => Some(ApiFormat::Gemini),
         _ => None,
     }
 }
