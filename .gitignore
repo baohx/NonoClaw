@@ -62,3 +62,13 @@ release/
 .mcp.json
 opencode.jsonc
 abc.pdf
+
+# Agent memory (canonical path is .nonoclaw/memory; top-level was stray writes)
+memory/
+
+# Benchmark artifacts (terminal-bench) — adapter code stays, outputs excluded
+bench/**/__pycache__/
+bench/terminal-bench/runs/
+bench/terminal-bench/smoke_work/
+bench/terminal-bench/bin/
+bench/terminal-bench/scripts/
