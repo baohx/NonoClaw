@@ -1,0 +1,53 @@
+# electron-builder config — kept out of package.json because the frontend
+# package is also consumed by Vite, and "type": "module" + builder config
+# interplay is cleaner as a standalone file.
+#
+# Packaging model: this ships the SPA (dist/) + desktop main/preload. The
+# nonoclaw binary is attached via extraResources from the repo release
+# build — run `cargo build --release -p nonoclaw` before `desktop:dist`.
+
+appId: dev.nono.claw
+productName: NonoClaw
+directories:
+  output: desktop/release
+  buildResources: desktop/build
+
+files:
+  - dist/**/*
+  - desktop/main.cjs
+  - desktop/preload.cjs
+
+extraResources:
+  # nonoclaw binary → resources/nonoclaw/bin/
+  # Staged here by rust/install.sh (works for both dev release-fast and
+  # release profiles; rust/install.sh copies the freshly built binary in).
+  - from: desktop/bin
+    to: nonoclaw/bin
+    filter:
+      # Linux/macOS build stages `nonoclaw`; Windows cross-build stages
+      # `nonoclaw.exe` — include whichever is present at pack time.
+      - nonoclaw
+      - nonoclaw.exe
+  # SPA bundle → resources/nonoclaw/frontend/dist/
+  # (main.cjs sets server cwd to resources/nonoclaw so static_service's
+  #  first candidate cwd/frontend/dist resolves)
+  - from: dist/
+    to: nonoclaw/frontend/dist
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  artifactName: nonoclaw-desktop-${version}-${arch}.${ext}
+
+mac:
+  target:
+    - dmg
+  category: public.app-category.developer-tools
+  artifactName: nonoclaw-desktop-${version}-${arch}.${ext}
+
+win:
+  target:
+    - nsis
+  artifactName: nonoclaw-desktop-${version}-${arch}.${ext}

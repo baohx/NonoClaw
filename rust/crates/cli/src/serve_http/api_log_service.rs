@@ -78,7 +78,7 @@ pub struct ContentQuery {
 }
 
 fn logs_dir(state: &Arc<AppState>) -> PathBuf {
-    state.cwd.join(".nonoclaw/logs/api")
+    state.cwd().join(".nonoclaw/logs/api")
 }
 
 /// Classify a log file's kind from its filename.

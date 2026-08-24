@@ -956,8 +956,8 @@ pub fn session_path(cwd: &Path, id: &str) -> Option<PathBuf> {
 
 fn sanitize_cwd(cwd: &Path) -> String {
     cwd.to_string_lossy()
-        .trim_start_matches('/')
-        .replace('/', "-")
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\', ':'], "-")
 }
 
 pub fn new_session_id() -> String {

@@ -117,7 +117,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
     *state.last_activity.lock().await = std::time::SystemTime::now();
     // Resolve or create a session.
     let session_handle = if let Some(ref id) = req.session_id {
-        match resume_session(&state.session_service, &state.cwd, id) {
+        match resume_session(&state.session_service, &state.cwd(), id) {
             Ok(handle) => handle,
             Err(e) => {
                 return super::http_error::error_response(
@@ -132,7 +132,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             }
         }
     } else {
-        match create_new_session(&state.session_service, &state.cwd, &state.config) {
+        match create_new_session(&state.session_service, &state.cwd(), &state.config) {
             Some(handle) => handle,
             None => {
                 return super::http_error::error_response(
@@ -268,7 +268,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
         session_snapshot,
     );
 
-    let controller = RunController::for_engine(&engine, state.cwd.clone());
+    let controller = RunController::for_engine(&engine, state.cwd());
 
     // Channel for streaming events back to the HTTP response.
     let (event_tx, event_rx) = mpsc::unbounded_channel::<RunStreamItem>();

@@ -33,7 +33,9 @@ const FILE_TREE_MAX_ENTRIES: usize = 10_000;
 /// concurrent git/config/skills scans without holding registry or WebSocket
 /// locks across disk or Git awaits.
 pub(super) struct ProjectService {
-    cwd: PathBuf,
+    /// Current project cwd. Shared with AppState so SwitchProject updates
+    /// both atomically; readers clone via `cwd()`.
+    cwd: Arc<RwLock<PathBuf>>,
     registry: Arc<ToolRegistry>,
     config: Arc<ResolvedConfig>,
     public_url: Option<String>,
@@ -45,7 +47,7 @@ pub(super) struct ProjectService {
 
 impl ProjectService {
     pub(super) fn new(
-        cwd: PathBuf,
+        cwd: Arc<RwLock<PathBuf>>,
         registry: Arc<ToolRegistry>,
         config: Arc<ResolvedConfig>,
         public_url: Option<String>,
@@ -63,8 +65,12 @@ impl ProjectService {
         }
     }
 
+    pub(super) fn cwd(&self) -> PathBuf {
+        self.cwd.read().unwrap().clone()
+    }
+
     pub(super) fn file_tree(&self) -> Vec<FileEntry> {
-        build_file_tree(&self.cwd)
+        build_file_tree(&self.cwd())
     }
 
     pub(super) async fn snapshot(&self, model: &str) -> ProjectInfo {
@@ -82,7 +88,7 @@ impl ProjectService {
             .system_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let _refresh = self.refresh_gate.lock().await;
-        self.skills_manager.write().unwrap().rescan(&self.cwd);
+        self.skills_manager.write().unwrap().rescan(&self.cwd());
         let config = self.config.reload();
         config.log_diagnostics();
         let balances = self.fetch_balances(&config).await;
@@ -148,7 +154,7 @@ impl ProjectService {
             )
         };
         gather(
-            &self.cwd,
+            &self.cwd(),
             model,
             &self.registry,
             config,
@@ -163,11 +169,11 @@ impl ProjectService {
     }
 
     pub(super) async fn git_show(&self, sha: &str) -> Option<String> {
-        crate::project_info::git_show(&self.cwd, sha).await
+        crate::project_info::git_show(&self.cwd(), sha).await
     }
 
     pub(super) fn open(&self, relative: &str, force_code: bool) -> std::io::Result<()> {
-        let roots = open_roots(&self.cwd);
+        let roots = open_roots(&self.cwd());
         let full = resolve_within(&roots, relative).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

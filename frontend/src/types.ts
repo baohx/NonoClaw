@@ -618,6 +618,11 @@ export interface FileTreeRequest {
   type: "file_tree";
 }
 
+export interface SwitchProjectRequest {
+  type: "switch_project";
+  path: string;
+}
+
 export interface OpenFileRequest {
   type: "open_file";
   path: string;
@@ -639,6 +644,7 @@ export type ClientMsg =
   | QuestionAnswer
   | FileTreeRequest
   | OpenFileRequest
+  | SwitchProjectRequest
   | ProjectInfoRefreshRequest
   | GitShowRequest
   | SessionPromptsRequest

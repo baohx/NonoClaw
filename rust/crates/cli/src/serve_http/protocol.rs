@@ -73,6 +73,13 @@ pub(super) enum ClientMsg {
     SetModel {
         name: String,
     },
+    /// Switch the working directory to another project. Server rebinds the
+    /// cwd-derived state (file tree, ProjectInfo, sessions), then auto-resumes
+    /// the most recent non-dream session of the new project (or creates a
+    /// fresh one).
+    SwitchProject {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,6 +735,7 @@ mod tests {
             ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
+            ClientMsg::SwitchProject { .. } => "switch_project",
         }
     }
 

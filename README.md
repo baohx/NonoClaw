@@ -1,8 +1,8 @@
 # NonoClaw [English/中文]
 
-A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
+A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, an **Electron desktop app** (Linux / Windows), and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.22.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, **high-fidelity DOCX/PDF export**, **AutoDream background memory consolidation**, and **adversarial verification agents**.
+> **Version**: v0.23.0 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, **high-fidelity DOCX/PDF export**, **AutoDream background memory consolidation**, and **adversarial verification agents**.
 
 ---
 
@@ -14,6 +14,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Cross-Session Memory (Mneme)](#cross-session-memory-mneme)
 - [Permission Modes](#permission-modes)
 - [Web UI](#web-ui)
+- [Desktop app (Electron)](#desktop-app-electron-v023)
 - [Mobile & Remote Access](#mobile--remote-access)
 - [Skills & Plugins](#skills--plugins)
 - [Agent Profiles](#agent-profiles)
@@ -63,6 +64,28 @@ XDG_DATA_HOME="$HOME/.local/share" bash install.sh
 # Windows (separate installer; behavior may differ from install.sh):
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
+
+### Desktop app (Electron, v0.23+)
+
+`install.sh` optionally builds a bundled desktop application on top of the same
+`nonoclaw` backend:
+
+```bash
+bash install.sh --electron          # Linux desktop shell (~/.local/bin/nonoclaw-desktop)
+bash install.sh --win               # additionally cross-compile a Windows NSIS installer
+                                    # (requires mingw-w64 + wine for rcedit; exe lands in
+                                    #  frontend/desktop/release/)
+bash install.sh --no-electron       # CLI + Web UI only
+```
+
+Default working directories for the packaged desktop app:
+
+- **Linux**: `~/NonoClaw` (created on first launch)
+- **Windows**: the user's home directory (`C:\Users\&lt;name&gt;`)
+
+Sessions are scoped per working directory (same rule as the CLI/Web UI), so the
+desktop app always opens the session list belonging to its default working
+directory. Passing `--project <dir>` overrides it.
 
 The installer copies the release binary rather than symlinking the Cargo target, stages it in the destination directory for atomic replacement, and verifies both the installed executable and installed `frontend/dist/index.html`. Re-running it safely replaces the previous installation. `NONOCLAW_HOME` controls runtime settings/sessions (default `~/.nonoclaw`); it is separate from the installed Web asset directory.
 
@@ -751,6 +774,17 @@ NonoClaw 从多个文件加载项目上下文，在 system prompt 中以 `<proje
 
 ## Configuration (settings.json)
 
+A committed, minimal, ready-to-copy example lives at **[`settings.min.json`](settings.min.json)**
+in the repository root: DeepSeek model trio, STT (`elevenlabsApiKey`), OCR
+(`docModel`), Brave/Firecrawl keys, a few MCP servers, and provider billing —
+with every secret replaced by `RANDOM_*_REPLACE_ME` placeholders. Copy it to
+`~/.nonoclaw/settings.json` on a new machine, fill in real keys, and go:
+
+```bash
+cp settings.min.json ~/.nonoclaw/settings.json
+# edit: replace RANDOM_*_REPLACE_ME with real keys
+```
+
 Full example at `~/.nonoclaw/settings.json`:
 
 ```json
@@ -1037,7 +1071,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.22.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**、**高保真 DOCX/PDF 导出**、**AutoDream 后台记忆整理**和**对抗性验证 agent**。
+> **版本**: v0.23.0 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**、**高保真 DOCX/PDF 导出**、**AutoDream 后台记忆整理**和**对抗性验证 agent**。
 
 ---
 

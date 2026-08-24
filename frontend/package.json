@@ -1,8 +1,9 @@
 {
   "name": "nonoclaw-frontend",
   "private": true,
-  "version": "0.22.0",
+  "version": "0.23.0",
   "type": "module",
+  "main": "desktop/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -11,7 +12,10 @@
     "test:websocket": "node --experimental-strip-types --loader ./src/ts-extension-loader.mjs src/websocket.test.ts",
     "test:security": "node --experimental-strip-types src/security.test.ts",
     "test:export": "node --experimental-strip-types src/export.test.ts",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "desktop": "electron .",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder"
   },
   "dependencies": {
     "@codemirror/lang-markdown": "^6.3.1",
@@ -37,7 +41,12 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "typescript": "~5.6.2",
     "vite": "^6.0.0"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
   }
 }

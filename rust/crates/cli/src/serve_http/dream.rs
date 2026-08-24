@@ -223,7 +223,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
         return;
     }
 
-    let cwd = state.cwd.clone();
+    let cwd = state.cwd();
     tokio::spawn(async move {
         let mut dream = DreamState::default();
         // Startup grace period: never dream in the first interval.
@@ -329,7 +329,7 @@ async fn run_dream(state: Arc<AppState>) -> bool {
             .join("projects")
             .join(
                 state
-                    .cwd
+                    .cwd()
                     .to_string_lossy()
                     .trim_start_matches('/')
                     .replace('/', "-"),

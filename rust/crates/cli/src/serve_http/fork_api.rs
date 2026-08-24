@@ -52,7 +52,7 @@ pub async fn fork_session(
     }
     let Json(req) = body.unwrap_or(Json(ForkRequest { at_index: None, title: None }));
 
-    let cwd = state.cwd.clone();
+    let cwd = state.cwd();
     let service = state.session_service.clone();
 
     // Load source snapshot.

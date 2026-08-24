@@ -9,6 +9,9 @@ Cargo.lock.bak
 # Node / Frontend
 frontend/node_modules/
 frontend/dist/
+frontend/desktop/release/
+frontend/desktop/build/
+frontend/desktop/bin/
 frontend/*.tsbuildinfo
 
 # OS
@@ -67,8 +70,4 @@ abc.pdf
 memory/
 
 # Benchmark artifacts (terminal-bench) — adapter code stays, outputs excluded
-bench/**/__pycache__/
-bench/terminal-bench/runs/
-bench/terminal-bench/smoke_work/
-bench/terminal-bench/bin/
-bench/terminal-bench/scripts/
+bench/

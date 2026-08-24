@@ -12,7 +12,6 @@ import GitPane from "./components/GitPane";
 import InsightRail from "./components/InsightRail";
 import InputBox from "./components/InputBox";
 import PermissionDialog from "./components/PermissionDialog";
-import Pet from "./components/Pet";
 import QrDialog from "./components/QrDialog";
 import QuestionDialog from "./components/QuestionDialog";
 import SessionPicker from "./components/SessionPicker";
@@ -368,7 +367,6 @@ export default function App() {
   return (
     <>
       <BreathField />
-      <Pet />
       <div className="aurora-grain" />
       <div className="aurora-noise" />
 
@@ -394,6 +392,7 @@ export default function App() {
                 entries={fileTree}
                 onOpen={handleOpenFile}
                 onRefresh={() => send({ type: "file_tree" })}
+                onSwitchProject={(path) => send({ type: "switch_project", path })}
                 collapsed={!railSections.files}
                 onToggleCollapsed={() => toggleRailSection("files")}
               />

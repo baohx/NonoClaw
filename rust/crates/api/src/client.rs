@@ -1480,6 +1480,23 @@ fn handle_openai_chunk(
     };
     for choice in choices {
         if let Some(reason) = choice.get("finish_reason").and_then(|value| value.as_str()) {
+            // opencode zen (x-preview-f/ox-alpha) signals upstream network failure
+            // as a well-formed SSE frame with finish_reason "network_error" instead
+            // of an HTTP error or dropped connection. Mapping it to StopReason::Other
+            // would make the engine treat the turn as *normally* finished with an
+            // empty response (no retry), silently discarding the whole run.
+            if reason == "network_error" {
+                return Err(StreamFailure {
+                    error: ProviderError::stream(
+                        format!(
+                            "provider stream ended with finish_reason=network_error (model={})",
+                            state.model
+                        ),
+                        true,
+                    ),
+                    partial: state.partial(),
+                });
+            }
             let reason = openai_stop_reason(reason);
             state.stop_reason = Some(reason.clone());
             on_event(&StreamEvent::MessageDelta {
@@ -3386,6 +3403,32 @@ mod tests {
             .filter(|event| matches!(event, StreamEvent::ToolUseInputDelta { .. }))
             .count();
         assert_eq!(argument_deltas, 2);
+    }
+
+    #[test]
+    fn openai_finish_reason_network_error_is_retryable_stream_failure() {
+        // Regression (2026-08-23, live capture from opencode zen x-preview-f-free):
+        // the gateway reports upstream network failure as a well-formed SSE frame
+        // with finish_reason "network_error" followed by [DONE]. It must surface
+        // as a retryable StreamFailure, NOT a normal end-of-turn — otherwise the
+        // engine treats the empty response as a final answer and discards the run.
+        let frame = serde_json::json!({
+            "id": "20260823120651473fa56d928d44ac",
+            "model": "x-preview-f-free",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "network_error",
+                "delta": { "role": "assistant", "content": "" }
+            }]
+        });
+        let mut state = OpenAiState::default();
+        let mut events = Vec::new();
+        let result = handle_openai_chunk(&frame, &mut state, &mut |e| events.push(e.clone()));
+        let failure = result.expect_err("network_error must fail the stream");
+        // StreamFailure → core Error must classify as retryable so the engine's
+        // retry loop (6 attempts, 90s budget) gets a chance to recover.
+        let core_error = failure.into_core();
+        assert!(core_error.is_retryable(), "got: {core_error:?}");
     }
 
     #[test]

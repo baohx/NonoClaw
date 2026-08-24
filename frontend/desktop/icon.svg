@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- NonoClaw desktop icon: cat paw on dark rounded tile -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23272e"/>
+      <stop offset="1" stop-color="#14171c"/>
+    </linearGradient>
+    <linearGradient id="paw" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb454"/>
+      <stop offset="1" stop-color="#e8913a"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#tile)" stroke="#3a414d" stroke-width="2"/>
+  <!-- main pad -->
+  <path d="M64 78c-12 0-24 6-28 14-3 7 1 14 8 16 6 2 13-1 20-1s14 3 20 1c7-2 11-9 8-16-4-8-16-14-28-14z" fill="url(#paw)"/>
+  <!-- toe beans -->
+  <ellipse cx="38" cy="58" rx="10" ry="13" transform="rotate(-18 38 58)" fill="url(#paw)"/>
+  <ellipse cx="90" cy="58" rx="10" ry="13" transform="rotate(18 90 58)" fill="url(#paw)"/>
+  <ellipse cx="52" cy="42" rx="10" ry="13" transform="rotate(-8 52 42)" fill="url(#paw)"/>
+  <ellipse cx="76" cy="42" rx="10" ry="13" transform="rotate(8 76 42)" fill="url(#paw)"/>
+  <!-- claw glints -->
+  <circle cx="35" cy="53" r="2.4" fill="#ffd9a0" opacity="0.85"/>
+  <circle cx="49" cy="37" r="2.4" fill="#ffd9a0" opacity="0.85"/>
+</svg>

@@ -55,7 +55,7 @@ pub(super) async fn download_handler(
         DEFAULT_BUFFER_BYTES,
     )
     .clamp(1, MAX_BUFFER_BYTES);
-    let path = match confined_regular_file(&state.cwd, requested_path).await {
+    let path = match confined_regular_file(&state.cwd(), requested_path).await {
         Ok(path) => path,
         Err(response) => return response,
     };

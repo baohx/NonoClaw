@@ -10,6 +10,7 @@ interface Props {
   onRefresh: () => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  onSwitchProject: (path: string) => void;
 }
 
 /** Basename of the cwd — shown as the tree root label. */
@@ -48,9 +49,11 @@ function fileGlyph(name: string): string {
   }
 }
 
-export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, onToggleCollapsed }: Props) {
+export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, onToggleCollapsed, onSwitchProject }: Props) {
   // ALL directories collapsed by default — user expands what they need.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>());
+  const [switcher, setSwitcher] = useState(false);
+  const [switchPath, setSwitchPath] = useState("");
   const [menu, setMenu] = useState<{ entry: FileEntry; x: number; y: number } | null>(null);
   const menuOrigin = useRef<HTMLButtonElement | null>(null);
 
@@ -172,6 +175,13 @@ export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, 
           {rootLabel(root)}
         </button>
         <span className="filetree__actions">
+          <button
+            className="iconbtn"
+            title="Switch working directory"
+            onClick={() => setSwitcher((v) => !v)}
+          >
+            ⇄
+          </button>
           <button className="iconbtn" title="Collapse all" onClick={collapseAll}>
             ⇲
           </button>
@@ -180,6 +190,38 @@ export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, 
           </button>
         </span>
       </div>
+
+      {switcher && (
+        <div className="filetree__switcher">
+          <input
+            autoFocus
+            value={switchPath}
+            placeholder="绝对路径，如 /home/me/project 或 C:\project"
+            onChange={(e) => setSwitchPath(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && switchPath.trim()) {
+                onSwitchProject(switchPath.trim());
+                setSwitchPath("");
+                setSwitcher(false);
+              }
+              if (e.key === "Escape") setSwitcher(false);
+            }}
+          />
+          <button
+            className="filetree__switcher__go"
+            disabled={!switchPath.trim()}
+            onClick={() => {
+              if (switchPath.trim()) {
+                onSwitchProject(switchPath.trim());
+                setSwitchPath("");
+                setSwitcher(false);
+              }
+            }}
+          >
+            Switch
+          </button>
+        </div>
+      )}
 
       {!collapsed && (
       <div className="filetree__list">

@@ -70,7 +70,9 @@ fn safe_provider_failure_message(reason: &str, status: Option<u16>) -> String {
 pub(super) struct AppState {
     pub(super) registry: Arc<ToolRegistry>,
     pub(super) todos: Arc<TodoStore>,
-    pub(super) cwd: PathBuf,
+    /// Current working directory. Mutable at runtime via SwitchProject
+    /// (FileTree cwd switcher); readers must clone via `cwd()`.
+    pub(super) cwd: Arc<RwLock<PathBuf>>,
     /// Canonical immutable configuration snapshot shared by all Web paths.
     pub(super) config: Arc<ResolvedConfig>,
     /// Auth token for remote (QR-code) mobile access.
@@ -110,6 +112,11 @@ pub(super) struct AppState {
 }
 
 impl AppState {
+    /// Current project cwd (clone of the shared value).
+    pub(super) fn cwd(&self) -> PathBuf {
+        self.cwd.read().unwrap().clone()
+    }
+
     pub(super) fn authorized(&self, supplied_token: Option<&str>) -> bool {
         token_is_authorized(self.require_auth, &self.auth_token, supplied_token)
     }
@@ -120,7 +127,7 @@ impl AppState {
 
     /// Path for persisting pending permission metadata across restarts.
     fn pending_permissions_path(&self) -> Option<std::path::PathBuf> {
-        nonoclaw_engine::session::project_dir(&self.cwd)
+        nonoclaw_engine::session::project_dir(&self.cwd())
             .map(|d| d.join("pending_permissions.json"))
     }
 
@@ -196,8 +203,9 @@ pub(super) fn upload_exploration_state(
     let (registry, todos) = nonoclaw_tools::register_all();
     let registry = Arc::new(registry);
     let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
+    let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
     let project_service = Arc::new(ProjectService::new(
-        cwd.clone(),
+        Arc::clone(&shared_cwd),
         Arc::clone(&registry),
         Arc::clone(&config),
         None,
@@ -206,7 +214,7 @@ pub(super) fn upload_exploration_state(
     Arc::new(AppState {
         registry,
         todos,
-        cwd,
+        cwd: std::sync::Arc::new(std::sync::RwLock::new(cwd.clone())),
         config: Arc::clone(&config),
         auth_token: "exploration-token".into(),
         require_auth: false,
@@ -289,7 +297,7 @@ fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) ->
 fn list_sessions_wire(state: &AppState) -> Vec<SessionInfoWire> {
     state
         .session_service
-        .list_sessions(&state.cwd)
+        .list_sessions(&state.cwd())
         .unwrap_or_default()
         .into_iter()
         .map(|s| SessionInfoWire {
@@ -367,8 +375,9 @@ pub async fn serve(
     }
 
     let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
+    let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
     let project_service = Arc::new(ProjectService::new(
-        cwd.clone(),
+        Arc::clone(&shared_cwd),
         Arc::clone(&registry),
         Arc::clone(&config),
         public_url.clone(),
@@ -380,7 +389,7 @@ pub async fn serve(
         active_model: Arc::new(Mutex::new(active_model)),
         registry,
         todos,
-        cwd: cwd.clone(),
+        cwd: shared_cwd,
         auth_token,
         require_auth,
         public_url,
@@ -564,7 +573,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     let mut shared_sid = session_id.clone().or_else(|| {
         state
             .session_service
-            .most_recent_session(&state.cwd)
+            .most_recent_session(&state.cwd())
             .ok()
             .flatten()
     });
@@ -573,7 +582,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     if let Some(ref sid) = shared_sid {
         state
             .session_hub
-            .register_existing(&state.session_service, &state.cwd, sid, &tx)
+            .register_existing(&state.session_service, &state.cwd(), sid, &tx)
             .await;
     }
 
@@ -601,7 +610,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         // peer (e.g. mobile) sees the same conversation. Otherwise, fresh.
         let existing = session.lock().await.clone();
         let Some(handle) = existing
-            .or_else(|| create_new_session(&state.session_service, &state.cwd, &state.config))
+            .or_else(|| create_new_session(&state.session_service, &state.cwd(), &state.config))
         else {
             send_msg(
                 &tx,
@@ -673,7 +682,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         send_msg(
             &tx,
             ServerMsg::FileTree {
-                root: nonoclaw_core::display_path(&state.cwd),
+                root: nonoclaw_core::display_path(&state.cwd()),
                 entries: state.project_service.file_tree(),
             },
         )
@@ -736,7 +745,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         match parsed {
             // ── New / Resume session ────────────────────────────────────────
             ClientMsg::NewSession => {
-                let h = create_new_session(&state.session_service, &state.cwd, &state.config);
+                let h = create_new_session(&state.session_service, &state.cwd(), &state.config);
                 match h {
                     Some(h) => {
                         let sid = h.session.id().to_string();
@@ -815,7 +824,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 }
             }
             ClientMsg::ResumeSession { id } => {
-                match resume_session(&state.session_service, &state.cwd, &id) {
+                match resume_session(&state.session_service, &state.cwd(), &id) {
                     Ok(handle) => match handle.session.snapshot().await {
                         Ok(snapshot) => {
                             let sid = handle.session.id().to_string();
@@ -900,7 +909,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 send_msg(
                     &tx,
                     ServerMsg::FileTree {
-                        root: nonoclaw_core::display_path(&state.cwd),
+                        root: nonoclaw_core::display_path(&state.cwd()),
                         entries: state.project_service.file_tree(),
                     },
                 )
@@ -952,7 +961,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             ClientMsg::SessionPrompts { session_id } => {
                 const PROMPT_PREVIEW_CHARS: usize = 40;
                 let prompts = super::protocol::session_run_prompts(
-                    &state.cwd,
+                    &state.cwd(),
                     &session_id,
                     PROMPT_PREVIEW_CHARS,
                 );
@@ -1160,7 +1169,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         );
                         let controller = RunController::new(RunContext::new(
                             session_for_run.id(),
-                            s.cwd.clone(),
+                            s.cwd(),
                             model_used.clone(),
                             fork_limits,
                         ));
@@ -1363,7 +1372,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         include_attachment_images,
                         attachment_max_chars,
                     );
-                    let controller = RunController::for_engine(&engine, s.cwd.clone());
+                    let controller = RunController::for_engine(&engine, s.cwd());
                     *active_for_run.lock().await = Some(controller.clone());
 
                     tracing::debug!(
@@ -1481,7 +1490,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             // Incrementally refresh the session vector index
                             // (fingerprints make unchanged files a no-op).
                             {
-                                let cwd = s.cwd.clone();
+                                let cwd = s.cwd();
                                 tokio::task::spawn_blocking(move || {
                                     let root = nonoclaw_engine::session::home_root();
                                     let Some(dir) = root.map(|r| {
@@ -1687,6 +1696,150 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 } else {
                     tracing::warn!("unknown model requested — ignored");
                 }
+            }
+
+            // ── Switch project working directory ──────────────────────
+            ClientMsg::SwitchProject { path } => {
+                // Reject while a run is active: the engine holds a session
+                // handle and cwd snapshot for the current run; rebinding
+                // underneath it would corrupt tool execution and persistence.
+                if active_controller.lock().await.is_some() {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            "cannot switch project while a run is active",
+                            false,
+                            "switch_project",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                // Accept both slash styles: a Windows-style input like
+                // `C:\proj` must parse on any host, and a POSIX-style input
+                // (`/home/me/x`) works natively on Unix.
+                let raw = if path.len() > 1 && path[1..2].eq_ignore_ascii_case(":") {
+                    std::path::PathBuf::from(path.replace('/', r"\")) // drive-letter → Windows form
+                } else {
+                    std::path::PathBuf::from(&path)
+                };
+                let joined = if raw.is_absolute() { raw } else { state.cwd().join(raw) };
+                let Some(resolved) = joined.canonicalize().ok().filter(|p| p.is_dir()) else {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            "project path is not a directory",
+                            false,
+                            "switch_project",
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                if false {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            "project path is not a directory",
+                            false,
+                            "switch_project",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                *state.cwd.write().unwrap() = resolved.clone();
+                tracing::info!(dir = %resolved.display(), "project switched");
+
+                // Skills are cwd-derived; rescan against the new root.
+                state
+                    .skills_manager
+                    .write()
+                    .unwrap()
+                    .rescan(&resolved);
+
+                // Replace the chat session: auto-resume the most recent
+                // non-dream session of the new project, else create fresh.
+                let current_model = state.active_model.lock().await.clone();
+                let new_handle = state
+                    .session_service
+                    .most_recent_session(&resolved)
+                    .ok()
+                    .flatten()
+                    .and_then(|sid| resume_session(&state.session_service, &resolved, &sid).ok())
+                    .or_else(|| create_new_session(&state.session_service, &resolved, &state.config));
+                let Some(handle) = new_handle else {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            "cannot open a session for the new project",
+                            false,
+                            "switch_project",
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                let sid = handle.session.id().to_string();
+                state
+                    .session_hub
+                    .move_registration(shared_sid.as_deref(), &handle, &tx)
+                    .await;
+                shared_sid = Some(sid.clone());
+                *session.lock().await = Some(handle);
+                if let Ok(snapshot) = session.lock().await.as_ref().unwrap().session.snapshot().await {
+                    send_msg(
+                        &tx,
+                        messages_loaded(
+                            &sid,
+                            snapshot,
+                            state.session_hub.cumulative_usage_json(&sid).await,
+                        ),
+                    )
+                    .await;
+                }
+
+                send_msg(
+                    &tx,
+                    ServerMsg::Info {
+                        model: current_model.clone(),
+                        auth_token: state.auth_token.clone(),
+                        available_models: state
+                            .config
+                            .all_models()
+                            .iter()
+                            .filter(|p| p.is_conversation_model())
+                            .map(|p| ModelInfo {
+                                name: p.name.clone(),
+                                label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                                context_window: p.context_window,
+                            })
+                            .collect(),
+                        session_id: sid,
+                    },
+                )
+                .await;
+                send_msg(
+                    &tx,
+                    ServerMsg::FileTree {
+                        root: nonoclaw_core::display_path(&state.cwd()),
+                        entries: state.project_service.file_tree(),
+                    },
+                )
+                .await;
+                send_msg(
+                    &tx,
+                    ServerMsg::SessionList {
+                        sessions: list_sessions_wire(&state),
+                    },
+                )
+                .await;
+                let info = state.project_service.snapshot(&current_model).await;
+                send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
             }
 
             // ── Clear (in-memory only; on-disk transcript is the archive) ───
@@ -2080,6 +2233,7 @@ mod characterization_tests {
             ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
+            ClientMsg::SwitchProject { .. } => "switch_project",
         }
     }
 

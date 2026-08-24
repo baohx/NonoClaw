@@ -116,6 +116,8 @@ function outboundKey(message: ClientMsg): string {
       return `${message.type}:${message.mode}`;
     case "set_model":
       return `${message.type}:${message.name}`;
+    case "switch_project":
+      return `${message.type}:${message.path}`;
     case "run":
       return `${message.type}:${JSON.stringify(message)}`;
   }
