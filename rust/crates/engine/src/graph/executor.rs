@@ -103,6 +103,65 @@ fn clear_checkpoint(cwd: &Path, name: &str) {
     let _ = std::fs::remove_file(checkpoint_path(cwd, name));
 }
 
+/// Write `.nonoclaw/plans/<graph>-<timestamp>.md`: a durable planning
+/// artifact with the AutoGenesis plan.md five-section shape (objective,
+/// steps, execution history, results, open items). Soft-fail.
+fn write_plan_artifact(
+    cwd: &Path,
+    def: &GraphDefinition,
+    completed: &[String],
+    nodes_run: &[String],
+    aborted: bool,
+    state: &BTreeMap<String, Value>,
+) {
+    let dir = cwd.join(".nonoclaw/plans");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut md = String::new();
+    md.push_str(&format!("# Plan: graph `{}`\n\n", def.name));
+    md.push_str("## Objective\n\nDeclared nodes of this run.\n\n## Steps\n\n");
+    for id in def.nodes.keys() {
+        let mark = if completed.contains(id) {
+            "[x]"
+        } else if aborted {
+            "[ ]"
+        } else {
+            "[ ]"
+        };
+        md.push_str(&format!("- {mark} {id}\n"));
+    }
+    md.push_str("\n## Execution History\n\n");
+    for id in nodes_run {
+        md.push_str(&format!("- {id}\n"));
+    }
+    md.push_str("\n## Results\n\n");
+    for id in nodes_run {
+        if let Some(out) = state.get(id).and_then(Value::as_str) {
+            let snippet: String = out.chars().take(400).collect();
+            md.push_str(&format!("### {id}\n{snippet}\n\n"));
+        }
+    }
+    let open: Vec<&String> = def
+        .nodes
+        .keys()
+        .filter(|id| !completed.contains(id))
+        .collect();
+    md.push_str("## Open Items\n\n");
+    if open.is_empty() {
+        md.push_str("(none — all nodes completed)\n");
+    } else {
+        for id in open {
+            md.push_str(&format!("- {id} not completed{}\n", if aborted { " (aborted by human gate)" } else { "" }));
+        }
+    }
+    let _ = std::fs::write(dir.join(format!("{}-{ts}.md", def.name)), md);
+}
+
 /// Execute a graph to completion (or until the step budget / a gate abort).
 pub async fn run_graph(
     def: &GraphDefinition,
@@ -292,6 +351,11 @@ pub async fn run_graph(
         summary
     };
 
+    // --- Plan artifact (AutoGenesis plan.md borrow) ---
+    // Persist a human/agent-readable planning artifact so global intent
+    // survives session resume / compaction and is inspectable on disk.
+    write_plan_artifact(opts.cwd, def, &completed, &nodes_run, aborted, &state);
+
     if reached_end || aborted || steps >= max_steps {
         // A completed run (or one that hit a terminal state) should not leave
         // a stale checkpoint that a later resume would wrongly skip. End nodes
@@ -307,8 +371,7 @@ pub async fn run_graph(
         nodes_run,
         nodes_completed: completed,
         resumed,
-        aborted,
-    })
+        aborted,    })
 }
 
 /// Run one node: agent (subagent), router (subagent picks a branch), or gate

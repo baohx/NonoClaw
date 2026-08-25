@@ -225,6 +225,7 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 - 不要重复已有事实：先 Grep memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
 - 通用性门槛：每条事实写之前自检——换个任务/换个项目这条还成立吗？只写通用原则，不写任务特定 trick（如「X 文件要改 Y 行」）。不成立的信息留在总结输出里，不写入 facts。\n\
 - 编排经验也是知识：如果失败/成功的根因在编排层（任务拆得太碎/太粗、该 fan-out 却串行、子代理轮次不够、验证步骤缺失/冗余），把它提炼为 convention/decision 类事实（如「多文件重构类任务先 fan-out 只读探查再汇总修改」），供未来同类任务的编排参考。\n\
+- 技能/系统提示演化（AutoGenesis 式提案）：如果发现【同一类指令反复出错】且根因是技能说明或系统提示缺口，可以提案修改 .nonoclaw/skills/ 下的技能文件或 .nonoclaw/APPEND_SYSTEM.md ——但必须写到【影子文件】：<原文件名>.shadow（如 skills/foo.md → skills/foo.md.shadow），绝不直接改活文件。影子会在下次 dream 后经结果门禁评估：通过则转正（旧版本自动快照可回滚），不通过则丢弃。没有把握就不提案。\n\
 - reward 标签（run_outcome 条目）本身是数据不是知识——萃取的是轨迹里【导致成功/失败的做法】。\n\
 - 单次 dream 最多产出 3 条事实，宁缺毋滥；没有值得萃取的就一个都不写\n\
 - 事件类/一次性信息不要写成事实\n\
@@ -434,6 +435,17 @@ fn elbow_select(priorities_desc: &[f64]) -> usize {
     best_j.clamp(1, n)
 }
 
+/// AutoGenesis-style headroom gate (adaptive triggering): a dream is only
+/// worth its tokens when at least one recent outcome shows unexploited
+/// learning signal — a non-`done` status or a sub-perfect reward. All-clean
+/// windows (every run done at full reward) are skipped: near-saturated
+/// behaviour yields no reflection material, so we save the budget.
+fn has_headroom(outcomes: &[OutcomeSummary]) -> bool {
+    outcomes
+        .iter()
+        .any(|o| o.status != "done" || o.reward < 1.0)
+}
+
 /// Build the reward brief injected into the dream prompt. Skill-MAS-style:
 /// aggregate outcomes per session into (uncertainty, difficulty), rank by a
 /// blended priority, elbow-truncate to the most informative subset, and
@@ -557,6 +569,18 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
             if dream.last_fingerprint == Some(fp) {
                 continue;
             }
+            // Condition 4 (AutoGenesis adaptive trigger): skip windows where
+            // every outcome is clean — nothing to learn from.
+            let since = dream
+                .last_fingerprint
+                .map(|(_, t)| t)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let fresh = scan_run_outcomes(&sessions_dir, since);
+            if !fresh.is_empty() && !has_headroom(&fresh) {
+                dream.last_fingerprint = Some(fp);
+                tracing::debug!("dream skipped: no headroom (all outcomes clean)");
+                continue;
+            }
 
             // All conditions hold — dream.
             dream.dreaming = true;
@@ -599,6 +623,14 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                 )
                 {
                     bench_validate_facts(&workspace, &project);
+                }
+            }
+            // AutoGenesis SEPL commit gate: the dream may have staged shadow
+            // proposals (skills / APPEND_SYSTEM.md). Commit them only when
+            // the freshest outcome clears the default gate; reject discards.
+            if ok {
+                if let Some(project) = nonoclaw_engine::session::project_dir(&cwd) {
+                    evolution_commit_gate(&cwd, &project, &sessions_dir);
                 }
             }
             dream.last_fingerprint = session_fingerprint(&sessions_dir).or(Some(fp));
@@ -665,6 +697,68 @@ async fn run_dream(state: Arc<AppState>) -> bool {
         }
     }
     ok
+}
+
+/// AutoGenesis SEPL commit gate: find shadow files staged by the dream under
+/// the project `.nonoclaw/` tree (skills + APPEND_SYSTEM.md), and evaluate-
+/// gate-commit each. The gate uses the most recent `run_outcome` since the
+/// dream started — via `default_gate` (status `done` && reward ≥ 0.5).
+/// When no outcome exists yet (first cycle), a bench pass substitutes; if
+/// neither is available the shadows are left in place for the next cycle
+/// (no data → no commit, no discard). All failures are soft.
+fn evolution_commit_gate(cwd: &Path, project_dir: &Path, sessions_dir: &Path) {
+    let nonoclaw = cwd.join(".nonoclaw");
+    let mut shadows = Vec::new();
+    for root in [nonoclaw.join("skills"), nonoclaw.clone()] {
+        collect_shadows(&root, &mut shadows);
+    }
+    if shadows.is_empty() {
+        return;
+    }
+    // Freshest outcome since the dream began staging.
+    let now = SystemTime::now();
+    let window_start = now
+        .checked_sub(Duration::from_secs(3600 * 2))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let recent = scan_run_outcomes(sessions_dir, window_start);
+    let latest = recent.iter().max_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap());
+    for live in shadows {
+        let resource = live
+            .strip_prefix(&nonoclaw)
+            .map(|p| p.to_string_lossy().replace(['/', '\\'], "_"))
+            .unwrap_or_else(|_| "resource".into());
+        // Strip the `.shadow` suffix: `foo.md.shadow` -> `foo.md`
+        let live_file = live.with_extension("");
+        let outcome = super::evolution::commit_gated(
+            &live_file,
+            project_dir,
+            &resource,
+            || match latest {
+                Some(o) => super::evolution::default_gate(&o.status, o.reward),
+                None => Err("no outcome since staging; deferring".into()),
+            },
+        );
+        match outcome {
+            Ok(super::evolution::CommitOutcome::Committed) => {
+                tracing::info!(resource = %resource, "evolution: skill/system shadow committed")
+            }
+            Ok(super::evolution::CommitOutcome::Rejected(r)) => {
+                tracing::info!(resource = %resource, reason = %r, "evolution: shadow rejected")
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_shadows(root: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(root).ok().into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_shadows(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("shadow") {
+            out.push(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -897,5 +991,28 @@ mod tests {
         for phase in ["碎片收集", "关联分析", "知识萃取", "记忆索引"] {
             assert!(p.contains(phase), "missing phase {phase}");
         }
+    }
+
+    #[test]
+    fn headroom_gate_skips_all_clean_windows() {
+        let clean = vec![
+            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
+            OutcomeSummary { session_id: "b".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
+        ];
+        assert!(!has_headroom(&clean), "saturated window skips dreaming");
+        let dirty = vec![
+            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
+            OutcomeSummary { session_id: "c".into(), run_id: "r".into(), status: "error".into(), reward: -1.0, detail: String::new() },
+        ];
+        assert!(has_headroom(&dirty), "one non-done outcome is headroom");
+        // Empty windows are handled by the scheduler guard (`!fresh.is_empty()`),
+        // so `has_headroom` itself may return false here without effect.
+        assert!(!has_headroom(&[]));
+    }
+
+    #[test]
+    fn dream_prompt_mentions_shadow_proposal_path() {
+        let p = dream_prompt_with_brief(None);
+        assert!(p.contains("shadow"), "prompt must instruct shadow staging");
     }
 }

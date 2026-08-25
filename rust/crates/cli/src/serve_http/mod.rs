@@ -7,6 +7,7 @@ mod api_log_service;
 mod connection;
 mod download_service;
 mod dream;
+mod evolution;
 mod fork_api;
 mod http_error;
 mod permission_api;

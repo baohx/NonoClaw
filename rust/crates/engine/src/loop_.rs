@@ -1360,6 +1360,11 @@ impl QueryEngine {
         let activated_tools = nonoclaw_tools::builtin::tool_search::activated_tools(&tool_scope);
         let mut visible_tools =
             selected_tool_names(&self.registry, &self.options, &user_text, &activated_tools);
+        // Static MCP contract (AutoGenesis borrow): refresh the disk-cached
+        // inventory only when registry content changed; hash-gated no-op.
+        if context.parent_run_id.is_none() {
+            crate::tool_selector::refresh_mcp_contract(cwd, &self.registry.search_entries());
+        }
         let priority =
             tool_payload_priority(&visible_tools, &self.options.core_tools, &activated_tools);
         let tool_schema_max_chars =

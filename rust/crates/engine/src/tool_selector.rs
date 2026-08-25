@@ -75,8 +75,7 @@ fn query_tokens(query: &str) -> Vec<String> {
 fn score_entry(tokens: &[String], entry: &ToolSearchEntry) -> i32 {
     let name = entry.name.to_lowercase();
     let description = entry.description.to_lowercase();
-    let hint = entry.search_hint.to_lowercase();
-    let mut score = 0;
+    let hint = entry.search_hint.to_lowercase();    let mut score = 0;
     for token in tokens {
         if name == *token {
             score += 100;
@@ -160,6 +159,87 @@ pub fn select_visible_tools(
     }
 
     visible
+}
+
+// ── Static MCP contract (AutoGenesis contract-generation borrow) ───────────
+//
+// The paper's context manager emits a static "skills.md-style contract" that
+// summarises each registered resource once, instead of re-deriving per-turn
+// descriptions. NonoClaw's equivalent: a merged one-line-per-MCP-tool
+// contract document, cached in `.nonoclaw/mcp-contract.md` keyed by a content
+// hash of the entry list. Regenerated only when the registry content hash
+// changes (server add/remove). The per-request keyword scoring above stays —
+// the contract is the stable, human/agent-readable inventory layer.
+
+fn entry_list_hash(entries: &[ToolSearchEntry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut mcp: Vec<&ToolSearchEntry> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("mcp__"))
+        .collect();
+    mcp.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in mcp {
+        e.name.hash(&mut hasher);
+        e.search_hint.hash(&mut hasher);
+        e.description.chars().take(200).collect::<String>().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Build the merged MCP contract document from the entry list.
+pub fn build_mcp_contract(entries: &[ToolSearchEntry]) -> String {
+    let mut mcp: Vec<&ToolSearchEntry> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("mcp__"))
+        .collect();
+    mcp.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::from("# MCP Tool Contract\n\n");
+    if mcp.is_empty() {
+        out.push_str("(no MCP servers registered)\n");
+        return out;
+    }
+    let mut current_server = String::new();
+    for e in mcp {
+        // name shape: mcp__<server>__<tool>
+        let server = e
+            .name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split("__").next())
+            .unwrap_or("unknown");
+        if server != current_server {
+            current_server = server.to_string();
+            out.push_str(&format!("\n## {server}\n\n"));
+        }
+        let hint = if e.search_hint.is_empty() {
+            e.description.chars().take(120).collect::<String>()
+        } else {
+            e.search_hint.clone()
+        };
+        out.push_str(&format!("- `{}` — {}\n", e.name, hint));
+    }
+    out
+}
+
+/// Write the contract to `<cwd>/.nonoclaw/mcp-contract.md` when the entry
+/// hash changed (content-hash invalidation, same pattern as the vector
+/// index). Soft-fail; returns true when the file was refreshed.
+pub fn refresh_mcp_contract(cwd: &std::path::Path, entries: &[ToolSearchEntry]) -> bool {
+    use std::sync::Mutex;
+    static LAST_HASH: std::sync::OnceLock<Mutex<u64>> = std::sync::OnceLock::new();
+    let hash = entry_list_hash(entries);
+    let cell = LAST_HASH.get_or_init(|| Mutex::new(0));
+    if let Ok(mut seen) = cell.lock() {
+        if *seen == hash {
+            return false;
+        }
+        *seen = hash;
+    }
+    let dir = cwd.join(".nonoclaw");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    std::fs::write(dir.join("mcp-contract.md"), build_mcp_contract(entries)).is_ok()
 }
 
 #[cfg(test)]
@@ -268,5 +348,37 @@ mod tests {
             &activated,
         );
         assert!(visible.contains("mcp__db__query"));
+    }
+
+
+
+    #[test]
+    fn mcp_contract_groups_by_server_and_lists_tools() {
+        let entries = vec![
+            entry("mcp__db__query", "run SQL query", "database"),
+            entry("mcp__db__migrate", "migrate schema", "database"),
+            entry("mcp__web__fetch", "fetch page", "web"),
+        ];
+        let c = build_mcp_contract(&entries);
+        assert!(c.contains("# MCP Tool Contract"));
+        assert!(c.contains("## db"));
+        assert!(c.contains("## web"));
+        assert!(c.find("mcp__db__query").unwrap() < c.find("mcp__web__fetch").unwrap());
+        let builtin = vec![entry("Read", "read a file", "file")];
+        assert!(build_mcp_contract(&builtin).contains("no MCP servers"));
+    }
+
+    #[test]
+    fn contract_refresh_is_hash_gated() {
+        let dir = std::env::temp_dir().join(format!("nc-ctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![entry("mcp__db__query", "query", "db")];
+        assert!(refresh_mcp_contract(&dir, &entries), "first call writes");
+        assert!(!refresh_mcp_contract(&dir, &entries), "same hash is no-op");
+        let changed = vec![entry("mcp__db__query", "query v2", "db"), entry("mcp__db__exec", "exec", "db")];
+        assert!(refresh_mcp_contract(&dir, &changed), "content change rewrites");
+        assert!(dir.join(".nonoclaw/mcp-contract.md").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
