@@ -57,11 +57,13 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 你正在执行 AutoDream 后台记忆整理（用户离线期间运行）。严格按四个阶段工作，全程只读 + 写记忆，不修改任何项目代码：\n\n\
 {brief}\
 1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。用 Bash `ls -t` 看最近改动的文件。\n\
-2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，对照同类任务的成功轨迹找差异（这类任务怎么做会失败）。\n\
+2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，做对比反思：检索同类任务的成功轨迹，高分 vs 低分逐段对照，定位第一个分歧点——是哪个编排决策（任务拆解方式、子代理/工具选择、步骤顺序）不同导致结果分岔。\n\
 3. 【知识萃取】只把【可复用、非显而易见】的知识提炼为结构化事实：类型选 preference/convention/decision/architecture/bug。写法遵循 memory/facts 的 YAML frontmatter 格式，importance 1-5。\n\
 4. 【记忆索引】用 Write 工具把每条事实写入 memory/facts/<slug>.md。\n\n\
 纪律：\\
 - 不要重复已有事实：先 Grep memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
+- 通用性门槛：每条事实写之前自检——换个任务/换个项目这条还成立吗？只写通用原则，不写任务特定 trick（如「X 文件要改 Y 行」）。不成立的信息留在总结输出里，不写入 facts。\n\
+- 编排经验也是知识：如果失败/成功的根因在编排层（任务拆得太碎/太粗、该 fan-out 却串行、子代理轮次不够、验证步骤缺失/冗余），把它提炼为 convention/decision 类事实（如「多文件重构类任务先 fan-out 只读探查再汇总修改」），供未来同类任务的编排参考。\n\
 - reward 标签（run_outcome 条目）本身是数据不是知识——萃取的是轨迹里【导致成功/失败的做法】。\n\
 - 单次 dream 最多产出 3 条事实，宁缺毋滥；没有值得萃取的就一个都不写\n\
 - 事件类/一次性信息不要写成事实\n\
@@ -161,8 +163,118 @@ fn scan_run_outcomes(
     out
 }
 
-/// Build the reward brief injected into the dream prompt. Aggregates terminal
-/// outcomes and points at the worst trajectories for targeted review.
+/// Per-session aggregate of run outcomes — the "task" analogue of the
+/// Skill-MAS rollout distribution: difficulty = negated mean reward (how
+/// badly this session's runs fared), uncertainty = std of rewards (how
+/// inconsistently it fared). A single-run session has zero uncertainty and
+/// is ranked by difficulty alone; a session with mixed done/cancelled/error
+/// outcomes is volatile even if its mean is acceptable.
+#[derive(Debug, Clone)]
+struct SessionStats {
+    session_id: String,
+    runs: usize,
+    mean: f64,
+    std: f64,
+    /// Status + detail of the lowest-reward run (the review entry point).
+    worst_status: String,
+    worst_detail: String,
+    /// (û + d̂) / 2 after min–max normalization across sessions.
+    priority: f64,
+}
+
+const MAX_REVIEW_SESSIONS: usize = 4;
+
+fn aggregate_sessions(outcomes: &[OutcomeSummary]) -> Vec<SessionStats> {
+    // Group by session, preserving insertion order of first appearance.
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, Vec<&OutcomeSummary>> =
+        std::collections::HashMap::new();
+    for o in outcomes {
+        if !grouped.contains_key(&o.session_id) {
+            order.push(o.session_id.clone());
+        }
+        grouped.entry(o.session_id.clone()).or_default().push(o);
+    }
+
+    let mut sessions: Vec<SessionStats> = order
+        .into_iter()
+        .filter_map(|id| {
+            let runs = grouped.remove(&id)?;
+            let n = runs.len() as f64;
+            let mean = runs.iter().map(|r| r.reward).sum::<f64>() / n;
+            let var = runs.iter().map(|r| (r.reward - mean).powi(2)).sum::<f64>() / n;
+            let worst = runs.iter().min_by(|a, b| {
+                a.reward
+                    .partial_cmp(&b.reward)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+            Some(SessionStats {
+                session_id: id,
+                runs: runs.len(),
+                mean,
+                std: var.sqrt(),
+                worst_status: worst.status.clone(),
+                worst_detail: worst.detail.clone(),
+                priority: 0.0,
+            })
+        })
+        .collect();
+
+    // Min–max normalize uncertainty and difficulty across sessions, then
+    // blend into a unified priority (Skill-MAS §3.3.1). Ties (max==min)
+    // normalize to 0.5 so neither axis dominates artificially.
+    let norm = |vals: &[f64], v: f64| -> f64 {
+        let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if max > min {
+            (v - min) / (max - min)
+        } else {
+            0.5
+        }
+    };
+    let stds: Vec<f64> = sessions.iter().map(|s| s.std).collect();
+    let diffs: Vec<f64> = sessions.iter().map(|s| -s.mean).collect();
+    for s in &mut sessions {
+        let û = norm(&stds, s.std);
+        let d̂ = norm(&diffs, -s.mean);
+        s.priority = (û + d̂) / 2.0;
+    }
+
+    sessions.sort_by(|a, b| {
+        b.priority
+            .partial_cmp(&a.priority)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    sessions
+}
+
+/// Elbow truncation over a descending-sorted priority curve (Skill-MAS
+/// §3.3.1): first-order differences δⱼ = pⱼ − pⱼ₊₁, elbow at the maximum
+/// absolute second-order difference; select the top j* sessions. Fewer than
+/// 3 sessions give no second-order signal — take all (bounded by the cap).
+fn elbow_select(priorities_desc: &[f64]) -> usize {
+    let n = priorities_desc.len().min(MAX_REVIEW_SESSIONS);
+    if n < 3 {
+        return n;
+    }
+    let deltas: Vec<f64> = (0..n - 1).map(|j| priorities_desc[j] - priorities_desc[j + 1]).collect();
+    let mut best_j = n; // fallback: keep everything
+    let mut best = 1e-12; // curvature must be non-trivial to count as an elbow
+    for j in 0..deltas.len() - 1 {
+        let curvature = (deltas[j] - deltas[j + 1]).abs();
+        if curvature > best {
+            best = curvature;
+            best_j = j + 1;
+        }
+    }
+    best_j.clamp(1, n)
+}
+
+/// Build the reward brief injected into the dream prompt. Skill-MAS-style:
+/// aggregate outcomes per session into (uncertainty, difficulty), rank by a
+/// blended priority, elbow-truncate to the most informative subset, and
+/// instruct contrastive (high-vs-low trajectory) reflection.
 fn reward_brief(dir: &Path, since: SystemTime) -> String {
     let outcomes = scan_run_outcomes(dir, since);
     if outcomes.is_empty() {
@@ -174,32 +286,37 @@ fn reward_brief(dir: &Path, since: SystemTime) -> String {
         .filter(|o| o.status == "cancelled")
         .count();
     let error = outcomes.iter().filter(|o| o.status == "error").count();
+    let sessions = aggregate_sessions(&outcomes);
     let mut brief = format!(
-        "【Reward 简报】上次 dream 以来的 run 结局：done × {done}，cancelled × {cancelled}，error × {error}。\n"
+        "【Reward 简报】上次 dream 以来 run 结局：done × {done}，cancelled × {cancelled}，error × {error}（{} 个 session）。\n",
+        sessions.len()
     );
-    // Worst 3 trajectories (lowest reward first) for targeted review.
-    let worst: Vec<&OutcomeSummary> = outcomes
-        .iter()
-        .filter(|o| o.status != "done")
-        .take(3)
-        .collect();
-    if !worst.is_empty() {
-        brief.push_str("重点复盘（低 reward 轨迹，优先检索分析失败/被打断的原因）：\n");
-        for o in worst {
+    let failed: Vec<&SessionStats> = sessions.iter().filter(|s| s.mean < 1.0).collect();
+    if !failed.is_empty() {
+        let priorities: Vec<f64> = sessions.iter().map(|s| s.priority).collect();
+        let selected = elbow_select(&priorities);
+        brief.push_str(&format!(
+            "重点复盘（优先级 = 不稳定度×难度，elbow 截断选前 {selected} 个）：\n"
+        ));
+        for s in sessions.iter().take(selected) {
             brief.push_str(&format!(
-                "- session {} · run {}（{}，reward {:.1}）：{}\n",
-                &o.session_id.chars().take(8).collect::<String>(),
-                &o.run_id.chars().take(8).collect::<String>(),
-                o.status,
-                o.reward,
-                o.detail
+                "- session {}（{} runs，均分 {:.2}，波动 {:.2}，最差 {}）：{}\n",
+                &s.session_id.chars().take(8).collect::<String>(),
+                s.runs,
+                s.mean,
+                s.std,
+                s.worst_status,
+                s.worst_detail
             ));
         }
+        brief.push_str(
+            "对比反思：对每个 session，用 session_search 检索同类任务的成功轨迹，高分 vs 低分对照，定位第一个分歧点（哪个编排决策不同导致了结果分岔）。\n",
+        );
     } else {
-        brief.push_str("全部成功。萃取最近成功轨迹的工具使用模式（怎么做对的）。\n");
+        brief.push_str("全部成功。萃取最近成功轨迹的工具使用与编排模式（怎么做对的）。\n");
     }
     // Cap the brief so it cannot grow unboundedly with session count.
-    brief.chars().take(600).collect()
+    brief.chars().take(900).collect()
 }
 
 #[derive(Default)]
@@ -446,6 +563,63 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
         assert!(brief.contains("没有"), "degraded brief explains absence: {brief}");
+    }
+
+    fn outcome(session: &str, status: &str, reward: f64) -> OutcomeSummary {
+        OutcomeSummary {
+            session_id: session.into(),
+            run_id: format!("{session}-r"),
+            status: status.into(),
+            reward,
+            detail: "d".into(),
+        }
+    }
+
+    #[test]
+    fn aggregate_sessions_ranks_volatile_and_difficult_first() {
+        // s-volatile: mixed outcomes (high std, mid mean) → should outrank
+        // s-steady-good (low std, high mean) even though its mean is worse.
+        let out = vec![
+            outcome("s-steady-good", "done", 1.0),
+            outcome("s-volatile", "done", 1.0),
+            outcome("s-volatile", "error", -1.0),
+            outcome("s-flat-bad", "error", -1.0),
+        ];
+        let sessions = aggregate_sessions(&out);
+        let names: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        // s-flat-bad: max difficulty, zero uncertainty; s-volatile: mid both.
+        // Both must outrank the clean session; the clean one sorts last.
+        assert_eq!(names.last(), Some(&"s-steady-good"));
+        assert!(names.contains(&"s-flat-bad") && names.contains(&"s-volatile"));
+        let vol = sessions.iter().find(|s| s.session_id == "s-volatile").unwrap();
+        assert!((vol.std - 1.0).abs() < 1e-9, "std was {}", vol.std);
+    }
+
+    #[test]
+    fn elbow_select_cuts_at_sharpest_curvature() {
+        // Sharp drop after the 2nd element → elbow at index 2.
+        let pri = [1.0, 0.9, 0.2, 0.15, 0.1];
+        assert_eq!(elbow_select(&pri), 2);
+        // Flat curve → keeps all (capped).
+        assert_eq!(elbow_select(&[0.5, 0.5, 0.5, 0.5]), 4);
+        // Fewer than 3 → take all.
+        assert_eq!(elbow_select(&[0.9, 0.1]), 2);
+    }
+
+    #[test]
+    fn reward_brief_lists_priority_sessions_and_contrast_instruction() {
+        let dir = std::env::temp_dir().join("dream_reward_brief_priority");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = vec![
+            r#"{"type":"user","text":"t"}"#.to_string(),
+            r#"{"kind":"run_outcome","run_id":"r1","status":"error","reward":-1.0,"detail":"boom"}"#.to_string(),
+        ];
+        std::fs::write(dir.join("abc.jsonl"), lines.join("\n") + "\n").unwrap();
+        let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
+        assert!(brief.contains("重点复盘"), "has review section: {brief}");
+        assert!(brief.contains("对比反思"), "has contrastive instruction: {brief}");
+        assert!(brief.contains("boom"), "cites worst detail: {brief}");
     }
 
     #[test]
