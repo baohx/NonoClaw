@@ -284,8 +284,18 @@ pub fn supersede_fact(cwd: &Path, name: &str, superseded_by: &str) -> std::io::R
     let path = cwd
         .join(".nonoclaw/memory/facts")
         .join(format!("{}.md", sanitize_filename(name)));
-    let raw = std::fs::read_to_string(&path)?;
-    // Append superseded_by to frontmatter.
+    supersede_fact_by_path(&path, superseded_by, "superseded")
+}
+
+/// Supersede a fact at an explicit path — used by the dream bench-validation
+/// loop, which resolves the file by mtime rather than by name.
+pub fn supersede_fact_by_path(
+    path: &Path,
+    superseded_by: &str,
+    reason: &str,
+) -> std::io::Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    // Append superseded_by (+ reason when non-default) to frontmatter.
     let mut new = String::new();
     let mut in_fm = false;
     let mut fm_closed = false;
@@ -298,13 +308,16 @@ pub fn supersede_fact(cwd: &Path, name: &str, superseded_by: &str) -> std::io::R
                 continue;
             } else if !fm_closed {
                 new.push_str(&format!("superseded_by: {superseded_by}\n"));
+                if reason != "superseded" {
+                    new.push_str(&format!("superseded_reason: {reason}\n"));
+                }
                 fm_closed = true;
             }
         }
         new.push_str(line);
         new.push('\n');
     }
-    std::fs::write(&path, new)
+    std::fs::write(path, new)
 }
 
 // ── Goals (multi-step task plans, extends beads) ──────────────────────────

@@ -25,6 +25,167 @@ use tokio::sync::Mutex;
 
 use super::connection::AppState;
 
+// ── Bench-validated fact loop (Skill-MAS S* selection) ────────────────────
+//
+// Orchestration facts change HOW the agent plans work; a regression in the
+// smoke bench is objective evidence the new guidance hurts more than helps.
+// After each dream that wrote facts we re-run the local terminal-bench smoke
+// harness and compare pass rates:
+//   rate ≥ history  → keep facts, record the new baseline
+//   rate <  history → supersede the newest fact (roll back) and keep history
+// Skipped entirely when the harness or python3 is missing — the loop is an
+// enhancement, never a blocker for dreaming.
+
+/// Where the smoke harness lives relative to the workspace root.
+const BENCH_SMOKE_SCRIPT: &str = "bench/terminal-bench/run_local_smoke.py";
+/// History file (per project dir) tracking the last accepted pass rate.
+const BENCH_HISTORY_FILE: &str = "bench_history.json";
+/// Pass-rate drop (absolute) that triggers a fact rollback.
+const BENCH_REGRESSION_THRESHOLD: f64 = 0.34; // 1 of 3 tasks
+/// Timeout for one harness invocation.
+const BENCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Latest line of the harness stdout: `=== N/M tasks passed ===`.
+fn parse_pass_rate(stdout: &str) -> Option<f64> {
+    for line in stdout.lines().rev() {
+        let rest = line.trim().strip_prefix("===")?.trim();
+        let rest = rest.trim_end_matches('=').trim();
+        let rest = rest.strip_suffix("tasks passed")?.trim();
+        let (n, m) = rest.split_once('/')?;
+        let n: f64 = n.trim().parse().ok()?;
+        let m: f64 = m.trim().parse().ok()?;
+        if m > 0.0 {
+            return Some(n / m);
+        }
+    }
+    None
+}
+
+fn read_pass_rate(path: &Path) -> Option<f64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("pass_rate")?.as_f64()
+}
+
+fn write_pass_rate(path: &Path, rate: f64, rolled_back: bool) {
+    let v = serde_json::json!({
+        "pass_rate": rate,
+        "updated_at": SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "last_rollback": rolled_back,
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, v.to_string());
+}
+
+/// Newest fact file (by mtime) in the project's facts dir.
+fn newest_fact(facts_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(facts_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let mtime = entry.metadata().ok()?.modified().ok()?;
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Locate the workspace root (the ancestor directory holding the bench
+/// harness) for bench validation. `None` outside a NonoClaw checkout.
+fn workspace_root_of(cwd: &Path) -> Option<PathBuf> {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join(BENCH_SMOKE_SCRIPT).is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Run the smoke harness, returning its stdout (empty on spawn failure).
+fn run_bench(workspace_root: &Path) -> Option<String> {
+    let script = workspace_root.join(BENCH_SMOKE_SCRIPT);
+    if !script.is_file() {
+        tracing::debug!(script = %script.display(), "bench smoke harness missing, skip validation");
+        return None;
+    }
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .current_dir(workspace_root)
+        .output();
+    match out {
+        Ok(out) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Err(e) => {
+            tracing::debug!(error = %e, "bench harness failed to spawn, skip validation");
+            None
+        }
+    }
+}
+
+/// Validate freshly written dream facts against the smoke bench. Runs at most
+/// once per dream, never blocks the dream itself (all failures are soft).
+fn bench_validate_facts(workspace_root: &Path, project_dir: &Path) {
+    let Some(stdout) = run_bench(workspace_root) else {
+        return;
+    };
+    let Some(rate) = parse_pass_rate(&stdout) else {
+        tracing::debug!("bench harness produced no pass-rate line, skip validation");
+        return;
+    };
+    let history_path = project_dir.join(BENCH_HISTORY_FILE);
+    match read_pass_rate(&history_path) {
+        None => {
+            write_pass_rate(&history_path, rate, false);
+            tracing::info!(pass_rate = rate, "bench baseline recorded");
+        }
+        Some(prev) => {
+            if rate + f64::EPSILON >= prev {
+                write_pass_rate(&history_path, rate, false);
+                tracing::info!(pass_rate = rate, previous = prev, "bench validated, facts kept");
+                return;
+            }
+            // Regression: roll back the newest fact.
+            let facts_dir = project_dir.join(".nonoclaw/memory/facts");
+            if let Some(fact) = newest_fact(&facts_dir) {
+                let name = fact
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let rollback = format!("{}.rollback", name);
+                let result = nonoclaw_tools::memory::supersede_fact_by_path(
+                    &fact,
+                    &rollback,
+                    "bench regression: smoke pass rate dropped",
+                );
+                match result {
+                    Ok(()) => {
+                        tracing::warn!(fact = %name, previous = prev, now = rate, "bench regression — fact rolled back");
+                        write_pass_rate(&history_path, prev, true);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "bench rollback failed; recording regression anyway");
+                        write_pass_rate(&history_path, rate, true);
+                    }
+                }
+            } else {
+                tracing::warn!(previous = prev, now = rate, "bench regression but no fact to roll back");
+                write_pass_rate(&history_path, rate, true);
+            }
+        }
+    }
+}
+
+
 /// Default idle threshold before a dream may start.
 const DEFAULT_IDLE_MINUTES: u64 = 10;
 /// How often the watcher loop re-evaluates trigger conditions.
@@ -95,6 +256,8 @@ fn session_fingerprint(dir: &Path) -> Option<(usize, SystemTime)> {
 #[derive(Debug, Clone)]
 struct OutcomeSummary {
     session_id: String,
+    /// Kept for log/debug fidelity even though the brief aggregates by session.
+    #[allow(dead_code)]
     run_id: String,
     status: String,
     reward: f64,
@@ -425,6 +588,19 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                     ),
                 );
             }
+            // Bench-validated fact loop: the dream may have written
+            // orchestration facts — verify they did not regress the smoke
+            // bench, roll back the newest fact if they did. Runs on this
+            // watcher thread (idle anyway); all failures are soft.
+            if ok {
+                if let (Some(project), Some(workspace)) = (
+                    nonoclaw_engine::session::project_dir(&cwd),
+                    workspace_root_of(&cwd),
+                )
+                {
+                    bench_validate_facts(&workspace, &project);
+                }
+            }
             dream.last_fingerprint = session_fingerprint(&sessions_dir).or(Some(fp));
             dream.dreaming = false;
             if ok {
@@ -495,8 +671,54 @@ async fn run_dream(state: Arc<AppState>) -> bool {
 mod tests {
     use super::*;
 
-    /// Reward brief: aggregates outcomes, lists worst-first, skips dream
-    /// sessions, and degrades gracefully when there is nothing to review.
+    #[test]
+    fn parse_pass_rate_reads_summary_line() {
+        let out = "✅ PASS hello_world\n\n=== 2/3 tasks passed ===\n";
+        assert!((parse_pass_rate(out).unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(parse_pass_rate("no summary here"), None);
+        assert_eq!(parse_pass_rate("=== 0/0 tasks passed ==="), None);
+    }
+
+    #[test]
+    fn bench_regression_supersedes_newest_fact() {
+        let base = std::env::temp_dir().join("dream_bench_loop_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let facts = project.join(".nonoclaw/memory/facts");
+        std::fs::create_dir_all(&facts).unwrap();
+        let old_fact = facts.join("aaa-old.md");
+        let new_fact = facts.join("zzz-new.md");
+        let fm = |name: &str| {
+            format!("---\nname: {name}\ntitle: t\ntype: convention\nimportance: 0.5\nconfidence: 0.5\ntags: []\nsources: []\n---\nbody\n")
+        };
+        std::fs::write(&old_fact, fm("aaa-old")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&new_fact, fm("zzz-new")).unwrap();
+
+        // Newest fact is zzz-new (mtime ordering).
+        assert_eq!(newest_fact(&facts).unwrap(), new_fact);
+
+        // Baseline record.
+        let history = project.join("bench_history.json");
+        assert_eq!(read_pass_rate(&history), None);
+        write_pass_rate(&history, 1.0, false);
+        assert_eq!(read_pass_rate(&history), Some(1.0));
+
+        // Regression → newest fact superseded, old untouched.
+        let rollback = "zzz-new.rollback";
+        nonoclaw_tools::memory::supersede_fact_by_path(
+            &new_fact,
+            rollback,
+            "bench regression: smoke pass rate dropped",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&new_fact).unwrap();
+        assert!(raw.contains("superseded_by: zzz-new.rollback"), "{raw}");
+        assert!(raw.contains("superseded_reason: bench regression"), "{raw}");
+        let old_raw = std::fs::read_to_string(&old_fact).unwrap();
+        assert!(!old_raw.contains("superseded_by"));
+    }
+
     #[test]
     fn reward_brief_aggregates_and_targets_worst() {
         let dir = std::env::temp_dir().join("dream_reward_brief_test");

@@ -276,6 +276,10 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
     // Spawn the engine run in a background task.
     let session_for_run = session.clone();
     let state_for_run = Arc::clone(&state);
+    // Label-free reward signals: per-run tool success/failure counts, observed
+    // from the event stream (no LLM judge involved).
+    let tool_stats = Arc::new(std::sync::atomic::AtomicU64::new(0)); // high 32: ok, low 32: fail
+    let tool_stats_consumer = Arc::clone(&tool_stats);
     tokio::spawn(async move {
         let session_for_events = session_for_run.clone();
         let event_tx_done = event_tx.clone();
@@ -283,7 +287,28 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             .start(engine, MessageContent::from_text(&req.prompt), move |sequenced| {
                 let session_clone = session_for_events.clone();
                 let tx = event_tx.clone();
+                let stats = Arc::clone(&tool_stats_consumer);
                 async move {
+                    if let nonoclaw_core::RunEvent::ToolExecutionFinished { status, .. } =
+                        &sequenced.event
+                    {
+                        use nonoclaw_core::TechnicalStatus;
+                        let shift = match status {
+                            TechnicalStatus::Succeeded | TechnicalStatus::Repaired => 32,
+                            TechnicalStatus::Failed => 0,
+                            _ => {
+                                let revision = session_clone
+                                    .snapshot()
+                                    .await
+                                    .map(|s| s.revision)
+                                    .unwrap_or_default();
+                                let envelope = sequenced.with_session_revision(revision);
+                                let _ = tx.send(RunStreamItem::Event { envelope });
+                                return;
+                            }
+                        };
+                        stats.fetch_add(1u64 << shift, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let revision = session_clone
                         .snapshot()
                         .await
@@ -331,8 +356,12 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
                     ("error", detail, 0)
                 }
             };
-            let reward =
-                nonoclaw_engine::session::run_reward(status, &detail);
+            let packed = tool_stats.load(std::sync::atomic::Ordering::Relaxed);
+            let signals = nonoclaw_engine::session::RewardSignals {
+                tools_ok: (packed >> 32) as u32,
+                tools_failed: packed as u32,
+            };
+            let reward = nonoclaw_engine::session::run_reward_labeled(status, &detail, &signals);
             if let Err(e) = session_for_run
                 .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
                 .await

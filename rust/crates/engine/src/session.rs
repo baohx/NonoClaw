@@ -470,6 +470,53 @@ impl SessionService {
 /// exhaustion finishes (max-turns / budget / context-limit) reduce a "done"
 /// run because the agent stalled instead of converging.
 pub fn run_reward(status: &str, finish_detail: &str) -> f64 {
+    run_reward_labeled(status, finish_detail, &RewardSignals::default())
+}
+
+/// Objective (label-free) signals observed during a run — no LLM judge, only
+/// mechanically verifiable facts from the event stream.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RewardSignals {
+    /// Tools finishing `Succeeded`/`Repaired`.
+    pub tools_ok: u32,
+    /// Tools finishing `Failed`.
+    pub tools_failed: u32,
+}
+
+impl RewardSignals {
+    fn tool_error_rate(&self) -> Option<f64> {
+        let total = self.tools_ok + self.tools_failed;
+        (total >= 3).then(|| self.tools_failed as f64 / total as f64)
+    }
+}
+
+/// Reward with label-free adjustments layered on the terminal-status heuristic:
+/// - **verification evidence bonus** (+0.15, capped at 1.0): the transcript's
+///   finish detail contains a passing test/build/lint run — the strongest
+///   objective "task actually works" signal available without ground truth.
+/// - **high tool error rate penalty** (−0.3 at ≥60%, −0.15 at ≥30%): a run
+///   that mostly fights its tools rarely reflects good orchestration, even
+///   when it technically completes.
+pub fn run_reward_labeled(status: &str, finish_detail: &str, signals: &RewardSignals) -> f64 {
+    let base = run_reward_base(status, finish_detail);
+    if status != "done" {
+        return base;
+    }
+    let mut reward = base;
+    if verification_evidence(finish_detail) {
+        reward += 0.15;
+    }
+    if let Some(rate) = signals.tool_error_rate() {
+        if rate >= 0.6 {
+            reward -= 0.3;
+        } else if rate >= 0.3 {
+            reward -= 0.15;
+        }
+    }
+    reward.clamp(-1.0, 1.0)
+}
+
+fn run_reward_base(status: &str, finish_detail: &str) -> f64 {
     const DONE: f64 = 1.0;
     const CANCELLED: f64 = -0.3;
     const ERROR: f64 = -1.0;
@@ -488,6 +535,34 @@ pub fn run_reward(status: &str, finish_detail: &str) -> f64 {
         "cancelled" => CANCELLED - exhaustion_penalty * 0.5,
         _ => ERROR,
     }
+}
+
+/// Does the finish detail contain evidence of a *passing* verification run?
+/// Intentionally narrow patterns to avoid false positives (e.g. "0 tests
+/// passed" on an empty suite is not evidence).
+fn verification_evidence(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    // "N passed" with N ≥ 1 (cargo/pytest/jest style), "all tests passed",
+    // "tests: ok", "npm test" followed by pass markers.
+    for pat in ["test result: ok", "all tests passed", "tests passed"] {
+        if d.contains(pat) {
+            // Guard against "0 tests passed".
+            if pat == "tests passed" && d.contains("0 tests passed") {
+                continue;
+            }
+            return true;
+        }
+    }
+    if let Some(idx) = d.find(" passed") {
+        // Look back for a digit prefix: "12 passed", "3 passed".
+        let prefix = &d[..idx];
+        if prefix.chars().rev().find(|c| !c.is_whitespace()).is_some_and(|c| c.is_ascii_digit())
+            && !prefix.ends_with('0')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 struct SessionState {
@@ -1021,6 +1096,25 @@ mod tests {
         assert_eq!(run_reward("done", "context limit"), 0.8);
         assert_eq!(run_reward("cancelled", "user pressed stop"), -0.3);
         assert_eq!(run_reward("error", "boom"), -1.0);
+
+        // Label-free adjustments (only apply to done runs).
+        let ok = RewardSignals { tools_ok: 10, tools_failed: 0 };
+        let mixed = RewardSignals { tools_ok: 5, tools_failed: 3 };
+        let hostile = RewardSignals { tools_ok: 2, tools_failed: 5 };
+        // Verification evidence bonus, capped at 1.0.
+        assert_eq!(
+            run_reward_labeled("done", "test result: ok. 12 passed", &RewardSignals::default()),
+            1.0
+        );
+        assert_eq!(run_reward_labeled("done", "3 passed", &RewardSignals::default()), 1.0);
+        assert_eq!(run_reward_labeled("done", "0 tests passed", &RewardSignals::default()), 1.0, "empty suite is not evidence");
+        assert_eq!(run_reward_labeled("done", "completed", &RewardSignals::default()), 1.0);
+        // High tool error rate penalizes even a clean finish.
+        assert!((run_reward_labeled("done", "completed", &hostile) - 0.7).abs() < 1e-9);
+        assert!((run_reward_labeled("done", "completed", &mixed) - 0.85).abs() < 1e-9);
+        assert_eq!(run_reward_labeled("done", "completed", &ok), 1.0, "few tools → no rate judgment");
+        // Non-done runs keep the base label untouched.
+        assert_eq!(run_reward_labeled("error", "boom", &hostile), -1.0);
     }
 
     #[tokio::test]
