@@ -14,7 +14,7 @@ test -f "$PKG/nonoclaw.exe" || { echo "缺少 nonoclaw.exe"; exit 1; }
 test -f "$PKG/frontend/dist/index.html" || { echo "缺少 frontend/dist"; exit 1; }
 test -f "$PKG/node/node.exe" || { echo "缺少 node"; exit 1; }
 test -f "$PKG/python/python.exe" || { echo "缺少 python"; exit 1; }
-test -f "$PKG/.nonoclaw/settings.json" || { echo "缺少 settings.json"; exit 1; }
+test -f "$PKG/templates/settings.json" || { echo "缺少 settings.json 模板"; exit 1; }
 test -f "$PKG/start-nonoclaw.bat" || { echo "缺少启动器"; exit 1; }
 test -f "$PKG/setup-first-run.bat" || { echo "缺少 setup"; exit 1; }
 test -f "$PKG/安装说明.txt" || { echo "缺少安装说明"; exit 1; }
