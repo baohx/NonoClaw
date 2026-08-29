@@ -185,6 +185,21 @@ check(idleTimeline !== null && idleTimeline.idleBreaks.length > 0, "gap beyond t
   // Idle mark must sit inside the rendered domain (normalized 0..1), not at the
   // raw far-future coordinate that the old code left behind.
   check(idleTimeline!.idleBreaks.every((b) => b.at >= 0 && b.at <= 1), "idle marks are normalized into the compressed domain");
+
+  // Time vs Actual must differ: Time compresses the idle gap, Actual keeps the
+  // raw wall clock (honest time proportions). Regression for the port gap that
+  // ran both modes through the same code path — identical charts.
+  const actualTimeline = deriveTrajectoryTimeline(layoutIdle.turns, "actual");
+  check(actualTimeline !== null, "actual timeline derives");
+  check(actualTimeline!.idleBreaks.length === 0, "actual mode reports no idle breaks (raw wall clock)");
+  const actualSpan = actualTimeline!.domain[1] - actualTimeline!.domain[0];
+  check(Math.abs(actualSpan - rawSpan) < 1_000, `actual keeps the raw span (~${(rawSpan / 1000).toFixed(1)}s, got ${(actualSpan / 1000).toFixed(1)}s)`);
+  check(actualSpan - renderedSpan > IDLE_COMPRESS_SECONDS * 1000, "time mode compresses while actual mode does not — the two charts differ");
+  const actualMaxEnd = Math.max(...actualTimeline!.spans.map((s) => s.end));
+  check(actualMaxEnd <= 1 + 1e-9, `actual spans stay inside the raw domain (max ${actualMaxEnd.toFixed(4)})`);
+  const actualToolSpans = actualTimeline!.spans.filter((s) => s.kind === "tool");
+  const actualLateSpan = actualToolSpans[actualToolSpans.length - 1];
+  check(actualLateSpan !== undefined && actualLateSpan.start > 0.9, "actual mode keeps the late tool near the far end of the raw timeline");
 }
 
 // ── search index (incremental, AND terms, case-insensitive) ───────────────

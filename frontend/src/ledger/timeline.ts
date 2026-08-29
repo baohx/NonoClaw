@@ -115,16 +115,16 @@ export function deriveTrajectoryTimeline(
         : [Math.min(...timed.map((t) => t.range.start)), Math.max(...timed.map((t) => t.range.end))];
 
   const isTimeDomain = mode === "time" || mode === "actual";
-  // Idle compression for wall-clock modes: gaps beyond the threshold collapse
-  // down to the threshold so idle time doesn't flatten the activity. Both the
-  // span coordinates and the idle marks are computed in the same *compressed*
-  // coordinate space, then normalized against the compressed domain — the
-  // marks must align with what actually renders.
+  // Idle compression applies to the Time mode only: Time folds idle gaps
+  // (>threshold) down to the threshold to expose activity structure, while
+  // Actual keeps the raw wall clock so real time proportions stay honest.
+  // Both are still wheel-zoomable time domains.
+  const shouldCompress = mode === "time";
   const idleBreaksRaw: { at: number; savedSeconds: number }[] = [];
   let renderDomain: [number, number] = domain;
   const compressedRange = new Map<LedgerCellLike, CellRange>();
 
-  if (isTimeDomain) {
+  if (shouldCompress) {
     const sorted = [...timed].sort((a, b) => a.range.start - b.range.start);
     const IDLE_MS = IDLE_COMPRESS_SECONDS * 1000;
     let offset = 0; // cumulative compressed-out time (ms)
@@ -157,7 +157,7 @@ export function deriveTrajectoryTimeline(
         : cell.kind === "thinking" ? "thinking"
           : cell.kind === "tool" ? "tool"
             : "request";
-    const r = isTimeDomain ? (compressedRange.get(cell) ?? range) : range;
+    const r = shouldCompress ? (compressedRange.get(cell) ?? range) : range;
     return {
       index: cell.index,
       start: (r.start - renderDomain[0]) / renderSpan,
