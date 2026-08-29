@@ -275,6 +275,21 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   });
   const plainAssistant = layoutNoTrace.turns[0].cells.find((c) => c.kind === "assistant");
   check(plainAssistant !== undefined && plainAssistant.timeSeconds === null, "no trace → assistant duration stays null rather than guessing");
+  // Replay fallback: the thinking row must NOT take the same gap as the
+  // assistant row — adjacent thinking/assistant durations were identical
+  // (double-counted). With a following stamped record the assistant gap fills,
+  // thinking stays unknown.
+  const replayWithNext = buildLedgerLayout({
+    messages: [{ id: "u4", role: "user", content: "hi", timestamp: now },
+               { id: "a3", role: "assistant", content: "answer", thinking: "reasoning", timestamp: stepEnd, streaming: false },
+               { id: "t1", role: "tool", toolName: "Read", toolOk: true, content: "ok", timestamp: stepEnd + 1_500, durationMs: 900 } as unknown as ChatMessage],
+    traceEntries: [],
+    subagentRunsById: {},
+  });
+  const filledAssistant = replayWithNext.turns[0].cells.find((c) => c.kind === "assistant");
+  check(filledAssistant !== undefined && filledAssistant.timeSeconds !== null && Math.abs(filledAssistant.timeSeconds! - 1.5) < 1e-9, `replay fallback still fills the assistant gap (got ${filledAssistant?.timeSeconds}s, want 1.5s)`);
+  const skippedThinking = replayWithNext.turns[0].cells.find((c) => c.kind === "thinking");
+  check(skippedThinking !== undefined && skippedThinking.timeSeconds === null, "replay fallback skips thinking rows — adjacent thinking/assistant durations no longer identical");
 }
 
 console.log("ledger invariants: all passed");

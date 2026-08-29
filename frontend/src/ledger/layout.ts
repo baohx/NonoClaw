@@ -330,6 +330,11 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       for (const turn of turns) {
         for (const cell of turn.cells) {
           if (cell.timeSeconds != null || cell.startedAt == null) continue;
+          // Thinking rows never take the fallback: without a trace there is no
+          // recorded close event, and the gap belongs to the assistant row
+          // (the whole step). Filling both made adjacent thinking/assistant
+          // rows show the identical duration — double-counted.
+          if (cell.kind === "thinking") continue;
           let cursor: { t: number; next: number | undefined } | null = null;
           for (const entry of timelineMs) {
             if (entry.t <= cell.startedAt) cursor = entry;
