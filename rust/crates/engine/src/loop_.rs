@@ -2536,13 +2536,34 @@ impl QueryEngine {
                         "subagent completed without a non-empty final answer".into(),
                     ));
                 }
+                // max_tokens that landed mid-thinking (last block is an
+                // unterminated Thinking, no text/tool_use ever followed) means
+                // the per-turn output budget was consumed before the model
+                // produced any usable output. Surface it as a warning instead
+                // of letting the run pass as a silent "done".
+                let thinking_truncated = turn.stop_reason == Some(StopReason::MaxTokens)
+                    && matches!(
+                        turn.content.last(),
+                        Some(ContentBlock::Thinking { .. })
+                    );
+                if thinking_truncated {
+                    on_event(&RunEvent::RecoveryApplied {
+                        category: "max_tokens_thinking_truncation".into(),
+                        detail: "per-turn output token cap hit while the model was still thinking; no text or tool call was produced for this turn".into(),
+                        items_affected: 0,
+                    });
+                }
                 final_text = assistant_text;
                 break RunFinishReason::Completed {
-                    detail: turn
-                        .stop_reason
-                        .as_ref()
-                        .map(|reason| format!("model stop reason: {}", reason.as_str()))
-                        .unwrap_or_else(|| "model returned no further tool calls".into()),
+                    detail: if thinking_truncated {
+                        "model stop reason: max_tokens (truncated mid-thinking; per-turn output budget exhausted before any answer)".into()
+                    } else {
+                        turn
+                            .stop_reason
+                            .as_ref()
+                            .map(|reason| format!("model stop reason: {}", reason.as_str()))
+                            .unwrap_or_else(|| "model returned no further tool calls".into())
+                    },
                 };
             }
 

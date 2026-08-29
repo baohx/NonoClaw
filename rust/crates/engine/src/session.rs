@@ -611,7 +611,14 @@ fn run_reward_base(status: &str, finish_detail: &str) -> f64 {
     const CANCELLED: f64 = -0.3;
     const ERROR: f64 = -1.0;
     let d = finish_detail.to_lowercase();
-    let exhaustion_penalty = if d.contains("max turns") || d.contains("max_turns") {
+    let exhaustion_penalty = if d.contains("mid-thinking") {
+        // max_tokens hit while the model was still thinking — the turn
+        // produced no usable output at all, yet the run still finishes as
+        // "done". Same weight as max-turns exhaustion. Checked before the
+        // generic branches because the engine's detail text also mentions
+        // the output budget.
+        0.4
+    } else if d.contains("max turns") || d.contains("max_turns") {
         0.4
     } else if d.contains("budget") {
         0.3
@@ -1244,6 +1251,11 @@ mod tests {
         assert_eq!(run_reward("done", "max turns reached"), 0.6);
         assert_eq!(run_reward("done", "budget exceeded"), 0.7);
         assert_eq!(run_reward("done", "context limit"), 0.8);
+        assert_eq!(
+            run_reward("done", "model stop reason: max_tokens (truncated mid-thinking; per-turn output budget exhausted before any answer)"),
+            0.6,
+            "mid-thinking truncation penalized like max-turns exhaustion"
+        );
         assert_eq!(run_reward("cancelled", "user pressed stop"), -0.3);
         assert_eq!(run_reward("error", "boom"), -1.0);
 
