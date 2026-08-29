@@ -33,7 +33,7 @@ function buildSubagentBranch(
   runsById: Record<string, SubagentRun>,
   childIdsByParentToolId: Record<string, string[]>,
   linearCalls: ToolCallRecord[],
-  now: number,
+  now: number | undefined,
 ): TrajectoryNode {
   const run = runsById[runId];
   const branch: BranchInfo = {
@@ -53,20 +53,22 @@ function buildSubagentBranch(
       input: tool.input,
       ok: tool.ok,
       result: tool.result,
-      timestamp: now + linearCalls.length,
+      // Subagent tools carry no measured timestamp of their own — inherit the
+      // parent tool-call's wall-clock (never synthesize `+ index` fake ms).
+      timestamp: now,
       turn: undefined,
     });
     // Nested subagents (a subagent delegating further) attach at the tool
     // call that spawned them. NonoClaw caps subagent depth at 1, so this is
     // normally empty — kept correct for completeness.
     const toolChildren: TrajectoryNode[] = (childIdsByParentToolId[tool.id] ?? []).map((childId) =>
-      buildSubagentBranch(childId, runsById, childIdsByParentToolId, linearCalls, now + linearCalls.length),
+      buildSubagentBranch(childId, runsById, childIdsByParentToolId, linearCalls, now),
     );
     children.push({
       nodeId,
       kind: "tool",
       label: `${tool.name}${tool.ok === false ? " ✗" : ""}`,
-      timestamp: now + linearCalls.length,
+      timestamp: now,
       toolName: tool.name,
       toolInput: tool.input,
       toolOk: tool.ok,
@@ -97,16 +99,13 @@ export function buildTrajectoryTree(input: TreeInput): TrajectoryTree {
     nodeId: "root",
     kind: "turn",
     label: "trajectory",
-    timestamp: 0,
     children: [],
     branch: MAIN_BRANCH,
   };
   let currentTurn: TrajectoryNode | null = null;
   let turnNumber = 0;
-  let clock = 0;
 
   for (const message of messages) {
-    clock += 1;
     if (message.role === "user") {
       if (!userBaseline && message.content.trim()) userBaseline = message.content;
     } else if (message.role === "assistant") {
@@ -115,7 +114,7 @@ export function buildTrajectoryTree(input: TreeInput): TrajectoryTree {
         nodeId: `turn:${turnNumber}`,
         kind: "turn",
         label: `Turn ${turnNumber}`,
-        timestamp: message.timestamp ?? clock,
+        timestamp: message.timestamp,
         children: [],
         branch: MAIN_BRANCH,
       };
@@ -126,7 +125,7 @@ export function buildTrajectoryTree(input: TreeInput): TrajectoryTree {
         text: message.content,
         inputTokens: 0,
         outputTokens: 0,
-        timestamp: message.timestamp ?? clock,
+        timestamp: message.timestamp,
       });
     } else if (message.role === "tool" && currentTurn) {
       const toolUseId = toolUseIdOf(message);
@@ -135,7 +134,7 @@ export function buildTrajectoryTree(input: TreeInput): TrajectoryTree {
         nodeId,
         kind: "tool",
         label: `${message.toolName ?? "tool"}${message.toolOk === false ? " ✗" : ""}`,
-        timestamp: message.timestamp ?? clock,
+        timestamp: message.timestamp,
         toolName: message.toolName,
         toolInput: message.toolInput,
         toolOk: message.toolOk,
@@ -150,14 +149,14 @@ export function buildTrajectoryTree(input: TreeInput): TrajectoryTree {
         input: message.toolInput,
         ok: message.toolOk,
         result: message.content,
-        timestamp: message.timestamp ?? clock,
+        timestamp: message.timestamp,
         turn: turnNumber,
       });
       // Attach subagent branches spawned by this tool call.
       const childRunIds = childIdsByParentToolId[toolUseId] ?? [];
       for (const childId of childRunIds) {
         node.children.push(
-          buildSubagentBranch(childId, subagentRunsById, childIdsByParentToolId, linearCalls, message.timestamp ?? clock),
+          buildSubagentBranch(childId, subagentRunsById, childIdsByParentToolId, linearCalls, message.timestamp),
         );
       }
     }

@@ -64,6 +64,10 @@ export interface StepWindow {
   start: number;
   firstToken: number | null;
   completed: number | null;
+  /** Epoch ms when the extended-thinking block closed (thinking_state
+   * active:false). Distinct from `completed` (whole step), so thinking can be
+   * timed without the visible text that follows it. */
+  thinkingEnd: number | null;
   usage: UsageRaw | null;
   provider?: string;
   model?: string;
@@ -101,6 +105,7 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
         start: entry.timestampMs,
         firstToken: null,
         completed: null,
+        thinkingEnd: null,
         usage: null,
         provider: typeof ev?.provider === "string" ? ev.provider : undefined,
       };
@@ -115,6 +120,11 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
       if (attempt !== null && (current.retryAttempt === undefined || attempt > current.retryAttempt)) current.retryAttempt = attempt;
     } else if (entry.kind === "stream_state_changed" && ev?.state === "streaming") {
       if (current.firstToken === null) current.firstToken = entry.timestampMs;
+    } else if (entry.kind === "thinking_state" && ev?.active === false) {
+      // Precise end of the reasoning block. The first (earliest) active:false
+      // wins — providers may emit both a block-level close and a MessageStop
+      // fallback; the block close is the accurate one.
+      if (current.thinkingEnd === null) current.thinkingEnd = entry.timestampMs;
     } else if (entry.kind === "usage_updated") {
       if (current.completed === null) current.completed = entry.timestampMs;
       const raw = collectTurnUsageRaw(ev);
@@ -249,14 +259,18 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
         };
       if (message.thinking !== undefined && message.thinking.length > 0) {
         // Thinking precedes the visible assistant output; project it as its
-        // own ledger record so all four timeline modes can render it.
+        // own ledger record so all four timeline modes can render it. Its
+        // duration is the thinking block alone (step start → thinking close),
+        // not the whole assistant step — the visible text that follows must
+        // not be charged to the thinking row.
+        const thinkingEnd = timing?.thinkingEnd ?? null;
         pushCell(turnModel, {
           kind: "thinking",
           text: preview(message.thinking, 200) || "(empty thinking)",
           thinkingDetail: message.thinking,
           recordId: `thinking\u0000${message.id}`,
-          timeSeconds: startedAt !== null && completedAt !== null
-            ? (completedAt - startedAt) / 1000
+          timeSeconds: startedAt !== null && thinkingEnd !== null
+            ? (thinkingEnd - startedAt) / 1000
             : null,
           startedAt,
         } as LedgerCell);
@@ -307,16 +321,16 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       .map((m) => (typeof m.timestamp === "number" && Number.isFinite(m.timestamp) ? m.timestamp : null))
       .filter((t): t is number => t !== null);
     if (stamped.length >= 2) {
-      const timelineMs = stamped.map((t, i) => ({ t, next: stamped[i + 1] }));
+      const timelineMs = stamped.map((t, i) => ({ t, next: stamped[i + 1] as number | undefined }));
       for (const turn of turns) {
         for (const cell of turn.cells) {
           if (cell.timeSeconds != null || cell.startedAt == null) continue;
-          let cursor: { t: number; next: number } | null = null;
+          let cursor: { t: number; next: number | undefined } | null = null;
           for (const entry of timelineMs) {
             if (entry.t <= cell.startedAt) cursor = entry;
             else break;
           }
-          if (cursor === null) continue;
+          if (cursor === null || cursor.next === undefined) continue;
           const spanMs = cursor.next - cursor.t;
           if (spanMs > 0 && spanMs <= REPLAY_FALLBACK_CAP_SECONDS * 1000) {
             cell.timeSeconds = spanMs / 1000;
@@ -396,7 +410,6 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
   for (const entry of traceEntries) {
     if (entry.kind !== "compaction_started" && entry.kind !== "compacted") continue;
     const ev = entry.details as Record<string, unknown> | undefined;
-    const anchor = findTurnContainingSeq(turns, entry.sequence);
     const cell: LedgerCell = {
       index: 0,
       kind: "compacted",
@@ -406,7 +419,9 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       timeSeconds: null,
       startedAt: entry.timestampMs,
     };
-    const target = anchor ?? ensureBetweenTurns(turns);
+    // Compaction is a session-level event, not part of any single turn — it
+    // always lands in the "Between turns" pseudo-turn.
+    const target = ensureBetweenTurns(turns);
     target.cells.push({ ...cell, index: ++index });
     if (target.startAt === null || entry.timestampMs < target.startAt) target.startAt = entry.timestampMs;
     if (entry.timestampMs > (target.endAt ?? 0)) target.endAt = entry.timestampMs;
@@ -422,7 +437,7 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
     const ev = entry.details as Record<string, unknown> | undefined;
     const id = typeof ev?.tool_use_id === "string" ? ev.tool_use_id : null;
     if (id === null || seenCallIds.has(id)) continue;
-    const owner = findTurnContainingSeq(turns, entry.sequence) ?? turns[turns.length - 1] ?? null;
+    const owner = findTurnContainingAt(turns, entry.timestampMs) ?? turns[turns.length - 1] ?? null;
     if (owner === null) continue;
     owner.cells.push({
       index: ++index,
@@ -439,10 +454,16 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
   return { turns, total: index };
 }
 
-function findTurnContainingSeq(turns: LedgerTurnModel[], _seq: number): LedgerTurnModel | null {
-  // Sequence numbers only exist in the trace stream; messages do not carry
-  // them, so compaction anchors are placed by timestamp overlap instead.
-  void _seq;
+function findTurnContainingAt(turns: LedgerTurnModel[], tsMs: number): LedgerTurnModel | null {
+  // Trace entries carry real timestamps but messages do not carry sequence
+  // numbers, so place in-flight records by timestamp overlap. Walk newest →
+  // oldest and return the first turn whose measured start does not exceed the
+  // entry timestamp (the nearest turn that already began). Turns without a
+  // measurable start are skipped; the caller falls back to the last turn.
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const start = turns[i].startAt;
+    if (start !== null && tsMs >= start) return turns[i];
+  }
   return null;
 }
 

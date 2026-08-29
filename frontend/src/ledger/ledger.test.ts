@@ -175,6 +175,17 @@ const idleEntries: TraceEntry[] = [...baseEntries,
 const layoutIdle = buildLedgerLayout({ messages: baseMessages, traceEntries: idleEntries, subagentRunsById: {} });
 const idleTimeline = deriveTrajectoryTimeline(layoutIdle.turns, "time");
 check(idleTimeline !== null && idleTimeline.idleBreaks.length > 0, "gap beyond threshold inserts an idle break mark");
+// Regression: idle compression must actually shrink the rendered domain — the
+// far-future record pair sits 600s after the main activity, so the compressed
+// domain must be far below the raw 600s span (not just a cosmetic "⌁" mark).
+{
+  const rawSpan = (10 * IDLE_COMPRESS_SECONDS * 1000 + 100); // ~600.1s of wall clock
+  const renderedSpan = idleTimeline!.domain[1] - idleTimeline!.domain[0];
+  check(renderedSpan < rawSpan / 2, `idle compression shrinks the rendered domain (raw ${rawSpan}ms -> ${renderedSpan.toFixed(0)}ms)`);
+  // Idle mark must sit inside the rendered domain (normalized 0..1), not at the
+  // raw far-future coordinate that the old code left behind.
+  check(idleTimeline!.idleBreaks.every((b) => b.at >= 0 && b.at <= 1), "idle marks are normalized into the compressed domain");
+}
 
 // ── search index (incremental, AND terms, case-insensitive) ───────────────
 const searchIndex = new TrajectorySearchIndex();
@@ -211,5 +222,33 @@ for (const mode of ["sequence", "duration", "time", "actual"] as const) {
 const thinkSearch = new TrajectorySearchIndex();
 thinkSearch.addCells(layoutThink.turns[0].cells);
 check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
+
+// ── thinking duration = block close, not whole step ────────────────────────
+// Regression: thinking time was charged the entire assistant step (step start
+// → step completed), which includes the visible text that follows reasoning.
+// The precise end is the thinking_state active:false event (ThinkingEnd).
+{
+  const start = now + 100;
+  const thinkEnd = now + 700;   // reasoning closes here
+  const stepEnd = now + 1_500;  // visible text + usage finish the step later
+  const entries: TraceEntry[] = [
+    { id: "x1", runId: "r", sessionId: "s", sequence: 1, timestampMs: start, kind: "model_request_started", summary: "req", details: { turn: 1 }, category: "model", status: "active" },
+    { id: "x2", runId: "r", sessionId: "s", sequence: 2, timestampMs: thinkEnd, kind: "thinking_state", summary: "thinking", details: { active: false, turn: 1 }, category: "model", status: "success" },
+    { id: "x3", runId: "r", sessionId: "s", sequence: 3, timestampMs: stepEnd, kind: "usage_updated", summary: "usage", details: { turn: 1, turn_output: 10 }, category: "usage", status: "success" },
+  ];
+  const msgs: ChatMessage[] = [
+    { id: "u1", role: "user", content: "hi", timestamp: now },
+    { id: "a1", role: "assistant", content: "visible answer", thinking: "hidden reasoning", timestamp: stepEnd, streaming: false },
+  ];
+  const layout = buildLedgerLayout({ messages: msgs, traceEntries: entries, subagentRunsById: {} });
+  const thinkingCell = layout.turns[0].cells.find((c) => c.kind === "thinking");
+  const assistantCell = layout.turns[0].cells.find((c) => c.kind === "assistant");
+  check(thinkingCell !== undefined && assistantCell !== undefined, "both thinking and assistant records projected");
+  const thinkSec = thinkingCell!.timeSeconds;
+  const assistantSec = assistantCell!.timeSeconds;
+  check(thinkSec !== null && Math.abs(thinkSec - (thinkEnd - start) / 1000) < 1e-9, `thinking duration is block-close minus start (got ${thinkSec}s, want ${((thinkEnd - start) / 1000).toFixed(3)}s)`);
+  check(assistantSec !== null && Math.abs(assistantSec - (stepEnd - start) / 1000) < 1e-9, `assistant duration still spans the whole step (got ${assistantSec}s, want ${((stepEnd - start) / 1000).toFixed(3)}s)`);
+  check(thinkSec !== null && assistantSec !== null && thinkSec < assistantSec, "thinking duration excludes the visible text that follows it");
+}
 
 console.log("ledger invariants: all passed");

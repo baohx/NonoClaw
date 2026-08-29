@@ -42,7 +42,9 @@ export interface TrajectoryNode {
   kind: TrajectoryNodeKind;
   /** Short human summary. */
   label: string;
-  timestamp: number;
+  /** Wall-clock epoch ms when known; absent for live runs that carry no
+   * timestamps. Never a synthetic sequence number. */
+  timestamp?: number;
   /** Tool-call fields (kind === "tool"). */
   toolName?: string;
   toolInput?: unknown;
@@ -77,7 +79,9 @@ export interface ToolCallRecord {
   input?: unknown;
   ok?: boolean;
   result: string;
-  timestamp: number;
+  /** Wall-clock epoch ms when known (absent for live runs / subagent tools,
+   * which carry no measured timestamp). Never a synthetic sequence number. */
+  timestamp?: number;
   /** Turn number, when known (for cost attribution). */
   turn?: number;
 }
@@ -88,7 +92,8 @@ export interface TurnRecord {
   text: string;
   inputTokens: number;
   outputTokens: number;
-  timestamp: number;
+  /** Wall-clock epoch ms when known. */
+  timestamp?: number;
 }
 
 export interface Alert {

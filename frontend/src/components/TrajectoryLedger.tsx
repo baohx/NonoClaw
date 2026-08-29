@@ -34,11 +34,6 @@ function clockTime(ms: number | null | undefined): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
-function shortClock(ms: number | null | undefined): string {
-  const label = clockTime(ms);
-  return label === "" ? "—" : label;
-}
-
 export default function TrajectoryLedger() {
   const messages = useStore((s) => s.messages);
   const traceEntries = useStore((s) => s.traceEntries);
@@ -171,7 +166,11 @@ export default function TrajectoryLedger() {
         cacheRead += turn.usage.cacheRead;
       }
       for (const cell of turn.cells) {
-        if (cell.kind === "tool") tools += 1;
+        // Subagent-internal tools ride under the parent turn but are a
+        // separate branch — exclude them from the main agent's tool count
+        // (they also carry no timestamps, so counting them here both inflates
+        // the number and leaves a pile of "—" rows in the time column).
+        if (cell.kind === "tool" && cell.subagentRunId == null) tools += 1;
         if (cell.isError) errors += 1;
       }
     }
@@ -310,9 +309,7 @@ export default function TrajectoryLedger() {
                     <span className="ledger-row__time">
                       {cell.requestOnly === true
                         ? "…"
-                        : cell.timeSeconds === null
-                          ? shortClock(cell.startedAt)
-                          : formatElapsedSeconds(cell.timeSeconds)}
+                        : formatElapsedSeconds(cell.timeSeconds)}
                     </span>
                   </div>
                 );

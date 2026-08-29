@@ -114,26 +114,42 @@ export function deriveTrajectoryTimeline(
         ? [0, Math.max(1, ...timed.map((t) => t.range.end))]
         : [Math.min(...timed.map((t) => t.range.start)), Math.max(...timed.map((t) => t.range.end))];
 
-  // Idle compression for wall-clock modes only.
-  const idleBreaks: { at: number; savedSeconds: number }[] = [];
-  if (mode === "time" || mode === "actual") {
+  const isTimeDomain = mode === "time" || mode === "actual";
+  // Idle compression for wall-clock modes: gaps beyond the threshold collapse
+  // down to the threshold so idle time doesn't flatten the activity. Both the
+  // span coordinates and the idle marks are computed in the same *compressed*
+  // coordinate space, then normalized against the compressed domain — the
+  // marks must align with what actually renders.
+  const idleBreaksRaw: { at: number; savedSeconds: number }[] = [];
+  let renderDomain: [number, number] = domain;
+  const compressedRange = new Map<LedgerCellLike, CellRange>();
+
+  if (isTimeDomain) {
     const sorted = [...timed].sort((a, b) => a.range.start - b.range.start);
-    let compressedCursor = sorted[0].range.start;
+    const IDLE_MS = IDLE_COMPRESS_SECONDS * 1000;
+    let offset = 0; // cumulative compressed-out time (ms)
     let prevEnd = sorted[0].range.start;
-    let offset = 0;
     for (const item of sorted) {
       const gap = item.range.start - prevEnd;
-      if (gap > IDLE_COMPRESS_SECONDS * 1000) {
-        const saved = (gap - IDLE_COMPRESS_SECONDS * 1000) / 1000;
-        idleBreaks.push({ at: (prevEnd + IDLE_COMPRESS_SECONDS * 1000 - domain[0]) / (domain[1] - domain[0]), savedSeconds: saved });
-        offset += gap - IDLE_COMPRESS_SECONDS * 1000;
+      if (gap > IDLE_MS) {
+        const saved = gap - IDLE_MS;
+        // The mark sits at the end of the kept threshold gap, in compressed
+        // coordinates (offset is the amount collapsed *before* this gap).
+        idleBreaksRaw.push({ at: prevEnd + IDLE_MS - offset, savedSeconds: saved / 1000 });
+        offset += saved;
       }
+      compressedRange.set(item.cell, {
+        start: item.range.start - offset,
+        end: item.range.end - offset,
+      });
       prevEnd = Math.max(prevEnd, item.range.end);
-      void compressedCursor;
-      compressedCursor = 0;
     }
-    void offset;
+    const minStart = sorted[0].range.start; // offset is 0 for the first item
+    const maxEnd = Math.max(...sorted.map((i) => i.range.end)) - offset;
+    renderDomain = [minStart, maxEnd];
   }
+
+  const renderSpan = renderDomain[1] - renderDomain[0] || 1;
 
   const spans: TrajectoryTimelineSpan[] = timed.map(({ cell, range }) => {
     const lane: TrajectoryTimelineSpan["lane"] =
@@ -141,17 +157,23 @@ export function deriveTrajectoryTimeline(
         : cell.kind === "thinking" ? "thinking"
           : cell.kind === "tool" ? "tool"
             : "request";
+    const r = isTimeDomain ? (compressedRange.get(cell) ?? range) : range;
     return {
       index: cell.index,
-      start: (range.start - domain[0]) / (domain[1] - domain[0]),
-      end: (range.end - domain[0]) / (domain[1] - domain[0]),
+      start: (r.start - renderDomain[0]) / renderSpan,
+      end: (r.end - renderDomain[0]) / renderSpan,
       isError: cell.isError === true,
       kind: cell.kind,
       lane,
     };
   });
 
-  return { mode, spans, domain, idleBreaks, isTimeDomain: mode === "time" || mode === "actual" };
+  const idleBreaks = idleBreaksRaw.map((b) => ({
+    at: (b.at - renderDomain[0]) / renderSpan,
+    savedSeconds: b.savedSeconds,
+  }));
+
+  return { mode, spans, domain: renderDomain, idleBreaks, isTimeDomain };
 }
 
 /** Focus records whose span overlaps the selected normalized range. */
