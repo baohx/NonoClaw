@@ -290,6 +290,61 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   check(filledAssistant !== undefined && filledAssistant.timeSeconds !== null && Math.abs(filledAssistant.timeSeconds! - 1.5) < 1e-9, `replay fallback still fills the assistant gap (got ${filledAssistant?.timeSeconds}s, want 1.5s)`);
   const skippedThinking = replayWithNext.turns[0].cells.find((c) => c.kind === "thinking");
   check(skippedThinking !== undefined && skippedThinking.timeSeconds === null, "replay fallback skips thinking rows — adjacent thinking/assistant durations no longer identical");
+  const replayUser = replayWithNext.turns[0].cells.find((c) => c.kind === "user");
+  check(replayUser !== undefined && replayUser.timeSeconds === null, "replay fallback skips user rows — the gap is model latency, not prompt runtime");
+
+  // Parallel tool_use in one replayed step: without per-tool trace both tool
+  // rows inherit the identical synthetic span and draw fully overlapping bars
+  // on the tool lane. Siblings must be serialized start-after-previous-end.
+  {
+    const parallel = buildLedgerLayout({
+      messages: [
+        { id: "pu1", role: "user", content: "go", timestamp: now },
+        { id: "pa1", role: "assistant", content: "", timestamp: now + 1_000, streaming: false },
+        { id: "pt1", role: "tool", toolName: "Read", toolOk: true, content: "ok", timestamp: now + 3_000, durationMs: 2_000 } as unknown as ChatMessage,
+        { id: "pt2", role: "tool", toolName: "Read", toolOk: true, content: "ok", timestamp: now + 3_000, durationMs: 2_000 } as unknown as ChatMessage,
+      ],
+      traceEntries: [],
+      subagentRunsById: {},
+    });
+    const tools = parallel.turns[0].cells.filter((c) => c.kind === "tool");
+    check(tools.length === 2, `both parallel tool records projected (got ${tools.length})`);
+    const [first, second] = tools;
+    const fEnd = (first.startedAt ?? 0) + (first.timeSeconds ?? 0) * 1000;
+    const sStart = second.startedAt ?? 0;
+    check(
+      first.startedAt !== null && second.startedAt !== null && sStart >= fEnd,
+      `parallel tool rows serialized, no overlap (first ends ${fEnd}, second starts ${sStart})`,
+    );
+    const laneEnd = (now + 3_000) + 2_000;
+    check(fEnd <= laneEnd && sStart + (second.timeSeconds ?? 0) * 1000 <= laneEnd, "serialized tools stay within the shared replay window");
+  }
+
+  // Out-of-order thinking close: the provider flushes `thinking_state
+  // active:false` AFTER the step's completion event (usage_updated /
+  // tool_use_start / run_finished). Without a clamp the assistant window
+  // starts at thinkingEnd > stepEnd → negative "time" (regression from the
+  // live run where ASSISTANT showed -527ms / -399ms). The thinking block is a
+  // sequential half of the step, so it can never extend past stepEnd.
+  const lateThinkEnd = now + 1_600; // reasoning close arrives late (AFTER step completion)
+  const earlyStepEnd = now + 1_400; // step actually completes earlier
+  const outOfOrderEntries: TraceEntry[] = [
+    { id: "o1", runId: "r", sessionId: "s", sequence: 1, timestampMs: now + 100, kind: "model_request_started", summary: "req", details: { turn: 1 }, category: "model", status: "active" },
+    // usage_updated fires BEFORE the thinking close (provider flushes the
+    // reasoning block last) — this is what pushed assistant duration negative.
+    { id: "o2", runId: "r", sessionId: "s", sequence: 2, timestampMs: earlyStepEnd, kind: "usage_updated", summary: "usage", details: { turn: 1, turn_output: 10 }, category: "usage", status: "success" },
+    { id: "o3", runId: "r", sessionId: "s", sequence: 3, timestampMs: lateThinkEnd, kind: "thinking_state", summary: "thinking", details: { active: false, turn: 1 }, category: "model", status: "success" },
+  ];
+  const oooMsgs: ChatMessage[] = [
+    { id: "u1", role: "user", content: "hi", timestamp: now },
+    { id: "a1", role: "assistant", content: "visible answer", thinking: "hidden reasoning", timestamp: lateThinkEnd, streaming: false },
+  ];
+  const layoutOoo = buildLedgerLayout({ messages: oooMsgs, traceEntries: outOfOrderEntries, subagentRunsById: {} });
+  const oooThinking = layoutOoo.turns[0].cells.find((c) => c.kind === "thinking");
+  const oooAssistant = layoutOoo.turns[0].cells.find((c) => c.kind === "assistant");
+  check(oooThinking !== undefined && oooAssistant !== undefined, "out-of-order thinking close still projects both records");
+  check(oooAssistant!.timeSeconds !== null && oooAssistant!.timeSeconds! >= 0, `out-of-order thinking close never yields a negative assistant duration (got ${oooAssistant?.timeSeconds}s)`);
+  check(oooThinking!.timeSeconds !== null && oooThinking!.timeSeconds! <= (earlyStepEnd - (now + 100)) / 1000 + 1e-9, `thinking duration clamps at the step end (got ${oooThinking?.timeSeconds}s, cap ${((earlyStepEnd - (now + 100)) / 1000).toFixed(3)}s)`);
 }
 
 console.log("ledger invariants: all passed");

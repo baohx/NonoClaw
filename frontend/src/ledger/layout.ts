@@ -134,6 +134,16 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
       if (current.completed === null) current.completed = entry.timestampMs;
     }
   }
+  // Thinking is a sequential half of the step, so its close can never extend
+  // past the step end. Providers may flush `thinking_state active:false`
+  // AFTER the step's completion event (usage_updated / tool_use_start /
+  // run_finished), which would otherwise anchor the assistant window at a
+  // thinkingEnd > completed → negative duration. Clamp to completed.
+  for (const w of windows) {
+    if (w.thinkingEnd !== null && w.completed !== null && w.thinkingEnd > w.completed) {
+      w.thinkingEnd = w.completed;
+    }
+  }
   return windows;
 }
 
@@ -335,6 +345,11 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           // (the whole step). Filling both made adjacent thinking/assistant
           // rows show the identical duration — double-counted.
           if (cell.kind === "thinking") continue;
+          // User prompts are instantaneous; the gap to the next stamped
+          // record is model response latency that belongs to the following
+          // assistant step, not to the user row. Filling it made the USER bar
+          // span the whole model step and overlap the thinking/assistant rows.
+          if (cell.kind === "user") continue;
           let cursor: { t: number; next: number | undefined } | null = null;
           for (const entry of timelineMs) {
             if (entry.t <= cell.startedAt) cursor = entry;
@@ -380,6 +395,31 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           if (turn.startAt === null || span.start < turn.startAt) turn.startAt = span.start;
           const end = span.start + span.elapsed;
           if (end > (turn.endAt ?? 0)) turn.endAt = end;
+        }
+      }
+    }
+    // Replay sessions give every tool_use of one assistant message the same
+    // synthetic span [assistant ts, result ts] — parallel calls then draw as
+    // fully overlapping bars on the tool lane. With no per-tool trace there is
+    // no real start order, so serialize siblings: shift each tool's start to
+    // just after the previous one ends, shrinking durations to fit the shared
+    // window when needed.
+    const tools = turn.cells.filter((c) => c.kind === "tool" && c.startedAt !== null && c.timeSeconds !== null);
+    if (tools.length > 1) {
+      tools.sort((a, b) => a.index - b.index);
+      let prevEnd: number | null = null;
+      for (const cell of tools) {
+        const start = cell.startedAt as number;
+        const durMs = (cell.timeSeconds as number) * 1000;
+        if (prevEnd !== null && start < prevEnd) {
+          const windowEnd = start + durMs;
+          const newStart: number = prevEnd;
+          const newDur = Math.max(0, windowEnd - newStart);
+          cell.startedAt = newStart;
+          cell.timeSeconds = newDur / 1000;
+          prevEnd = newStart + newDur;
+        } else {
+          prevEnd = start + durMs;
         }
       }
     }
