@@ -172,6 +172,18 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         name: "providerBilling",
         description: "Provider API balance-check endpoints: { providers: { name: { balanceUrl, apiKey } } }.",
     },
+    ConfigFieldReference {
+        name: "dreamEnabled",
+        description: "Enable the AutoDream idle background memory consolidation run. Default true.",
+    },
+    ConfigFieldReference {
+        name: "dreamIdleMinutes",
+        description: "Idle minutes (no client activity) before a dream run may start. Default 10.",
+    },
+    ConfigFieldReference {
+        name: "proxy",
+        description: "Outbound proxy URL (e.g. \"http://127.0.0.1:20171\") exported as HTTP(S)_PROXY/ALL_PROXY for all HTTP clients. Loopback bypasses via NO_PROXY.",
+    },
 ];
 
 pub fn config_reference() -> &'static [ConfigFieldReference] {
@@ -253,6 +265,12 @@ pub struct SettingsFile {
     pub dream_idle_minutes: Option<u64>,
     #[serde(rename = "elevenlabsApiKey", default)]
     pub elevenlabs_api_key: Option<String>,
+    /// Outbound proxy URL (e.g. "http://127.0.0.1:20171") applied to all
+    /// HTTP clients (API providers, WebFetch, WebSearch, uploads, OCR) by
+    /// exporting HTTP_PROXY/HTTPS_PROXY/ALL_PROXY before any client is
+    /// built. Loopback addresses bypass the proxy via NO_PROXY defaults.
+    #[serde(default)]
+    pub proxy: Option<String>,
     #[serde(rename = "charsPerToken", default = "default_chars_per_token")]
     pub chars_per_token: usize,
     #[serde(rename = "docModel", default)]
@@ -467,6 +485,7 @@ impl Default for SettingsFile {
             dream_enabled: None,
             dream_idle_minutes: None,
             elevenlabs_api_key: None,
+            proxy: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
             attachment_converter: None,
@@ -1707,6 +1726,9 @@ fn merge_settings_value(
     }
     if present("skillDisclosure", overlay.skill_disclosure.is_some()) {
         base.skill_disclosure = overlay.skill_disclosure.clone();
+    }
+    if present("proxy", overlay.proxy.is_some()) {
+        base.proxy = overlay.proxy.clone();
     }
     if present(
         "skillIndexMaxTokens",
@@ -3109,6 +3131,25 @@ pub fn load_mcp_json(cwd: &Path) -> Option<HashMap<String, McpServerConfig>> {
     layers.pop()?.settings.mcp_servers
 }
 
+/// Export `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and a default `NO_PROXY`
+/// excluding loopback) when `settings.proxy` is configured. Must run before
+/// any reqwest client is built — reqwest snapshots proxy env vars at
+/// `Client::builder().build()` time. Process-provided proxy variables take
+/// precedence over the settings file.
+pub fn apply_proxy_env(settings: &SettingsFile) {
+    let Some(proxy) = settings.proxy.as_deref().filter(|p| !p.is_empty()) else {
+        return;
+    };
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, proxy);
+        }
+    }
+    if std::env::var_os("NO_PROXY").is_none() && std::env::var_os("no_proxy").is_none() {
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
+    }
+}
+
 /// Legacy compatibility only. Canonical callers use the captured environment
 /// in [`ResolvedConfig`] and never mutate process state while resolving config.
 #[deprecated(note = "use load_resolved_config; configuration resolution is side-effect free")]
@@ -3267,6 +3308,35 @@ mod tests {
         assert!(!diagnostics
             .iter()
             .any(|diagnostic| diagnostic.field.as_deref() == Some("models")));
+    }
+
+    #[test]
+    fn proxy_and_dream_fields_are_known_config_fields() {
+        // Regression: `proxy` (SettingsFile field) and the dream scheduler
+        // toggles were missing from CONFIG_REFERENCE, so every real user
+        // settings.json tripped a spurious unknown_field warning at startup.
+        let names = config_reference()
+            .iter()
+            .map(|field| field.name)
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("proxy"));
+        assert!(names.contains("dreamEnabled"));
+        assert!(names.contains("dreamIdleMinutes"));
+
+        let mut diagnostics = Vec::new();
+        diagnose_unknown_fields(
+            &serde_json::json!({
+                "proxy": "http://127.0.0.1:20171",
+                "dreamEnabled": true,
+                "dreamIdleMinutes": 15
+            }),
+            &source("proxy"),
+            &mut diagnostics,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "known fields must not warn: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -3472,7 +3542,7 @@ mod tests {
                 serde_json::json!({
                     "model": "low",
                     "permissions": {"allow": ["Read"], "deny": ["Bash"]},
-                    "models": [{"name":"low","baseUrl":"http://low","apiKey":"key"}],
+                    "models": [{"name":"low","baseUrl":"https://low","apiKey":"key"}],
                     "hooks": {"PreToolUse": {"items": ["a"], "timeout": 1}},
                     "mcpServers": {"shared": {"command":"low"}, "kept": {"command":"kept"}}
                 }),
@@ -3482,7 +3552,7 @@ mod tests {
                 serde_json::json!({
                     "model": "high",
                     "permissions": {"allow": ["Read", "Edit"], "deny": ["Write"]},
-                    "models": [{"name":"high","baseUrl":"http://high","apiKey":"key"}],
+                    "models": [{"name":"high","baseUrl":"https://high","apiKey":"key"}],
                     "hooks": {"PreToolUse": {"items": ["b"], "enabled": true}},
                     "mcpServers": {"shared": {"command":"high"}}
                 }),
@@ -3528,7 +3598,7 @@ mod tests {
                     "permissions":{"allow":["Read"]},
                     "models":[{
                         "name":"profile",
-                        "baseUrl":"http://example",
+                        "baseUrl":"https://example",
                         "apiKey":"key",
                         "role":[]
                     }],
@@ -3568,7 +3638,7 @@ mod tests {
             "settings.json",
             serde_json::json!({
                 "env":{"API_KEY":"file-value"},
-                "models":[{"name":"m","baseUrl":"http://example","apiKey":"$API_KEY","default":true}]
+                "models":[{"name":"m","baseUrl":"https://example","apiKey":"$API_KEY","default":true}]
             }),
         )];
         let environment =
@@ -3591,11 +3661,11 @@ mod tests {
                 "models.json",
                 serde_json::json!({
                     "models": [
-                        {"name":"main-a","baseUrl":"http://a","apiKey":"key-a","default":true},
-                        {"name":"main-b","baseUrl":"http://b","apiKey":"key-b"},
-                        {"name":"cheap","baseUrl":"http://cheap","apiKey":"key-c","role":"compact"},
-                        {"name":"worker","baseUrl":"http://worker","apiKey":"key-w","role":"subagent"},
-                        {"name":"vision","baseUrl":"http://vision","apiKey":"key-v","role":"doc","apiFormat":"openai"}
+                        {"name":"main-a","baseUrl":"https://a","apiKey":"key-a","default":true},
+                        {"name":"main-b","baseUrl":"https://b","apiKey":"key-b"},
+                        {"name":"cheap","baseUrl":"https://cheap","apiKey":"key-c","role":"compact"},
+                        {"name":"worker","baseUrl":"https://worker","apiKey":"key-w","role":"subagent"},
+                        {"name":"vision","baseUrl":"https://vision","apiKey":"key-v","role":"doc","apiFormat":"openai"}
                     ],
                     "compactModel": "cheap",
                     "docModel": "vision"
@@ -3635,14 +3705,14 @@ mod tests {
                 .client_for(ClientPurpose::Compact, Some("main-b"))
                 .unwrap()
                 .base_url(),
-            "http://cheap"
+            "https://cheap"
         );
         assert_eq!(
             resolved
                 .client_for(ClientPurpose::Subagent, Some("main-b"))
                 .unwrap()
                 .base_url(),
-            "http://worker"
+            "https://worker"
         );
         assert_eq!(
             resolved
@@ -3661,8 +3731,8 @@ mod tests {
                 "model":"missing",
                 "permissions":{"allow":["Bash"],"deny":["Bash"]},
                 "models":[
-                    {"name":"one","baseUrl":"http://one","apiKey":"$MISSING","default":true},
-                    {"name":"two","baseUrl":"http://two","apiKey":"key","default":true}
+                    {"name":"one","baseUrl":"https://one","apiKey":"$MISSING","default":true},
+                    {"name":"two","baseUrl":"https://two","apiKey":"key","default":true}
                 ],
                 "compactModel":"absent",
                 "docModel":"absent"
@@ -3814,7 +3884,7 @@ mod tests {
         )
         .unwrap();
         let explicit = root.join("explicit.json");
-        std::fs::write(&explicit, r#"{"model":"explicit","maxTurns":42,"models":[{"name":"explicit","baseUrl":"http://example","apiKey":"key"}]}"#).unwrap();
+        std::fs::write(&explicit, r#"{"model":"explicit","maxTurns":42,"models":[{"name":"explicit","baseUrl":"https://example","apiKey":"key"}]}"#).unwrap();
         std::fs::write(
             cwd.join(".nonoclaw/mcp.json"),
             r#"{"mcpServers":{"shared":{"command":"standalone"}}}"#,
@@ -3878,5 +3948,44 @@ mod tests {
             resolved.source_for("executables.node.node.version")[0],
             source("project.json")
         );
+    }
+
+    #[test]
+    fn apply_proxy_env_exports_proxy_variables() {
+        let saved: Vec<_> = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "no_proxy"]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "no_proxy"] {
+            std::env::remove_var(key);
+        }
+
+        // No proxy configured → no-op.
+        apply_proxy_env(&SettingsFile::default());
+        assert!(std::env::var_os("HTTP_PROXY").is_none());
+
+        // Configured proxy → all three exported, NO_PROXY defaults to loopback.
+        let settings = serde_json::from_str::<SettingsFile>(r#"{"proxy":"http://127.0.0.1:20171"}"#)
+            .unwrap();
+        apply_proxy_env(&settings);
+        assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:20171");
+        assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), "http://127.0.0.1:20171");
+        assert_eq!(std::env::var("ALL_PROXY").unwrap(), "http://127.0.0.1:20171");
+        assert_eq!(std::env::var("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1");
+
+        // Process-provided variables win over the settings file.
+        std::env::set_var("HTTPS_PROXY", "http://corporate:3128");
+        std::env::remove_var("HTTP_PROXY");
+        std::env::remove_var("ALL_PROXY");
+        apply_proxy_env(&settings);
+        assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), "http://corporate:3128");
+        assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:20171");
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

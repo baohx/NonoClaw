@@ -74,6 +74,11 @@ enum RunStreamItem {
         usage: serde_json::Value,
         turns: u32,
         stop_reason: Option<String>,
+        /// Short finish label derived from `terminal.reason` ("completed",
+        /// "max_turns", "budget_exceeded", "context_limit"). Lets in-process
+        /// consumers (the dream scheduler) distinguish a clean end_turn from
+        /// a MaxTurns truncation without re-parsing stop_reason.
+        finish: String,
     },
     Error {
         run_id: String,
@@ -374,6 +379,18 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             RunTerminalStatus::Done => {
                 if let Some(r) = terminal.result {
                     state_for_run.session_hub.accumulate_usage(&session_id, &r.usage).await;
+                    let finish = match &terminal.reason {
+                        nonoclaw_engine::RunFinishReason::Completed { .. } => "completed",
+                        nonoclaw_engine::RunFinishReason::MaxTurns { .. } => "max_turns",
+                        nonoclaw_engine::RunFinishReason::BudgetExceeded { .. } => {
+                            "budget_exceeded"
+                        }
+                        nonoclaw_engine::RunFinishReason::ContextLimit { .. } => {
+                            "context_limit"
+                        }
+                        _ => "other",
+                    }
+                    .to_string();
                     let _ = event_tx_done.send(RunStreamItem::Done {
                         run_id: terminal.run_id.clone(),
                         session_id: session_id.clone(),
@@ -382,6 +399,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
                         usage: serde_json::to_value(r.usage).unwrap_or_default(),
                         turns: r.turns,
                         stop_reason: r.stop_reason.as_ref().map(|s| s.as_str().to_string()),
+                        finish,
                     });
                 } else {
                     let _ = event_tx_done.send(RunStreamItem::Error {

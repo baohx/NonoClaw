@@ -41,6 +41,9 @@ pub(super) async fn index(index_path: PathBuf) -> Response {
         Ok(content) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
+            // index.html references hashed assets; serving a stale copy keeps
+            // the whole old bundle alive. Always revalidate.
+            .header("cache-control", "no-cache")
             .body(Body::from(content))
             .expect("static response is valid"),
         Err(_) => Response::builder()
@@ -77,6 +80,9 @@ pub(super) async fn serve_sw() -> impl IntoResponse {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/javascript")
+        // Service workers must be revalidated every load, otherwise the
+        // browser keeps serving a stale SW (and its cached assets) forever.
+        .header("cache-control", "no-cache")
         .body(Body::from(body))
         .expect("static response is valid")
 }

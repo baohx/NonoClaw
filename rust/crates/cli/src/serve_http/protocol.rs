@@ -67,6 +67,16 @@ pub(super) enum ClientMsg {
     SessionPrompts {
         session_id: String,
     },
+    /// Request one page of older history for a tail-windowed session.
+    /// `before` is the count of messages the client currently holds that are
+    /// newer than the requested page (i.e. the window boundary).
+    LoadOlder {
+        session_id: String,
+        #[serde(default = "default_history_page_size")]
+        limit: usize,
+        #[serde(default)]
+        before: Option<usize>,
+    },
     SetPermissionMode {
         mode: String,
     },
@@ -198,6 +208,25 @@ pub(super) enum ServerMsg {
         /// (input_tokens, output_tokens, cache tokens). Used by the frontend
         /// to restore the right-rail in/out display across page refreshes.
         cumulative_usage: serde_json::Value,
+        /// Total messages in the persisted session. When the payload is a
+        /// tail window (`total > messages.len()`), the client may request the
+        /// remainder with `load_older`.
+        #[serde(default)]
+        total: usize,
+    },
+    /// One older page of a tail-windowed session, prepended by the client.
+    HistoryPage {
+        protocol_version: u16,
+        session_id: String,
+        revision: u64,
+        timestamp_ms: u64,
+        /// Messages strictly before index `before` (descending boundaries
+        /// resolve to ascending order in the payload). Empty signals "no
+        /// more history" and closes the loader.
+        messages: Vec<serde_json::Value>,
+        /// Remaining message count older than this page (0 = start reached).
+        #[serde(default)]
+        remaining: usize,
     },
     FileTree {
         root: String,
@@ -246,8 +275,11 @@ pub(super) fn safe_error(
     }
 }
 
-pub(super) fn timestamp_ms() -> u64 {
-    SystemTime::now()
+fn default_history_page_size() -> usize {
+    100
+}
+
+pub(super) fn timestamp_ms() -> u64 {    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
@@ -260,19 +292,73 @@ pub(super) fn messages_loaded(
     snapshot: SessionSnapshot,
     cumulative_usage: serde_json::Value,
 ) -> ServerMsg {
-    let started_ms = snapshot.started.as_deref().and_then(parse_rfc3339_ms);
+    let total = snapshot.messages.len();
+    let (window, total) = tail_window(snapshot.messages, HISTORY_TAIL_MESSAGES);
+    messages_loaded_windowed(session_id, window, total, snapshot.revision, snapshot.started, cumulative_usage)
+}
+
+/// Tail-windowed constructor used when restoring a session: send only the
+/// most recent `HISTORY_TAIL_MESSAGES` messages; `total` tells the client how
+/// much older history exists behind `load_older` paging.
+pub(super) fn messages_loaded_windowed(
+    session_id: &str,
+    messages: Vec<Message>,
+    total: usize,
+    revision: u64,
+    started: Option<String>,
+    cumulative_usage: serde_json::Value,
+) -> ServerMsg {
+    let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
     ServerMsg::MessagesLoaded {
         protocol_version: WS_PROTOCOL_VERSION,
         session_id: session_id.to_string(),
-        revision: snapshot.revision,
+        revision,
         timestamp_ms: timestamp_ms(),
-        messages: snapshot
-            .messages
+        messages: messages
             .into_iter()
-            .enumerate()
-            .map(|(index, message)| message_for_wire(message, started_ms, index))
+            .map(|message| message_for_wire(message, started_ms, 0))
             .collect(),
         cumulative_usage,
+        total,
+    }
+}
+
+/// One `load_older` response: messages strictly before `before_index`,
+/// ascending. `remaining` counts what is older still.
+pub(super) fn history_page(
+    session_id: &str,
+    messages: Vec<Message>,
+    before_index: usize,
+    total: usize,
+    revision: u64,
+    started: Option<String>,
+) -> ServerMsg {
+    let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
+    let remaining = before_index.saturating_sub(messages.len()).min(before_index);
+    ServerMsg::HistoryPage {
+        protocol_version: WS_PROTOCOL_VERSION,
+        session_id: session_id.to_string(),
+        revision,
+        timestamp_ms: timestamp_ms(),
+        messages: messages
+            .into_iter()
+            .map(|message| message_for_wire(message, started_ms, 0))
+            .collect(),
+        remaining,
+    }
+}
+
+
+/// Default session-restore tail window.
+pub(super) const HISTORY_TAIL_MESSAGES: usize = 50;
+
+/// Keep only the last `tail` messages, reporting the pre-window total.
+fn tail_window(mut messages: Vec<Message>, tail: usize) -> (Vec<Message>, usize) {
+    let total = messages.len();
+    if total <= tail {
+        (messages, total)
+    } else {
+        (messages.split_off(total - tail), total)
     }
 }
 
@@ -415,7 +501,10 @@ fn message_for_wire(
         "role": message.role,
         "content": safe_message_content(message.content),
     });
-    if let Some(ts) = estimated_message_ms(started_ms, index) {
+    // Real wall-clock commit time (v0.23.2+) takes precedence; fall back to
+    // the synthetic started+index estimate for legacy entries without `ts`.
+    let ts = message.ts.or_else(|| estimated_message_ms(started_ms, index));
+    if let Some(ts) = ts {
         wire["ts"] = serde_json::Value::from(ts);
     }
     if !attachments.is_empty() {
@@ -539,7 +628,13 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
             "content": safe_tool_result_content(content),
             "is_error": is_error,
         })),
-        ContentBlock::Thinking { .. } => None,
+        // Thinking text is surfaced (live runs already stream it via
+        // ThinkingDelta, and restored sessions/ledger views render it); only
+        // the provider signature is dropped.
+        ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({
+            "type": "thinking",
+            "thinking": redact_text(&thinking),
+        })),
     }
 }
 
@@ -613,6 +708,38 @@ mod tests {
     use nonoclaw_core::{ImageSource, Role};
 
     #[test]
+    fn tail_window_keeps_last_n_and_reports_total() {
+        let messages: Vec<Message> = (0..10)
+            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .collect();
+        let (window, total) = tail_window(messages, 3);
+        assert_eq!(total, 10);
+        assert_eq!(window.len(), 3);
+        match &window[0].content {
+            nonoclaw_core::MessageContent::Text(text) => assert_eq!(text, "m7"),
+            _ => panic!("expected text"),
+        }
+        // Short sessions pass through untouched.
+        let short: Vec<Message> = (0..2)
+            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .collect();
+        let (window, total) = tail_window(short, 3);
+        assert_eq!(total, 2);
+        assert_eq!(window.len(), 2);
+    }
+
+    #[test]
+    fn history_page_reports_remaining_before_start() {
+        let messages: Vec<Message> = (0..10)
+            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .collect();
+        // Page covering indexes 3..7 requested as "before 7, limit 4".
+        let remaining = 7usize.saturating_sub(4).min(7);
+        assert_eq!(remaining, 3);
+        let _ = messages;
+    }
+
+    #[test]
     fn session_run_prompts_detects_run_boundaries() {
         let dir = std::env::temp_dir().join(format!("nonoclaw-prompts-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -647,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn session_wire_messages_hide_thinking_attachments_and_sensitive_tool_fields() {
+    fn session_wire_messages_redact_thinking_signature_attachments_and_sensitive_tool_fields() {
         // **Validates: Requirements 8.8, 9.8, 11.1**
         let attachment = Message::user(MessageContent::from_blocks(vec![
             ContentBlock::text(
@@ -671,7 +798,7 @@ mod tests {
             role: Role::Assistant,
             content: MessageContent::from_blocks(vec![
                 ContentBlock::Thinking {
-                    thinking: "hidden chain of thought".into(),
+                    thinking: "restored chain of thought".into(),
                     signature: Some("provider-signature".into()),
                 },
                 ContentBlock::ToolUse {
@@ -686,6 +813,7 @@ mod tests {
                 },
                 ContentBlock::text("visible answer"),
             ]),
+            ts: None,
         };
 
         let attachment_wire = message_for_wire(attachment, None, 0);
@@ -704,18 +832,41 @@ mod tests {
         for forbidden in [
             "private attachment body",
             "private-image-data",
-            "hidden chain of thought",
             "provider-signature",
             "sk-proj-tool",
             "private tool prompt",
         ] {
             assert!(!encoded.contains(forbidden), "wire leaked {forbidden}");
         }
+        // Thinking text survives (redacted) so restored sessions and the
+        // trajectory ledger can render it; the signature does not.
+        assert!(encoded.contains("restored chain of thought"));
+        assert!(encoded.contains("\"type\":\"thinking\""));
         assert!(encoded.contains("architecture.png"));
         assert!(encoded.contains("requirements.md"));
         assert!(encoded.contains("please summarize"));
         assert!(encoded.contains("visible answer"));
         assert!(encoded.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn message_ts_prefers_real_over_synthetic() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::from_text("hi"),
+            ts: Some(1_700_000_123_456),
+        };
+        // Real wall-clock ts wins over the started+index estimate.
+        let wire = message_for_wire(
+            Message { ts: Some(1_700_000_123_456), ..msg.clone() },
+            Some(1_700_000_000_000),
+            5,
+        );
+        assert_eq!(wire["ts"], 1_700_000_123_456u64);
+        // Legacy entries without ts fall back to the synthetic estimate.
+        let legacy = Message { ts: None, ..msg };
+        let wire = message_for_wire(legacy, Some(1_700_000_000_000), 5);
+        assert_eq!(wire["ts"], 1_700_000_005_000u64);
     }
 
     fn client_kind(message: ClientMsg) -> &'static str {
@@ -733,6 +884,7 @@ mod tests {
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
             ClientMsg::GitShow { .. } => "git_show",
             ClientMsg::SessionPrompts { .. } => "session_prompts",
+            ClientMsg::LoadOlder { .. } => "load_older",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
             ClientMsg::SwitchProject { .. } => "switch_project",
@@ -810,6 +962,15 @@ mod tests {
             timestamp_ms: 1_700_000_000_001,
             messages: vec![],
             cumulative_usage: serde_json::json!({}),
+            total: 0,
+        };
+        let history = ServerMsg::HistoryPage {
+            protocol_version: 1,
+            session_id: "session-fixture".into(),
+            revision: 7,
+            timestamp_ms: 1_700_000_000_003,
+            messages: vec![],
+            remaining: 0,
         };
         let done = ServerMsg::Done {
             protocol_version: 1,
@@ -838,6 +999,7 @@ mod tests {
             serde_json::to_value(snapshot).unwrap(),
             fixtures["snapshot"]
         );
+        assert_eq!(serde_json::to_value(history).unwrap(), fixtures["history_page"]);
         assert_eq!(serde_json::to_value(done).unwrap(), fixtures["done"]);
         assert_eq!(serde_json::to_value(error).unwrap(), fixtures["error"]);
     }

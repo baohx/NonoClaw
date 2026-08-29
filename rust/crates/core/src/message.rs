@@ -148,6 +148,12 @@ impl MessageContent {
 pub struct Message {
     pub role: Role,
     pub content: MessageContent,
+    /// Wall-clock epoch-ms when this message was committed to the session
+    /// transcript (None on legacy entries and synthetic contexts). Persisted
+    /// in the session JSONL but never sent to providers — stripped at
+    /// request serialization so prompt-cache bytes stay stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
 }
 
 impl Message {
@@ -155,12 +161,14 @@ impl Message {
         Message {
             role: Role::User,
             content,
+            ts: None,
         }
     }
     pub fn assistant(content: MessageContent) -> Self {
         Message {
             role: Role::Assistant,
             content,
+            ts: None,
         }
     }
     /// Extract any `ToolUse` blocks carried by this message (assistant turns).

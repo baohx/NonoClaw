@@ -267,6 +267,48 @@ fn endpoint_url(base_url: &str, endpoint: &str) -> String {
     format!("{base}/{endpoint}")
 }
 
+/// Gate ④ (transport): refuse plaintext-HTTP base URLs except to loopback,
+/// unless the operator explicitly opts out (`NONOCLAW_ALLOW_INSECURE_HTTP=1`)
+/// for a corporate gateway. API keys travel in headers; sending them in
+/// cleartext on the wire would defeat header/body separation entirely.
+/// Loopback stays allowed so local Ollama/vLLM endpoints (`http://localhost:*`)
+/// keep working.
+fn validate_base_url(base_url: &str) -> Result<()> {
+    let url = reqwest::Url::parse(base_url.trim()).map_err(|e| {
+        Error::Config(format!("invalid provider base_url `{base_url}`: {e}"))
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            // host_str() returns IPv6 with brackets ("[::1]"), so normalize.
+            let host = url
+                .host_str()
+                .unwrap_or("")
+                .trim_matches(['[', ']'])
+                .to_lowercase();
+            let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+            if loopback {
+                return Ok(());
+            }
+            if std::env::var_os("NONOCLAW_ALLOW_INSECURE_HTTP").is_some() {
+                tracing::warn!(
+                    "plaintext HTTP base_url `{base_url}` accepted because NONOCLAW_ALLOW_INSECURE_HTTP is set; \
+                     API keys and prompts are NOT encrypted in transit"
+                );
+                return Ok(());
+            }
+            Err(Error::Config(format!(
+                "refusing plaintext HTTP base_url `{base_url}`: API keys in headers would travel \
+                 unencrypted. Use https, a loopback address (localhost/127.0.0.1/::1), or set \
+                 NONOCLAW_ALLOW_INSECURE_HTTP=1 to override."
+            )))
+        }
+        other => Err(Error::Config(format!(
+            "unsupported provider base_url scheme `{other}` in `{base_url}`"
+        ))),
+    }
+}
+
 pub struct Client {
     http: reqwest::Client,
     api_key: Option<String>,
@@ -287,6 +329,7 @@ impl Client {
                 "no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN set".into(),
             ));
         }
+        validate_base_url(&base_url)?;
         let http = reqwest::Client::builder()
             .user_agent(concat!("nonoclaw/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -1049,11 +1092,21 @@ fn enforce_cache_breakpoint_cap(body: &mut serde_json::Value) {
 }
 
 fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
+    let mut messages_value = serde_json::to_value(&params.messages)?;
+    // Session-transcript metadata (`ts`) must never reach the provider: it
+    // would 400 on strict schemas and shift prompt-cache bytes every turn.
+    if let serde_json::Value::Array(ref mut arr) = messages_value {
+        for message in arr.iter_mut() {
+            if let serde_json::Value::Object(ref mut map) = message {
+                map.remove("ts");
+            }
+        }
+    }
     let mut body = serde_json::json!({
         "model": params.model,
         "max_tokens": params.max_tokens,
         "stream": true,
-        "messages": serde_json::to_value(&params.messages)?,
+        "messages": messages_value,
     });
     if !params.system.is_empty() {
         body["system"] = serde_json::to_value(&params.system)?;
@@ -2465,6 +2518,10 @@ impl RawApiLogger {
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
         }
+        // Gate ④ (retention): raw payloads are secrets; prune once per
+        // process so old files do not accumulate forever.
+        static PRUNE: std::sync::Once = std::sync::Once::new();
+        PRUNE.call_once(|| prune_raw_api_logs(&dir));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2531,6 +2588,39 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     let mut file = options.open(path).ok()?;
     use std::io::Write;
     file.write_all(bytes).ok()
+}
+
+/// Gate ④ (retention): raw API payloads are secrets themselves; sweep files
+/// older than the retention window so they do not accumulate indefinitely.
+/// Default 7 days, overridable via `NONOCLAW_RAW_API_LOG_RETENTION_DAYS`
+/// (0 disables pruning). Runs once per process on the first raw write.
+fn prune_raw_api_logs(dir: &std::path::Path) {
+    let days: u64 = std::env::var("NONOCLAW_RAW_API_LOG_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    if days == 0 {
+        return;
+    }
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(days * 86_400))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if let Ok(modified) = meta.modified() {
+            if modified < cutoff {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Same as [`usage_json`] but with an explicit input-token base (use the
@@ -2914,6 +3004,14 @@ pub(crate) fn api_error_from_body(status: u16, text: &str) -> Error {
 }
 
 #[cfg(test)]
+/// Serializes tests that touch process-global state (env vars, current dir).
+/// `NONOCLAW_RAW_API_LOG` + `set_current_dir` are shared across the parallel
+/// test process; any test that runs `build_request` / `run_turn` while the
+/// raw-log env is set would write payload files into whichever directory is
+/// current. Tests that set the env OR pass through `build_request` must hold
+/// this lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod tests {
     use super::*;
     use crate::sse::SseFrame;
@@ -2934,13 +3032,13 @@ mod tests {
                 content: nonoclaw_core::MessageContent::Blocks(vec![
                     ContentBlock::text("describe"),
                     ContentBlock::Image {
-                        source: nonoclaw_core::ImageSource {
-                            kind: "base64".into(),
+                        source: nonoclaw_core::ImageSource {                            kind: "base64".into(),
                             media_type: "image/png".into(),
                             data: "aGk=".into(),
                         },
                     },
                 ]),
+                ts: None,
             }],
             tools: vec![],
             tool_choice: None,
@@ -3012,6 +3110,7 @@ mod tests {
                         input: serde_json::json!({"path": "/a"}),
                         cache_control: None,
                     }]),
+                    ts: None,
                 },
                 Message {
                     role: nonoclaw_core::Role::User,
@@ -3025,6 +3124,7 @@ mod tests {
                             },
                         },
                     ]),
+                    ts: None,
                 },
             ],
             tools: vec![],
@@ -3074,6 +3174,32 @@ mod tests {
             }
             _ => panic!("expected tool_use"),
         }
+    }
+
+    #[test]
+    fn plaintext_http_base_urls_are_refused_except_loopback() {
+        // Gate ④ transport: keys live in headers, so cleartext HTTP is a
+        // credential leak unless the endpoint is loopback (local Ollama/vLLM).
+        assert!(validate_base_url("https://api.anthropic.com").is_ok());
+        assert!(validate_base_url("https://gateway.example/v1").is_ok());
+        assert!(validate_base_url("http://localhost:11434").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:8080/v1").is_ok());
+        assert!(validate_base_url("http://[::1]:8080").is_ok());
+
+        let err = validate_base_url("http://api.anthropic.com").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing plaintext HTTP"), "{msg}");
+
+        let err = validate_base_url("ftp://example.com").unwrap_err();
+        assert!(err.to_string().contains("unsupported provider base_url scheme"), "{}", err);
+    }
+
+    #[test]
+    fn insecure_http_optout_permits_non_loopback() {
+        std::env::set_var("NONOCLAW_ALLOW_INSECURE_HTTP", "1");
+        let r = validate_base_url("http://proxy.corp.example/v1");
+        std::env::remove_var("NONOCLAW_ALLOW_INSECURE_HTTP");
+        assert!(r.is_ok());
     }
 
     #[test]
@@ -3285,6 +3411,7 @@ mod tests {
                 text: "rolling tail".into(),
                 cache_control: cc(),
             }]),
+            ts: None,
         }];
         let body: serde_json::Value =
             serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
@@ -3546,6 +3673,24 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_serializer_strips_session_ts_from_messages() {
+        // Session-transcript `ts` is local metadata for replay timing; if it
+        // reached the provider it would 400 strict schemas and shift the
+        // prompt-cache prefix every turn.
+        let mut params = fixture_params();
+        params.messages = vec![Message {
+            role: nonoclaw_core::Role::User,
+            content: nonoclaw_core::MessageContent::from_text("hi"),
+            ts: Some(1_700_000_000_000),
+        }];
+        let body: serde_json::Value =
+            serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
+        let encoded = body.to_string();
+        assert!(!encoded.contains("\"ts\""), "session ts leaked into anthropic payload: {encoded}");
+        assert!(body["messages"][0]["content"].is_string());
+    }
+
+    #[test]
     fn openai_serializer_strips_anthropic_cache_markers_from_tool_blocks() {
         // The engine's rolling breakpoint lands on tool_use / tool_result
         // blocks (Anthropic accepts cache_control on every block kind).
@@ -3559,9 +3704,9 @@ mod tests {
             content: nonoclaw_core::MessageContent::Blocks(vec![ContentBlock::ToolUse {
                 id: "tu_x".into(),
                 name: "Read".into(),
-                input: serde_json::json!({}),
-                cache_control: cc,
+                input: serde_json::json!({}),                cache_control: cc,
             }]),
+            ts: None,
         }];
         let openai_str = serialize_body_openai(&params).unwrap();
         assert!(
@@ -3719,6 +3864,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_stream_retry_is_bounded_and_emits_trace_event() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3776,6 +3922,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_preserves_received_partial_content() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let first = "data: {\"id\":\"cancelled\",\"model\":\"gpt-fixture\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
         let (base_url, server) = spawn_chunked_fixture(first, false).await;
         let client = Client::new(Some("fixture-key".into()), None, base_url)
@@ -3805,6 +3952,7 @@ mod tests {
 
     #[tokio::test]
     async fn mid_stream_transport_failure_returns_structured_partial_output() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let first = "data: {\"id\":\"broken\",\"model\":\"gpt-fixture\",\"choices\":[{\"delta\":{\"content\":\"kept\"},\"finish_reason\":null}]}\n\n";
         let (base_url, server) = spawn_chunked_fixture(first, true).await;
         let client = Client::new(Some("fixture-key".into()), None, base_url)
@@ -3933,6 +4081,8 @@ mod security_tests {
             original: original_cwd,
             tmp: tmp.clone(),
         };
+        // Serialize against tests that also touch the process-global env/cwd.
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_current_dir(&tmp).unwrap();
         std::env::set_var("NONOCLAW_RAW_API_LOG", "1");
 
@@ -3979,5 +4129,63 @@ mod security_tests {
 
         std::env::remove_var("NONOCLAW_RAW_API_LOG");
         assert!(RawApiLogger::create(&params, "https://x", "{}", "openai").is_none());
+    }
+
+    #[test]
+    fn api_key_lives_in_header_never_in_body() {
+        // Gate ② negative control at the wire boundary: the API key goes into
+        // `x-api-key` / `Authorization` headers only, never into the
+        // serialized body — regardless of what the prompt says. This is the
+        // property that "header/body separation" must hold under adversarial
+        // prompts too.
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Keep raw logging off so this test never writes payload files (env
+        // var is process-global; `raw_api_logger_writes` turns it on).
+        let had_raw = std::env::var_os("NONOCLAW_RAW_API_LOG");
+        std::env::remove_var("NONOCLAW_RAW_API_LOG");
+
+        let secret = "sk-ant-api03-SUPERSECRETKEY1234567890";
+        let client = Client::new(
+            Some(secret.into()),
+            None,
+            "https://api.anthropic.com".into(),
+        )
+        .unwrap();
+        let params = RequestParams {
+            model: "test-model".into(),
+            max_tokens: 64,
+            system: vec![SystemBlock {
+                kind: "text".into(),
+                text: "You are helpful.".into(),
+                cache_control: None,
+            }],
+            messages: vec![Message {
+                role: nonoclaw_core::Role::User,
+                content: nonoclaw_core::MessageContent::from_text("hi"),
+                ts: None,
+            }],
+            tools: vec![],
+            tool_choice: None,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            trace_label: None,
+        };
+        let (builder, _logger) = client.build_request(&params).unwrap();
+        let req = builder.build().unwrap();
+        assert_eq!(
+            req.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some(secret),
+            "key must ride in the x-api-key header"
+        );
+        let body_bytes = req.body().and_then(|b| b.as_bytes()).unwrap_or_default();
+        let body = String::from_utf8_lossy(body_bytes);
+        assert!(!body.contains(secret), "api key leaked into body: {body}");
+        assert!(!body.contains("x-api-key"), "header name leaked into body: {body}");
+
+        if let Some(v) = had_raw {
+            std::env::set_var("NONOCLAW_RAW_API_LOG", v);
+        }
     }
 }

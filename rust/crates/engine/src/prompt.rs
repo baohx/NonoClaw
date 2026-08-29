@@ -715,11 +715,11 @@ const MEMORY_GUIDE: &str = r#"## Memory (Mneme — three-layer cross-session mem
 
 NonoClaw has a three-layer memory system so you don't start fresh every session:
 
-- **Facts** — immutable knowledge in `memory/facts/*.md`. One `.md` file per fact \
+- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`. One `.md` file per fact \
   with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, \
   `tags`, `supersedes`). Types: preference, convention, decision, architecture, \
   bug. Facts are never deleted — wrong ones are superseded.
-- **Beads** — task continuity in `memory/beads/*.md`. Each bead tracks one active \
+- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Each bead tracks one active \
   task. YAML frontmatter (`id`, `title`, `status`, `priority`). Status: todo, \
   in_progress, blocked, done. **Critical**: save beads at session end so the \
   next session knows what you were working on.
@@ -730,17 +730,17 @@ NonoClaw has a three-layer memory system so you don't start fresh every session:
   reports a bug pattern, or establishes a convention.
 - The user gives feedback on your work ("don't do Y again").
 - You discover a project-invariant (architecture, dependency constraints).
-- **Before creating**: use Read tool to check `memory/facts/` for existing \
+- **Before creating**: use Read tool to check `.nonoclaw/memory/facts/` for existing \
   similar facts. Update if found; create new if not.
 
 ### When to use beads
-- At the start of a session: check `memory/beads/` for active tasks from \
+- At the start of a session: check `.nonoclaw/memory/beads/` for active tasks from \
   previous sessions. Resume where you left off.
 - During work: save a bead when you're blocked or the task spans multiple turns.
 - At session end: save current progress as beads so work can continue later.
 
 ### Search
-Use the `Memory` tool or Grep over `memory/facts/` to find relevant knowledge \
+Use the `Memory` tool or Grep over `.nonoclaw/memory/facts/` to find relevant knowledge \
 before starting work. The context already includes the top facts and active \
 beads, but you may need to search for specifics."#;
 
@@ -781,7 +781,7 @@ The LLM acts as a compiler: raw sources → wiki pages.
 - Cross-reference with `[[page-name]]` wikilinks
 - Write for humans AND future LLM sessions — be precise, cite sources, note \
   confidence levels
-- Facts in `memory/facts/` capture session-specific learning; wiki pages \
+- Facts in `.nonoclaw/memory/facts/` capture session-specific learning; wiki pages \
   capture structured domain knowledge that compounds over time"#;
 
 const DIAGRAM_GUIDE: &str = r#"## Diagrams and visual output
@@ -914,11 +914,11 @@ ask: can stdlib or existing deps already do this? Justify every addition.
 
 NonoClaw has a three-layer memory system so you don't start fresh every session:
 
-- **Facts** — immutable knowledge in `memory/facts/*.md`. One `.md` file per fact \
+- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`. One `.md` file per fact \
   with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, \
   `tags`, `supersedes`). Types: preference, convention, decision, architecture, \
   bug. Facts are never deleted — wrong ones are superseded.
-- **Beads** — task continuity in `memory/beads/*.md`. Each bead tracks one active \
+- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Each bead tracks one active \
   task. YAML frontmatter (`id`, `title`, `status`, `priority`). Status: todo, \
   in_progress, blocked, done. **Critical**: save beads at session end so the \
   next session knows what you were working on.
@@ -929,17 +929,17 @@ NonoClaw has a three-layer memory system so you don't start fresh every session:
   reports a bug pattern, or establishes a convention.
 - The user gives feedback on your work ("don't do Y again").
 - You discover a project-invariant (architecture, dependency constraints).
-- **Before creating**: use Read tool to check `memory/facts/` for existing \
+- **Before creating**: use Read tool to check `.nonoclaw/memory/facts/` for existing \
   similar facts. Update if found; create new if not.
 
 ### When to use beads
-- At the start of a session: check `memory/beads/` for active tasks from \
+- At the start of a session: check `.nonoclaw/memory/beads/` for active tasks from \
   previous sessions. Resume where you left off.
 - During work: save a bead when you're blocked or the task spans multiple turns.
 - At session end: save current progress as beads so work can continue later.
 
 ### Search
-Use the `Memory` tool or Grep over `memory/facts/` to find relevant knowledge \
+Use the `Memory` tool or Grep over `.nonoclaw/memory/facts/` to find relevant knowledge \
 before starting work. The context already includes the top facts and active \
 beads, but you may need to search for specifics.
 
@@ -980,7 +980,7 @@ The LLM acts as a compiler: raw sources → wiki pages.
 - Cross-reference with `[[page-name]]` wikilinks
 - Write for humans AND future LLM sessions — be precise, cite sources, note \
   confidence levels
-- Facts in `memory/facts/` capture session-specific learning; wiki pages \
+- Facts in `.nonoclaw/memory/facts/` capture session-specific learning; wiki pages \
   capture structured domain knowledge that compounds over time
 
 ## Diagrams and visual output

@@ -195,6 +195,7 @@ fn bounded_history_summary(message: &Message, max_chars: usize) -> Option<Messag
     Some(Message {
         role: message.role,
         content: MessageContent::from_text(format!("{OPEN}{inner}{CLOSE}")),
+        ts: message.ts,
     })
 }
 
@@ -358,6 +359,7 @@ fn bounded_history_message(message: &Message, max_chars: usize) -> Option<Messag
     Some(Message {
         role: message.role,
         content,
+        ts: message.ts,
     })
 }
 
@@ -459,6 +461,7 @@ fn limit_attachment_images(messages: &[Message], max_chars: usize) -> Vec<Messag
             Message {
                 role: message.role,
                 content,
+                ts: message.ts,
             }
         })
         .collect()
@@ -471,10 +474,107 @@ fn prepare_messages_for_request(
     attachment_max_chars: usize,
 ) -> Vec<Message> {
     let compatible = strip_unsupported_blocks(messages, supports_images);
-    let attachment_bounded = limit_attachment_images(&compatible, attachment_max_chars);
+    let sanitized = redact_tool_result_credentials(&compatible);
+    let attachment_bounded = limit_attachment_images(&sanitized, attachment_max_chars);
     let windowed = history_window(&attachment_bounded, history_max_chars);
     apply_cache_breakpoints(windowed)
 }
+
+/// Content-layer credential gate: scrub credential-shaped material out of
+/// tool results before they are serialized into a provider body.
+///
+/// Read/Grep/Bash can pull `.env`, `~/.ssh/id_rsa`, or cloud credential files
+/// into a tool result; the next turn ships that text to the provider. This is
+/// the universal backstop (it runs even under permission bypass) that keeps
+/// private keys, `KEY=value` secret lines, and well-known token formats from
+/// leaving the machine. Only rebuilds a message when something changed, so
+/// the common case adds no churn.
+fn redact_tool_result_credentials(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|msg| {
+            let MessageContent::Blocks(blocks) = &msg.content else {
+                return msg.clone();
+            };
+            let mut changed = false;
+            let rebuilt: Vec<ContentBlock> = blocks
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        cache_control,
+                    } => match content {
+                        ToolResultContent::Text(text) => {
+                            match nonoclaw_core::redaction::redact_credentials_opt(text) {
+                                Some(clean) => {
+                                    changed = true;
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: ToolResultContent::Text(clean),
+                                        is_error: *is_error,
+                                        cache_control: cache_control.clone(),
+                                    }
+                                }
+                                None => block.clone(),
+                            }
+                        }
+                        ToolResultContent::Blocks(inner) => {
+                            match redact_inner_text_blocks(inner) {
+                                Some(inner2) => {
+                                    changed = true;
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: ToolResultContent::Blocks(inner2),
+                                        is_error: *is_error,
+                                        cache_control: cache_control.clone(),
+                                    }
+                                }
+                                None => block.clone(),
+                            }
+                        }
+                    },
+                    _ => block.clone(),
+                })
+                .collect();
+            if changed {
+                Message {
+                    role: msg.role,
+                    content: MessageContent::Blocks(rebuilt),
+                    ts: msg.ts,
+                }
+            } else {
+                msg.clone()
+            }
+        })
+        .collect()
+}
+
+/// Redact text blocks nested inside a multi-block tool result.
+fn redact_inner_text_blocks(inner: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
+    let mut changed = false;
+    let out: Vec<ContentBlock> = inner
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text { text, cache_control } => {
+                match nonoclaw_core::redaction::redact_credentials_opt(text) {
+                    Some(clean) => {
+                        changed = true;
+                        ContentBlock::Text {
+                            text: clean,
+                            cache_control: cache_control.clone(),
+                        }
+                    }
+                    None => b.clone(),
+                }
+            }
+            _ => b.clone(),
+        })
+        .collect();
+    if changed { Some(out) } else { None }
+}
+
 
 /// Mark prefix breakpoints for Anthropic prompt caching.
 ///
@@ -1144,8 +1244,13 @@ impl QueryEngine {
     }
 
     /// Commit a transcript message through the canonical session actor.
+    /// Stamps wall-clock `ts` at commit time so replays see real timing.
     async fn persist(&mut self, msg: Message) {
         if let Some(session) = &self.session {
+            let mut msg = msg;
+            if msg.ts.is_none() {
+                msg.ts = Some(nonoclaw_core::run_event::timestamp_ms());
+            }
             match session.append(msg).await {
                 Ok(revision) => self.session_revision = revision,
                 Err(error) => tracing::warn!(%error, "failed to persist session message"),
@@ -2920,8 +3025,12 @@ fn forward_stream_event(
             });
             on_event(&RunEvent::TextDelta { text: text.clone() });
         }
-        StreamEvent::ThinkingDelta { .. } => {
+        StreamEvent::ThinkingDelta { thinking } => {
             on_event(&RunEvent::ThinkingState { active: true, turn });
+            on_event(&RunEvent::ThinkingDelta {
+                text: thinking.clone(),
+                turn,
+            });
         }
         StreamEvent::MessageDelta { usage, .. } => {
             let mut total = total_before_turn;
@@ -3356,6 +3465,7 @@ pub fn strip_unsupported_blocks(messages: &[Message], supports_images: bool) -> 
             Message {
                 role: m.role,
                 content,
+                ts: m.ts,
             }
         })
         .collect()
@@ -3727,6 +3837,35 @@ mod tests {
             })
             .count();
         assert_eq!(tool_blocks, 0);
+    }
+
+    #[test]
+    fn tool_result_credentials_are_redacted_before_serialization() {
+        // A tool result carrying `.env`-style secrets + a PEM private key must
+        // be scrubbed before the messages are serialized into a provider body.
+        let messages = vec![
+            Message::user(MessageContent::from_text("read the key file")),
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/.env"}),
+                cache_control: None,
+            }])),
+            Message::user(MessageContent::from_blocks(vec![ContentBlock::tool_result(
+                "tool-1".into(),
+                "PASSWORD=hunter2\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\nok",
+                false,
+            )])),
+        ];
+        let prepared = prepare_messages_for_request(&messages, true, 1_000_000, 10_000);
+        let serialized = serde_json::to_string(&prepared).unwrap();
+        assert!(!serialized.contains("hunter2"), "kv secret leaked");
+        assert!(!serialized.contains("MIIEow"), "private key body leaked");
+        assert!(!serialized.contains("RSA PRIVATE KEY-----"), "pem headers leaked");
+        assert!(serialized.contains("[REDACTED PRIVATE KEY]"));
+        assert!(serialized.contains("PASSWORD=[REDACTED]"));
+        // Benign content in the same result survives.
+        assert!(serialized.contains("\\nok"));
     }
 
     #[test]
@@ -4894,6 +5033,7 @@ mod tests {
             messages.push(Message {
                 role: if i % 2 == 0 { Role::User } else { Role::Assistant },
                 content: MessageContent::from_text(text),
+                ts: None,
             });
         }
         let result = apply_cache_breakpoints(messages);
@@ -4924,6 +5064,7 @@ mod tests {
         let mk = |block: ContentBlock, role: Role| Message {
             role,
             content: MessageContent::Blocks(vec![block]),
+            ts: None,
         };
         let tool_result = mk(
             ContentBlock::tool_result("t1".to_string(), "result text".to_string(), false),

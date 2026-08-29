@@ -121,6 +121,35 @@ pub fn get_user_context_with_limit(
         project_max_chars,
     );
 
+    // Ancestor traversal (monorepo support): walk cwd upward to the
+    // filesystem root and load any NONOCLAW.md found above the project —
+    // outer instructions (org-wide conventions) complement the inner ones.
+    // The cwd itself was handled above; skip it here. Nearest ancestors are
+    // appended first so the more specific (closer) context wins the budget.
+    // The home-dir NONOCLAW.md is excluded: it is loaded (with its rules/)
+    // explicitly further down, and loading it twice would duplicate content.
+    let home_nonoclaw = nonoclaw_core::nonoclaw_data_dir().map(|d| d.join("NONOCLAW.md"));
+    let mut seen = vec![cwd.to_path_buf()];
+    let mut ancestor = cwd.parent().map(Path::to_path_buf);
+    while let Some(dir) = ancestor {
+        if seen.iter().any(|s| s == &dir) {
+            break;
+        }
+        seen.push(dir.clone());
+        let candidate = dir.join(".nonoclaw/NONOCLAW.md");
+        if home_nonoclaw.as_deref() != Some(candidate.as_path()) {
+            if let Some(content) = read_optional(&candidate) {
+                append_md_bounded(
+                    &mut nonoclaw_md,
+                    &candidate.to_string_lossy().replace('\\', "/"),
+                    content,
+                    project_max_chars,
+                );
+            }
+        }
+        ancestor = dir.parent().map(Path::to_path_buf);
+    }
+
     for directory in add_dirs {
         if let Some(content) = read_optional(&directory.join(".nonoclaw/NONOCLAW.md")) {
             append_md_bounded(
@@ -428,6 +457,46 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestor_nonoclaw_md_loaded_from_parent_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "nonoclaw-ancestor-ctx-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outer = root.join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(inner.join(".nonoclaw")).unwrap();
+        std::fs::create_dir_all(outer.join(".nonoclaw")).unwrap();
+        std::fs::write(
+            outer.join(".nonoclaw/NONOCLAW.md"),
+            "OUTER-CONVENTION: always run tests from the workspace root.",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join(".nonoclaw/NONOCLAW.md"),
+            "INNER-CONVENTION: this project uses tabs.",
+        )
+        .unwrap();
+
+        let ctx = get_user_context(&inner, &[]);
+        assert!(
+            ctx.nonoclaw_md.contains("INNER-CONVENTION"),
+            "project instructions present: {}",
+            ctx.nonoclaw_md
+        );
+        assert!(
+            ctx.nonoclaw_md.contains("OUTER-CONVENTION"),
+            "ancestor NONOCLAW.md must be traversed: {}",
+            ctx.nonoclaw_md
+        );
+        // Inner (more specific) comes first in the budget race.
+        let inner_pos = ctx.nonoclaw_md.find("INNER-CONVENTION");
+        let outer_pos = ctx.nonoclaw_md.find("OUTER-CONVENTION");
+        assert!(inner_pos < outer_pos, "nearest ancestor loaded last-wins order");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn truncate_works() {

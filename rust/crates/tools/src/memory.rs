@@ -22,15 +22,20 @@ pub struct Fact {
     /// One-line summary.
     pub title: String,
     /// Full markdown body.
+    /// Optional in the frontmatter: hand-written facts (e.g. from a dream
+    /// run) carry the body after the closing `---`, where `from_file` fills
+    /// it in. Without this default every hand-written fact file fails to
+    /// deserialize and is silently dropped by `scan_dir`.
+    #[serde(default)]
     pub content: String,
     /// What kind of fact.
     #[serde(default)]
     pub fact_type: FactType,
     /// 0.0–1.0. Higher = more important to keep in context.
-    #[serde(default = "default_half")]
+    #[serde(default = "default_half", deserialize_with = "de_f64_forgiving")]
     pub importance: f64,
     /// 0.0–1.0. How confident the agent is in this fact.
-    #[serde(default = "default_half")]
+    #[serde(default = "default_half", deserialize_with = "de_f64_forgiving")]
     pub confidence: f64,
     /// ISO-8601 creation timestamp.
     #[serde(default)]
@@ -42,7 +47,7 @@ pub struct Fact {
     #[serde(default)]
     pub sources: Vec<String>,
     /// Name of a fact this one supersedes (old fact keeps `superseded_by`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "de_supersedes_forgiving", skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
     /// Free-form tags for search.
     #[serde(default)]
@@ -63,6 +68,69 @@ pub enum FactType {
 
 fn default_half() -> f64 {
     0.5
+}
+
+/// Deserialize a numeric-or-word priority (`high`/`medium`/`low`) into u8.
+/// Hand-written beads (dream runs) use word scales; maps high→7, medium→4,
+/// low→2 (dream prompt: priority 1-7).
+fn de_priority_forgiving<'de, D>(d: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_yaml::Value::deserialize(d)?;
+    match v {
+        serde_yaml::Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(4.0);
+            Ok(f.clamp(0.0, 10.0) as u8)
+        }
+        serde_yaml::Value::String(s) => Ok(match s.to_ascii_lowercase().as_str() {
+            "high" => 7,
+            "medium" => 4,
+            "low" => 2,
+            _ => 4,
+        }),
+        _ => Ok(4),
+    }
+}
+
+/// Deserialize a numeric-or-word field (`high`/`medium`/`low`) into f64.
+/// Dream/agent hand-written facts use word scales; the strict schema
+/// silently drops those files. Maps: high→0.9, medium→0.6, low→0.3,
+/// unknown words → default (0.5), per docs in NONOCLAW.md.
+fn de_f64_forgiving<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_yaml::Value::deserialize(d)?;
+    match v {
+        serde_yaml::Value::Number(n) => n.as_f64().ok_or_else(|| D::Error::custom("nan")),
+        serde_yaml::Value::String(s) => Ok(match s.to_ascii_lowercase().as_str() {
+            "high" => 0.9,
+            "medium" => 0.6,
+            "low" => 0.3,
+            _ => 0.5,
+        }),
+        _ => Ok(0.5),
+    }
+}
+
+/// Deserialize `supersedes` where hand-written facts sometimes put an empty
+/// list (`supersedes: []`), `none`, or prose instead of a string-or-null.
+fn de_supersedes_forgiving<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_yaml::Value::deserialize(d)?;
+    match v {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::String(s) if s.is_empty() || s.eq_ignore_ascii_case("none") => Ok(None),
+        serde_yaml::Value::String(s) => Ok(Some(s)),
+        // `supersedes: []` and other non-scalar shapes — treat as absent.
+        _ => Ok(None),
+    }
 }
 
 impl Fact {
@@ -128,7 +196,7 @@ pub struct Bead {
     #[serde(default)]
     pub status: BeadStatus,
     /// 0–10 priority.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_priority_forgiving")]
     pub priority: u8,
     /// ISO-8601 creation timestamp.
     #[serde(default)]
@@ -139,7 +207,10 @@ pub struct Bead {
     /// Session ID that owns this bead.
     #[serde(default)]
     pub session: String,
-    /// Markdown body — context, progress, blockers.
+    /// Markdown body — context, progress, blockers. Optional in the
+    /// frontmatter: hand-written beads (e.g. from a dream run) carry the
+    /// body after the closing `---`, where `from_file` fills it in.
+    #[serde(default)]
     pub content: String,
 }
 
@@ -960,6 +1031,27 @@ mod tests {
     }
 
     #[test]
+    fn hand_written_fact_without_content_frontmatter_loads() {
+        // Dream runs and agents write facts by hand: YAML frontmatter only,
+        // body after the closing `---`. Regression: `content` lacked a serde
+        // default, so ALL hand-written facts were silently dropped by
+        // `scan_dir` (114 of 123 real files on 2026-08-27).
+        let tmp = test_dir();
+        let dir = tmp.join(".nonoclaw/memory/facts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hand-written.md"),
+            "---\nname: hand-written\ntitle: Hand written\ntype: convention\nimportance: 3\nconfidence: 0.9\ntags: [dream]\n---\nBody prose here.\n",
+        )
+        .unwrap();
+        let loaded = load_facts(&tmp);
+        assert_eq!(loaded.len(), 1, "hand-written fact must load");
+        assert_eq!(loaded[0].content, "Body prose here.");
+        assert_eq!(loaded[0].importance, 3.0);
+        assert_eq!(loaded[0].confidence, 0.9);
+    }
+
+    #[test]
     fn bead_roundtrip() {
         let tmp = test_dir();
         let bead = Bead {
@@ -1170,3 +1262,4 @@ mod tests {
         assert!(ctx.contains("pip use tsinghua"));
     }
 }
+

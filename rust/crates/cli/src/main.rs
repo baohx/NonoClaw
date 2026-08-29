@@ -46,6 +46,11 @@ struct Cli {
     #[arg(short = 'p', long, default_value_t = false)]
     print: bool,
 
+    /// Tag the created session (e.g. `bench-smoke`, `eval`). Tagged sessions
+    /// are skipped by auto-resume and by dream outcome scanning.
+    #[arg(long, value_name = "TAG")]
+    tag: Option<String>,
+
     /// Override the main-loop model.
     #[arg(long, value_name = "ID")]
     model: Option<String>,
@@ -267,6 +272,10 @@ async fn main() -> Result<()> {
     ));
     resolved.log_diagnostics();
 
+    // Export proxy env vars before any reqwest client is built (reqwest
+    // snapshots proxy config at client build time).
+    nonoclaw_engine::apply_proxy_env(resolved.settings());
+
     if let Some(addr) = &cli.serve {
         return remote::serve(addr, Arc::clone(&resolved)).await;
     }
@@ -379,6 +388,8 @@ async fn main() -> Result<()> {
     // --- Headless path ---
     let prompt = read_prompt(&cli)?;
     let session = resolve_session(&session_service, &cli, &cwd, &model).await?;
+    // Keep a handle for the Level-1 RL outcome label written after the run.
+    let outcome_session = session.as_ref().map(|(s, _)| s.clone());
     let engine = match session {
         Some((session, snapshot)) => {
             QueryEngine::with_session(client, registry, todos, options, session, snapshot)
@@ -398,6 +409,46 @@ async fn main() -> Result<()> {
         )
         .wait()
         .await;
+
+    // Level-1 RL label: persist the terminal outcome + heuristic reward for
+    // headless runs too (parity with the WS and REST write sites).
+    if let Some(outcome_session) = &outcome_session {
+        let terminal = &completion.terminal;
+        let (status, detail, turns) = match (&terminal.status, &terminal.reason) {
+            (RunTerminalStatus::Done, reason) => {
+                let turns = terminal.result.as_ref().map(|r| r.turns).unwrap_or(0);
+                let detail = match reason {
+                    nonoclaw_engine::RunFinishReason::Completed { detail } => detail.clone(),
+                    other => format!("{other:?}"),
+                };
+                ("done", detail, turns)
+            }
+            (RunTerminalStatus::Cancelled, reason) => {
+                let detail = match reason {
+                    nonoclaw_engine::RunFinishReason::Cancelled { reason } => reason.clone(),
+                    other => format!("{other:?}"),
+                };
+                ("cancelled", detail, 0)
+            }
+            (RunTerminalStatus::Error, reason) => {
+                let detail = match reason {
+                    nonoclaw_engine::RunFinishReason::Error { message, .. } => {
+                        nonoclaw_core::redact_text(message)
+                    }
+                    other => format!("{other:?}"),
+                };
+                ("error", detail, 0)
+            }
+        };
+        let reward = nonoclaw_engine::session::run_reward(status, &detail);
+        if let Err(e) = outcome_session
+            .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist run outcome");
+        }
+    }
+
     let result = match completion.terminal.status {
         RunTerminalStatus::Done => completion
             .terminal
@@ -484,6 +535,16 @@ async fn resolve_session(
         service.create(cwd, nonoclaw_engine::new_session_id(), model)?
     };
     let snapshot = session.snapshot().await?;
+    if let Some(tag) = &cli.tag {
+        // Only tag freshly created sessions; a --tag + --resume combination
+        // would retroactively relabel prior work.
+        if cli.resume.is_none() && !cli.continue_session {
+            session
+                .write_tag(tag.clone())
+                .await
+                .context("failed to tag session")?;
+        }
+    }
     Ok(Some((session, snapshot)))
 }
 

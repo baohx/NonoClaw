@@ -18,6 +18,11 @@ use tokio::sync::oneshot;
 /// user's working sessions.
 pub const DREAM_SESSION_TAG: &str = "dream";
 
+/// Tag for bench-smoke harness sessions (`nonoclaw --tag bench-smoke`, driven
+/// by `bench/terminal-bench/run_local_smoke.py` after every dream). Same
+/// exclusion semantics as dream sessions: auto-resume must not land on them.
+pub const BENCH_SMOKE_SESSION_TAG: &str = "bench-smoke";
+
 /// One JSONL line in a session file. The wire representation is retained for
 /// compatibility with all existing session files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +148,17 @@ enum SessionCommand {
     Clear(Reply<u64>),
     AppendMetadata(SessionEntry, Reply<u64>),
     Snapshot(Reply<SessionSnapshot>),
+    HistoryPage { before: usize, limit: usize, reply: Reply<SessionHistoryPage> },
+}
+
+/// One `load_older` page: messages strictly before `before`, ascending,
+/// with the session revision for ordering checks.
+#[derive(Debug, Clone)]
+pub struct SessionHistoryPage {
+    pub revision: u64,
+    pub messages: Vec<Message>,
+    /// Number of messages older than this page (0 = start reached).
+    pub remaining: usize,
 }
 
 struct SessionInner {
@@ -168,6 +184,13 @@ impl Session {
 
     pub async fn snapshot(&self) -> SessionResult<SessionSnapshot> {
         self.request(SessionCommand::Snapshot).await
+    }
+
+    /// Read one page of older messages (strictly before `before`, ascending)
+    /// without materializing a full snapshot. Used by UI history paging.
+    pub async fn history_page(&self, before: usize, limit: usize) -> SessionResult<SessionHistoryPage> {
+        self.request(|reply| SessionCommand::HistoryPage { before, limit, reply })
+            .await
     }
 
     pub async fn append(&self, message: Message) -> SessionResult<u64> {
@@ -273,17 +296,57 @@ impl Session {
 }
 
 /// Canonical owner of session discovery, loading, and actor creation.
+///
+/// `list_sessions` fingerprints each JSONL by (len, mtime) and reuses the
+/// previously parsed `SessionInfo` when the file is untouched, so listing a
+/// large project stays cheap. All clones share one process-wide cache cell;
+/// writing is always persisted to the JSONL first, the cache may only lag.
 #[derive(Debug, Clone, Default)]
-pub struct SessionService;
+pub struct SessionService {
+    list_cache: Arc<CacheCell<Mutex<HashMap<PathBuf, ListCache>>>>,
+}
+
+/// Per-sessions-dir list cache: file fingerprint → parsed metadata.
+type ListCache = HashMap<String, CachedSessionInfo>;
+
+#[derive(Debug, Clone)]
+struct CachedSessionInfo {
+    len: u64,
+    mtime_ms: u64,
+    info: SessionInfo,
+}
 
 fn writer_registry() -> &'static Mutex<HashMap<PathBuf, Weak<SessionInner>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<SessionInner>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Interior-mutable Default (a `Default` impl that produces an unset cell).
+struct CacheCell<T: Default> {
+    value: OnceLock<T>,
+}
+
+impl<T: Default> std::fmt::Debug for CacheCell<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CacheCell")
+    }
+}
+
+impl<T: Default> Default for CacheCell<T> {
+    fn default() -> Self {
+        Self { value: OnceLock::new() }
+    }
+}
+
+impl<T: Default> CacheCell<T> {
+    fn get(&self) -> &T {
+        self.value.get_or_init(T::default)
+    }
+}
+
 impl SessionService {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     /// Create a fresh lazily-persisted session. The header is written together
@@ -400,21 +463,37 @@ impl SessionService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
+        let mut cache = self.list_cache.get().lock().unwrap();
+        let cache = cache.entry(sessions_dir.clone()).or_default();
+        let mut seen = Vec::new();
         for entry in read {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let mtime = entry
-                .metadata()?
-                .modified()
-                .unwrap_or(std::time::UNIX_EPOCH);
+            let metadata = entry.metadata()?;
+            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let len = metadata.len();
             let id = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("")
                 .to_string();
+            seen.push(id.clone());
+            let mtime_ms = u64::try_from(
+                mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
+            if let Some(cached) = cache.get(&id) {
+                if cached.len == len && cached.mtime_ms == mtime_ms {
+                    out.push(cached.info.clone());
+                    continue;
+                }
+            }
             let state = match SessionState::load(&path, None) {
                 Ok(state) => state,
                 Err(_) => continue,
@@ -431,14 +510,19 @@ impl SessionService {
             } else {
                 state.summary.clone()
             };
+            // The UI shows a single-line ellipsis preview; sessions restored
+            // from compaction summaries otherwise ship their whole first text
+            // message (often multi-KB) and the session_list frame balloons
+            // past WebSocket size limits on large projects.
+            let summary = truncate_chars(&summary, LIST_SUMMARY_MAX_CHARS);
             let title = state.title();
             let run_outcomes = state
                 .preserved
                 .iter()
                 .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("run_outcome"))
                 .count();
-            out.push(SessionInfo {
-                id,
+            let info = SessionInfo {
+                id: id.clone(),
                 started: state.started,
                 message_count: state.messages.len(),
                 summary,
@@ -446,20 +530,26 @@ impl SessionService {
                 tag: state.tag,
                 mtime,
                 run_outcomes,
-            });
+            };
+            cache.insert(id, CachedSessionInfo { len, mtime_ms, info: info.clone() });
+            out.push(info);
         }
+        cache.retain(|id, _| seen.contains(id));
         out.sort_by_key(|session| std::cmp::Reverse(session.mtime));
         Ok(out)
     }
 
     /// The most recent session to auto-resume, skipping background-generated
-    /// ones (AutoDream consolidation) so the Web UI lands on the user's last
-    /// working session, not a dream transcript.
+    /// ones (AutoDream consolidation, bench-smoke harness runs) so the Web UI
+    /// lands on the user's last working session, not a machine transcript.
     pub fn most_recent_session(&self, cwd: &Path) -> std::io::Result<Option<String>> {
         Ok(self
             .list_sessions(cwd)?
             .into_iter()
-            .find(|info| info.tag.as_deref() != Some(DREAM_SESSION_TAG))
+            .find(|info| !matches!(
+                info.tag.as_deref(),
+                Some(DREAM_SESSION_TAG) | Some(BENCH_SMOKE_SESSION_TAG)
+            ))
             .map(|info| info.id))
     }
 }
@@ -878,6 +968,18 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
             SessionCommand::Snapshot(reply) => {
                 let _ = reply.send(Ok(state.snapshot()));
             }
+            SessionCommand::HistoryPage { before, limit, reply } => {
+                // Pure read over the in-memory message list: messages
+                // strictly before index `before`, ascending, capped at
+                // `limit`. Cloning the page keeps the writer's state intact.
+                let start = before.saturating_sub(limit);
+                let page = state.messages[start..before.min(state.messages.len())].to_vec();
+                let _ = reply.send(Ok(SessionHistoryPage {
+                    revision: state.revision,
+                    remaining: start,
+                    messages: page,
+                }));
+            }
             SessionCommand::AppendMessage(message, reply) => {
                 let entry = SessionEntry::Message(message.clone());
                 let result = mutate_append(&path, &mut state, &entry).inspect(|_| {
@@ -1029,8 +1131,21 @@ pub fn session_path(cwd: &Path, id: &str) -> Option<PathBuf> {
     )
 }
 
-fn sanitize_cwd(cwd: &Path) -> String {
-    cwd.to_string_lossy()
+/// Session-list previews are capped so one frame stays well under WebSocket
+/// message limits regardless of how many sessions a project accumulated.
+const LIST_SUMMARY_MAX_CHARS: usize = 240;
+
+/// Cap a string at `max` chars (UTF-8 aware), appending an ellipsis.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn sanitize_cwd(cwd: &Path) -> String {    cwd.to_string_lossy()
         .trim_start_matches(['/', '\\'])
         .replace(['/', '\\', ':'], "-")
 }
@@ -1069,6 +1184,41 @@ mod tests {
     /// Level-1 RL labels: run outcomes persist as metadata entries, are
     /// counted by list_sessions, and reward scoring matches the documented
     /// heuristic (done=1, exhaustion penalties, cancelled=-0.3, error=-1).
+    #[tokio::test]
+    async fn list_sessions_cache_updates_on_append() {
+        let cwd = tempdir();
+        let service = SessionService::new();
+        let s = service.create(&cwd, "cached-session", "model-x").unwrap();
+        s.append(Message::user(MessageContent::from_text("first")))
+            .await
+            .unwrap();
+
+        let first = service.list_sessions(&cwd).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].message_count, 1, "message appended");
+
+        // Second listing is served from the fingerprint cache and must agree.
+        let cached = service.list_sessions(&cwd).unwrap();
+        assert_eq!(cached[0].message_count, 1);
+
+        // A later append changes the file → fingerprint differs → reparsed.
+        s.append(Message::user(MessageContent::from_text("second")))
+            .await
+            .unwrap();
+        let second = service.list_sessions(&cwd).unwrap();
+        assert_eq!(
+            second[0].message_count, 2,
+            "cache must invalidate when the JSONL changes"
+        );
+
+        // Deleted files drop out of the cache.
+        let path = s.path().to_path_buf();
+        drop(s);
+        std::fs::remove_file(&path).unwrap();
+        let third = service.list_sessions(&cwd).unwrap();
+        assert!(third.is_empty(), "deleted session still listed");
+    }
+
     #[tokio::test]
     async fn run_outcome_persists_and_scores() {
         let cwd = tempdir();
@@ -1143,6 +1293,25 @@ mod tests {
             picked.as_deref(),
             Some("work-session"),
             "auto-resume must not land on a dream transcript"
+        );
+
+        // Bench-smoke harness sessions (spawned after every dream by
+        // bench_validate_facts) are machine-generated the same way.
+        let smoke = service
+            .create(&cwd, "bench-smoke-session", "model-x")
+            .unwrap();
+        smoke
+            .append(Message::user(MessageContent::from_text("task")))
+            .await
+            .unwrap();
+        smoke
+            .write_tag(BENCH_SMOKE_SESSION_TAG)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.most_recent_session(&cwd).unwrap().as_deref(),
+            Some("work-session"),
+            "auto-resume must not land on a bench-smoke transcript"
         );
 
         // All-dream projects (fresh install, dream ran before any work)

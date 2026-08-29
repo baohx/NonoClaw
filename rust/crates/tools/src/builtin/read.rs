@@ -9,6 +9,12 @@ use crate::builtin::resolve_path;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const MAX_LINES: usize = 2000;
+/// Hard cap on a single Read result (≈16k tokens): a huge dump (e.g. a secret
+/// or minified file) must not dominate the context on its own.
+const MAX_RESULT_CHARS: usize = 64_000;
+/// Cap for a single line — credential material often arrives as one enormous
+/// line; truncate it so the redaction layer sees a bounded payload.
+const MAX_LINE_CHARS: usize = 4_000;
 
 const PROMPT: &str = "Reads a file from the local filesystem. You can access any file directly by using this tool.\nAssume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- The file_path parameter can be an absolute path or a path relative to cwd (e.g. paths returned by Glob or Grep)\n- By default, it reads up to 2000 lines starting from the beginning of the file\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Results are returned using cat -n format, with line numbers starting at 1\n- This tool allows reading images (PNG, JPG, etc.) as content is presented visually (multimodal).\n- This tool can read Jupyter notebooks (.ipynb) and returns all cells with their outputs.\n- This tool can only read files, not directories. To read a directory, use an `ls` command via the Bash tool.\n- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.";
 
@@ -61,7 +67,7 @@ impl Tool for ReadTool {
         true
     }
     fn max_result_size_chars(&self) -> usize {
-        usize::MAX
+        MAX_RESULT_CHARS
     }
 
     async fn check_permissions(&self, _: &Value, _: &ToolCtx<'_>) -> PermissionResult {
@@ -78,6 +84,19 @@ impl Tool for ReadTool {
         let offset = input["offset"].as_u64().map(|n| n as usize);
         let limit = input["limit"].as_u64().map(|n| n as usize);
         let path = resolve_path(ctx.cwd, file_path);
+
+        // Gate ③: refuse to read locations that routinely hold credentials
+        // (SSH keys, cloud tokens, dotenv, private-key material). This runs in
+        // every permission mode, bypass included — the agent must use a
+        // scrubbed, non-secret source for secrets.
+        if crate::sensitive::is_sensitive_path(&path) {
+            return Ok(ToolResult::error(format!(
+                "refusing to read {}: path may contain credentials (SSH/cloud/dotenv/private-key). \
+                 Read does not expose secret material; provide the value via env vars or a \
+                 non-secret, scrubbed source instead.",
+                path.display()
+            )));
+        }
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -111,7 +130,14 @@ impl Tool for ReadTool {
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate().skip(start).take(take) {
             // cat -n style: 6-wide right-justified number + tab + content.
-            out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            // Truncate pathologically long lines (credential/minified dumps).
+            let shown = if line.chars().count() > MAX_LINE_CHARS {
+                let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
+                format!("{cut}…[{} chars truncated]", line.chars().count() - MAX_LINE_CHARS)
+            } else {
+                (*line).to_string()
+            };
+            out.push_str(&format!("{:>6}\t{shown}\n", i + 1));
         }
         Ok(ToolResult::ok(out))
     }
@@ -164,6 +190,82 @@ mod tests {
             .unwrap();
         assert!(res.data.contains("     2\tbeta"));
         assert!(!res.data.contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn refuses_sensitive_paths_in_every_mode() {
+        let tmp = tempfile_dir();
+        let secret = tmp.join(".env");
+        std::fs::write(&secret, "PASSWORD=supersecret\n").unwrap();
+        let tool = ReadTool;
+        let opts = crate::tool::ToolOptions {
+            model: "x".into(),
+            // Bypass must NOT bypass the credential denylist.
+            permission_mode: nonoclaw_core::PermissionMode::BypassPermissions,
+            is_non_interactive: true,
+            max_budget_usd: None,
+        };
+        let cancel = CancellationToken::new();
+        let cwd: &Path = &tmp;
+        let ctx = ToolCtx {
+            cwd,
+            options: &opts,
+            cancel: &cancel,
+            tool_use_id: "read-test-secret",
+            task_scope: Some("read-test"),
+            subagent: None,
+            graph_runner: None,
+            question: None,
+            background_registry: None,
+        };
+        let res = tool
+            .call(
+                json!({"file_path": ".env"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(res.data.contains("refusing to read"), "got: {}", res.data);
+        assert!(!res.data.contains("supersecret"));
+    }
+
+    #[tokio::test]
+    async fn truncates_pathologically_long_lines() {
+        let tmp = tempfile_dir();
+        let file = tmp.join("long.txt");
+        let long_line = "x".repeat(MAX_LINE_CHARS + 500);
+        std::fs::write(&file, format!("{long_line}\n")).unwrap();
+        let tool = ReadTool;
+        let opts = crate::tool::ToolOptions {
+            model: "x".into(),
+            permission_mode: nonoclaw_core::PermissionMode::Default,
+            is_non_interactive: true,
+            max_budget_usd: None,
+        };
+        let cancel = CancellationToken::new();
+        let cwd: &Path = &tmp;
+        let ctx = ToolCtx {
+            cwd,
+            options: &opts,
+            cancel: &cancel,
+            tool_use_id: "read-test-long",
+            task_scope: Some("read-test"),
+            subagent: None,
+            graph_runner: None,
+            question: None,
+            background_registry: None,
+        };
+        let res = tool
+            .call(
+                json!({"file_path": "long.txt"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(res.data.contains("[500 chars truncated]"), "got: {}", &res.data[..200]);
+        assert!(res.data.len() < MAX_LINE_CHARS + 200);
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

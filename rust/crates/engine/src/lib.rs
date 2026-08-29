@@ -10,7 +10,6 @@ pub mod graph;
 pub mod hooks;
 pub mod loop_;
 pub mod prompt;
-pub mod prompt_templates;
 pub mod run;
 pub mod session;
 pub mod settings;
@@ -40,13 +39,13 @@ pub use run::{
     SequencedEngineEvent,
 };
 pub use session::{
-    new_session_id, session_path, Session, SessionEntry, SessionError, SessionInfo, SessionResult,
-    SessionService, SessionSnapshot,
+    new_session_id, session_path, Session, SessionEntry, SessionError, SessionHistoryPage,
+    SessionInfo, SessionResult, SessionService, SessionSnapshot,
 };
 pub use settings::{
-    config_reference, load_resolved_config, ConfigDiagnostic, ConfigFieldReference, ConfigSource,
-    ModelProfile, ProviderBalance, ProviderBilling, ProviderBillingEntry, ResolvedConfig,
-    RunConfigOverrides, SettingsFile,
+    apply_proxy_env, config_reference, load_resolved_config, ConfigDiagnostic,
+    ConfigFieldReference, ConfigSource, ModelProfile, ProviderBalance, ProviderBilling,
+    ProviderBillingEntry, ResolvedConfig, RunConfigOverrides, SettingsFile,
 };
 pub use skills::{
     substitute_arguments, EngineSkillSource, Skill, SkillActivation, SkillDisclosure, SkillsManager,

@@ -7,6 +7,7 @@ pub mod error;
 pub mod extension;
 pub mod message;
 pub mod permissions;
+pub mod redaction;
 pub mod run_event;
 pub mod task;
 pub mod usage;

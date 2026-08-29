@@ -11,6 +11,7 @@ pub mod permissions;
 pub mod registry;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+pub mod sensitive;
 pub mod session_index;
 pub mod task_store;
 pub mod tool;

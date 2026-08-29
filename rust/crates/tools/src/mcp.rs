@@ -179,14 +179,14 @@ impl McpClient {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                prompt_guidelines: parse_prompt_guidelines(t.get("promptGuidelines")),
             });
         }
         Ok(out)
     }
 
     /// Invoke a tool; returns (text, is_error).
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool)> {
-        let result = self
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool)> {        let result = self
             .request("tools/call", json!({"name": name, "arguments": arguments}))
             .await?;
         let is_error = result
@@ -378,6 +378,27 @@ pub struct McpToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Behavioural guidelines the server wants surfaced in the system
+    /// prompt (T8.3). Parsed from the tool definition's optional
+    /// `promptGuidelines` field: a string, or an array of strings.
+    pub prompt_guidelines: Vec<String>,
+}
+
+/// Parse the optional `promptGuidelines` field of an MCP tool definition.
+/// Accepts a single string or an array of strings; anything else is ignored
+/// (the MCP spec does not know this field — it is a NonoClaw extension, so
+/// tolerance beats strictness).
+fn parse_prompt_guidelines(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A [`Tool`] wrapper around one MCP-provided tool.
@@ -386,6 +407,7 @@ pub struct McpTool {
     raw_name: String,
     description: String,
     input_schema: Value,
+    prompt_guidelines: Vec<String>,
     client: std::sync::Arc<McpClient>,
 }
 
@@ -401,6 +423,7 @@ impl McpTool {
             raw_name: def.name,
             description,
             input_schema: def.input_schema,
+            prompt_guidelines: def.prompt_guidelines,
             client,
         }
     }
@@ -417,6 +440,22 @@ impl Tool for McpTool {
     // MCP tools reuse their server-supplied description as the model-facing text.
     fn prompt(&self) -> &str {
         &self.description
+    }
+    /// Server-declared guidelines (T8.3). The trait demands `&[&str]` while
+    /// our strings arrive dynamically from the server's tools/list response;
+    /// leaking them is bounded (once per tool definition per registration)
+    /// and the registry lives for the whole process anyway.
+    fn prompt_guidelines(&self) -> &[&str] {
+        if self.prompt_guidelines.is_empty() {
+            return &[];
+        }
+        Box::leak(
+            self.prompt_guidelines
+                .iter()
+                .map(|g| g.as_str())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
     }
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
@@ -525,6 +564,24 @@ fn mcp_failure(name: &str, source: &str, error: &Error) -> ExtensionDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_guidelines_parse_string_or_array() {
+        // Array form.
+        let v = serde_json::json!(["use foo before bar", ""]);
+        let g = parse_prompt_guidelines(Some(&v));
+        assert_eq!(g, vec!["use foo before bar".to_string()]);
+        // Single-string form.
+        let v = serde_json::json!("always pass limit");
+        assert_eq!(
+            parse_prompt_guidelines(Some(&v)),
+            vec!["always pass limit".to_string()]
+        );
+        // Absent / wrong type / empty → none.
+        assert!(parse_prompt_guidelines(None).is_empty());
+        assert!(parse_prompt_guidelines(Some(&serde_json::json!(42))).is_empty());
+        assert!(parse_prompt_guidelines(Some(&serde_json::json!(""))).is_empty());
+    }
 
     #[test]
     fn expands_nonoclaw_home_placeholder() {

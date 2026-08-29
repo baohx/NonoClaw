@@ -170,6 +170,13 @@ pub enum RunEvent {
         active: bool,
         turn: u32,
     },
+    /// Streaming reasoning text (extended thinking). Unlike
+    /// [`RunEvent::ThinkingState`] this carries the delta so UIs can render
+    /// the model's reasoning live; the text is never sent back to the model.
+    ThinkingDelta {
+        text: String,
+        turn: u32,
+    },
     RetryScheduled {
         attempt: u32,
         delay_ms: u64,

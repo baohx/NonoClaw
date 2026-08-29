@@ -4,7 +4,7 @@
 //! source leak: when the user has been idle for a while and no work is
 //! happening, the server quietly launches a headless "dream" run that walks
 //! recent session transcripts, correlates fragments, distills reusable
-//! knowledge into `memory/facts/`, and refreshes the session vector index —
+//! knowledge into `.nonoclaw/memory/facts/`, and refreshes the session vector index —
 //! so the next session starts with organized long-term memory.
 //!
 //! Trigger conditions (all must hold, checked every minute):
@@ -24,6 +24,52 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
 use super::connection::AppState;
+
+/// Cross-process mutex for dream runs, scoped to one project directory.
+///
+/// `DreamState.dreaming` only guards within a single process; a CLI serve and
+/// the desktop-embedded serve can both pass the idle window for the same
+/// project and start parallel dreams. A per-project `flock` closes that gap:
+/// the loser skips its round. Released on drop (or process exit).
+struct DreamLock {
+    _file: Option<std::fs::File>,
+}
+
+impl DreamLock {
+    /// Try to acquire the per-project dream lock (non-blocking). Returns
+    /// `None` only when another process holds it; IO errors degrade to an
+    /// unlocked guard so a transient failure never disables dreaming.
+    fn try_acquire(cwd: &Path) -> Option<DreamLock> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let dir = nonoclaw_engine::session::project_dir(cwd)?;
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("last_dream.lock");
+            let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+            else {
+                tracing::warn!(path = %path.display(), "dream lock open failed; proceeding unlocked");
+                return Some(DreamLock { _file: None });
+            };
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                tracing::debug!(path = %path.display(), "dream skipped: another process holds the dream lock");
+                return None;
+            }
+            Some(DreamLock { _file: Some(file) })
+        }
+        #[cfg(not(unix))]
+        {
+            // No flock on non-unix; single-serve assumption.
+            let _ = cwd;
+            Some(DreamLock { _file: None })
+        }
+    }
+}
 
 // ── Bench-validated fact loop (Skill-MAS S* selection) ────────────────────
 //
@@ -191,7 +237,7 @@ const DEFAULT_IDLE_MINUTES: u64 = 10;
 /// How often the watcher loop re-evaluates trigger conditions.
 const TICK: Duration = Duration::from_secs(60);
 /// Turn cap for the dream run — it summarizes, it does not work.
-const DREAM_MAX_TURNS: u32 = 16;
+const DREAM_MAX_TURNS: u32 = 32;
 
 /// How far back the reward brief looks for run_outcome labels (24h). Long
 /// enough to always cover the gap between dreams; short enough to keep the
@@ -201,6 +247,44 @@ const DREAM_BRIEF_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// Marker recording when the last dream ran; stored in the project state dir.
 fn dream_marker_path(cwd: &Path) -> Option<PathBuf> {
     nonoclaw_engine::session::project_dir(cwd).map(|d| d.join("last_dream.json"))
+}
+
+/// Read the analyzed-sessions ledger from `last_dream.json`. Tolerates the
+/// legacy `{ "finished_at": <secs> }` shape (no ledger → empty set) and any
+/// parse failure (treated as "nothing analyzed yet").
+fn read_analyzed_sessions(marker: &Path) -> std::collections::HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(marker) else {
+        return Default::default();
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("analyzed_sessions")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|id| id.as_str().map(str::to_owned))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// Stamp the marker, extending it into an analyzed-sessions ledger. The dream
+/// prompt built from a brief that listed sessions S1..Sn should cause those
+/// sessions to be skipped (or marked analyzed) by the NEXT brief — that is
+/// what breaks the re-analysis loop where a truncated dream re-reads the same
+/// worst-N board every idle window.
+fn write_dream_marker(marker: &Path, analyzed_sessions: &[String]) {
+    let finished_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "finished_at": finished_at,
+        "analyzed_sessions": analyzed_sessions,
+    });
+    let _ = std::fs::write(marker, payload.to_string());
 }
 
 /// Fixed dream prompt: four-phase REM consolidation. `reward_brief` is the
@@ -219,10 +303,11 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 {brief}\
 1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。用 Bash `ls -t` 看最近改动的文件。\n\
 2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，做对比反思：检索同类任务的成功轨迹，高分 vs 低分逐段对照，定位第一个分歧点——是哪个编排决策（任务拆解方式、子代理/工具选择、步骤顺序）不同导致结果分岔。\n\
-3. 【知识萃取】只把【可复用、非显而易见】的知识提炼为结构化事实：类型选 preference/convention/decision/architecture/bug。写法遵循 memory/facts 的 YAML frontmatter 格式，importance 1-5。\n\
-4. 【记忆索引】用 Write 工具把每条事实写入 memory/facts/<slug>.md。\n\n\
+3. 【知识萃取】只把【可复用、非显而易见】的知识提炼为结构化事实：类型选 preference/convention/decision/architecture/bug。写法遵循 .nonoclaw/memory/facts 的 YAML frontmatter 格式，importance 1-5。\n\
+4. 【记忆索引】用 Write 工具把每条事实写入 .nonoclaw/memory/facts/<slug>.md（注意：必须带 .nonoclaw/ 前缀，写到顶层 memory/ 的文件引擎不会加载）。bead 写入 .nonoclaw/memory/beads/<uuid>.md。\n\
+5. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\n\
 纪律：\\
-- 不要重复已有事实：先 Grep memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
+- 不要重复已有事实：先 Grep .nonoclaw/memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
 - 通用性门槛：每条事实写之前自检——换个任务/换个项目这条还成立吗？只写通用原则，不写任务特定 trick（如「X 文件要改 Y 行」）。不成立的信息留在总结输出里，不写入 facts。\n\
 - 编排经验也是知识：如果失败/成功的根因在编排层（任务拆得太碎/太粗、该 fan-out 却串行、子代理轮次不够、验证步骤缺失/冗余），把它提炼为 convention/decision 类事实（如「多文件重构类任务先 fan-out 只读探查再汇总修改」），供未来同类任务的编排参考。\n\
 - 技能/系统提示演化（AutoGenesis 式提案）：如果发现【同一类指令反复出错】且根因是技能说明或系统提示缺口，可以提案修改 .nonoclaw/skills/ 下的技能文件或 .nonoclaw/APPEND_SYSTEM.md ——但必须写到【影子文件】：<原文件名>.shadow（如 skills/foo.md → skills/foo.md.shadow），绝不直接改活文件。影子会在下次 dream 后经结果门禁评估：通过则转正（旧版本自动快照可回滚），不通过则丢弃。没有把握就不提案。\n\
@@ -262,6 +347,7 @@ struct OutcomeSummary {
     run_id: String,
     status: String,
     reward: f64,
+    turns: u64,
     detail: String,
 }
 
@@ -289,8 +375,12 @@ fn scan_run_outcomes(
             .unwrap_or("")
             .to_string();
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        // Skip dream sessions so the brief only describes real work.
-        if text.contains("\"tag\":\"dream\"") {
+        // Skip dream sessions (self-counting) and bench-smoke harness
+        // sessions (low-value marker runs after every dream) so the brief
+        // only describes real work.
+        if text.contains("\"tag\":\"dream\"")
+            || text.contains("\"tag\":\"bench-smoke\"")
+        {
             continue;
         }
         for line in text.lines() {
@@ -313,6 +403,7 @@ fn scan_run_outcomes(
                     .unwrap_or("unknown")
                     .to_string(),
                 reward: value.get("reward").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                turns: value.get("turns").and_then(|v| v.as_u64()).unwrap_or(0),
                 detail: value
                     .get("detail")
                     .and_then(|v| v.as_str())
@@ -323,6 +414,11 @@ fn scan_run_outcomes(
             });
         }
     }
+    // Zero-turn non-done outcomes are noise, not failure trajectories: an
+    // aborted-at-start run (user resend, transient provider 500) has no
+    // decisions to review, yet its -1.0 reward monopolizes the worst-N board
+    // (see fact: reward-brief-zero-turn-outcome-noise). Filter before ranking.
+    out.retain(|o| o.status == "done" || o.turns > 0);
     out.sort_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
@@ -451,16 +547,54 @@ fn has_headroom(outcomes: &[OutcomeSummary]) -> bool {
 /// blended priority, elbow-truncate to the most informative subset, and
 /// instruct contrastive (high-vs-low trajectory) reflection.
 fn reward_brief(dir: &Path, since: SystemTime) -> String {
-    let outcomes = scan_run_outcomes(dir, since);
+    reward_brief_with_ledger(dir, since, &Default::default()).0
+}
+
+/// Brief variant honouring the analyzed-sessions ledger: sessions already
+/// covered by a completed dream are excluded from the review board (their
+/// aggregates still count toward the done/cancelled/error tally so the
+/// "nothing new" signal stays honest).
+///
+/// Returns the brief text plus the FULL session ids it presents for review —
+/// the caller stamps these into the ledger when the dream completes so the
+/// next brief skips them.
+fn reward_brief_with_ledger(
+    dir: &Path,
+    since: SystemTime,
+    analyzed: &std::collections::HashSet<String>,
+) -> (String, Vec<String>) {
+    let all = scan_run_outcomes(dir, since);
+    let outcomes: Vec<_> = all
+        .iter()
+        .filter(|o| !analyzed.contains(&o.session_id))
+        .cloned()
+        .collect();
     if outcomes.is_empty() {
-        return "【Reward 简报】上次 dream 以来没有带 reward 标签的新轨迹（旧 session 可能无标签），按常规四阶段整理。".to_string();
+        let analyzed_count = all
+            .iter()
+            .map(|o| o.session_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if analyzed_count > 0 {
+            return (
+                format!(
+                    "【Reward 简报】窗口内 {analyzed_count} 个 session 的轨迹均已被此前 dream 完整分析（台账已记录），无增量。快速扫描是否有遗漏的跨会话模式即可结束，不需要重新复盘。"
+                ),
+                Vec::new(),
+            );
+        }
+        return (
+            "【Reward 简报】上次 dream 以来没有带 reward 标签的新轨迹（旧 session 可能无标签），按常规四阶段整理。"
+                .to_string(),
+            Vec::new(),
+        );
     }
-    let done = outcomes.iter().filter(|o| o.status == "done").count();
-    let cancelled = outcomes
+    let done = all.iter().filter(|o| o.status == "done").count();
+    let cancelled = all
         .iter()
         .filter(|o| o.status == "cancelled")
         .count();
-    let error = outcomes.iter().filter(|o| o.status == "error").count();
+    let error = all.iter().filter(|o| o.status == "error").count();
     let sessions = aggregate_sessions(&outcomes);
     let mut brief = format!(
         "【Reward 简报】上次 dream 以来 run 结局：done × {done}，cancelled × {cancelled}，error × {error}（{} 个 session）。\n",
@@ -491,7 +625,10 @@ fn reward_brief(dir: &Path, since: SystemTime) -> String {
         brief.push_str("全部成功。萃取最近成功轨迹的工具使用与编排模式（怎么做对的）。\n");
     }
     // Cap the brief so it cannot grow unboundedly with session count.
-    brief.chars().take(900).collect()
+    (
+        brief.chars().take(900).collect(),
+        sessions.iter().map(|s| s.session_id.clone()).collect(),
+    )
 }
 
 #[derive(Default)]
@@ -500,6 +637,9 @@ struct DreamState {
     last_fingerprint: Option<(usize, SystemTime)>,
     /// True while a dream run is in flight (prevents re-entry).
     dreaming: bool,
+    /// Consecutive MaxTurns-truncated dreams for the current fingerprint
+    /// window. Reset on completion or fingerprint change.
+    truncation_count: u32,
 }
 
 /// Spawn the idle watcher. `last_activity` is updated by every inbound
@@ -582,10 +722,18 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                 continue;
             }
 
-            // All conditions hold — dream.
+            // All conditions hold — dream. First take the per-project
+            // cross-process lock so a second serve (CLI vs desktop) on the
+            // same project cannot start a parallel dream; skip this round if
+            // another process already holds it.
+            let Some(_lock) = DreamLock::try_acquire(&cwd) else {
+                continue;
+            };
             dream.dreaming = true;
             let state2 = Arc::clone(&state);
-            let ok = run_dream(state2).await;
+            let truncations = dream.truncation_count;
+            let (outcome, listed_sessions) = run_dream(state2, truncations).await;
+            let ok = outcome != DreamOutcome::Failed;
             // Refresh the session index (Layer 3) with anything new, then
             // stamp the fingerprint regardless of success so a failing
             // dream does not hot-loop.
@@ -600,17 +748,16 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                     );
                 });
             }
+            // Ledger write-back: only a Completed dream marks its listed
+            // sessions as analyzed. Truncated dreams keep the ledger
+            // untouched so the increment is retried, but the backoff below
+            // prevents the retry from hot-looping.
             if let Some(marker) = dream_marker_path(&cwd) {
-                let _ = std::fs::write(
-                    &marker,
-                    format!(
-                        "{{\"finished_at\":{}}}",
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    ),
-                );
+                let mut analyzed = read_analyzed_sessions(&marker);
+                if outcome == DreamOutcome::Completed {
+                    analyzed.extend(listed_sessions.iter().cloned());
+                }
+                write_dream_marker(&marker, &analyzed.into_iter().collect::<Vec<_>>());
             }
             // Bench-validated fact loop: the dream may have written
             // orchestration facts — verify they did not regress the smoke
@@ -633,8 +780,47 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                     evolution_commit_gate(&cwd, &project, &sessions_dir);
                 }
             }
-            dream.last_fingerprint = session_fingerprint(&sessions_dir).or(Some(fp));
+            // Fingerprint policy by outcome:
+            // - Completed/Failed → stamp (finished, or avoid hot-looping).
+            // - Truncated (MaxTurns) → do NOT stamp so the next idle window
+            //   re-triggers with a "already analyzed N times" dedup brief;
+            //   the ledger guarantees the re-trigger only sees the increment.
+            //   After 3 consecutive truncations force-stamp to break the loop
+            //   (prose dedup hints have repeatedly failed to prevent re-
+            //   analysis — see fact: dream-dedup-brief-ineffective).
+            match outcome {
+                DreamOutcome::Truncated if dream.truncation_count < 2 => {
+                    dream.truncation_count += 1;
+                    tracing::warn!(
+                        count = dream.truncation_count,
+                        "dream truncated at max turns; will re-trigger with ledger-filtered brief"
+                    );
+                }
+                _ => {
+                    dream.last_fingerprint =
+                        session_fingerprint(&sessions_dir).or(Some(fp));
+                    dream.truncation_count = 0;
+                }
+            }
             dream.dreaming = false;
+            // Phase-5 suggestions: normalize any beads the dream wrote so
+            // they parse cleanly and surface in the next session's context.
+            {
+                let fixed = normalize_dream_beads(&cwd);
+                if fixed > 0 {
+                    tracing::info!(fixed, "dream suggestion beads normalized");
+                }
+                let pending = nonoclaw_tools::memory::load_beads(&cwd)
+                    .into_iter()
+                    .filter(|b| {
+                        b.priority >= 5
+                            && b.status != nonoclaw_tools::memory::BeadStatus::Done
+                    })
+                    .count();
+                if pending > 0 {
+                    tracing::info!(pending, "high-priority dream suggestion beads pending");
+                }
+            }
             if ok {
                 tracing::info!("dream run finished");
             }
@@ -644,27 +830,144 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
 
 /// Launch the dream as a REST run via the same handler path used by external
 /// automation (in-process — no HTTP self-call).
-async fn run_dream(state: Arc<AppState>) -> bool {
+/// Post-dream bead hygiene: the dream (an LLM run) writes beads by hand, so
+/// normalize anything it got wrong — clamp priority to 1-7, default status to
+/// todo, log what landed so the operator sees actionable suggestions arrived.
+/// Soft-fail: a broken bead file is left for human inspection, not deleted.
+fn normalize_dream_beads(cwd: &Path) -> usize {
+    use nonoclaw_tools::memory::{load_beads, Bead, BeadStatus};
+    let beads = load_beads(cwd);
+    let mut changed = 0usize;
+    for bead in &beads {
+        // load_beads already parsed these; only clamp what is out of range.
+        let clamped = bead.priority.min(7);
+        if clamped != bead.priority {
+            let mut b = bead.clone();
+            b.priority = clamped;
+            if b.save(cwd).is_ok() {
+                changed += 1;
+            }
+        }
+    }
+    // Beads with unparsable frontmatter (e.g. a hallucinated status value)
+    // are invisible to load_beads — repair them by hand: rewrite status.
+    let dir = cwd.join(".nonoclaw/memory/beads");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if Bead::from_file(&path).is_none() && raw.contains("status:") {
+                // Substitute an unknown status with todo, keep everything else.
+                let fixed = fix_bead_status(&raw);
+                if let Some(fixed) = fixed {
+                    if std::fs::write(&path, fixed).is_ok() {
+                        changed += 1;
+                        tracing::warn!(path = %path.display(), "repaired dream bead status");
+                    }
+                }
+            }
+        }
+    }
+    let _ = BeadStatus::Todo; // keep import when no repair path triggers
+    changed
+}
+
+/// Rewrite an invalid `status:` value in bead frontmatter to `todo`, and
+/// clamp an out-of-range `priority:` to 1-7 (dreams may hallucinate either).
+fn fix_bead_status(raw: &str) -> Option<String> {
+    let valid = ["todo", "in_progress", "blocked", "done"];
+    let mut out = String::with_capacity(raw.len());
+    let mut fixed = false;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("status:") {
+            let val = rest.trim();
+            if !valid.contains(&val) {
+                out.push_str("status: todo");
+                fixed = true;
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        } else if let Some(rest) = line.strip_prefix("priority:") {
+            let val: u8 = rest.trim().parse().unwrap_or(5);
+            if val > 7 {
+                out.push_str("priority: 7");
+                fixed = true;
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if fixed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Terminal outcome of a dream run, derived from the final `done` frame's
+/// `finish` label. Drives the scheduler's fingerprint policy:
+/// - `Completed` → stamp (analysis finished).
+/// - `Truncated` → do NOT stamp (allow re-trigger next idle window); the
+///   brief carries a "already analyzed N times" dedup marker.
+/// - `Failed` → stamp (avoid hot-looping on a broken dream pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DreamOutcome {
+    Completed,
+    Truncated,
+    Failed,
+}
+
+/// Inject a dedup marker into the brief when the same fingerprint window has
+/// already been (partially) analyzed N times, so the re-triggered dream does
+/// not repeat phase-1 collection verbatim.
+fn truncation_marker(n: u32) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(
+            "【重触发提示】这批会话已被截断的 dream 分析过 {n} 次。阶段 1 只需检索上次未覆盖的增量（用 `ls -t` 定位最新文件），不要重复已完成的碎片收集。\n"
+        )
+    }
+}
+
+async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome, Vec<String>) {
     let model = state.active_model.lock().await.clone();
     // Reward-guided brief: aggregate Level-1 RL labels since the last dream
     // so the dream reviews the worst trajectories first. Falls back to the
     // plain prompt when the sessions dir is unavailable.
-    let brief = nonoclaw_engine::session::home_root().map(|root| {
-        let sessions_dir = root
-            .join("projects")
-            .join(
-                state
-                    .cwd()
-                    .to_string_lossy()
-                    .trim_start_matches('/')
-                    .replace('/', "-"),
-            )
-            .join("sessions");
-        let since = SystemTime::now() - DREAM_BRIEF_WINDOW;
-        reward_brief(&sessions_dir, since)
-    });
+    let (brief, listed_sessions) = nonoclaw_engine::session::home_root()
+        .map(|root| {
+            let sessions_dir = root
+                .join("projects")
+                .join(
+                    state
+                        .cwd()
+                        .to_string_lossy()
+                        .trim_start_matches('/')
+                        .replace('/', "-"),
+                )
+                .join("sessions");
+            let since = SystemTime::now() - DREAM_BRIEF_WINDOW;
+            let analyzed = dream_marker_path(&state.cwd())
+                .map(|m| read_analyzed_sessions(&m))
+                .unwrap_or_default();
+            let (text, listed) =
+                reward_brief_with_ledger(&sessions_dir, since, &analyzed);
+            (format!("{}{}", truncation_marker(truncation_count), text), listed)
+        })
+        .unwrap_or_default();
     let req = super::run_api::RunRequest {
-        prompt: dream_prompt_with_brief(brief),
+        prompt: dream_prompt_with_brief(if brief.is_empty() { None } else { Some(brief) }),
         session_id: None,
         model: Some(model),
         max_turns: Some(DREAM_MAX_TURNS),
@@ -680,23 +983,47 @@ async fn run_dream(state: Arc<AppState>) -> bool {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, "dream run failed to start");
-            return false;
+            return (DreamOutcome::Failed, listed_sessions);
         }
     };
     tracing::info!("dream run started");
     // Consume the body so the run actually executes to completion: collect
     // via into_data_stream (the same stream type run_api built it from).
     let mut stream = resp.into_body().into_data_stream();
-    let mut ok = true;
+    let mut outcome = DreamOutcome::Failed;
+    let mut last_line = String::new();
     use futures::StreamExt;
+    let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
-        if chunk.is_err() {
-            tracing::warn!("dream run stream error");
-            ok = false;
-            break;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!("dream run stream error");
+                outcome = DreamOutcome::Failed;
+                break;
+            }
+        };
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        // Keep only the trailing partial line; completed NDJSON lines are
+        // scanned for the terminal `done` frame.
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            let trimmed = line.trim();
+            if trimmed.contains("\"type\":\"done\"") {
+                last_line = trimmed.to_string();
+            }
         }
+        outcome = DreamOutcome::Completed; // provisional; refined below
     }
-    ok
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last_line) {
+        let finish = v.get("finish").and_then(|f| f.as_str()).unwrap_or("");
+        outcome = match finish {
+            "completed" => DreamOutcome::Completed,
+            "max_turns" | "budget_exceeded" | "context_limit" => DreamOutcome::Truncated,
+            _ => DreamOutcome::Failed,
+        };
+    }
+    (outcome, listed_sessions)
 }
 
 /// AutoGenesis SEPL commit gate: find shadow files staged by the dream under
@@ -814,6 +1141,33 @@ mod tests {
     }
 
     #[test]
+    fn dream_lock_excludes_second_process() {
+        let base = std::env::temp_dir().join("dream_lock_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // First acquisition succeeds (holds the lock).
+        let lock = DreamLock::try_acquire(&base);
+        assert!(lock.is_some(), "first process should acquire the lock");
+
+        // Second acquisition on the same project dir must be refused — this
+        // is the CLI-serve vs desktop-serve double-trigger we are guarding.
+        assert!(
+            DreamLock::try_acquire(&base).is_none(),
+            "second process must be excluded while the first holds the lock"
+        );
+
+        // Releasing (drop) frees it for the next process.
+        drop(lock);
+        assert!(
+            DreamLock::try_acquire(&base).is_some(),
+            "lock must be re-acquirable after release"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn reward_brief_aggregates_and_targets_worst() {
         let dir = std::env::temp_dir().join("dream_reward_brief_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -835,7 +1189,7 @@ mod tests {
             &other,
             concat!(
                 "{\"kind\":\"session\",\"id\":\"o\"}\n",
-                "{\"kind\":\"run_outcome\",\"run_id\":\"r3\",\"status\":\"cancelled\",\"reward\":-0.3,\"turns\":0,\"detail\":\"user requested cancellation\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r3\",\"status\":\"cancelled\",\"reward\":-0.3,\"turns\":1,\"detail\":\"user requested cancellation\"}\n",
             ),
         )
         .unwrap();
@@ -846,6 +1200,17 @@ mod tests {
             concat!(
                 "{\"kind\":\"tag\",\"tag\":\"dream\"}\n",
                 "{\"kind\":\"run_outcome\",\"run_id\":\"r4\",\"status\":\"done\",\"reward\":1.0,\"turns\":9,\"detail\":\"dream done\"}\n",
+            ),
+        )
+        .unwrap();
+        // A bench-smoke harness session (marker tasks run after every dream)
+        // is machine-generated the same way — excluded from the brief.
+        let smoke = dir.join("smoke55555555-eeee.jsonl");
+        std::fs::write(
+            &smoke,
+            concat!(
+                "{\"kind\":\"tag\",\"tag\":\"bench-smoke\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r6\",\"status\":\"done\",\"reward\":1.0,\"turns\":4,\"detail\":\"smoke ok\"}\n",
             ),
         )
         .unwrap();
@@ -862,14 +1227,89 @@ mod tests {
         drop(old);
 
         let brief = reward_brief(&dir, now - DREAM_BRIEF_WINDOW);
-        assert!(brief.contains("done × 1"), "done count excludes dream+stale: {brief}");
+        assert!(brief.contains("done × 1"), "done count excludes dream+stale+smoke: {brief}");
         assert!(brief.contains("cancelled × 1"), "cancelled count: {brief}");
-        assert!(brief.contains("error × 1"), "error count: {brief}");
+        assert!(brief.contains("error × 0"), "0-turn error filtered as noise: {brief}");
         assert!(brief.contains("work1111"), "worst-first pointer to work session: {brief}");
         assert!(brief.contains("other222"), "pointer to cancelled session: {brief}");
+        assert!(!brief.contains("provider 500"), "0-turn error detail not surfaced: {brief}");
         assert!(!brief.contains("dream3333"), "dream session excluded");
+        assert!(!brief.contains("smoke5555"), "bench-smoke session excluded");
         assert!(!brief.contains("r5"), "stale outcome excluded");
         assert!(brief.chars().count() <= 620, "brief capped: {}", brief.chars().count());
+    }
+
+    #[test]
+    fn scan_filters_zero_turn_non_done_noise() {
+        let dir = std::env::temp_dir().join("dream_scan_zero_turn");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let f = dir.join("noise11111111-aaaa.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"error\",\"reward\":-1.0,\"turns\":0,\"detail\":\"upstream service is temporarily unavailable\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r2\",\"status\":\"cancelled\",\"reward\":-1.0,\"turns\":0,\"detail\":\"user requested cancellation\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r3\",\"status\":\"cancelled\",\"reward\":-0.3,\"turns\":4,\"detail\":\"real aborted trajectory\"}\n",
+            ),
+        )
+        .unwrap();
+        let out = scan_run_outcomes(&dir, now - DREAM_BRIEF_WINDOW);
+        assert_eq!(out.len(), 1, "only the 4-turn cancelled run survives: {out:?}");
+        assert_eq!(out[0].turns, 4);
+        assert_eq!(out[0].detail, "real aborted trajectory");
+    }
+
+    #[test]
+    fn ledger_skips_analyzed_sessions_in_brief() {
+        let dir = std::env::temp_dir().join("dream_ledger_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let f = dir.join("sess11111111-aaaa.jsonl");
+        std::fs::write(
+            &f,
+            "{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"error\",\"reward\":-1.0,\"turns\":7,\"detail\":\"boom\"}\n",
+        )
+        .unwrap();
+        let mut analyzed = std::collections::HashSet::new();
+        analyzed.insert("sess11111111-aaaa".to_string());
+        let (brief, listed) =
+            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &analyzed);
+        assert!(
+            brief.contains("均已被此前 dream 完整分析"),
+            "no-increment brief: {brief}"
+        );
+        assert!(listed.is_empty(), "nothing listed for re-review");
+
+        // Without the ledger entry the session is listed with its full id.
+        let (brief2, listed2) =
+            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &Default::default());
+        assert!(brief2.contains("boom"), "unanalyzed session surfaces: {brief2}");
+        assert_eq!(listed2, vec!["sess11111111-aaaa".to_string()]);
+    }
+
+    #[test]
+    fn marker_roundtrip_preserves_ledger_and_legacy_shape() {
+        let dir = std::env::temp_dir().join("dream_marker_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("last_dream.json");
+
+        // Legacy shape: timestamp only, no ledger.
+        std::fs::write(&marker, "{\"finished_at\":1787804456}").unwrap();
+        assert!(read_analyzed_sessions(&marker).is_empty());
+
+        // Roundtrip: write then read back.
+        write_dream_marker(&marker, &["aaaa1111-aaaa".into(), "bbbb2222-bbbb".into()]);
+        let back = read_analyzed_sessions(&marker);
+        assert_eq!(back.len(), 2);
+        assert!(back.contains("aaaa1111-aaaa") && back.contains("bbbb2222-bbbb"));
+
+        // Garbage marker degrades to empty ledger.
+        std::fs::write(&marker, "not json").unwrap();
+        assert!(read_analyzed_sessions(&marker).is_empty());
     }
 
     #[test]
@@ -887,6 +1327,7 @@ mod tests {
             run_id: format!("{session}-r"),
             status: status.into(),
             reward,
+            turns: 5,
             detail: "d".into(),
         }
     }
@@ -929,7 +1370,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lines = vec![
             r#"{"type":"user","text":"t"}"#.to_string(),
-            r#"{"kind":"run_outcome","run_id":"r1","status":"error","reward":-1.0,"detail":"boom"}"#.to_string(),
+            r#"{"kind":"run_outcome","run_id":"r1","status":"error","reward":-1.0,"turns":6,"detail":"boom"}"#.to_string(),
         ];
         std::fs::write(dir.join("abc.jsonl"), lines.join("\n") + "\n").unwrap();
         let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
@@ -955,6 +1396,43 @@ mod tests {
         assert!(guided.contains("碎片收集"));
         // Brief must come before the phases so it frames them.
         assert!(guided.find("Reward 简报").unwrap() < guided.find("碎片收集").unwrap());
+    }
+
+    #[test]
+    fn truncation_marker_dedup_hint() {
+        assert!(truncation_marker(0).is_empty(), "first attempt has no marker");
+        let m = truncation_marker(2);
+        assert!(m.contains("已被截断的 dream 分析过 2 次"), "marker: {m}");
+        assert!(m.contains("增量"), "marker should point at delta collection");
+    }
+
+    #[test]
+    fn normalize_dream_beads_clamps_and_fixes_status() {
+        let dir = std::env::temp_dir().join("dream_bead_norm_test");
+        let beads = dir.join(".nonoclaw/memory/beads");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&beads).unwrap();
+        // Priority out of range (dream hallucinated 9) + bogus status.
+        std::fs::write(
+            beads.join("aaa.md"),
+            "---\nid: aaa\ntitle: t\nstatus: weird\npriority: 9\n---\nbody\n",
+        )
+        .unwrap();
+        // Well-formed bead must be left alone.
+        std::fs::write(
+            beads.join("bbb.md"),
+            "---\nid: bbb\ntitle: t2\nstatus: todo\npriority: 5\n---\nbody2\n",
+        )
+        .unwrap();
+        let fixed = normalize_dream_beads(&dir);
+        assert_eq!(fixed, 1, "only the malformed bead is rewritten");
+        let reloaded = nonoclaw_tools::memory::load_beads(&dir);
+        let a = reloaded.iter().find(|b| b.id == "aaa").unwrap();
+        assert_eq!(a.priority, 7, "priority clamped to 7");
+        assert_eq!(a.status, nonoclaw_tools::memory::BeadStatus::Todo);
+        let b = reloaded.iter().find(|b| b.id == "bbb").unwrap();
+        assert_eq!(b.priority, 5, "good bead untouched");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -991,18 +1469,29 @@ mod tests {
         for phase in ["碎片收集", "关联分析", "知识萃取", "记忆索引"] {
             assert!(p.contains(phase), "missing phase {phase}");
         }
+        // Phase 5: actionable improvement suggestions must land as beads so
+        // they surface in the next session's context automatically.
+        assert!(p.contains("改进建议落盘"), "missing phase 5");
+        assert!(p.contains("memory/beads/"), "phase 5 must target beads dir");
+        // Facts/beads paths must carry the `.nonoclaw/` prefix — bare
+        // `memory/facts/` wording caused agents to write to the repo top level,
+        // where the engine never loads them (silent strays).
+        for bare in ["写入 memory/", "写入 memory/facts"] {
+            assert!(!p.contains(bare), "prompt must not use bare relative path: {bare}");
+        }
+        assert!(p.contains(".nonoclaw/memory/facts/"), "facts path needs .nonoclaw prefix");
     }
 
     #[test]
     fn headroom_gate_skips_all_clean_windows() {
         let clean = vec![
-            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
-            OutcomeSummary { session_id: "b".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
+            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
+            OutcomeSummary { session_id: "b".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
         ];
         assert!(!has_headroom(&clean), "saturated window skips dreaming");
         let dirty = vec![
-            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, detail: String::new() },
-            OutcomeSummary { session_id: "c".into(), run_id: "r".into(), status: "error".into(), reward: -1.0, detail: String::new() },
+            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
+            OutcomeSummary { session_id: "c".into(), run_id: "r".into(), status: "error".into(), reward: -1.0, turns: 3, detail: String::new() },
         ];
         assert!(has_headroom(&dirty), "one non-done outcome is headroom");
         // Empty windows are handled by the scheduler guard (`!fresh.is_empty()`),

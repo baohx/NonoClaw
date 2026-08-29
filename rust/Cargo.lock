@@ -1569,6 +1569,7 @@ dependencies = [
  "clap",
  "futures",
  "image",
+ "libc",
  "nonoclaw-api",
  "nonoclaw-core",
  "nonoclaw-engine",
@@ -1611,6 +1612,7 @@ name = "nonoclaw-core"
 version = "0.23.2"
 dependencies = [
  "chrono",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

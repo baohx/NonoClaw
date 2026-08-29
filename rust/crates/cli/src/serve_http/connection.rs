@@ -42,6 +42,8 @@ use super::protocol::{
     event_message, messages_loaded, safe_error, send_msg, send_msg_ok, synthetic_event_message,
     terminal_fields, ClientMsg, ModelInfo, ServerMsg, SessionInfoWire,
 };
+#[allow(unused_imports)]
+use super::protocol::history_page;
 use crate::attachments;
 #[cfg(test)]
 use crate::project_info::ProjectInfo;
@@ -294,11 +296,14 @@ fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) ->
             .unwrap_or(true)
 }
 
-fn list_sessions_wire(state: &AppState) -> Vec<SessionInfoWire> {
-    state
-        .session_service
-        .list_sessions(&state.cwd())
-        .unwrap_or_default()
+async fn list_sessions_wire(state: &AppState) -> Vec<SessionInfoWire> {
+    let service = state.session_service.clone();
+    let cwd = state.cwd();
+    let sessions = match tokio::task::spawn_blocking(move || service.list_sessions(&cwd)).await {
+        Ok(sessions) => sessions.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    sessions
         .into_iter()
         .map(|s| SessionInfoWire {
             id: s.id,
@@ -601,7 +606,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         send_msg(
             &tx,
             ServerMsg::SessionList {
-                sessions: list_sessions_wire(&state),
+                sessions: list_sessions_wire(&state).await,
             },
         )
         .await;
@@ -804,7 +809,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         send_msg(
                             &tx,
                             ServerMsg::SessionList {
-                                sessions: list_sessions_wire(&state),
+                                sessions: list_sessions_wire(&state).await,
                             },
                         )
                         .await;
@@ -871,7 +876,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             send_msg(
                                 &tx,
                                 ServerMsg::SessionList {
-                                    sessions: list_sessions_wire(&state),
+                                    sessions: list_sessions_wire(&state).await,
                                 },
                             )
                             .await;
@@ -973,6 +978,49 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     },
                 )
                 .await;
+            }
+            ClientMsg::LoadOlder { session_id, limit, before } => {
+                // Serve one older page for the session this connection is
+                // viewing. `before` defaults to the count the client holds
+                // (older messages exist behind that boundary only when the
+                // restore payload was a tail window).
+                let current = session.lock().await;
+                let Some(handle) = current.as_ref() else {
+                    send_msg(&tx, safe_error(ErrorCode::NotFound, "no active session", false, "load_older")).await;
+                    continue;
+                };
+                if handle.session.id() != session_id {
+                    send_msg(&tx, safe_error(ErrorCode::NotFound, "session is not active", false, "load_older")).await;
+                    continue;
+                }
+                let snapshot = handle.session.snapshot().await;
+                let (total, started, revision) = match &snapshot {
+                    Ok(s) => (s.messages.len(), s.started.clone(), s.revision),
+                    Err(_) => {
+                        send_msg(&tx, safe_error(ErrorCode::Storage, "history page unavailable", true, "load_older")).await;
+                        continue;
+                    }
+                };
+                let before = before.unwrap_or(0).min(total);
+                match handle.session.history_page(before, limit.max(1).min(500)).await {
+                    Ok(page) => {
+                        send_msg(
+                            &tx,
+                            super::protocol::history_page(
+                                &session_id,
+                                page.messages,
+                                before,
+                                total,
+                                revision,
+                                started,
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        send_msg(&tx, safe_error(ErrorCode::Storage, "history page unavailable", true, "load_older")).await;
+                    }
+                }
             }
             ClientMsg::OpenFile { path, force_code } => {
                 match state.project_service.open(&path, force_code) {
@@ -1534,7 +1582,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             send_msg(
                                 &tx2,
                                 ServerMsg::SessionList {
-                                    sessions: list_sessions_wire(&s),
+                                    sessions: list_sessions_wire(&s).await,
                                 },
                             )
                             .await;
@@ -1834,7 +1882,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 send_msg(
                     &tx,
                     ServerMsg::SessionList {
-                        sessions: list_sessions_wire(&state),
+                        sessions: list_sessions_wire(&state).await,
                     },
                 )
                 .await;
@@ -2231,6 +2279,7 @@ mod characterization_tests {
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
             ClientMsg::GitShow { .. } => "git_show",
             ClientMsg::SessionPrompts { .. } => "session_prompts",
+            ClientMsg::LoadOlder { .. } => "load_older",
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
             ClientMsg::SwitchProject { .. } => "switch_project",
@@ -2430,6 +2479,7 @@ mod characterization_tests {
                 timestamp_ms: 1,
                 messages: vec![],
                 cumulative_usage: serde_json::json!({}),
+                total: 0,
             },
             ServerMsg::FileTree {
                 root: "/fixture".into(),
