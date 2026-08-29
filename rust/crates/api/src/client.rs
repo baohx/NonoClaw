@@ -128,6 +128,10 @@ pub enum StreamEvent {
     ThinkingDelta {
         thinking: String,
     },
+    /// Emitted when the model finishes its extended-thinking block (the
+    /// thinking `content_block_stop`). Distinct from `MessageStop` so UIs can
+    /// time thinking separately from the visible text that follows it.
+    ThinkingEnd,
     ToolUseStart {
         index: usize,
         id: String,
@@ -967,6 +971,9 @@ fn handle_frame(
                 index: usize,
             }
             if let Ok(p) = serde_json::from_str::<P>(&frame.data) {
+                if matches!(blocks.get(&p.index), Some(BlockBuilder::Thinking { .. })) {
+                    on_event(&StreamEvent::ThinkingEnd);
+                }
                 on_event(&StreamEvent::BlockStop { index: p.index });
             }
         }
@@ -1340,6 +1347,10 @@ struct OpenAiState {
     usage: Usage,
     stop_reason: Option<StopReason>,
     message_started: bool,
+    /// Whether a reasoning (`reasoning_content`) block is currently streaming.
+    /// When the first visible `content` delta arrives, reasoning has ended and
+    /// a `ThinkingEnd` is emitted to time thinking separately from text.
+    thinking_active: bool,
 }
 
 impl OpenAiState {
@@ -1564,6 +1575,7 @@ fn handle_openai_chunk(
         // thought process and the turn doesn't look stalled.
         if let Some(thinking) = delta.get("reasoning_content").and_then(|value| value.as_str()) {
             if !thinking.is_empty() {
+                state.thinking_active = true;
                 on_event(&StreamEvent::ThinkingDelta {
                     thinking: thinking.to_string(),
                 });
@@ -1571,6 +1583,12 @@ fn handle_openai_chunk(
         }
         if let Some(text) = delta.get("content").and_then(|value| value.as_str()) {
             if !text.is_empty() {
+                // First visible text after reasoning: the thinking block just
+                // closed. Emit its precise end before streaming the text.
+                if state.thinking_active {
+                    state.thinking_active = false;
+                    on_event(&StreamEvent::ThinkingEnd);
+                }
                 state.text.push_str(text);
                 on_event(&StreamEvent::TextDelta {
                     text: text.to_string(),

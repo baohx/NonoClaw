@@ -3032,6 +3032,12 @@ fn forward_stream_event(
                 turn,
             });
         }
+        StreamEvent::ThinkingEnd => {
+            // The thinking block closed (not the whole message). This is the
+            // precise end of reasoning; MessageStop still emits a fallback
+            // `active: false` for providers that skip block-level events.
+            on_event(&RunEvent::ThinkingState { active: false, turn });
+        }
         StreamEvent::MessageDelta { usage, .. } => {
             let mut total = total_before_turn;
             total.update_from_part(usage);
