@@ -35,7 +35,7 @@ export interface TraceRun {
   status: TraceStatus;
 }
 
-const OMITTED_KINDS = new Set<EngineEvent["kind"]>(["text_delta", "assistant_done"]);
+const OMITTED_KINDS = new Set<EngineEvent["kind"]>(["text_delta", "thinking_delta", "assistant_done"]);
 const SENSITIVE_KEY = /(authorization|credential|secret|token$|api[_-]?key|password|prompt|input|preview|attachment|content|text)/i;
 
 function text(value: unknown, fallback = ""): string {

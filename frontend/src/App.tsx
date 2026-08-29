@@ -17,6 +17,7 @@ import QuestionDialog from "./components/QuestionDialog";
 import SessionPicker from "./components/SessionPicker";
 import SessionRail from "./components/SessionRail";
 import StatusBar from "./components/StatusBar";
+import TrajectoryGovernance from "./components/TrajectoryGovernance";
 
 const WS_PROTO = window.location.protocol === "https:" ? "wss" : "ws";
 const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
@@ -33,6 +34,8 @@ export default function App() {
   const setShowSessionPicker = useStore((s) => s.setShowSessionPicker);
   const showApiLog = useStore((s) => s.showApiLog);
   const setShowApiLog = useStore((s) => s.setShowApiLog);
+  const showGovernance = useStore((s) => s.showGovernance);
+  const setShowGovernance = useStore((s) => s.setShowGovernance);
   const compacting = useStore((s) => s.compacting);
   const pendingPermission = useStore((s) => s.pendingPermission);
   // Questions queue in FIFO order (parallel AskUserQuestion calls must not
@@ -41,8 +44,6 @@ export default function App() {
   const pendingCommit = useStore((s) => s.pendingCommit);
   const setPendingCommit = useStore((s) => s.setPendingCommit);
   const clearMessages = useStore((s) => s.clearMessages);
-  const messages = useStore((s) => s.messages);
-  const streamingIdx = useStore((s) => s.streamingIdx);
   const fileTree = useStore((s) => s.fileTree);
   const fileTreeRoot = useStore((s) => s.fileTreeRoot);
   const projectInfo = useStore((s) => s.projectInfo);
@@ -120,10 +121,24 @@ export default function App() {
   }, [connectionStatus, send]);
 
   const userScrolledUp = useRef(false);
+  // Stick-to-bottom follows the store directly (delta coalescing means the
+  // component re-renders once per frame, not once per delta) — no [messages]
+  // subscription here keeps App.tsx out of the streaming hot path.
   useEffect(() => {
-    if (!chatRef.current || userScrolledUp.current) return;
-    chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [messages]);
+    let lastLen = 0;
+    return useStore.subscribe((state) => {
+      const len = state.messages.length;
+      const streaming = state.streamingIdx !== null;
+      if (len !== lastLen) {
+        lastLen = len;
+        if (!userScrolledUp.current && chatRef.current) {
+          chatRef.current.scrollTop = chatRef.current.scrollHeight;
+        }
+      } else if (streaming && !userScrolledUp.current && chatRef.current) {
+        chatRef.current.scrollTop = chatRef.current.scrollHeight;
+      }
+    });
+  }, []);
 
   // Locate a message jumped to from the session rail: scroll into view and
   // briefly highlight it, then release the marker.
@@ -382,6 +397,7 @@ export default function App() {
           onToggleLeftRail={toggleLeftRail}
           onToggleInsight={toggleInsight}
           onToggleApiLog={() => setShowApiLog(true)}
+          onToggleGovernance={() => setShowGovernance(true)}
           onShowQr={() => setShowQr(true)}
         />
         <div className={bodyClass}>
@@ -426,7 +442,7 @@ export default function App() {
               {toolsHidden ? "◈" : "◇"}
             </button>
             <div ref={chatRef} className="chat-scroll" onScroll={handleScroll}>
-              <ChatView messages={messages} streamingIdx={streamingIdx} toolsHidden={toolsHidden} send={send} />
+              <ChatView toolsHidden={toolsHidden} send={send} />
             </div>
             <InputBox
               onSubmit={handleSubmit}
@@ -493,6 +509,7 @@ export default function App() {
       )}
       {showQr && <QrDialog onClose={() => setShowQr(false)} />}
       {showApiLog && <ApiLogDrawer onClose={() => setShowApiLog(false)} />}
+      {showGovernance && <TrajectoryGovernance onClose={() => setShowGovernance(false)} />}
     </>
   );
 }

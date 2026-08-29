@@ -15,6 +15,7 @@ interface Props {
   onToggleLeftRail: () => void;
   onToggleInsight: () => void;
   onToggleApiLog: () => void;
+  onToggleGovernance: () => void;
 }
 
 const ALL_THEMES = Object.keys(THEME_COLORS) as Theme[];
@@ -30,6 +31,7 @@ export default function StatusBar({
   onToggleLeftRail,
   onToggleInsight,
   onToggleApiLog,
+  onToggleGovernance,
   onShowQr,
 }: Props) {
   const inputTokens = useStore((s) => s.inputTokens);
@@ -172,6 +174,14 @@ export default function StatusBar({
           aria-label="Toggle API log viewer"
         >
           &#x1f4dd;
+        </button>
+        <button
+          className="iconbtn"
+          onClick={onToggleGovernance}
+          title="Trajectory governance — tree, loop/retry/drift detection"
+          aria-label="Toggle trajectory governance"
+        >
+          &#x1f333;
         </button>
         {hasMobileAccessToken && (
           <button

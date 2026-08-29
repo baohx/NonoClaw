@@ -421,6 +421,8 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
                   <option value="auto">Auto</option>
                   <option value="bypassPermissions">Bypass</option>
                   <option value="plan">Plan</option>
+                  <option value="sandboxWorkspaceWrite">Sandbox write</option>
+                  <option value="sandboxReadOnly">Sandbox read-only</option>
                 </select>
               </label>
               {disabled && <span className="composer__run-status" role="status">Run settings are locked until the current run ends.</span>}

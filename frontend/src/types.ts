@@ -31,6 +31,7 @@ export interface TokenBudgetComponent {
 export interface EngineEvent {
   kind:
     | "text_delta" | "tool_use_start" | "tool_result" | "assistant_done"
+    | "thinking_delta"
     | "compacted" | "compacting" | "model_info" | "skill_activated"
     | "session_repair" | "task_changed" | "run_started" | "context_prepared"
     | "token_budget_breakdown" | "model_request_started" | "model_resolved" | "provider_diagnostic"
@@ -265,10 +266,26 @@ export interface MessagesLoadedMsg {
   /** Canonical SessionSnapshot.revision. */
   revision?: number;
   timestamp_ms?: number;
-  /** Each entry is a serialized engine Message ({role, content}). */
+  /** Each entry is a serialized engine Message ({role, content}). Tail-windowed:
+   * may hold fewer than `total` messages when restoring a long session. */
   messages: unknown[];
   /** Cumulative token usage from all completed runs (restores the in/out display). */
   cumulative_usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+  /** Total persisted messages in the session (≥ messages.length). When larger,
+   * older history is available via `load_older` paging. */
+  total?: number;
+}
+
+export interface HistoryPageMsg {
+  type: "history_page";
+  protocol_version?: number;
+  session_id?: string;
+  revision?: number;
+  timestamp_ms?: number;
+  /** Older messages, ascending; prepend before the current window. */
+  messages: unknown[];
+  /** Messages older than this page (0 = start reached). */
+  remaining?: number;
 }
 
 /** One node of the flattened project file tree. */
@@ -514,7 +531,16 @@ export interface SessionPromptsRequest {
   session_id: string;
 }
 
-export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions" | "plan";
+export interface LoadOlderRequest {
+  type: "load_older";
+  session_id: string;
+  /** Page size (default 100 server-side, capped at 500). */
+  limit?: number;
+  /** Window boundary: request messages strictly before this count. */
+  before?: number;
+}
+
+export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions" | "plan" | "sandboxWorkspaceWrite" | "sandboxReadOnly";
 
 export interface SetPermissionModeRequest {
   type: "set_permission_mode";
@@ -541,6 +567,7 @@ export type ServerMsg =
   | InfoMsg
   | SessionListMsg
   | MessagesLoadedMsg
+  | HistoryPageMsg
   | FileTreeMsg
   | SessionPromptsMsg
   | ProjectInfoMsg
@@ -648,6 +675,7 @@ export type ClientMsg =
   | ProjectInfoRefreshRequest
   | GitShowRequest
   | SessionPromptsRequest
+  | LoadOlderRequest
   | SetPermissionModeRequest
   | SetModelRequest;
 
@@ -665,6 +693,9 @@ export interface ChatMessage {
   content: string;
   /** When this message was created (epoch ms). */
   timestamp?: number;
+  /** Measured wall-clock duration (ms) — replayed tool records: the gap
+   * between the tool_use commit and its tool_result commit. */
+  durationMs?: number;
   /** Attachment names associated with this user turn. */
   attachments?: MessageAttachment[];
   /** Tool name (only for tool messages). */
@@ -675,6 +706,8 @@ export interface ChatMessage {
   toolOk?: boolean;
   /** Streaming text buffer (assistant messages in progress). */
   streaming?: boolean;
+  /** Model reasoning text (extended thinking), accumulated from thinking_delta. */
+  thinking?: string;
   /** Collapsed tool output. */
   collapsed?: boolean;
   /** Index of the source JSONL message this chat entry derives from

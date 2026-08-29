@@ -214,6 +214,53 @@ function acceptRunMessage(
   }, terminal);
 }
 
+/**
+ * Streaming-delta frame coalescing: providers emit many small text/thinking
+ * deltas per turn; committing each one to the store re-renders the whole
+ * message list per delta. Buffer deltas and flush once per animation frame
+ * (both kinds keep their arrival order — one combined flush preserves the
+ * text/thinking interleave because append order follows arrival order).
+ */
+const deltaBuffer: Array<{ text: string; thinking: boolean }> = [];
+let deltaFlushScheduled = false;
+
+/** Flush any pending coalesced deltas now (stream end, run end). */
+function flushDeltas(): void {
+  if (!deltaBuffer.length) return;
+  const state = useStore.getState();
+  let text = "";
+  let thinkingText = "";
+  for (const delta of deltaBuffer) {
+    if (delta.thinking) {
+      if (text) { state.appendStreaming(text); text = ""; }
+      thinkingText += delta.text;
+    } else {
+      if (thinkingText) { state.appendThinking(thinkingText); thinkingText = ""; }
+      text += delta.text;
+    }
+  }
+  if (text) state.appendStreaming(text);
+  if (thinkingText) state.appendThinking(thinkingText);
+  deltaBuffer.length = 0;
+}
+
+function scheduleDelta(text: string, thinking: boolean): void {
+  deltaBuffer.push({ text, thinking });
+  if (deltaFlushScheduled) return;
+  deltaFlushScheduled = true;
+  const flush = () => {
+    deltaFlushScheduled = false;
+    flushDeltas();
+  };
+  // requestAnimationFrame batches to paint cadence; the setTimeout fallback
+  // covers hidden tabs where rAF is throttled to never.
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(flush);
+  } else {
+    setTimeout(flush, 16);
+  }
+}
+
 /** Deterministic protocol dispatcher; ordering decisions are delegated to pure store transitions. */
 export function dispatchServerMessage(message: ServerMsg): void {
   const state = useStore.getState();
@@ -235,7 +282,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
         ? state.acceptSnapshot(message.session_id, message.revision)
         : state.acceptLegacySnapshot();
       if (accepted) {
-        state.loadMessages(message.messages);
+        state.loadMessages(message.messages, message.total);
         // Restore cumulative token usage so the right-rail in/out display
         // survives a page refresh. These are real API token counts accumulated
         // across all completed runs in this session.
@@ -247,6 +294,14 @@ export function dispatchServerMessage(message: ServerMsg): void {
             cacheWrite: message.cumulative_usage.cache_creation_input_tokens ?? 0,
           });
         }
+      }
+      break;
+    }
+    case "history_page": {
+      // Older messages for a tail-windowed session. Guard against pages from
+      // a superseded session arriving after a switch.
+      if (message.session_id === state.sessionId) {
+        state.prependHistory(message.messages, message.remaining ?? 0);
       }
       break;
     }
@@ -306,7 +361,11 @@ export function dispatchServerMessage(message: ServerMsg): void {
       switch (event.kind) {
         case "text_delta":
           state.ensureStreaming();
-          state.appendStreaming(event.text || "");
+          scheduleDelta(event.text || "", false);
+          break;
+        case "thinking_delta":
+          state.ensureStreaming();
+          scheduleDelta(event.text || "", true);
           break;
         case "tool_use_start":
           state.addToolCard(event.id || "", event.name || "unknown", event.input);
@@ -315,6 +374,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
           state.updateToolResult(event.id || "", event.ok ?? false, event.preview || "");
           break;
         case "assistant_done":
+          flushDeltas();
           state.finishStreaming();
           break;
         case "model_info":
@@ -370,6 +430,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
       breathController.consumePrompt("question", true);
       break;
     case "done": {
+      flushDeltas();
       // A run-scoped done means that run is over. Clear running/cancelling/
       // compacting state before the ordering guard — even if this frame is
       // rejected as a duplicate/late terminal, the UI must not stay stuck on
@@ -404,6 +465,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
       break;
     }
     case "error": {
+      flushDeltas();
       const safeMessage = sanitizeBrowserText(message.message || "operation failed");
       // A run-scoped error means that run is over. Reset running/cancelling
       // state before the ordering guard: even if this frame is rejected as a

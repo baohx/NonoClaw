@@ -1,4 +1,5 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import VirtualChat, { type VirtualChatRow } from "./VirtualChat";
 import type { ChatMessage, ClientMsg, SubagentRun, SubagentTool } from "../types";
 import { useStore } from "../store";
 import Markdown from "./Markdown";
@@ -34,25 +35,69 @@ async function forkAtMessage(msg: ChatMessage, send: (m: ClientMsg) => void) {
 }
 
 interface Props {
-  messages: ChatMessage[];
-  streamingIdx: number | null;
   toolsHidden: boolean;
   send: (message: ClientMsg) => void;
 }
 
-export default function ChatView({ messages, toolsHidden, send }: Props) {
-  if (!toolsHidden) {
-    return (
-      <div>
-        {messages.length === 0 && <WelcomeMessage />}
-        {messages.map((msg) => (
+/** "Load earlier messages" affordance for tail-windowed sessions. The bar
+ * itself is the scroll anchor: after a page prepend, restoring its viewport
+ * offset keeps the reader's position stable. */
+const LoadOlderBar = memo(function LoadOlderBar({ send }: { send: (m: ClientMsg) => void }) {
+  const remaining = useStore((s) => s.historyOlderRemaining);
+  const loading = useStore((s) => s.historyLoading);
+  const requestOlderHistory = useStore((s) => s.requestOlderHistory);
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  if (remaining <= 0 && !loading) return null;
+  const onLoad = () => {
+    const el = anchorRef.current;
+    // Viewport offset of the anchor before the prepend. The chat scroller is
+    // the nearest scrollable ancestor of this bar — find it and restore the
+    // offset after the page lands so the reader's position stays put.
+    const scroller = el?.closest<HTMLElement>(".chat-scroll") ?? null;
+    const top = el && scroller ? el.getBoundingClientRect().top - scroller.getBoundingClientRect().top : 0;
+    requestOlderHistory(send);
+    requestAnimationFrame(() => {
+      if (!el || !scroller) return;
+      const delta = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - top;
+      if (delta > 0) scroller.scrollTop += delta;
+    });
+  };
+  return (
+    <div ref={anchorRef} className="load-older-bar">
+      <button className="load-older-btn" onClick={onLoad} disabled={loading}>
+        {loading ? "加载中…" : `加载更早的消息（还有 ${remaining} 条）`}
+      </button>
+    </div>
+  );
+});
+
+export default function ChatView({ toolsHidden, send }: Props) {
+  // ChatView owns the message subscription: App.tsx stays out of the
+  // streaming hot path entirely (one re-rendering subtree per frame).
+  const messages = useStore((s) => s.messages);
+  // Default view: one virtual row per message; only the viewport (± overscan)
+  // is mounted. Deep-link anchors (`msg-${id}`) live on MessageCard itself.
+  const rows: VirtualChatRow[] = useMemo(
+    () =>
+      messages.map((msg) => ({
+        key: `m-${msg.id}`,
+        node: (
           <MessageCard
-            key={msg.id}
             msg={msg}
             send={send}
             isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
           />
-        ))}
+        ),
+      })),
+    [messages, send],
+  );
+
+  if (!toolsHidden) {
+    return (
+      <div>
+        {messages.length === 0 && <WelcomeMessage />}
+        <LoadOlderBar send={send} />
+        <VirtualChat rows={rows} />
       </div>
     );
   }
@@ -103,7 +148,7 @@ export default function ChatView({ messages, toolsHidden, send }: Props) {
   return (
     <div>
       {messages.length === 0 && <WelcomeMessage />}
-      {rendered}
+      <VirtualChat rows={rendered.map((node, i) => ({ key: `h-${i}`, node }))} />
     </div>
   );
 }
@@ -291,10 +336,15 @@ const MessageCard = memo(function MessageCard({
               )}
               <span className="msg__user-text">{msg.content}</span>
             </>
-          ) : msg.streaming ? (
-            <StreamingText text={msg.content} />
           ) : (
-            <Markdown content={msg.content} />
+            <>
+              {!isUser && msg.thinking && msg.thinking.trim().length > 0 && (
+                <ThinkingPanel text={msg.thinking} streaming={msg.streaming === true} />
+              )}
+              {msg.streaming
+                ? <StreamingText text={msg.content} />
+                : <Markdown content={msg.content} />}
+            </>
           )}
         </div>
       </div>
@@ -308,6 +358,24 @@ function StreamingText({ text }: { text: string }) {
       <pre className="stream-plain">{text}</pre>
       <span className="stream-caret" />
     </>
+  );
+}
+
+/** Collapsible extended-thinking panel above assistant content. */
+function ThinkingPanel({ text, streaming }: { text: string; streaming: boolean }) {
+  const [open, setOpen] = useState(false);
+  // Auto-collapse when the stream finishes (unless the user is reading it).
+  useEffect(() => {
+    if (!streaming) setOpen(false);
+  }, [streaming]);
+  return (
+    <details className="thinking" open={open || streaming} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+      <summary className="thinking__summary">
+        {streaming ? "thinking…" : "thinking"}
+        <span className="thinking__len">{text.length.toLocaleString()} chars</span>
+      </summary>
+      <pre className="thinking__body">{text}</pre>
+    </details>
   );
 }
 

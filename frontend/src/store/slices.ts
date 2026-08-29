@@ -27,6 +27,7 @@ import {
   accumulateUsage,
   addToolCardTransition,
   appendStreamingTransition,
+  appendThinkingTransition,
   enqueueClientMessage,
   ensureStreamingTransition,
   finishStreamingTransition,
@@ -107,6 +108,7 @@ export interface SessionSlice {
   addMessage: (message: ChatMessage) => void;
   ensureStreaming: () => void;
   appendStreaming: (text: string) => void;
+  appendThinking: (text: string) => void;
   finishStreaming: () => void;
   setInfo: (model: string, sessionId: string, hasMobileAccessToken?: boolean, availableModels?: ModelInfo[]) => void;
   setModel: (model: string) => void;
@@ -114,7 +116,14 @@ export interface SessionSlice {
   acceptSnapshot: (sessionId: string, revision: number) => boolean;
   acceptLegacySnapshot: () => boolean;
   prepareSessionSwitch: (sessionId?: string) => void;
-  loadMessages: (messages: unknown[]) => void;
+  loadMessages: (messages: unknown[], total?: number) => void;
+  /** Prepend one `history_page` payload; returns the new remaining count. */
+  prependHistory: (messages: unknown[], remaining: number) => void;
+  /** Older-history window state for the active session. */
+  historyOlderRemaining: number;
+  historyTotal: number;
+  historyLoading: boolean;
+  requestOlderHistory: (send: (msg: ClientMsg) => void, limit?: number) => void;
   clearMessages: () => void;
 }
 
@@ -250,12 +259,15 @@ export interface UiSlice {
   toolsHidden: boolean;
   /** Whether the raw API log viewer drawer is open. */
   showApiLog: boolean;
+  /** Whether the trajectory governance tab is open. */
+  showGovernance: boolean;
   setXrayBudget: (event: import("../types").EngineEvent | null) => void;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
   toggleLeftRail: () => void;
   toggleInsight: () => void;
   setShowApiLog: (show: boolean) => void;
+  setShowGovernance: (show: boolean) => void;
   setTheme: (theme: Theme) => void;
   setPermissionMode: (mode: PermissionMode) => void;
   setLocatedMessage: (id: string | null) => void;
@@ -377,11 +389,15 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   sessions: [],
   hasMobileAccessToken: false,
   availableModels: [],
+  historyOlderRemaining: 0,
+  historyTotal: 0,
+  historyLoading: false,
   addMessage: (message) => set((state) => state.messages.some((item) => item.id === message.id)
     ? {}
     : { messages: [...state.messages, { timestamp: Date.now(), ...message }] }),
   ensureStreaming: () => set((state) => ensureStreamingTransition(state)),
   appendStreaming: (text) => set((state) => appendStreamingTransition(state, text)),
+  appendThinking: (text) => set((state) => appendThinkingTransition(state, text)),
   finishStreaming: () => set((state) => finishStreamingTransition(state)),
   setInfo: (model, sessionId, hasMobileAccessToken = false, availableModels = []) => set((state) => ({
     ...(state.sessionId && state.sessionId !== sessionId ? boundaryCleanup(state, sessionId) : {}),
@@ -423,7 +439,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     return accepted;
   },
   prepareSessionSwitch: (sessionId) => set((state) => boundaryCleanup(state, sessionId ?? state.sessionId)),
-  loadMessages: (messages) => {
+  loadMessages: (messages, total) => {
     const mapped = engineMessagesToChat(messages);
     const nextMessageId = mapped.reduce((next, message) => {
       const match = String(message.id).match(/^msg-(\d+)$/);
@@ -437,7 +453,36 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
       toolCards,
       subagentRunsById: {},
       childIdsByParentToolId: {},
+      // Tail window: total persisted messages vs. what we hold now.
+      historyTotal: total ?? mapped.length,
+      historyOlderRemaining: Math.max(0, (total ?? mapped.length) - mapped.length),
+      historyLoading: false,
     });
+  },
+  prependHistory: (messages, remaining) => {
+    const state = get();
+    const mapped = engineMessagesToChat(messages);
+    if (!mapped.length) {
+      set({ historyLoading: false, historyOlderRemaining: 0 });
+      return;
+    }
+    // Re-base message ids so prepended rows never collide with live ones.
+    const rebase = state.messages.length;
+    const rebased = mapped.map((message, index) => ({ ...message, id: `msg-h${rebase + index}` }));
+    set({
+      messages: [...rebased, ...state.messages],
+      historyOlderRemaining: remaining,
+      historyLoading: false,
+    });
+  },
+  requestOlderHistory: (send, limit = 100) => {
+    const state = get();
+    if (!state.sessionId || state.historyLoading || state.historyOlderRemaining <= 0) return;
+    // The held tail window starts at absolute index `historyOlderRemaining`
+    // (= total - held): the server returns [before-limit, before).
+    const before = state.historyOlderRemaining;
+    set({ historyLoading: true });
+    send({ type: "load_older", session_id: state.sessionId, before, limit });
   },
   clearMessages: () => set((state) => ({
     ...prepareSessionBoundary(orderingState(state)),
@@ -447,6 +492,9 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     toolCards: {},
     subagentRunsById: {},
     childIdsByParentToolId: {},
+    historyOlderRemaining: 0,
+    historyTotal: 0,
+    historyLoading: false,
     activeRunId: null,
     agentRunning: false,
     cancelling: false,
@@ -667,9 +715,11 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   xrayBudget: null,
   toolsHidden: false,
   showApiLog: false,
+  showGovernance: false,
   setXrayBudget: (event) => set({ xrayBudget: event }),
   setToolsHidden: (toolsHidden) => set({ toolsHidden }),
   setShowApiLog: (showApiLog) => set({ showApiLog }),
+  setShowGovernance: (showGovernance) => set({ showGovernance }),
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),
@@ -683,7 +733,7 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
 });
 
 export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
-  type Block = { type?: string; text?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean };
+  type Block = { type?: string; text?: string; thinking?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean };
   const output: ChatMessage[] = [];
   let counter = 1;
   const nextId = () => `msg-${counter++}`;
@@ -691,6 +741,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
   const lastResultById = new Map<string, Block>();
   const duplicateUses = new Set<string>();
   const duplicateResults = new Set<string>();
+  const resultTsById = new Map<string, number>();
 
   for (const raw of messages) {
     const blocks = Array.isArray((raw as { content?: unknown })?.content)
@@ -702,6 +753,10 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
       } else if (block.type === "tool_result" && block.tool_use_id) {
         if (lastResultById.has(block.tool_use_id)) duplicateResults.add(block.tool_use_id);
         lastResultById.set(block.tool_use_id, block);
+        // Wall-clock of the result's source entry — gives replayed tool
+        // records a precise use→result duration without trace entries.
+        const ts = (raw as { ts?: unknown }).ts;
+        if (typeof ts === "number" && Number.isFinite(ts)) resultTsById.set(block.tool_use_id, ts);
       }
     }
   }
@@ -751,19 +806,49 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
       continue;
     }
     let pendingAttachments = attachments;
+    let pendingThinking: string | undefined;
     for (const block of blocks) {
+      if (block.type === "thinking") {
+        const text = typeof block.thinking === "string" ? block.thinking : "";
+        if (text.length > 0) pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
+        continue;
+      }
       if (block.type === "text") {
         if (message.role === "user" || message.role === "assistant") {
           appendText(message.role, block.text ?? "", pendingAttachments);
+          // Extended thinking precedes its visible text: attach to the entry
+          // this text just landed in (merged or fresh).
+          if (pendingThinking !== undefined && message.role === "assistant") {
+            const target = output[output.length - 1];
+            if (target?.role === "assistant" && !target.toolName) {
+              target.thinking = target.thinking
+                ? `${target.thinking}\n${pendingThinking}`
+                : pendingThinking;
+            }
+            pendingThinking = undefined;
+          }
           pendingAttachments = [];
         }
         continue;
       }
       if (block.type === "tool_use") {
+        // Thinking before a tool-only step belongs to that assistant turn.
+        if (pendingThinking !== undefined && message.role === "assistant") {
+          const target = output[output.length - 1];
+          if (target?.role === "assistant" && !target.toolName) {
+            target.thinking = target.thinking
+              ? `${target.thinking}\n${pendingThinking}`
+              : pendingThinking;
+          } else {
+            output.push({ id: nextId(), role: "assistant", content: "", thinking: pendingThinking, srcIndex: currentSrcIndex, ...(currentTs !== undefined ? { timestamp: currentTs } : {}) });
+          }
+          pendingThinking = undefined;
+        }
         const callId = block.id;
         if (!callId || firstUseById.get(callId) !== block || emittedUses.has(callId)) continue;
         emittedUses.add(callId);
         const result = lastResultById.get(callId);
+        const resultTs = resultTsById.get(callId);
         output.push({
           id: `tool-${callId}`,
           role: "tool",
@@ -773,6 +858,8 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
           toolOk: result ? !result.is_error : undefined,
           streaming: false,
           srcIndex: currentSrcIndex,
+          ...(currentTs !== undefined ? { timestamp: currentTs } : {}),
+          ...(currentTs !== undefined && resultTs !== undefined && resultTs > currentTs ? { durationMs: resultTs - currentTs } : {}),
         });
         if (duplicateUses.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool call ignored: ${callId}` });
         if (duplicateResults.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool results resolved to the last result: ${callId}` });
@@ -789,7 +876,13 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
           toolOk: !block.is_error,
           streaming: false,
           srcIndex: currentSrcIndex,
+          ...(currentTs !== undefined ? { timestamp: currentTs } : {}),
         });
+      }
+      if (pendingThinking !== undefined && message.role === "assistant") {
+        // Thinking-only assistant step (no text, no tool use).
+        output.push({ id: nextId(), role: "assistant", content: "", thinking: pendingThinking, srcIndex: currentSrcIndex, ...(currentTs !== undefined ? { timestamp: currentTs } : {}) });
+        pendingThinking = undefined;
       }
     }
   }

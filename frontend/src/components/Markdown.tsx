@@ -181,7 +181,50 @@ function restorePipes(children: ReactNode): ReactNode {
   return children;
 }
 
+/** Messages this short parse instantly — visibility gating would cost more
+ * (placeholder + observer churn) than it saves. */
+const LAZY_MIN_CHARS = 400;
+
 export default function Markdown({ content }: Props) {
+  if (content.length < LAZY_MIN_CHARS) {
+    return <MarkdownBody content={content} />;
+  }
+  return <LazyMarkdownBody content={content} />;
+}
+
+/** Gate expensive markdown parsing behind visibility: off-screen rows
+ * render a cheap text placeholder (keeps virtualized scroll height roughly
+ * stable); once near the viewport the full parse mounts and stays mounted
+ * (streaming rows never re-enter the placeholder state). */
+function LazyMarkdownBody({ content }: Props) {
+  const [visible, setVisible] = React.useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (visible) return;
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setVisible(true);
+    }, { root: null, rootMargin: "1200px 0px" });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  if (!visible) {
+    // Cheap stand-in: first lines as plain text. Matches the full render's
+    // height closely enough for the virtual scroller's measured heights.
+    const preview = content.slice(0, 400).replace(/\s+$/, "");
+    return (
+      <div ref={ref} className="markdown-body markdown-body--lazy">
+        <pre className="markdown-lazy-preview">{preview}{content.length > 400 ? "\n…" : ""}</pre>
+      </div>
+    );
+  }
+  return <MarkdownBody content={content} />;
+}
+
+function MarkdownBody({ content }: Props) {
   // Protect | inside $...$ and $$...$$ so GFM table parser doesn't split on them.
   const processed = content
     .replace(/\$\$([\s\S]+?)\$\$/g, (_, inner: string) =>

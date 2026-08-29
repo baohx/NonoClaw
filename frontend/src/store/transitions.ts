@@ -112,6 +112,8 @@ function outboundKey(message: ClientMsg): string {
       return `${message.type}:${message.sha}`;
     case "session_prompts":
       return `${message.type}:${message.session_id}`;
+    case "load_older":
+      return `${message.type}:${message.session_id}:${message.before ?? ""}`;
     case "set_permission_mode":
       return `${message.type}:${message.mode}`;
     case "set_model":
@@ -292,6 +294,19 @@ export function appendStreamingTransition(
   const messages = [...state.messages];
   const current = messages[state.streamingIdx];
   messages[state.streamingIdx] = { ...current, content: current.content + text };
+  return { ...state, messages };
+}
+
+/** Accumulate extended-thinking deltas onto the streaming assistant message.
+ * Thinking never feeds back into the model; this is display-only. */
+export function appendThinkingTransition(
+  state: ChatStreamState,
+  text: string,
+): ChatStreamState {
+  if (state.streamingIdx === null || !state.messages[state.streamingIdx]) return state;
+  const messages = [...state.messages];
+  const current = messages[state.streamingIdx];
+  messages[state.streamingIdx] = { ...current, thinking: (current.thinking ?? "") + text };
   return { ...state, messages };
 }
 

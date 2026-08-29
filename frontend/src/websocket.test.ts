@@ -200,3 +200,100 @@ function xrayAndUsageRealTime(): void {
 }
 
 xrayAndUsageRealTime();
+
+/** Tail-windowed restore + load_older paging invariants. */
+function historyPaging(): void {
+  resetStore();
+  establishSession();
+  // Restore a 600-message session as a 50-message tail window.
+  dispatchServerMessage({
+    type: "messages_loaded",
+    protocol_version: 1,
+    session_id: "session-1",
+    revision: 2,
+    messages: [{ role: "user", content: "recent" }],
+    total: 600,
+  } satisfies ServerMsg);
+  let state = useStore.getState();
+  assert(state.historyTotal === 600, "historyTotal set from snapshot total");
+  assert(state.historyOlderRemaining === 599, "older remaining = total - window");
+  assert(state.messages.length === 1, "tail window holds only the sent messages");
+
+  // load_older sends before = window start (= remaining count).
+  const sent: unknown[] = [];
+  state.requestOlderHistory((msg) => sent.push(msg));
+  assert(useStore.getState().historyLoading, "load in flight flag set");
+  const req = sent[0] as { type: string; before?: number; limit?: number };
+  assert(req.type === "load_older" && req.before === 599, `before = remaining (599), got ${req.before}`);
+  assert(req.limit === 100, "default page size 100");
+
+  // Page arrives: prepend + advance the boundary.
+  dispatchServerMessage({
+    type: "history_page",
+    protocol_version: 1,
+    session_id: "session-1",
+    revision: 2,
+    messages: [{ role: "user", content: "older" }],
+    remaining: 499,
+  } satisfies ServerMsg);
+  state = useStore.getState();
+  assert(!state.historyLoading, "loading cleared on page");
+  assert(state.messages.length === 2, "page prepended");
+  assert(state.messages[0].content === "older", "older message comes first");
+  assert(state.historyOlderRemaining === 499, "boundary advanced to page start");
+
+  // Cross-session pages are dropped.
+  dispatchServerMessage({
+    type: "history_page",
+    protocol_version: 1,
+    session_id: "other-session",
+    revision: 9,
+    messages: [{ role: "user", content: "stale" }],
+    remaining: 0,
+  } satisfies ServerMsg);
+  assert(useStore.getState().messages.length === 2, "stale page dropped");
+
+  // Exhausted: no request when nothing remains.
+  const sent2: unknown[] = [];
+  useStore.setState({ historyOlderRemaining: 0 });
+  useStore.getState().requestOlderHistory((msg) => sent2.push(msg));
+  assert(sent2.length === 0, "no load_older when exhausted");
+  console.log("✓ tail-window restore + load_older paging invariants");
+}
+
+historyPaging();
+
+/** Streaming deltas coalesce per frame but preserve text/thinking order. */
+function deltaCoalescing(): void {
+  resetStore();
+  establishSession();
+  const state = useStore.getState();
+  state.setAgentRunning(true);
+  const ev = (kind: string, text: string, seq: number): ServerMsg => ({
+    type: "event",
+    protocol_version: 1,
+    run_id: "run-1",
+    session_id: "session-1",
+    session_revision: 1,
+    sequence: seq,
+    event: { kind, text } as never,
+  });
+  // Three text deltas + two thinking deltas interleaved.
+  dispatchServerMessage(ev("text_delta", "a", 1));
+  dispatchServerMessage(ev("text_delta", "b", 2));
+  dispatchServerMessage(ev("thinking_delta", "t1", 3));
+  dispatchServerMessage(ev("thinking_delta", "t2", 4));
+  dispatchServerMessage(ev("text_delta", "c", 5));
+  // rAF is unavailable in Node: the scheduler falls back to setTimeout(16).
+  // Ordering guard: nothing flushed yet is fine; wait a tick and assert.
+  setTimeout(() => {
+    const st = useStore.getState();
+    const streaming = st.messages[st.streamingIdx ?? -1];
+    assert(!!streaming, "streaming message exists after flush");
+    assert(streaming?.content === "abc", `text coalesced in order, got "${streaming?.content}"`);
+    assert(streaming?.thinking === "t1t2", `thinking coalesced, got "${streaming?.thinking}"`);
+    console.log("✓ streaming deltas coalesce per frame with order preserved");
+  }, 40);
+}
+
+deltaCoalescing();

@@ -8,7 +8,10 @@
     "session_revision": 7,
     "sequence": 3,
     "timestamp_ms": 1700000000000,
-    "event": { "kind": "text_delta", "text": "hello" }
+    "event": {
+      "kind": "text_delta",
+      "text": "hello"
+    }
   },
   "snapshot": {
     "type": "messages_loaded",
@@ -17,7 +20,8 @@
     "revision": 7,
     "timestamp_ms": 1700000000001,
     "messages": [],
-    "cumulative_usage": {}
+    "cumulative_usage": {},
+    "total": 0
   },
   "done": {
     "type": "done",
@@ -51,5 +55,14 @@
     "operation": "fixture",
     "trace_id": "trace-fixture",
     "safe_details": {}
+  },
+  "history_page": {
+    "type": "history_page",
+    "protocol_version": 1,
+    "session_id": "session-fixture",
+    "revision": 7,
+    "timestamp_ms": 1700000000003,
+    "messages": [],
+    "remaining": 0
   }
 }
