@@ -247,6 +247,12 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       }
       const startedAt = timing?.start ?? message.timestamp ?? null;
       const completedAt = timing?.completed ?? null;
+      // The thinking block and the visible output are sequential halves of one
+      // step. Both rows previously anchored at step start, so they rendered
+      // identical "Started" stamps and overlapping timeline spans. Anchor the
+      // assistant row where thinking closed (visible output begins there).
+      const thinkingEnd = timing?.thinkingEnd ?? null;
+      const assistantStart = thinkingEnd ?? startedAt;
       const metric: AssistantMetricDetail | undefined = timing === undefined
         ? undefined
         : {
@@ -263,7 +269,6 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
         // duration is the thinking block alone (step start → thinking close),
         // not the whole assistant step — the visible text that follows must
         // not be charged to the thinking row.
-        const thinkingEnd = timing?.thinkingEnd ?? null;
         pushCell(turnModel, {
           kind: "thinking",
           text: preview(message.thinking, 200) || "(empty thinking)",
@@ -283,8 +288,8 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           ? message.thinking
           : undefined,
         recordId: `assistant\u0000${message.id}`,
-        timeSeconds: startedAt !== null && completedAt !== null ? (completedAt - startedAt) / 1000 : null,
-        startedAt,
+        timeSeconds: assistantStart !== null && completedAt !== null ? (completedAt - assistantStart) / 1000 : null,
+        startedAt: assistantStart,
         input: usage?.input_tokens,
         cacheRead: usage?.cache_read_input_tokens,
         cacheWrite: usage?.cache_creation_input_tokens,

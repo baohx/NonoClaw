@@ -223,10 +223,10 @@ const thinkSearch = new TrajectorySearchIndex();
 thinkSearch.addCells(layoutThink.turns[0].cells);
 check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
 
-// ── thinking duration = block close, not whole step ────────────────────────
-// Regression: thinking time was charged the entire assistant step (step start
-// → step completed), which includes the visible text that follows reasoning.
-// The precise end is the thinking_state active:false event (ThinkingEnd).
+// ── thinking/assistant split at the thinking close ─────────────────────────
+// Regression: both rows anchored at step start — identical "Started" stamps
+// and overlapping timeline spans. They are sequential halves of one step:
+// thinking = [start, thinkEnd), assistant = [thinkEnd, stepEnd).
 {
   const start = now + 100;
   const thinkEnd = now + 700;   // reasoning closes here
@@ -247,8 +247,19 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   const thinkSec = thinkingCell!.timeSeconds;
   const assistantSec = assistantCell!.timeSeconds;
   check(thinkSec !== null && Math.abs(thinkSec - (thinkEnd - start) / 1000) < 1e-9, `thinking duration is block-close minus start (got ${thinkSec}s, want ${((thinkEnd - start) / 1000).toFixed(3)}s)`);
-  check(assistantSec !== null && Math.abs(assistantSec - (stepEnd - start) / 1000) < 1e-9, `assistant duration still spans the whole step (got ${assistantSec}s, want ${((stepEnd - start) / 1000).toFixed(3)}s)`);
-  check(thinkSec !== null && assistantSec !== null && thinkSec < assistantSec, "thinking duration excludes the visible text that follows it");
+  check(assistantSec !== null && Math.abs(assistantSec - (stepEnd - thinkEnd) / 1000) < 1e-9, `assistant duration starts where thinking closed (got ${assistantSec}s, want ${((stepEnd - thinkEnd) / 1000).toFixed(3)}s)`);
+  check(assistantCell!.startedAt === thinkEnd && thinkingCell!.startedAt === start, "assistant and thinking rows carry distinct sequential starts");
+  // No thinking close on record (restored session without trace): assistant
+  // falls back to anchoring at the message timestamp, not overlapping a
+  // synthetic thinking end.
+  const layoutNoTrace = buildLedgerLayout({
+    messages: [{ id: "u2", role: "user", content: "hi", timestamp: now },
+               { id: "a2", role: "assistant", content: "plain answer", thinking: "reasoning without close event", timestamp: stepEnd, streaming: false }],
+    traceEntries: [],
+    subagentRunsById: {},
+  });
+  const plainAssistant = layoutNoTrace.turns[0].cells.find((c) => c.kind === "assistant");
+  check(plainAssistant !== undefined && plainAssistant.timeSeconds === null, "no trace → assistant duration stays null rather than guessing");
 }
 
 console.log("ledger invariants: all passed");
