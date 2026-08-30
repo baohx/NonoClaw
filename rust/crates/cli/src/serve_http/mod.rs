@@ -11,6 +11,7 @@ mod evolution;
 mod fork_api;
 mod http_error;
 mod permission_api;
+pub(crate) mod project_context;
 mod project_service;
 mod protocol;
 mod run_api;

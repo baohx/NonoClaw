@@ -45,7 +45,8 @@ pub(super) async fn upload_handler(
             serde_json::json!({}),
         );
     }
-    let doc_model = match state.config.doc_model() {
+    let project = state.project();
+    let doc_model = match project.config().doc_model() {
         Some(config) if config.is_enabled() => config,
         _ => {
             return upload_error(
@@ -163,7 +164,7 @@ pub(super) async fn upload_handler(
             serde_json::json!({ "max_filename_bytes": MAX_FILENAME_BYTES }),
         );
     }
-    let file_dir = match safe_upload_directory(&state.upload_dir, &upload_id) {
+    let file_dir = match safe_upload_directory(project.upload_dir(), &upload_id) {
         Ok(directory) => directory,
         Err(_) => {
             return upload_error(
@@ -186,8 +187,8 @@ pub(super) async fn upload_handler(
         );
     }
 
-    if state
-        .config
+    if project
+        .config()
         .client_for(ClientPurpose::Document, None)
         .is_err()
     {
@@ -199,10 +200,10 @@ pub(super) async fn upload_handler(
             serde_json::json!({ "setting": "docModel" }),
         );
     }
-    let http = state.config.client_factory().http_client();
+    let http = project.config().client_factory().http_client();
 
     // Determine the active conversion strategy.
-    let converter = state.config.attachment_converter();
+    let converter = project.config().attachment_converter();
     let md_path_guard = state.markitdown_path.lock().await;
     let md_path: Option<String> = match converter {
         "legacy" => None,

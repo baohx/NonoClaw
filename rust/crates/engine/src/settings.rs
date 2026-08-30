@@ -1556,8 +1556,16 @@ impl ResolvedConfig {
     }
 
     pub fn reload(&self) -> Self {
+        self.reload_for_cwd(&self.cwd)
+    }
+
+    /// Resolve the same explicit settings/MCP inputs for a different project.
+    /// User-level layers are retained while project/local layers are loaded
+    /// from `cwd`, allowing a complete ProjectContext to be prepared before an
+    /// atomic workspace switch.
+    pub fn reload_for_cwd(&self, cwd: &Path) -> Self {
         load_resolved_config(
-            &self.cwd,
+            cwd,
             self.settings_path.as_deref(),
             self.explicit_mcp_path.as_deref(),
         )

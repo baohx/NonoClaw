@@ -22,8 +22,10 @@ use uuid::Uuid;
 use super::protocol::{send_msg, AttachmentRef, ServerMsg, Tx};
 use crate::attachments;
 
-pub(super) type PermissionMap = Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>;
-pub(super) type QuestionMap = Mutex<HashMap<String, oneshot::Sender<Option<String>>>>;
+pub(super) type PermissionMap =
+    Mutex<HashMap<super::permission_api::PendingRequestKey, oneshot::Sender<PermissionDecision>>>;
+pub(super) type QuestionMap =
+    Mutex<HashMap<super::permission_api::PendingRequestKey, oneshot::Sender<Option<String>>>>;
 
 const MAX_ATTACHMENTS_PER_RUN: usize = 8;
 const MAX_IMAGES_PER_ATTACHMENT: usize = 8;
@@ -32,6 +34,7 @@ pub(super) struct WsQuestionResolver {
     pub pending: Arc<QuestionMap>,
     pub meta: super::permission_api::PendingQuestionMeta,
     pub tx: Tx,
+    pub session_id: String,
 }
 
 impl QuestionResolver for WsQuestionResolver {
@@ -42,14 +45,17 @@ impl QuestionResolver for WsQuestionResolver {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let meta = Arc::clone(&self.meta);
+        let session_id = self.session_id.clone();
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
             let request_id = Uuid::new_v4().to_string();
-            pending.lock().await.insert(request_id.clone(), sender);
+            let key = (session_id.clone(), request_id.clone());
+            pending.lock().await.insert(key.clone(), sender);
             // Store metadata so REST API can list/resolve the question.
             meta.lock().await.insert(
-                request_id.clone(),
+                key,
                 super::permission_api::PendingQuestionInfo {
+                    session_id,
                     request_id: request_id.clone(),
                     prompt: redact_text(&req.prompt),
                     context: req.context.as_deref().map(redact_text),
@@ -258,18 +264,22 @@ fn make_permission_resolver(
     tx: Tx,
     pending: Arc<PermissionMap>,
     meta: super::permission_api::PendingPermissionMeta,
+    session_id: String,
 ) -> nonoclaw_engine::PermissionResolver {
     Arc::new(move |request: PermissionRequest| {
         let tx = tx.clone();
         let pending = Arc::clone(&pending);
         let meta = Arc::clone(&meta);
+        let session_id = session_id.clone();
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
             let request_id = Uuid::new_v4().to_string();
-            pending.lock().await.insert(request_id.clone(), sender);
+            let key = (session_id.clone(), request_id.clone());
+            pending.lock().await.insert(key.clone(), sender);
             meta.lock().await.insert(
-                request_id.clone(),
+                key,
                 super::permission_api::PendingPermissionInfo {
+                    session_id,
                     request_id: request_id.clone(),
                     tool_name: request.tool_name.clone(),
                     message: redact_text(&request.message),
@@ -306,6 +316,7 @@ pub(super) fn build_options(
     skills_manager: Arc<RwLock<SkillsManager>>,
     background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
     permission_meta: super::permission_api::PendingPermissionMeta,
+    session_id: String,
 ) -> EngineOptions {
     let mut options = config
         .resolve_run(RunConfigOverrides {
@@ -325,6 +336,7 @@ pub(super) fn build_options(
         tx,
         pending_permissions,
         permission_meta,
+        session_id,
     ));
     options.skills_manager = Some(skills_manager);
     options.background_registry = Some(background_registry);

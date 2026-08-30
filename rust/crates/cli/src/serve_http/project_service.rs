@@ -1,12 +1,13 @@
 //! Project information, file-tree, Git, and safe file-opening service.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use nonoclaw_engine::{ResolvedConfig, SkillsManager};
+use nonoclaw_engine::ResolvedConfig;
 use nonoclaw_tools::ToolRegistry;
 use tokio::sync::Mutex;
 
+use super::project_context::ProjectContext;
 use super::protocol::FileEntry;
 use crate::project_info::{gather, ProjectInfo};
 
@@ -33,54 +34,53 @@ const FILE_TREE_MAX_ENTRIES: usize = 10_000;
 /// concurrent git/config/skills scans without holding registry or WebSocket
 /// locks across disk or Git awaits.
 pub(super) struct ProjectService {
-    /// Current project cwd. Shared with AppState so SwitchProject updates
-    /// both atomically; readers clone via `cwd()`.
-    cwd: Arc<RwLock<PathBuf>>,
     registry: Arc<ToolRegistry>,
-    config: Arc<ResolvedConfig>,
     public_url: Option<String>,
-    skills_manager: Arc<RwLock<SkillsManager>>,
     refresh_gate: Mutex<()>,
     system_cache: Mutex<Option<nonoclaw_engine::RuntimeProbeReport>>,
     system_generation: std::sync::atomic::AtomicU64,
 }
 
 impl ProjectService {
-    pub(super) fn new(
-        cwd: Arc<RwLock<PathBuf>>,
-        registry: Arc<ToolRegistry>,
-        config: Arc<ResolvedConfig>,
-        public_url: Option<String>,
-        skills_manager: Arc<RwLock<SkillsManager>>,
-    ) -> Self {
+    pub(super) fn new(registry: Arc<ToolRegistry>, public_url: Option<String>) -> Self {
         Self {
-            cwd,
             registry,
-            config,
             public_url,
-            skills_manager,
             refresh_gate: Mutex::new(()),
             system_cache: Mutex::new(None),
             system_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub(super) fn cwd(&self) -> PathBuf {
-        self.cwd.read().unwrap().clone()
+    pub(super) fn file_tree_for(&self, project: &ProjectContext) -> Vec<FileEntry> {
+        build_file_tree(project.cwd())
     }
 
-    pub(super) fn file_tree(&self) -> Vec<FileEntry> {
-        build_file_tree(&self.cwd())
-    }
-
-    pub(super) async fn snapshot(&self, model: &str) -> ProjectInfo {
+    pub(super) async fn snapshot_for(
+        &self,
+        project: Arc<ProjectContext>,
+        model: &str,
+    ) -> ProjectInfo {
         let _refresh = self.refresh_gate.lock().await;
-        let balances = self.fetch_balances(&self.config).await;
-        self.gather_with(model, &self.config, false, None, &mut |_| {}, balances)
-            .await
+        let balances = self.fetch_balances(project.config()).await;
+        self.gather_with(
+            &project,
+            model,
+            project.config(),
+            false,
+            None,
+            &mut |_| {},
+            balances,
+        )
+        .await
     }
 
-    pub(super) async fn refresh<F>(&self, model: &str, mut on_update: F) -> ProjectInfo
+    pub(super) async fn refresh_for<F>(
+        &self,
+        project: Arc<ProjectContext>,
+        model: &str,
+        mut on_update: F,
+    ) -> ProjectInfo
     where
         F: FnMut(nonoclaw_engine::RuntimeProbeReport) + Send,
     {
@@ -88,11 +88,16 @@ impl ProjectService {
             .system_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let _refresh = self.refresh_gate.lock().await;
-        self.skills_manager.write().unwrap().rescan(&self.cwd());
-        let config = self.config.reload();
+        project
+            .skills_manager()
+            .write()
+            .unwrap()
+            .rescan(project.cwd());
+        let config = project.config().reload();
         config.log_diagnostics();
         let balances = self.fetch_balances(&config).await;
         self.gather_with(
+            &project,
             model,
             &config,
             true,
@@ -116,6 +121,7 @@ impl ProjectService {
 
     async fn gather_with(
         &self,
+        project: &ProjectContext,
         model: &str,
         config: &ResolvedConfig,
         force_probe: bool,
@@ -146,7 +152,7 @@ impl ProjectService {
             report
         };
         let (skills, extensions, diagnostics) = {
-            let manager = self.skills_manager.read().unwrap();
+            let manager = project.skills_manager().read().unwrap();
             (
                 manager.all_active(),
                 manager.descriptors(),
@@ -154,7 +160,7 @@ impl ProjectService {
             )
         };
         gather(
-            &self.cwd(),
+            project.cwd(),
             model,
             &self.registry,
             config,
@@ -168,12 +174,17 @@ impl ProjectService {
         .await
     }
 
-    pub(super) async fn git_show(&self, sha: &str) -> Option<String> {
-        crate::project_info::git_show(&self.cwd(), sha).await
+    pub(super) async fn git_show_for(&self, project: &ProjectContext, sha: &str) -> Option<String> {
+        crate::project_info::git_show(project.cwd(), sha).await
     }
 
-    pub(super) fn open(&self, relative: &str, force_code: bool) -> std::io::Result<()> {
-        let roots = open_roots(&self.cwd());
+    pub(super) fn open_for(
+        &self,
+        project: &ProjectContext,
+        relative: &str,
+        force_code: bool,
+    ) -> std::io::Result<()> {
+        let roots = open_roots(project.cwd());
         let full = resolve_within(&roots, relative).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

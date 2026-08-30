@@ -6,6 +6,8 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; script-src-attr 'none'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' ws: wss:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-src 'none'; frame-ancestors 'none'";
+
 pub(super) fn frontend_dir(cwd: &Path) -> Option<PathBuf> {
     let exe_parent = std::env::current_exe()
         .ok()
@@ -41,6 +43,10 @@ pub(super) async fn index(index_path: PathBuf) -> Response {
         Ok(content) => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
+            .header("content-security-policy", CONTENT_SECURITY_POLICY)
+            .header("x-content-type-options", "nosniff")
+            .header("x-frame-options", "DENY")
+            .header("referrer-policy", "no-referrer")
             // index.html references hashed assets; serving a stale copy keeps
             // the whole old bundle alive. Always revalidate.
             .header("cache-control", "no-cache")

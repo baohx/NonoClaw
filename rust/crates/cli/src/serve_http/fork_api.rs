@@ -5,10 +5,11 @@
 //! fresh session, and stamps a `fork:<source>#<at_index>` tag for lineage.
 //! The client can then edit/resend the forked-from turn in the new branch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::json;
@@ -30,14 +31,16 @@ pub struct ForkRequest {
 pub async fn fork_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     body: Option<Json<ForkRequest>>,
 ) -> Response {
-    if !state.authorized(None) {
+    if !state.control_authorized(&headers, query.get("token").map(String::as_str)) {
         return super::http_error::error_response(
             StatusCode::UNAUTHORIZED,
             nonoclaw_core::AppError::new(
                 nonoclaw_core::ErrorCode::Authentication,
-                "this server requires authentication — include the token in the Authorization header or query string",
+                "a valid local ticket or access token is required",
                 false,
                 "rest_fork_auth",
             ),
@@ -50,13 +53,17 @@ pub async fn fork_session(
         )
             .into_response();
     }
-    let Json(req) = body.unwrap_or(Json(ForkRequest { at_index: None, title: None }));
+    let Json(req) = body.unwrap_or(Json(ForkRequest {
+        at_index: None,
+        title: None,
+    }));
 
-    let cwd = state.cwd();
+    let project = state.project();
     let service = state.session_service.clone();
 
-    // Load source snapshot.
-    let source = match service.resume(&cwd, &session_id) {
+    // Load source snapshot from the same immutable project context used to
+    // create the fork, so a concurrent switch cannot mix storage and config.
+    let source = match service.resume(project.cwd(), &session_id) {
         Ok(s) => s,
         Err(error) => {
             return (
@@ -82,8 +89,8 @@ pub async fn fork_session(
 
     // Create the forked session with a fresh id.
     let new_id = nonoclaw_engine::new_session_id();
-    let model = state.config.active_model.value.clone();
-    let fork = match service.create(&cwd, &new_id, &model) {
+    let model = project.config().active_model.value.clone();
+    let fork = match service.create(project.cwd(), &new_id, &model) {
         Ok(s) => s,
         Err(error) => {
             return (
@@ -164,7 +171,10 @@ mod tests {
         // Verify the fork sees exactly the first 2 messages + lineage tag.
         let fork_snap = fork.snapshot().await.unwrap();
         assert_eq!(fork_snap.messages.len(), 2);
-        assert_eq!(fork_snap.tag.as_deref(), Some("fork:aaaaaaaa-0000-0000-0000-000000000001#2"));
+        assert_eq!(
+            fork_snap.tag.as_deref(),
+            Some("fork:aaaaaaaa-0000-0000-0000-000000000001#2")
+        );
 
         // Source is untouched.
         let source_snap = source.snapshot().await.unwrap();

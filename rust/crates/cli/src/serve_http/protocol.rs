@@ -192,7 +192,11 @@ pub(super) enum ServerMsg {
     Info {
         model: String,
         session_id: String,
-        auth_token: String,
+        /// Remote-access token is disclosed only to a browser authenticated
+        /// with the independent local HttpOnly ticket. A remote client
+        /// already has its launch token and never receives it back.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
         available_models: Vec<ModelInfo>,
     },
     SessionList {

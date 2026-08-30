@@ -41,7 +41,8 @@ pub(super) async fn stt_handler(
             serde_json::json!({}),
         );
     }
-    let key = match state.config.elevenlabs_api_key() {
+    let project = state.project();
+    let key = match project.config().elevenlabs_api_key() {
         Some(key) if !key.is_empty() => key,
         _ => {
             return stt_error(
@@ -163,7 +164,7 @@ pub(super) async fn stt_handler(
         .text("model_id", "scribe_v2")
         .part("file", part);
     tracing::info!(audio_len, "sending bounded speech-to-text request");
-    let client = state.config.client_factory().http_client();
+    let client = project.config().client_factory().http_client();
     let response = tokio::time::timeout(
         STT_TIMEOUT,
         client

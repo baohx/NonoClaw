@@ -14,11 +14,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     extract::{ConnectInfo, DefaultBodyLimit, Query, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -52,11 +53,14 @@ use nonoclaw_engine::{EngineEvent, EventEnvelope};
 
 use super::http_error::model_client_error;
 use super::permission_api::PendingPermissionMeta;
+use super::project_context::{upload_dir_for, ProjectContext, ProjectContextStore};
 use super::project_service::ProjectService;
 use super::run_handler::{
     build_options, enrich_prompt_with_attachments, PermissionMap, QuestionMap, WsQuestionResolver,
 };
-use super::session_hub::{create_new_session, resume_session, SessionHub, SharedHandle};
+use super::session_hub::{
+    create_new_session, resume_session, CancelRunResult, SessionHub, SharedHandle,
+};
 
 fn safe_provider_failure_message(reason: &str, status: Option<u16>) -> String {
     if reason == "provider request failed" {
@@ -69,17 +73,30 @@ fn safe_provider_failure_message(reason: &str, status: Option<u16>) -> String {
 
 // ── Shared application state ────────────────────────────────────────────────
 
+const LOCAL_AUTH_COOKIE: &str = "nonoclaw_local_ticket";
+const LOCAL_BOOTSTRAP_HEADER: &str = "x-nonoclaw-bootstrap";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebSocketAuthKind {
+    /// A same-origin browser on the machine running NonoClaw. The local
+    /// ticket is HttpOnly and is never exposed to JavaScript.
+    LocalTicket,
+    /// A remote/mobile or non-browser client that supplied the QR token.
+    RemoteToken,
+}
+
 pub(super) struct AppState {
     pub(super) registry: Arc<ToolRegistry>,
     pub(super) todos: Arc<TodoStore>,
-    /// Current working directory. Mutable at runtime via SwitchProject
-    /// (FileTree cwd switcher); readers must clone via `cwd()`.
-    pub(super) cwd: Arc<RwLock<PathBuf>>,
-    /// Canonical immutable configuration snapshot shared by all Web paths.
-    pub(super) config: Arc<ResolvedConfig>,
+    /// Atomically published cwd/config/skills/upload snapshot. Every operation
+    /// clones one context so project switching cannot mix old and new fields.
+    pub(super) projects: super::project_context::ProjectContextStore,
     /// Auth token for remote (QR-code) mobile access.
     auth_token: String,
-    /// Public/tunnel listeners require the token; loopback remains low-friction.
+    /// Independent browser bootstrap ticket. It is delivered only as an
+    /// HttpOnly, SameSite=Strict cookie to a direct loopback same-origin page.
+    local_ws_ticket: String,
+    /// Public/tunnel listeners require the remote token for legacy REST paths.
     require_auth: bool,
     /// The public URL shown in the QR code, or None.
     public_url: Option<String>,
@@ -97,14 +114,10 @@ pub(super) struct AppState {
     pub(super) question_meta: super::permission_api::PendingQuestionMeta,
     /// Runtime-mutable permission mode (switchable via UI).
     pub(super) permission_mode: Arc<Mutex<nonoclaw_core::PermissionMode>>,
-    /// Skill manager: discovers, parses, and dynamically activates skills.
-    pub(super) skills_manager: Arc<RwLock<SkillsManager>>,
     /// Deduplicated owner of git/config/skills ProjectInfo and file operations.
     project_service: Arc<ProjectService>,
     /// Background task registry for run_in_background bash commands.
     pub(super) background_registry: Arc<std::sync::Mutex<nonoclaw_tools::BackgroundTaskRegistry>>,
-    /// Directory where uploaded attachments are stored.
-    pub(super) upload_dir: PathBuf,
     /// Resolved path to the `markitdown` CLI, from the runtime probe.
     /// `None` before the probe completes or when MarkItDown is absent.
     /// Updated atomically by the probe updater via `Arc<Mutex<..>>`.
@@ -114,9 +127,12 @@ pub(super) struct AppState {
 }
 
 impl AppState {
-    /// Current project cwd (clone of the shared value).
+    pub(super) fn project(&self) -> Arc<super::project_context::ProjectContext> {
+        self.projects.snapshot()
+    }
+
     pub(super) fn cwd(&self) -> PathBuf {
-        self.cwd.read().unwrap().clone()
+        self.project().cwd().to_path_buf()
     }
 
     pub(super) fn authorized(&self, supplied_token: Option<&str>) -> bool {
@@ -125,6 +141,22 @@ impl AppState {
 
     pub(super) fn download_authorized(&self, supplied_token: Option<&str>) -> bool {
         supplied_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+    }
+
+    /// Authenticate a state-changing REST control endpoint. Unlike legacy
+    /// media/log endpoints this is always required, including on loopback.
+    /// Local browser calls use the HttpOnly ticket; automation uses a Bearer
+    /// or query token.
+    pub(super) fn control_authorized(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> bool {
+        query_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+            || bearer_token(headers)
+                .is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+            || cookie_token(headers, LOCAL_AUTH_COOKIE)
+                .is_some_and(|token| constant_time_token_eq(&self.local_ws_ticket, token))
     }
 
     /// Path for persisting pending permission metadata across restarts.
@@ -172,28 +204,160 @@ impl AppState {
         // 410 Gone (run no longer active) which is correct behavior.
         let mut metas = self.permission_meta.lock().await;
         for entry in entries {
-            metas.insert(entry.request_id.clone(), entry);
+            if super::session_hub::valid_session_id(&entry.session_id) {
+                let key = (entry.session_id.clone(), entry.request_id.clone());
+                metas.insert(key, entry);
+            }
         }
         tracing::info!(count = metas.len(), "loaded persisted pending permissions");
     }
 
-    fn websocket_authorized(
+    fn websocket_authorization(
         &self,
         supplied_token: Option<&str>,
         peer_ip: IpAddr,
         headers: &HeaderMap,
-    ) -> bool {
-        let forwarded = headers.contains_key("forwarded")
-            || headers.contains_key("x-forwarded-for")
-            || headers.contains_key("x-real-ip")
-            || headers.contains_key("cf-connecting-ip");
-        let require_auth = request_requires_auth(self.require_auth, peer_ip, forwarded);
-        token_is_authorized(require_auth, &self.auth_token, supplied_token)
+    ) -> Option<WebSocketAuthKind> {
+        // Explicit QR/Bearer-style launch tokens support remote browsers and
+        // non-browser clients. Browsers must still be same-origin with Host;
+        // clients without Origin are permitted only because possession of the
+        // high-entropy token is their authentication boundary.
+        if supplied_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+            && browser_origin_allowed(headers, false)
+        {
+            return Some(WebSocketAuthKind::RemoteToken);
+        }
+
+        // The local ticket is intentionally narrower: direct loopback only,
+        // no reverse-proxy headers, a loopback Host, and an exact Origin/Host
+        // match. This blocks cross-site WebSocket hijacking and DNS rebinding.
+        if cookie_token(headers, LOCAL_AUTH_COOKIE)
+            .is_some_and(|token| constant_time_token_eq(&self.local_ws_ticket, token))
+            && local_browser_request_allowed(peer_ip, headers, true)
+        {
+            return Some(WebSocketAuthKind::LocalTicket);
+        }
+
+        None
     }
 }
 
-fn request_requires_auth(configured: bool, peer_ip: IpAddr, forwarded: bool) -> bool {
-    configured && (!peer_ip.is_loopback() || forwarded)
+fn has_forwarding_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("forwarded")
+        || headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-real-ip")
+        || headers.contains_key("cf-connecting-ip")
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)?
+                .to_str()
+                .ok()?
+                .strip_prefix("bearer ")
+        })
+}
+
+fn cookie_token<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+fn normalized_authority(url: &reqwest::Url) -> Option<(String, u16)> {
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Some((host, url.port_or_known_default()?))
+}
+
+fn origin_matches_host(headers: &HeaderMap) -> bool {
+    let origin = match headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(origin) if origin != "null" => origin,
+        _ => return false,
+    };
+    let host = match headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(host) => host,
+        None => return false,
+    };
+    let Ok(origin_url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(origin_url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Ok(host_url) = reqwest::Url::parse(&format!("{}://{host}", origin_url.scheme())) else {
+        return false;
+    };
+    normalized_authority(&origin_url) == normalized_authority(&host_url)
+}
+
+fn is_loopback_hostname(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
+    url.host_str().is_some_and(is_loopback_hostname)
+}
+
+fn request_declares_cross_site(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+}
+
+fn browser_origin_allowed(headers: &HeaderMap, origin_required: bool) -> bool {
+    if request_declares_cross_site(headers) {
+        return false;
+    }
+    if !headers.contains_key(header::ORIGIN) {
+        return !origin_required;
+    }
+    origin_matches_host(headers)
+}
+
+fn local_browser_request_allowed(
+    peer_ip: IpAddr,
+    headers: &HeaderMap,
+    origin_required: bool,
+) -> bool {
+    peer_ip.is_loopback()
+        && !has_forwarding_headers(headers)
+        && host_is_loopback(headers)
+        && browser_origin_allowed(headers, origin_required)
 }
 
 #[cfg(test)]
@@ -205,20 +369,20 @@ pub(super) fn upload_exploration_state(
     let (registry, todos) = nonoclaw_tools::register_all();
     let registry = Arc::new(registry);
     let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
-    let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
-    let project_service = Arc::new(ProjectService::new(
-        Arc::clone(&shared_cwd),
-        Arc::clone(&registry),
+    let projects = ProjectContextStore::new(ProjectContext::new(
+        1,
+        cwd,
         Arc::clone(&config),
-        None,
-        Arc::clone(&skills_manager),
+        skills_manager,
+        upload_dir,
     ));
+    let project_service = Arc::new(ProjectService::new(Arc::clone(&registry), None));
     Arc::new(AppState {
         registry,
         todos,
-        cwd: std::sync::Arc::new(std::sync::RwLock::new(cwd.clone())),
-        config: Arc::clone(&config),
+        projects,
         auth_token: "exploration-token".into(),
+        local_ws_ticket: "exploration-local-ticket".into(),
         require_auth: false,
         public_url: None,
         active_model: Arc::new(Mutex::new(config.active_model.value.clone())),
@@ -229,12 +393,10 @@ pub(super) fn upload_exploration_state(
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
         question_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(initial_permission_mode(&config))),
-        skills_manager,
         project_service,
         background_registry: Arc::new(std::sync::Mutex::new(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
-        upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
     })
@@ -296,9 +458,10 @@ fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) ->
             .unwrap_or(true)
 }
 
-async fn list_sessions_wire(state: &AppState) -> Vec<SessionInfoWire> {
-    let service = state.session_service.clone();
-    let cwd = state.cwd();
+async fn list_sessions_wire_for(
+    service: SessionService,
+    cwd: PathBuf,
+) -> Vec<SessionInfoWire> {
     let sessions = match tokio::task::spawn_blocking(move || service.list_sessions(&cwd)).await {
         Ok(sessions) => sessions.unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -351,6 +514,7 @@ pub async fn serve(
     };
 
     let auth_token = Uuid::new_v4().to_string().replace('-', "");
+    let local_ws_ticket = Uuid::new_v4().to_string().replace('-', "");
     let require_auth = listener_requires_auth(addr, tunnel, public_url.as_deref());
     let active_model = if config
         .conversation_models()
@@ -363,39 +527,31 @@ pub async fn serve(
     };
     tracing::info!(%active_model, public_auth_required = require_auth, "web authentication policy initialized");
 
-    // File upload storage: ~/.nonoclaw/projects/<cwd>/uploads/
-    let upload_dir = nonoclaw_engine::session::home_root()
-        .map(|r| {
-            r.join("projects")
-                .join(
-                    cwd.to_string_lossy()
-                        .trim_start_matches('/')
-                        .replace('/', "-"),
-                )
-                .join("uploads")
-        })
-        .unwrap_or_else(|| cwd.join(".nonoclaw/uploads"));
+    let upload_dir = upload_dir_for(&cwd);
     if let Err(error) = std::fs::create_dir_all(&upload_dir) {
         tracing::warn!(kind = ?error.kind(), "cannot create upload directory");
     }
 
-    let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
-    let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
-    let project_service = Arc::new(ProjectService::new(
-        Arc::clone(&shared_cwd),
-        Arc::clone(&registry),
-        Arc::clone(&config),
-        public_url.clone(),
-        Arc::clone(&skills_manager),
-    ));
     let default_permission_mode = initial_permission_mode(&config);
-    let state = Arc::new(AppState {
+    let skills_manager = Arc::new(RwLock::new(SkillsManager::new(&cwd)));
+    let projects = ProjectContextStore::new(ProjectContext::new(
+        1,
+        cwd.clone(),
         config,
+        skills_manager,
+        upload_dir,
+    ));
+    let project_service = Arc::new(ProjectService::new(
+        Arc::clone(&registry),
+        public_url.clone(),
+    ));
+    let state = Arc::new(AppState {
         active_model: Arc::new(Mutex::new(active_model)),
         registry,
         todos,
-        cwd: shared_cwd,
+        projects,
         auth_token,
+        local_ws_ticket,
         require_auth,
         public_url,
         session_service: SessionService::new(),
@@ -405,12 +561,10 @@ pub async fn serve(
         permission_meta: Arc::new(Mutex::new(HashMap::new())),
         question_meta: Arc::new(Mutex::new(HashMap::new())),
         permission_mode: Arc::new(Mutex::new(default_permission_mode)),
-        skills_manager,
         project_service,
         background_registry: Arc::new(std::sync::Mutex::new(
             nonoclaw_tools::BackgroundTaskRegistry::new(),
         )),
-        upload_dir,
         markitdown_path: Arc::new(Mutex::new(None)),
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
     });
@@ -421,8 +575,8 @@ pub async fn serve(
     // AutoDream: consolidate memory while the user is idle.
     super::dream::spawn_dream_scheduler(Arc::clone(&state), Arc::clone(&state.last_activity));
 
-    // Spawn file watcher for hot-reloading skills.
-    crate::skill_watcher::spawn_skill_watcher(Arc::clone(&state.skills_manager), cwd.clone());
+    // Spawn one watcher that follows atomically published project contexts.
+    crate::skill_watcher::spawn_project_skill_watcher(state.projects.clone());
 
     // Build vector indexes in the background so the first Memory search of a
     // session is already warm: facts index + full-transcript session index.
@@ -468,6 +622,10 @@ pub async fn serve(
 
     // Always register the WebSocket route + PWA manifest + service worker.
     let app = Router::new()
+        .route(
+            "/api/auth/bootstrap",
+            axum::routing::post(local_auth_bootstrap),
+        )
         .route("/ws", get(ws_handler))
         .route(
             "/api/download",
@@ -493,6 +651,10 @@ pub async fn serve(
         .route(
             "/api/run",
             axum::routing::post(super::run_api::run_handler),
+        )
+        .route(
+            "/api/sessions/:session_id/cancel",
+            axum::routing::post(super::run_api::cancel_handler),
         )
         .route(
             "/api/sessions/:session_id/fork",
@@ -541,6 +703,44 @@ pub async fn serve(
 
 // ── WebSocket handler ───────────────────────────────────────────────────────
 
+async fn local_auth_bootstrap(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let bootstrap_header_ok = headers
+        .get(LOCAL_BOOTSTRAP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+    if !bootstrap_header_ok || !local_browser_request_allowed(peer.ip(), &headers, true) {
+        return super::http_error::error_response(
+            StatusCode::UNAUTHORIZED,
+            AppError::new(
+                ErrorCode::Authentication,
+                "local browser bootstrap denied",
+                false,
+                "local_auth_bootstrap",
+            )
+            .with_trace_id(Uuid::new_v4().to_string()),
+        );
+    }
+
+    let cookie = format!(
+        "{LOCAL_AUTH_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
+        state.local_ws_ticket
+    );
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie is valid"),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::PRAGMA, "no-cache")
+        .body(Body::empty())
+        .expect("bootstrap response is valid")
+}
+
 async fn ws_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -548,29 +748,92 @@ async fn ws_handler(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !state.websocket_authorized(params.get("token").map(String::as_str), peer.ip(), &headers) {
+    let Some(auth_kind) =
+        state.websocket_authorization(params.get("token").map(String::as_str), peer.ip(), &headers)
+    else {
         return super::http_error::error_response(
             StatusCode::UNAUTHORIZED,
             AppError::new(
                 ErrorCode::Authentication,
-                "invalid or missing auth token",
+                "invalid WebSocket credential or origin",
                 false,
                 "websocket_authentication",
             )
             .with_trace_id(Uuid::new_v4().to_string()),
         );
-    }
+    };
     let session_id = params.get("session").cloned();
-    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id))
+    let expose_remote_token = auth_kind == WebSocketAuthKind::LocalTicket;
+    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id, expose_remote_token))
 }
 
-async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<String>) {
+async fn send_ws_project_msg(
+    state: &AppState,
+    tx: &super::protocol::Tx,
+    expected_generation: u64,
+    msg: ServerMsg,
+) -> bool {
+    let Ok(text) = serde_json::to_string(&msg) else {
+        return false;
+    };
+    // Validate only after this frame reaches the actual serialized writer.
+    // Waiting behind another socket send can span a project switch; checking
+    // before the Tx mutex would allow the now-stale frame through afterward.
+    let mut writer = tx.lock().await;
+    if state.project().generation() != expected_generation {
+        return false;
+    }
+    if writer.send(WsMessage::Text(text)).await.is_err() {
+        tracing::warn!("websocket send failed");
+        return false;
+    }
+    true
+}
+
+async fn ensure_ws_project_generation(
+    state: &AppState,
+    tx: &super::protocol::Tx,
+    expected_generation: u64,
+) -> bool {
+    if state.project().generation() == expected_generation {
+        return true;
+    }
+    send_msg(
+        tx,
+        safe_error(
+            ErrorCode::InvalidRequest,
+            "the active project changed; reconnecting is required",
+            true,
+            "project_context_changed",
+        ),
+    )
+    .await;
+    false
+}
+
+async fn handle_ws(
+    ws: WebSocket,
+    state: Arc<AppState>,
+    session_id: Option<String>,
+    expose_remote_token: bool,
+) {
     let (tx, mut rx) = super::protocol::split_socket(ws);
     let active_controller: Arc<Mutex<Option<RunController>>> = Arc::new(Mutex::new(None));
     // JoinHandle of the current controller supervisor adapter. Cancellation is
     // cooperative through RunController; awaiting this handle guarantees the
     // exactly-once terminal is sent before Clear or a replacement run.
     let mut run_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let (initial_project, mut project_updates) = state.projects.snapshot_and_subscribe();
+    let mut project_generation = initial_project.generation();
+    // Pair the initial context with the transition gate before touching
+    // project-scoped session storage. A concurrent switch therefore happens
+    // wholly before this handshake (which is rejected) or after setup.
+    let initial_transition = state.projects.lock_transition().await;
+    if state.project().generation() != project_generation {
+        drop(initial_transition);
+        let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
+        return;
+    }
 
     // Capture before any inner shadow (the Run arm destructures session_id).
     // Desktop (no URL param): auto-resume the most recent session.
@@ -578,7 +841,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     let mut shared_sid = session_id.clone().or_else(|| {
         state
             .session_service
-            .most_recent_session(&state.cwd())
+            .most_recent_session(initial_project.cwd())
             .ok()
             .flatten()
     });
@@ -587,7 +850,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
     if let Some(ref sid) = shared_sid {
         state
             .session_hub
-            .register_existing(&state.session_service, &state.cwd(), sid, &tx)
+            .register_existing(
+                &state.session_service,
+                initial_project.cwd(),
+                sid,
+                &tx,
+            )
             .await;
     }
 
@@ -603,11 +871,9 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
     // Connect handshake.
     {
-        send_msg(
-            &tx,
-            ServerMsg::SessionList {
-                sessions: list_sessions_wire(&state).await,
-            },
+        let initial_sessions = list_sessions_wire_for(
+            state.session_service.clone(),
+            initial_project.cwd().to_path_buf(),
         )
         .await;
 
@@ -615,10 +881,22 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         // peer (e.g. mobile) sees the same conversation. Otherwise, fresh.
         let existing = session.lock().await.clone();
         let Some(handle) = existing
-            .or_else(|| create_new_session(&state.session_service, &state.cwd(), &state.config))
+            .or_else(|| {
+                create_new_session(
+                    &state.session_service,
+                    initial_project.cwd(),
+                    initial_project.config(),
+                )
+            })
         else {
-            send_msg(
+            drop(initial_transition);
+            if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                return;
+            }
+            let _ = send_ws_project_msg(
+                &state,
                 &tx,
+                project_generation,
                 safe_error(
                     ErrorCode::Storage,
                     "session storage is unavailable",
@@ -632,8 +910,14 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         let snapshot = match handle.session.snapshot().await {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                send_msg(
+                drop(initial_transition);
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    return;
+                }
+                let _ = send_ws_project_msg(
+                    &state,
                     &tx,
+                    project_generation,
                     safe_error(
                         ErrorCode::Storage,
                         "session snapshot is unavailable",
@@ -652,23 +936,50 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             .await;
         shared_sid = Some(sid.clone());
         *session.lock().await = Some(handle);
+        let initial_model = state.active_model.lock().await.clone();
+        let cumulative_usage = state.session_hub.cumulative_usage_json(&sid).await;
+        drop(initial_transition);
 
-        send_msg(
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        if !send_ws_project_msg(
+            &state,
             &tx,
-            messages_loaded(
-                &sid,
-                snapshot,
-                state.session_hub.cumulative_usage_json(&sid).await,
-            ),
+            project_generation,
+            ServerMsg::SessionList {
+                sessions: initial_sessions,
+            },
         )
-        .await;
-        send_msg(
+        .await
+        {
+            return;
+        }
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        if !send_ws_project_msg(
+            &state,
             &tx,
+            project_generation,
+            messages_loaded(&sid, snapshot, cumulative_usage),
+        )
+        .await
+        {
+            return;
+        }
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        if !send_ws_project_msg(
+            &state,
+            &tx,
+            project_generation,
             ServerMsg::Info {
-                model: state.active_model.lock().await.clone(),
-                auth_token: state.auth_token.clone(),
-                available_models: state
-                    .config
+                model: initial_model.clone(),
+                auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                available_models: initial_project
+                    .config()
                     .all_models()
                     .iter()
                     .filter(|p| p.is_conversation_model())
@@ -681,22 +992,54 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 session_id: sid,
             },
         )
-        .await;
+        .await
+        {
+            return;
+        }
 
         // Send the project file tree so the frontend can render the left rail.
-        send_msg(
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        let file_tree = state.project_service.file_tree_for(&initial_project);
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        if !send_ws_project_msg(
+            &state,
             &tx,
+            project_generation,
             ServerMsg::FileTree {
-                root: nonoclaw_core::display_path(&state.cwd()),
-                entries: state.project_service.file_tree(),
+                root: nonoclaw_core::display_path(initial_project.cwd()),
+                entries: file_tree,
             },
         )
-        .await;
+        .await
+        {
+            return;
+        }
 
         // Send the full project context for the Insight rail + Git pane.
-        let current_model = state.active_model.lock().await.clone();
-        let info = state.project_service.snapshot(&current_model).await;
-        send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        let info = state
+            .project_service
+            .snapshot_for(Arc::clone(&initial_project), &initial_model)
+            .await;
+        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+            return;
+        }
+        if !send_ws_project_msg(
+            &state,
+            &tx,
+            project_generation,
+            ServerMsg::ProjectInfo { info },
+        )
+        .await
+        {
+            return;
+        }
     }
 
     // Server-side keepalive: send a lightweight data frame every 8s. Browser
@@ -720,7 +1063,35 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
         }
     });
 
-    while let Some(Ok(msg)) = rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            changed = project_updates.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let generation = *project_updates.borrow_and_update();
+                if generation == project_generation {
+                    continue;
+                }
+                send_msg(
+                    &tx,
+                    safe_error(
+                        ErrorCode::InvalidRequest,
+                        "the active project changed; reconnecting is required",
+                        true,
+                        "project_context_changed",
+                    ),
+                )
+                .await;
+                break;
+            }
+            message = rx.next() => {
+                let Some(Ok(message)) = message else {
+                    break;
+                };
+                message
+            }
+        };
         let text = match &msg {
             WsMessage::Text(t) => t.clone(),
             WsMessage::Close(_) => break,
@@ -747,156 +1118,162 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
             }
         };
 
+        // `select!` may choose a simultaneously ready client frame before the
+        // watch notification. Fence every frame against the published context
+        // so a stale connection cannot mutate project-global state.
+        if state.project().generation() != project_generation {
+            send_msg(
+                &tx,
+                safe_error(
+                    ErrorCode::InvalidRequest,
+                    "the active project changed; reconnecting is required",
+                    true,
+                    "project_context_changed",
+                ),
+            )
+            .await;
+            break;
+        }
+
         match parsed {
             // ── New / Resume session ────────────────────────────────────────
             ClientMsg::NewSession => {
-                let h = create_new_session(&state.session_service, &state.cwd(), &state.config);
-                match h {
-                    Some(h) => {
-                        let sid = h.session.id().to_string();
-                        let snapshot = match h.session.snapshot().await {
-                            Ok(snapshot) => snapshot,
-                            Err(_) => {
-                                send_msg(
-                                    &tx,
-                                    safe_error(
-                                        ErrorCode::Storage,
-                                        "session snapshot is unavailable",
-                                        true,
-                                        "session_snapshot",
-                                    ),
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        send_msg(
-                            &tx,
-                            messages_loaded(
-                                &sid,
-                                snapshot,
-                                state.session_hub.cumulative_usage_json(&sid).await,
-                            ),
-                        )
-                        .await;
-                        state
-                            .session_hub
-                            .move_registration(shared_sid.as_deref(), &h, &tx)
-                            .await;
-                        shared_sid = Some(sid.clone());
-                        *session.lock().await = Some(h);
-                        send_msg(
-                            &tx,
-                            ServerMsg::Info {
-                                model: state.active_model.lock().await.clone(),
-                                auth_token: state.auth_token.clone(),
-                                available_models: state
-                                    .config
-                                    .conversation_models()
-                                    .iter()
-                                    .map(|p| ModelInfo {
-                                        name: p.name.clone(),
-                                        label: p.label.clone().unwrap_or_else(|| p.name.clone()),
-                                        context_window: p.context_window,
-                                    })
-                                    .collect(),
-                                session_id: sid,
-                            },
-                        )
-                        .await;
-                        // Refresh the list (the previously active session may
-                        // now appear if it had content).
-                        send_msg(
-                            &tx,
-                            ServerMsg::SessionList {
-                                sessions: list_sessions_wire(&state).await,
-                            },
-                        )
-                        .await;
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let Some(handle) = create_new_session(
+                    &state.session_service,
+                    project.cwd(),
+                    project.config(),
+                ) else {
+                    drop(project_transition);
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
                     }
-                    None => {
-                        send_msg(
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(
+                            ErrorCode::Storage,
+                            "session storage is unavailable",
+                            true,
+                            "session_create",
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                let snapshot = match handle.session.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             safe_error(
                                 ErrorCode::Storage,
-                                "session storage is unavailable",
+                                "session snapshot is unavailable",
                                 true,
-                                "session_create",
+                                "session_snapshot",
                             ),
                         )
                         .await;
+                        continue;
                     }
+                };
+                let sid = handle.session.id().to_string();
+                state
+                    .session_hub
+                    .move_registration(shared_sid.as_deref(), &handle, &tx)
+                    .await;
+                shared_sid = Some(sid.clone());
+                *session.lock().await = Some(handle);
+                let loaded = messages_loaded(
+                    &sid,
+                    snapshot,
+                    state.session_hub.cumulative_usage_json(&sid).await,
+                );
+                let info = ServerMsg::Info {
+                    model: state.active_model.lock().await.clone(),
+                    auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                    available_models: project
+                        .config()
+                        .conversation_models()
+                        .iter()
+                        .map(|profile| ModelInfo {
+                            name: profile.name.clone(),
+                            label: profile
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| profile.name.clone()),
+                            context_window: profile.context_window,
+                        })
+                        .collect(),
+                    session_id: sid,
+                };
+                let sessions = list_sessions_wire_for(
+                    state.session_service.clone(),
+                    project.cwd().to_path_buf(),
+                )
+                .await;
+                drop(project_transition);
+
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(&state, &tx, project_generation, loaded).await {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(&state, &tx, project_generation, info).await {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::SessionList { sessions },
+                )
+                .await
+                {
+                    continue;
                 }
             }
             ClientMsg::ResumeSession { id } => {
-                match resume_session(&state.session_service, &state.cwd(), &id) {
-                    Ok(handle) => match handle.session.snapshot().await {
-                        Ok(snapshot) => {
-                            let sid = handle.session.id().to_string();
-                            state
-                                .session_hub
-                                .move_registration(shared_sid.as_deref(), &handle, &tx)
-                                .await;
-                            shared_sid = Some(sid.clone());
-                            *session.lock().await = Some(handle);
-                            send_msg(
-                                &tx,
-                                messages_loaded(
-                                    &sid,
-                                    snapshot,
-                                    state.session_hub.cumulative_usage_json(&sid).await,
-                                ),
-                            )
-                            .await;
-                            send_msg(
-                                &tx,
-                                ServerMsg::Info {
-                                    model: state.active_model.lock().await.clone(),
-                                    auth_token: state.auth_token.clone(),
-                                    available_models: state
-                                        .config
-                                        .all_models()
-                                        .iter()
-                                        .filter(|profile| profile.is_conversation_model())
-                                        .map(|profile| ModelInfo {
-                                            name: profile.name.clone(),
-                                            label: profile
-                                                .label
-                                                .clone()
-                                                .unwrap_or_else(|| profile.name.clone()),
-                                            context_window: profile.context_window,
-                                        })
-                                        .collect(),
-                                    session_id: sid,
-                                },
-                            )
-                            .await;
-                            // Refresh the list so sessions that received messages
-                            // since the last SessionList push are visible.
-                            send_msg(
-                                &tx,
-                                ServerMsg::SessionList {
-                                    sessions: list_sessions_wire(&state).await,
-                                },
-                            )
-                            .await;
-                        }
-                        Err(_) => {
-                            send_msg(
-                                &tx,
-                                safe_error(
-                                    ErrorCode::Storage,
-                                    "session snapshot is unavailable",
-                                    true,
-                                    "session_snapshot",
-                                ),
-                            )
-                            .await;
-                        }
-                    },
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let handle = match resume_session(&state.session_service, project.cwd(), &id) {
+                    Ok(handle) => handle,
                     Err(_) => {
-                        send_msg(
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             safe_error(
                                 ErrorCode::NotFound,
                                 "session could not be resumed",
@@ -905,145 +1282,399 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             ),
                         )
                         .await;
+                        continue;
                     }
+                };
+                let snapshot = match handle.session.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "session snapshot is unavailable",
+                                true,
+                                "session_snapshot",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let sid = handle.session.id().to_string();
+                state
+                    .session_hub
+                    .move_registration(shared_sid.as_deref(), &handle, &tx)
+                    .await;
+                shared_sid = Some(sid.clone());
+                *session.lock().await = Some(handle);
+                let loaded = messages_loaded(
+                    &sid,
+                    snapshot,
+                    state.session_hub.cumulative_usage_json(&sid).await,
+                );
+                let info = ServerMsg::Info {
+                    model: state.active_model.lock().await.clone(),
+                    auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                    available_models: project
+                        .config()
+                        .all_models()
+                        .iter()
+                        .filter(|profile| profile.is_conversation_model())
+                        .map(|profile| ModelInfo {
+                            name: profile.name.clone(),
+                            label: profile
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| profile.name.clone()),
+                            context_window: profile.context_window,
+                        })
+                        .collect(),
+                    session_id: sid,
+                };
+                let sessions = list_sessions_wire_for(
+                    state.session_service.clone(),
+                    project.cwd().to_path_buf(),
+                )
+                .await;
+                drop(project_transition);
+
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(&state, &tx, project_generation, loaded).await {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(&state, &tx, project_generation, info).await {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::SessionList { sessions },
+                )
+                .await
+                {
+                    continue;
                 }
             }
 
             // ── File tree + open-file (frontend left rail) ──────────────────
             ClientMsg::FileTree => {
-                send_msg(
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let root = nonoclaw_core::display_path(project.cwd());
+                let entries = state.project_service.file_tree_for(&project);
+                drop(project_transition);
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
                     &tx,
-                    ServerMsg::FileTree {
-                        root: nonoclaw_core::display_path(&state.cwd()),
-                        entries: state.project_service.file_tree(),
-                    },
+                    project_generation,
+                    ServerMsg::FileTree { root, entries },
                 )
-                .await;
+                .await
+                {
+                    continue;
+                }
             }
             ClientMsg::ProjectInfoRefresh => {
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
                 let current_model = state.active_model.lock().await.clone();
+                // The refresh may probe external runtimes, so retain immutable
+                // inputs but release the transition gate first.
+                drop(project_transition);
                 let (updates_tx, mut updates_rx) =
                     tokio::sync::mpsc::unbounded_channel::<nonoclaw_engine::RuntimeProbeReport>();
                 let updates_socket = Arc::clone(&tx);
+                let updates_state = Arc::clone(&state);
+                let expected_generation = project_generation;
                 let md_flag = Arc::clone(&state.markitdown_path);
                 let forward_updates = tokio::spawn(async move {
                     while let Some(system) = updates_rx.recv().await {
+                        if updates_state.project().generation() != expected_generation {
+                            break;
+                        }
                         // Keep the markitdown path in sync so the upload
                         // handler can route documents through MarkItDown
                         // without waiting for the full probe to finish.
                         if system.markitdown.status == "available" {
                             *md_flag.lock().await = system.markitdown.path.clone();
                         }
-                        send_msg(&updates_socket, ServerMsg::SystemProbe { system }).await;
+                        if !send_ws_project_msg(
+                            &updates_state,
+                            &updates_socket,
+                            expected_generation,
+                            ServerMsg::SystemProbe { system },
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                 });
                 let info = state
                     .project_service
-                    .refresh(&current_model, move |system| {
+                    .refresh_for(Arc::clone(&project), &current_model, move |system| {
                         let _ = updates_tx.send(system);
                     })
                     .await;
                 let _ = forward_updates.await;
-                send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::ProjectInfo { info },
+                )
+                .await
+                {
+                    continue;
+                }
             }
-            ClientMsg::GitShow { sha } => match state.project_service.git_show(&sha).await {
-                Some(output) => {
-                    send_msg(&tx, ServerMsg::GitShow { sha, output }).await;
+            ClientMsg::GitShow { sha } => {
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
                 }
-                None => {
-                    send_msg(
-                        &tx,
-                        safe_error(
-                            ErrorCode::NotFound,
-                            "commit is invalid or unavailable",
-                            false,
-                            "git_show",
-                        ),
-                    )
-                    .await;
+                drop(project_transition);
+                let output = state.project_service.git_show_for(&project, &sha).await;
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
                 }
-            },
+                let response = match output {
+                    Some(output) => ServerMsg::GitShow { sha, output },
+                    None => safe_error(
+                        ErrorCode::NotFound,
+                        "commit is invalid or unavailable",
+                        false,
+                        "git_show",
+                    ),
+                };
+                if !send_ws_project_msg(&state, &tx, project_generation, response).await {
+                    continue;
+                }
+            }
             ClientMsg::SessionPrompts { session_id } => {
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
                 const PROMPT_PREVIEW_CHARS: usize = 40;
                 let prompts = super::protocol::session_run_prompts(
-                    &state.cwd(),
+                    project.cwd(),
                     &session_id,
                     PROMPT_PREVIEW_CHARS,
                 );
-                send_msg(
+                drop(project_transition);
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
                     &tx,
+                    project_generation,
                     ServerMsg::SessionPrompts {
                         session_id,
                         prompts,
                     },
                 )
-                .await;
+                .await
+                {
+                    continue;
+                }
             }
-            ClientMsg::LoadOlder { session_id, limit, before } => {
+            ClientMsg::LoadOlder {
+                session_id,
+                limit,
+                before,
+            } => {
                 // Serve one older page for the session this connection is
                 // viewing. `before` defaults to the count the client holds
                 // (older messages exist behind that boundary only when the
                 // restore payload was a tail window).
-                let current = session.lock().await;
-                let Some(handle) = current.as_ref() else {
-                    send_msg(&tx, safe_error(ErrorCode::NotFound, "no active session", false, "load_older")).await;
-                    continue;
-                };
-                if handle.session.id() != session_id {
-                    send_msg(&tx, safe_error(ErrorCode::NotFound, "session is not active", false, "load_older")).await;
-                    continue;
-                }
-                let snapshot = handle.session.snapshot().await;
-                let (total, started, revision) = match &snapshot {
-                    Ok(s) => (s.messages.len(), s.started.clone(), s.revision),
-                    Err(_) => {
-                        send_msg(&tx, safe_error(ErrorCode::Storage, "history page unavailable", true, "load_older")).await;
+                let selected_session = session
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|handle| handle.session.clone());
+                let Some(selected_session) = selected_session else {
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
                         continue;
                     }
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(
+                            ErrorCode::NotFound,
+                            "no active session",
+                            false,
+                            "load_older",
+                        ),
+                    )
+                    .await;
+                    continue;
                 };
-                let before = before.unwrap_or(0).min(total);
-                match handle.session.history_page(before, limit.max(1).min(500)).await {
-                    Ok(page) => {
-                        send_msg(
+                if selected_session.id() != session_id {
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(
+                            ErrorCode::NotFound,
+                            "session is not active",
+                            false,
+                            "load_older",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                let snapshot = match selected_session.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
-                            super::protocol::history_page(
-                                &session_id,
-                                page.messages,
-                                before,
-                                total,
-                                revision,
-                                started,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "history page unavailable",
+                                true,
+                                "load_older",
                             ),
                         )
                         .await;
+                        continue;
                     }
+                };
+                let total = snapshot.messages.len();
+                let before = before.unwrap_or(0).min(total);
+                let page = match selected_session
+                    .history_page(before, limit.max(1).min(500))
+                    .await
+                {
+                    Ok(page) => page,
                     Err(_) => {
-                        send_msg(&tx, safe_error(ErrorCode::Storage, "history page unavailable", true, "load_older")).await;
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "history page unavailable",
+                                true,
+                                "load_older",
+                            ),
+                        )
+                        .await;
+                        continue;
                     }
+                };
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    super::protocol::history_page(
+                        &session_id,
+                        page.messages,
+                        before,
+                        total,
+                        snapshot.revision,
+                        snapshot.started,
+                    ),
+                )
+                .await
+                {
+                    continue;
                 }
             }
             ClientMsg::OpenFile { path, force_code } => {
-                match state.project_service.open(&path, force_code) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let kind = e.kind();
-                        let msg = match kind {
-                            std::io::ErrorKind::PermissionDenied => {
-                                "file outside project or home directory"
-                            }
-                            std::io::ErrorKind::NotFound => "file or parent directory not found",
-                            _ => "failed to open file with system editor",
-                        };
-                        tracing::warn!(
-                            kind = ?kind,
-                            "open-file failed (path redacted)"
-                        );
-                        send_msg(
-                            &tx,
-                            safe_error(ErrorCode::PathDenied, msg, false, "open_file"),
-                        )
-                        .await;
+                // Opening may create the requested file, so keep replacement
+                // fenced through path confinement and the side effect.
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let result = state
+                    .project_service
+                    .open_for(&project, &path, force_code);
+                drop(project_transition);
+                if let Err(error) = result {
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
                     }
+                    let kind = error.kind();
+                    let message = match kind {
+                        std::io::ErrorKind::PermissionDenied => {
+                            "file outside project or home directory"
+                        }
+                        std::io::ErrorKind::NotFound => "file or parent directory not found",
+                        _ => "failed to open file with system editor",
+                    };
+                    tracing::warn!(kind = ?kind, "open-file failed (path redacted)");
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(ErrorCode::PathDenied, message, false, "open_file"),
+                    )
+                    .await;
                 }
             }
 
@@ -1061,23 +1692,15 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     attachment_count = attachments.as_ref().map_or(0, Vec::len),
                     "ws run request accepted (prompt content omitted)"
                 );
-                // Cancel and join any in-progress run before taking the next
-                // canonical snapshot for this session.
-                if let Some(controller) = active_controller.lock().await.as_ref() {
-                    controller.cancel("superseded by a new run");
-                }
-                if let Some(handle) = run_handle.take() {
-                    let _ = handle.await;
-                }
-                *active_controller.lock().await = None;
-
                 let session_for_run = {
                     let guard = session.lock().await;
                     guard.as_ref().map(|handle| handle.session.clone())
                 };
                 let Some(session_for_run) = session_for_run else {
-                    send_msg(
+                    let _ = send_ws_project_msg(
+                        &state,
                         &tx,
+                        project_generation,
                         safe_error(
                             ErrorCode::InvalidRequest,
                             "no session is selected",
@@ -1089,11 +1712,90 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     continue;
                 };
                 let session_id = session_for_run.id().to_string();
+
+                // Preserve the WS supersede contract across every entry point:
+                // cancel the session's globally owned run, not merely a
+                // controller created by this connection.
+                let cancel_result = state
+                    .session_hub
+                    .cancel_run_and_wait(&session_id, "superseded by a new run")
+                    .await;
+                if matches!(
+                    cancel_result,
+                    CancelRunResult::NotCancellable | CancelRunResult::TimedOut
+                ) {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            if cancel_result == CancelRunResult::TimedOut {
+                                "the previous run did not stop in time"
+                            } else {
+                                "the session is performing non-cancellable exclusive work"
+                            },
+                            true,
+                            "run_lease",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(controller) = active_controller.lock().await.as_ref() {
+                    controller.cancel("superseded by a new run");
+                }
+                if let Some(handle) = run_handle.take() {
+                    let _ = handle.await;
+                }
+                *active_controller.lock().await = None;
+
+                // Serialize run startup with project replacement. The guard is
+                // released only after the controller is visible in SessionHub.
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let mut run_lease = match state
+                    .session_hub
+                    .try_acquire_run(&session_id, None)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(()) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::InvalidRequest,
+                                "this session already has an active run",
+                                true,
+                                "run_lease",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let session_snapshot = match session_for_run.snapshot().await {
                     Ok(snapshot) => snapshot,
                     Err(_) => {
-                        send_msg(
+                        run_lease.finish().await;
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             safe_error(
                                 ErrorCode::Storage,
                                 "session snapshot is unavailable",
@@ -1119,7 +1821,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 // has context: "fork", execute it as an isolated sub-agent
                 // instead of injecting inline.
                 let fork_body: Option<String> = {
-                    let mut mgr = state.skills_manager.write().unwrap();
+                    let mut mgr = project.skills_manager().write().unwrap();
                     // Extract skill name from prompt: "/name args..." -> "name"
                     let skill_name = prompt
                         .strip_prefix('/')
@@ -1155,6 +1857,8 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 };
 
                 let active_for_run = Arc::clone(&active_controller);
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let mut ready_tx = Some(ready_tx);
                 run_handle = Some(tokio::spawn(async move {
                     // If executing in fork context: run as a fresh sub-engine.
                     if let Some(body) = fork_body {
@@ -1162,10 +1866,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             pending: Arc::clone(&s.pending_questions),
                             meta: Arc::clone(&s.question_meta),
                             tx: tx2.clone(),
+                            session_id: session_id.clone(),
                         });
                         let fork_opts = {
                             let mut o = build_options(
-                                &s.config,
+                                project.config(),
                                 model_used.clone(),
                                 None,
                                 Some(body.clone()),
@@ -1173,34 +1878,49 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 tx2.clone(),
                                 Arc::clone(&s.pending_permissions),
                                 *s.permission_mode.lock().await,
-                                Arc::clone(&s.skills_manager),
+                                Arc::clone(project.skills_manager()),
                                 Arc::clone(&s.background_registry),
                                 Arc::clone(&s.permission_meta),
+                                session_id.clone(),
                             );
                             o.max_turns = o.max_turns.min(20);
                             o.is_non_interactive = true;
                             o.question_resolver = Some(qr);
                             o
                         };
-                        let fork_client = match s
-                            .config
+                        let fork_client = match project
+                            .config()
                             .client_for(ClientPurpose::Subagent, Some(&model_used))
                         {
                             Ok(client) => client,
                             Err(err) => {
                                 tracing::warn!(model = %model_used, error = %err, "subagent client build failed");
-                                send_msg(
+                                drop(project_transition);
+                                if let Some(ready) = ready_tx.take() {
+                                    let _ = ready.send(());
+                                }
+                                if ensure_ws_project_generation(
+                                    &s,
                                     &tx2,
-                                    ServerMsg::Error {
-                                        error: model_client_error(
-                                            &s.config,
-                                            &model_used,
-                                            &err,
-                                            "build_subagent_client",
-                                        ),
-                                    },
+                                    project.generation(),
                                 )
-                                .await;
+                                .await
+                                {
+                                    let _ = send_ws_project_msg(
+                                        &s,
+                                        &tx2,
+                                        project.generation(),
+                                        ServerMsg::Error {
+                                            error: model_client_error(
+                                                project.config(),
+                                                &model_used,
+                                                &err,
+                                                "build_subagent_client",
+                                            ),
+                                        },
+                                    )
+                                    .await;
+                                }
                                 return;
                             }
                         };
@@ -1217,11 +1937,46 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         );
                         let controller = RunController::new(RunContext::new(
                             session_for_run.id(),
-                            s.cwd(),
+                            project.cwd().to_path_buf(),
                             model_used.clone(),
                             fork_limits,
                         ));
+                        if run_lease
+                            .set_controller(controller.clone())
+                            .await
+                            .is_err()
+                        {
+                            drop(project_transition);
+                            if let Some(ready) = ready_tx.take() {
+                                let _ = ready.send(());
+                            }
+                            if ensure_ws_project_generation(
+                                &s,
+                                &tx2,
+                                project.generation(),
+                            )
+                            .await
+                            {
+                                let _ = send_ws_project_msg(
+                                    &s,
+                                    &tx2,
+                                    project.generation(),
+                                    safe_error(
+                                        ErrorCode::Internal,
+                                        "the reserved run slot was lost",
+                                        true,
+                                        "run_lease",
+                                    ),
+                                )
+                                .await;
+                            }
+                            return;
+                        }
                         *active_for_run.lock().await = Some(controller.clone());
+                        drop(project_transition);
+                        if let Some(ready) = ready_tx.take() {
+                            let _ = ready.send(());
+                        }
                         let tx_for_fork_events = tx2.clone();
                         let session_for_fork_events = session_for_run.clone();
                         let completion = controller
@@ -1341,11 +2096,12 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             }
                         }
                         *active_for_run.lock().await = None;
+                        run_lease.finish().await;
                         return;
                     }
 
                     let mut options = build_options(
-                        &s.config,
+                        project.config(),
                         model_used.clone(),
                         max_turns,
                         append_system_prompt.clone(),
@@ -1353,9 +2109,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
                         *s.permission_mode.lock().await,
-                        Arc::clone(&s.skills_manager),
+                        Arc::clone(project.skills_manager()),
                         Arc::clone(&s.background_registry),
                         Arc::clone(&s.permission_meta),
+                        session_id.clone(),
                     );
 
                     // Question resolver (per-run to avoid oneshot key clashes).
@@ -1363,31 +2120,46 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         pending: Arc::clone(&s.pending_questions),
                         meta: Arc::clone(&s.question_meta),
                         tx: tx2.clone(),
+                        session_id: session_id.clone(),
                     });
                     options.question_resolver = Some(qr);
 
                     // Resolve credentials/format from the same immutable
                     // snapshot. No process environment is changed when a Web
                     // session selects a different model.
-                    let run_client = match s
-                        .config
+                    let run_client = match project
+                        .config()
                         .client_for(ClientPurpose::Conversation, Some(&model_used))
                     {
                         Ok(client) => client,
                         Err(err) => {
                             tracing::warn!(model = %model_used, error = %err, "resolved run client build failed");
-                            send_msg(
+                            drop(project_transition);
+                            if let Some(ready) = ready_tx.take() {
+                                let _ = ready.send(());
+                            }
+                            if ensure_ws_project_generation(
+                                &s,
                                 &tx2,
-                                ServerMsg::Error {
-                                    error: model_client_error(
-                                        &s.config,
-                                        &model_used,
-                                        &err,
-                                        "build_model_client",
-                                    ),
-                                },
+                                project.generation(),
                             )
-                            .await;
+                            .await
+                            {
+                                let _ = send_ws_project_msg(
+                                    &s,
+                                    &tx2,
+                                    project.generation(),
+                                    ServerMsg::Error {
+                                        error: model_client_error(
+                                            project.config(),
+                                            &model_used,
+                                            &err,
+                                            "build_model_client",
+                                        ),
+                                    },
+                                )
+                                .await;
+                            }
                             return;
                         }
                     };
@@ -1416,12 +2188,44 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     let enriched = enrich_prompt_with_attachments(
                         &prompt,
                         &attachments,
-                        &s.upload_dir,
+                        project.upload_dir(),
                         include_attachment_images,
                         attachment_max_chars,
                     );
-                    let controller = RunController::for_engine(&engine, s.cwd());
+                    let controller = RunController::for_engine(
+                        &engine,
+                        project.cwd().to_path_buf(),
+                    );
+                    if run_lease
+                        .set_controller(controller.clone())
+                        .await
+                        .is_err()
+                    {
+                        drop(project_transition);
+                        if let Some(ready) = ready_tx.take() {
+                            let _ = ready.send(());
+                        }
+                        if ensure_ws_project_generation(&s, &tx2, project.generation()).await {
+                            let _ = send_ws_project_msg(
+                                &s,
+                                &tx2,
+                                project.generation(),
+                                safe_error(
+                                    ErrorCode::Internal,
+                                    "the reserved run slot was lost",
+                                    true,
+                                    "run_lease",
+                                ),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
                     *active_for_run.lock().await = Some(controller.clone());
+                    drop(project_transition);
+                    if let Some(ready) = ready_tx.take() {
+                        let _ = ready.send(());
+                    }
 
                     tracing::debug!(
                         "starting engine run (attachments: {})",
@@ -1525,6 +2329,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                                 )
                                 .await;
                                 *active_for_run.lock().await = None;
+                                run_lease.finish().await;
                                 return;
                             };
                             tracing::info!(
@@ -1538,7 +2343,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             // Incrementally refresh the session vector index
                             // (fingerprints make unchanged files a no-op).
                             {
-                                let cwd = s.cwd();
+                                let cwd = project.cwd().to_path_buf();
                                 tokio::task::spawn_blocking(move || {
                                     let root = nonoclaw_engine::session::home_root();
                                     let Some(dir) = root.map(|r| {
@@ -1574,7 +2379,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             // Refresh project context: git status / files may
                             // have changed after the run.
                             let current_model = s.active_model.lock().await.clone();
-                            let info = s.project_service.snapshot(&current_model).await;
+                            let info = s
+                                .project_service
+                                .snapshot_for(Arc::clone(&project), &current_model)
+                                .await;
                             send_msg(&tx2, ServerMsg::ProjectInfo { info: info.clone() }).await;
 
                             // Push a refreshed session list so newly-persisted
@@ -1582,7 +2390,11 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                             send_msg(
                                 &tx2,
                                 ServerMsg::SessionList {
-                                    sessions: list_sessions_wire(&s).await,
+                                    sessions: list_sessions_wire_for(
+                                        s.session_service.clone(),
+                                        project.cwd().to_path_buf(),
+                                    )
+                                    .await,
                                 },
                             )
                             .await;
@@ -1670,11 +2482,23 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         }
                     }
                     *active_for_run.lock().await = None;
+                    run_lease.finish().await;
                 }));
+                // Do not accept a follow-up Cancel/Clear until the shared
+                // controller has been registered (or setup has failed).
+                let _ = ready_rx.await;
             }
 
             // ── Cancel ──────────────────────────────────────────────────────
             ClientMsg::Cancel => {
+                if let Some(ref sid) = shared_sid {
+                    let _ = state
+                        .session_hub
+                        .cancel_run(sid, "user requested cancellation")
+                        .await;
+                }
+                // Keep the local handle only as a join point; SessionHub owns
+                // cancellation so REST and every WebSocket peer see one run.
                 if let Some(controller) = active_controller.lock().await.as_ref() {
                     controller.cancel("user requested cancellation");
                 }
@@ -1686,6 +2510,13 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
 
             // ── Switch permission mode at runtime ──────────────────────────
             ClientMsg::SetPermissionMode { mode } => {
+                let project_transition = state.projects.lock_transition().await;
+                if state.project().generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
                 let new_mode = match mode.as_str() {
                     "auto" => nonoclaw_core::PermissionMode::Auto,
                     "bypass" | "bypassPermissions" => {
@@ -1702,58 +2533,112 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     _ => nonoclaw_core::PermissionMode::Default,
                 };
                 *state.permission_mode.lock().await = new_mode;
+                drop(project_transition);
                 tracing::info!(?new_mode, "permission mode switched");
             }
 
             // ── Switch active model ────────────────────────────────────
             ClientMsg::SetModel { name } => {
-                // Verify the model exists in the profiles.
-                if state.config.all_models().iter().any(|p| p.name == name) {
+                // Verify and update against one project while replacement is
+                // fenced, so a stale socket cannot overwrite the next model.
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                if project
+                    .config()
+                    .all_models()
+                    .iter()
+                    .any(|p| p.name == name)
+                {
                     // Only session state changes. Client credentials are derived
                     // per run from ResolvedConfig, avoiding process-wide races.
                     *state.active_model.lock().await = name.clone();
+                    drop(project_transition);
                     tracing::info!(%name, "active model switched");
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
                     // Push updated Info + ProjectInfo so the UI reflects the new model immediately.
-                    send_msg(
+                    let info_message = ServerMsg::Info {
+                        model: name.clone(),
+                        auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                        available_models: project
+                            .config()
+                            .all_models()
+                            .iter()
+                            .filter(|p| p.is_conversation_model())
+                            .map(|p| ModelInfo {
+                                name: p.name.clone(),
+                                label: p.label.clone().unwrap_or_else(|| p.name.clone()),
+                                context_window: p.context_window,
+                            })
+                            .collect(),
+                        session_id: session
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|handle| handle.session.id().to_string())
+                            .unwrap_or_default(),
+                    };
+                    if !send_ws_project_msg(
+                        &state,
                         &tx,
-                        ServerMsg::Info {
-                            model: name.clone(),
-                            auth_token: state.auth_token.clone(),
-                            available_models: state
-                                .config
-                                .all_models()
-                                .iter()
-                                .filter(|p| p.is_conversation_model())
-                                .map(|p| ModelInfo {
-                                    name: p.name.clone(),
-                                    label: p.label.clone().unwrap_or_else(|| p.name.clone()),
-                                    context_window: p.context_window,
-                                })
-                                .collect(),
-                            session_id: session
-                                .lock()
-                                .await
-                                .as_ref()
-                                .map(|handle| handle.session.id().to_string())
-                                .unwrap_or_default(),
-                        },
+                        project_generation,
+                        info_message,
                     )
-                    .await;
-                    let info = state.project_service.snapshot(&name).await;
-                    send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
+                    .await
+                    {
+                        continue;
+                    }
+                    let info = state
+                        .project_service
+                        .snapshot_for(Arc::clone(&project), &name)
+                        .await;
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    if !send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        ServerMsg::ProjectInfo { info },
+                    )
+                    .await
+                    {
+                        continue;
+                    }
                 } else {
+                    drop(project_transition);
                     tracing::warn!("unknown model requested — ignored");
                 }
             }
 
             // ── Switch project working directory ──────────────────────
             ClientMsg::SwitchProject { path } => {
-                // Reject while a run is active: the engine holds a session
-                // handle and cwd snapshot for the current run; rebinding
-                // underneath it would corrupt tool execution and persistence.
-                if active_controller.lock().await.is_some() {
-                    send_msg(
+                // Run startup and project replacement share this gate. Once it
+                // is held, a global active-run check cannot race with a new
+                // WS, REST, or AutoDream run acquiring its session lease.
+                let project_transition = state.projects.lock_transition().await;
+                if state.project().generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                if state.session_hub.has_active_runs().await {
+                    drop(project_transition);
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    let _ = send_ws_project_msg(
+                        &state,
                         &tx,
+                        project_generation,
                         safe_error(
                             ErrorCode::InvalidRequest,
                             "cannot switch project while a run is active",
@@ -1764,18 +2649,30 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     .await;
                     continue;
                 }
-                // Accept both slash styles: a Windows-style input like
-                // `C:\proj` must parse on any host, and a POSIX-style input
-                // (`/home/me/x`) works natively on Unix.
-                let raw = if path.len() > 1 && path[1..2].eq_ignore_ascii_case(":") {
-                    std::path::PathBuf::from(path.replace('/', r"\")) // drive-letter → Windows form
+
+                let current_project = state.project();
+                // Accept both slash styles without byte-slicing arbitrary
+                // UTF-8 input. Relative paths resolve against one cwd snapshot.
+                let has_drive_prefix = path.as_bytes().get(1) == Some(&b':');
+                let raw = if has_drive_prefix {
+                    std::path::PathBuf::from(path.replace('/', r"\"))
                 } else {
                     std::path::PathBuf::from(&path)
                 };
-                let joined = if raw.is_absolute() { raw } else { state.cwd().join(raw) };
+                let joined = if raw.is_absolute() {
+                    raw
+                } else {
+                    current_project.cwd().join(raw)
+                };
                 let Some(resolved) = joined.canonicalize().ok().filter(|p| p.is_dir()) else {
-                    send_msg(
+                    drop(project_transition);
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    let _ = send_ws_project_msg(
+                        &state,
                         &tx,
+                        project_generation,
                         safe_error(
                             ErrorCode::InvalidRequest,
                             "project path is not a directory",
@@ -1786,78 +2683,146 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     .await;
                     continue;
                 };
-                if false {
-                    send_msg(
-                        &tx,
-                        safe_error(
-                            ErrorCode::InvalidRequest,
-                            "project path is not a directory",
-                            false,
-                            "switch_project",
-                        ),
-                    )
-                    .await;
-                    continue;
-                }
-                *state.cwd.write().unwrap() = resolved.clone();
-                tracing::info!(dir = %resolved.display(), "project switched");
 
-                // Skills are cwd-derived; rescan against the new root.
-                state
-                    .skills_manager
-                    .write()
-                    .unwrap()
-                    .rescan(&resolved);
-
-                // Replace the chat session: auto-resume the most recent
-                // non-dream session of the new project, else create fresh.
+                // Fully prepare config, skills, and upload storage before
+                // changing any globally visible project pointer.
+                let next = match state.projects.prepare(resolved.clone()) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::warn!(kind = ?error.kind(), "project preparation failed");
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "the new project could not be prepared",
+                                true,
+                                "switch_project",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let current_model = state.active_model.lock().await.clone();
+                let selected_model = if next
+                    .config()
+                    .conversation_models()
+                    .iter()
+                    .any(|profile| profile.name == current_model)
+                {
+                    current_model
+                } else {
+                    next.config().active_model.value.clone()
+                };
+
+                // Open the replacement session before publication as well, so
+                // failure leaves the old project and connection intact.
                 let new_handle = state
                     .session_service
-                    .most_recent_session(&resolved)
+                    .most_recent_session(next.cwd())
                     .ok()
                     .flatten()
-                    .and_then(|sid| resume_session(&state.session_service, &resolved, &sid).ok())
-                    .or_else(|| create_new_session(&state.session_service, &resolved, &state.config));
+                    .and_then(|sid| resume_session(&state.session_service, next.cwd(), &sid).ok())
+                    .or_else(|| {
+                        create_new_session(&state.session_service, next.cwd(), next.config())
+                    });
                 let Some(handle) = new_handle else {
-                    send_msg(
+                    drop(project_transition);
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    let _ = send_ws_project_msg(
+                        &state,
                         &tx,
+                        project_generation,
                         safe_error(
-                            ErrorCode::InvalidRequest,
+                            ErrorCode::Storage,
                             "cannot open a session for the new project",
-                            false,
+                            true,
                             "switch_project",
                         ),
                     )
                     .await;
                     continue;
                 };
+                let snapshot = match handle.session.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "session snapshot is unavailable",
+                                true,
+                                "session_snapshot",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let sid = handle.session.id().to_string();
+
+                // Persist old-project metadata, then swap every project-scoped
+                // input atomically and load metadata from the new project.
+                state.persist_pending_permissions().await;
+                state.pending_permissions.lock().await.clear();
+                state.pending_questions.lock().await.clear();
+                state.permission_meta.lock().await.clear();
+                state.question_meta.lock().await.clear();
+                *state.active_model.lock().await = selected_model.clone();
+                *state.permission_mode.lock().await = initial_permission_mode(next.config());
+                project_generation = next.generation();
+                state.projects.replace(Arc::clone(&next));
+                state.load_pending_permissions().await;
+
                 state
                     .session_hub
                     .move_registration(shared_sid.as_deref(), &handle, &tx)
                     .await;
                 shared_sid = Some(sid.clone());
                 *session.lock().await = Some(handle);
-                if let Ok(snapshot) = session.lock().await.as_ref().unwrap().session.snapshot().await {
-                    send_msg(
-                        &tx,
-                        messages_loaded(
-                            &sid,
-                            snapshot,
-                            state.session_hub.cumulative_usage_json(&sid).await,
-                        ),
-                    )
-                    .await;
-                }
+                drop(project_transition);
+                tracing::info!(dir = %resolved.display(), "project switched");
 
-                send_msg(
+                let cumulative_usage = state.session_hub.cumulative_usage_json(&sid).await;
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
                     &tx,
+                    project_generation,
+                    messages_loaded(&sid, snapshot, cumulative_usage),
+                )
+                .await
+                {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
                     ServerMsg::Info {
-                        model: current_model.clone(),
-                        auth_token: state.auth_token.clone(),
-                        available_models: state
-                            .config
+                        model: selected_model.clone(),
+                        auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                        available_models: next
+                            .config()
                             .all_models()
                             .iter()
                             .filter(|p| p.is_conversation_model())
@@ -1870,30 +2835,136 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         session_id: sid,
                     },
                 )
-                .await;
-                send_msg(
+                .await
+                {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                let file_tree = state.project_service.file_tree_for(&next);
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
                     &tx,
+                    project_generation,
                     ServerMsg::FileTree {
-                        root: nonoclaw_core::display_path(&state.cwd()),
-                        entries: state.project_service.file_tree(),
+                        root: nonoclaw_core::display_path(next.cwd()),
+                        entries: file_tree,
                     },
                 )
+                .await
+                {
+                    continue;
+                }
+                let sessions = list_sessions_wire_for(
+                    state.session_service.clone(),
+                    next.cwd().to_path_buf(),
+                )
                 .await;
-                send_msg(
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
                     &tx,
-                    ServerMsg::SessionList {
-                        sessions: list_sessions_wire(&state).await,
-                    },
+                    project_generation,
+                    ServerMsg::SessionList { sessions },
                 )
-                .await;
-                let info = state.project_service.snapshot(&current_model).await;
-                send_msg(&tx, ServerMsg::ProjectInfo { info }).await;
+                .await
+                {
+                    continue;
+                }
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                let info = state
+                    .project_service
+                    .snapshot_for(Arc::clone(&next), &selected_model)
+                    .await;
+                if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    continue;
+                }
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::ProjectInfo { info },
+                )
+                .await
+                {
+                    continue;
+                }
             }
 
             // ── Clear (in-memory only; on-disk transcript is the archive) ───
             ClientMsg::Clear => {
-                // Stop and join the event source before publishing the empty
-                // transcript, so no stale event can follow MessagesLoaded.
+                let canonical = session
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|handle| handle.session.clone());
+                let Some(canonical) = canonical else {
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            "no session is selected",
+                            false,
+                            "clear_session",
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                let clear_session_id = canonical.id().to_string();
+                let project_transition = state.projects.lock_transition().await;
+                if state.project().generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+
+                // Cancel and wait while run startup is fenced, then replace the
+                // old run with a non-cancellable mutation lease. No new writer
+                // can enter between the wait and the atomic clear.
+                let cancel_result = state
+                    .session_hub
+                    .cancel_run_and_wait(&clear_session_id, "session cleared")
+                    .await;
+                if matches!(
+                    cancel_result,
+                    CancelRunResult::NotCancellable | CancelRunResult::TimedOut
+                ) {
+                    drop(project_transition);
+                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                        continue;
+                    }
+                    let _ = send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            if cancel_result == CancelRunResult::TimedOut {
+                                "the active run did not stop in time"
+                            } else {
+                                "the session is performing non-cancellable exclusive work"
+                            },
+                            true,
+                            "clear_session",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                // A locally owned run may belong to the previously selected
+                // session; cancel it as a defensive connection-local fallback.
                 if let Some(controller) = active_controller.lock().await.as_ref() {
                     controller.cancel("session cleared");
                 }
@@ -1901,20 +2972,24 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     let _ = handle.await;
                 }
                 *active_controller.lock().await = None;
-                // Submit the clear as one atomic writer command.
-                let canonical = session
-                    .lock()
+                let clear_lease = match state
+                    .session_hub
+                    .try_acquire_run(&clear_session_id, None)
                     .await
-                    .as_ref()
-                    .map(|handle| handle.session.clone());
-                if let Some(canonical) = canonical {
-                    if canonical.clear().await.is_err() {
-                        tracing::warn!("failed to clear session (details redacted)");
-                        send_msg(
+                {
+                    Ok(lease) => lease,
+                    Err(()) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             safe_error(
-                                ErrorCode::Storage,
-                                "session could not be cleared",
+                                ErrorCode::InvalidRequest,
+                                "this session already has active work",
                                 true,
                                 "clear_session",
                             ),
@@ -1922,55 +2997,70 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .await;
                         continue;
                     }
-                    match canonical.snapshot().await {
-                        Ok(snapshot) => {
-                            let cum_usage = state
-                                .session_hub
-                                .cumulative_usage_json(canonical.id())
-                                .await;
-                            let ml = messages_loaded(canonical.id(), snapshot, cum_usage);
-                            send_msg(&tx, ml).await;
-                        }
-                        Err(_) => {
-                            send_msg(
-                                &tx,
-                                safe_error(
-                                    ErrorCode::Storage,
-                                    "session snapshot is unavailable",
-                                    true,
-                                    "session_snapshot",
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
-                }
+                };
+                drop(project_transition);
 
-                // Broadcast the clear to all other peers.
+                if canonical.clear().await.is_err() {
+                    tracing::warn!("failed to clear session (details redacted)");
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::Storage,
+                            "session could not be cleared",
+                            true,
+                            "clear_session",
+                        ),
+                    )
+                    .await;
+                    clear_lease.finish().await;
+                    continue;
+                }
+                let snapshot = match canonical.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::Storage,
+                                "session snapshot is unavailable",
+                                true,
+                                "session_snapshot",
+                            ),
+                        )
+                        .await;
+                        clear_lease.finish().await;
+                        continue;
+                    }
+                };
+                let cum_usage = state
+                    .session_hub
+                    .cumulative_usage_json(canonical.id())
+                    .await;
+                let ml = messages_loaded(canonical.id(), snapshot, cum_usage);
+                send_msg(&tx, ml).await;
+
+                // Broadcast the clear before releasing exclusivity, so a new
+                // run cannot race an older MessagesLoaded snapshot to peers.
                 if let Some(ref cid) = shared_sid {
                     state.session_hub.sync(cid, &tx).await;
                 }
+                clear_lease.finish().await;
             }
 
             // ── Manual /compact ─────────────────────────────────────────────
             ClientMsg::Compact => {
-                if let Some(controller) = active_controller.lock().await.as_ref() {
-                    controller.cancel("manual compaction requested");
-                }
-                if let Some(handle) = run_handle.take() {
-                    let _ = handle.await;
-                }
-                *active_controller.lock().await = None;
-
                 let canonical = session
                     .lock()
                     .await
                     .as_ref()
                     .map(|handle| handle.session.clone());
                 let Some(canonical) = canonical else {
-                    send_msg(
+                    let _ = send_ws_project_msg(
+                        &state,
                         &tx,
+                        project_generation,
                         safe_error(
                             ErrorCode::InvalidRequest,
                             "no session is selected",
@@ -1981,11 +3071,88 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     .await;
                     continue;
                 };
+                let compact_session_id = canonical.id().to_string();
+                let cancel_result = state
+                    .session_hub
+                    .cancel_run_and_wait(&compact_session_id, "manual compaction requested")
+                    .await;
+                if matches!(
+                    cancel_result,
+                    CancelRunResult::NotCancellable | CancelRunResult::TimedOut
+                ) {
+                    send_msg(
+                        &tx,
+                        safe_error(
+                            ErrorCode::InvalidRequest,
+                            if cancel_result == CancelRunResult::TimedOut {
+                                "the active run did not stop in time"
+                            } else {
+                                "the session is already performing non-cancellable exclusive work"
+                            },
+                            true,
+                            "compact_session",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(controller) = active_controller.lock().await.as_ref() {
+                    controller.cancel("manual compaction requested");
+                }
+                if let Some(handle) = run_handle.take() {
+                    let _ = handle.await;
+                }
+                *active_controller.lock().await = None;
+
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                // Reserve the session before reading its transcript. The
+                // snapshot and the compaction engine then describe the same
+                // exclusive interval, rather than a stale pre-lease view.
+                let compact_lease = match state
+                    .session_hub
+                    .try_acquire_run(&compact_session_id, None)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(()) => {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::InvalidRequest,
+                                "this session already has active work",
+                                true,
+                                "compact_session",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let snapshot = match canonical.snapshot().await {
                     Ok(snapshot) => snapshot,
                     Err(_) => {
-                        send_msg(
+                        compact_lease.finish().await;
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             safe_error(
                                 ErrorCode::Storage,
                                 "session snapshot is unavailable",
@@ -1999,22 +3166,10 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 };
                 let original_count = snapshot.messages.len();
                 let compact_run_id = Uuid::new_v4().to_string();
-                let compact_session_id = canonical.id().to_string();
                 let compact_start_revision = snapshot.revision;
-                send_msg(
-                    &tx,
-                    synthetic_event_message(
-                        &compact_run_id,
-                        &compact_session_id,
-                        compact_start_revision,
-                        1,
-                        RunEvent::Compacting,
-                    ),
-                )
-                .await;
                 let compact_for_model = state.active_model.lock().await.clone();
                 let options = build_options(
-                    &state.config,
+                    project.config(),
                     compact_for_model.clone(),
                     None,
                     None,
@@ -2022,22 +3177,30 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     tx.clone(),
                     Arc::clone(&state.pending_permissions),
                     *state.permission_mode.lock().await,
-                    Arc::clone(&state.skills_manager),
+                    Arc::clone(project.skills_manager()),
                     Arc::clone(&state.background_registry),
                     Arc::clone(&state.permission_meta),
+                    compact_session_id.clone(),
                 );
-                let compact_client = match state
-                    .config
+                let compact_client = match project
+                    .config()
                     .client_for(ClientPurpose::Conversation, Some(&compact_for_model))
                 {
                     Ok(client) => client,
                     Err(err) => {
                         tracing::warn!(model = %compact_for_model, error = %err, "compact client build failed");
-                        send_msg(
+                        compact_lease.finish().await;
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
                             &tx,
+                            project_generation,
                             ServerMsg::Error {
                                 error: model_client_error(
-                                    &state.config,
+                                    project.config(),
                                     &compact_for_model,
                                     &err,
                                     "build_model_client",
@@ -2057,6 +3220,18 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     canonical,
                     snapshot,
                 );
+                drop(project_transition);
+                send_msg(
+                    &tx,
+                    synthetic_event_message(
+                        &compact_run_id,
+                        &compact_session_id,
+                        compact_start_revision,
+                        1,
+                        RunEvent::Compacting,
+                    ),
+                )
+                .await;
                 match engine.compact_now().await {
                     Ok(Some((removed, kept))) => {
                         let revision = session_after_compact
@@ -2137,6 +3312,7 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                         .await;
                     }
                 }
+                compact_lease.finish().await;
             }
 
             // ── Permission / question resolution ────────────────────────────
@@ -2144,8 +3320,19 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                 request_id,
                 decision,
             } => {
-                state.permission_meta.lock().await.remove(&request_id);
-                let sender = state.pending_permissions.lock().await.remove(&request_id);
+                let project_transition = state.projects.lock_transition().await;
+                if state.project().generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let Some(session_id) = shared_sid.as_ref() else {
+                    continue;
+                };
+                let key = (session_id.clone(), request_id);
+                state.permission_meta.lock().await.remove(&key);
+                let sender = state.pending_permissions.lock().await.remove(&key);
                 if let Some(sender) = sender {
                     let decision = match decision.as_str() {
                         "allow" => PermissionDecision::allow(),
@@ -2154,13 +3341,26 @@ async fn handle_ws(ws: WebSocket, state: Arc<AppState>, session_id: Option<Strin
                     let _ = sender.send(decision);
                 }
                 state.persist_pending_permissions().await;
+                drop(project_transition);
             }
             ClientMsg::QuestionAnswer { request_id, answer } => {
-                state.question_meta.lock().await.remove(&request_id);
-                let sender = state.pending_questions.lock().await.remove(&request_id);
+                let project_transition = state.projects.lock_transition().await;
+                if state.project().generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let Some(session_id) = shared_sid.as_ref() else {
+                    continue;
+                };
+                let key = (session_id.clone(), request_id);
+                state.question_meta.lock().await.remove(&key);
+                let sender = state.pending_questions.lock().await.remove(&key);
                 if let Some(sender) = sender {
                     let _ = sender.send(answer);
                 }
+                drop(project_transition);
             }
         }
     }
@@ -2247,21 +3447,35 @@ mod characterization_tests {
     }
 
     #[test]
-    fn websocket_auth_policy_allows_only_direct_loopback_bootstrap_without_token() {
-        let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
-        let loopback_v6: IpAddr = "::1".parse().unwrap();
+    fn websocket_origin_policy_requires_same_origin_and_loopback_host_for_local_ticket() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         let remote: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:3000"),
+        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
 
-        assert!(!request_requires_auth(true, loopback_v4, false));
-        assert!(!request_requires_auth(true, loopback_v6, false));
-        assert!(request_requires_auth(true, loopback_v4, true));
-        assert!(request_requires_auth(true, remote, false));
-        assert!(!request_requires_auth(false, remote, true));
+        assert!(local_browser_request_allowed(loopback, &headers, true));
+        assert!(!local_browser_request_allowed(remote, &headers, true));
 
-        assert!(token_is_authorized(false, "secret", None));
-        assert!(!token_is_authorized(false, "secret", Some("wrong")));
-        assert!(!token_is_authorized(true, "secret", None));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!local_browser_request_allowed(loopback, &headers, true));
+
+        headers.insert(header::HOST, HeaderValue::from_static("attacker.example"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://attacker.example"),
+        );
+        assert!(!local_browser_request_allowed(loopback, &headers, true));
+
         assert!(token_is_authorized(true, "secret", Some("secret")));
+        assert!(!token_is_authorized(true, "secret", None));
     }
 
     fn client_kind(message: ClientMsg) -> &'static str {
@@ -2468,7 +3682,7 @@ mod characterization_tests {
             ServerMsg::Info {
                 model: "m".into(),
                 session_id: "s".into(),
-                auth_token: "t".into(),
+                auth_token: Some("t".into()),
                 available_models: vec![],
             },
             ServerMsg::SessionList { sessions: vec![] },

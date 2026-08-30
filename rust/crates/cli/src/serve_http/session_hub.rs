@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nonoclaw_engine::session::CumulativeUsageWire;
-use nonoclaw_engine::{ResolvedConfig, Session, SessionService};
-use tokio::sync::Mutex;
+use nonoclaw_engine::{ResolvedConfig, RunController, Session, SessionService};
+use tokio::sync::{watch, Mutex};
 
 use super::protocol::{messages_loaded, send_msg_ok, Tx};
 
@@ -22,9 +24,130 @@ struct SharedEntry {
     peers: Vec<Tx>,
 }
 
+struct ActiveRun {
+    lease_id: u64,
+    controller: Option<RunController>,
+    done: watch::Receiver<bool>,
+}
+
+const RUN_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CancelRunResult {
+    NotFound,
+    Cancelling,
+    NotCancellable,
+    TimedOut,
+}
+
+/// Ownership token for one session's active run/work slot. Normal completion
+/// calls `finish`. If an agent task is aborted or panics, Drop cancels its
+/// controller and keeps the slot reserved until the detached supervisor has
+/// committed a terminal, preventing a second writer from entering early.
+pub(super) struct RunLease {
+    active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
+    session_id: String,
+    lease_id: u64,
+    controller: Option<RunController>,
+    done_tx: Option<watch::Sender<bool>>,
+    released: bool,
+}
+
+impl RunLease {
+    /// Attach the controller after reserving the session but before starting
+    /// the engine. This lets callers take a consistent session snapshot while
+    /// already owning the one-writer slot.
+    pub(super) async fn set_controller(&mut self, controller: RunController) -> Result<(), ()> {
+        let mut active = self.active_runs.lock().await;
+        let Some(run) = active.get_mut(&self.session_id) else {
+            return Err(());
+        };
+        if run.lease_id != self.lease_id || run.controller.is_some() {
+            return Err(());
+        }
+        run.controller = Some(controller.clone());
+        self.controller = Some(controller);
+        Ok(())
+    }
+
+    pub(super) async fn finish(mut self) {
+        {
+            let mut active = self.active_runs.lock().await;
+            if active
+                .get(&self.session_id)
+                .is_some_and(|run| run.lease_id == self.lease_id)
+            {
+                active.remove(&self.session_id);
+            }
+        }
+        if let Some(done_tx) = self.done_tx.take() {
+            let _ = done_tx.send(true);
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+
+        let active_runs = Arc::clone(&self.active_runs);
+        let session_id = self.session_id.clone();
+        let lease_id = self.lease_id;
+        let controller = self.controller.take();
+        let done_tx = self.done_tx.take();
+        if let Some(controller) = &controller {
+            controller.cancel("run owner dropped before completion");
+        }
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(controller) = controller {
+                    while controller.terminal().is_none() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                let mut active = active_runs.lock().await;
+                if active
+                    .get(&session_id)
+                    .is_some_and(|run| run.lease_id == lease_id)
+                {
+                    active.remove(&session_id);
+                }
+                drop(active);
+                if let Some(done_tx) = done_tx {
+                    let _ = done_tx.send(true);
+                }
+            });
+            return;
+        }
+
+        // Outside a runtime there can be no detached async supervisor to wait
+        // for. Non-agent work is safe to release synchronously; an attached
+        // controller deliberately remains fail-closed in the active map.
+        if controller.is_none() {
+            if let Ok(mut active) = active_runs.try_lock() {
+                if active
+                    .get(&session_id)
+                    .is_some_and(|run| run.lease_id == lease_id)
+                {
+                    active.remove(&session_id);
+                }
+                if let Some(done_tx) = done_tx {
+                    let _ = done_tx.send(true);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SessionHub {
     entries: Mutex<HashMap<String, SharedEntry>>,
+    active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
+    next_lease_id: AtomicU64,
     /// Fast in-memory cache of cumulative token usage per session.  Backed by
     /// durable storage: every write also calls `session.write_usage()` so the
     /// values survive server restarts (reloaded from the session JSONL on
@@ -35,6 +158,84 @@ pub(super) struct SessionHub {
 impl SessionHub {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserve the one active run/work slot for a session. Agent runs supply a
+    /// controller so cancellation can propagate through provider/tool/child
+    /// tasks; short non-agent work (currently manual compaction) passes None
+    /// but still excludes concurrent mutation and project switching.
+    pub(super) async fn try_acquire_run(
+        &self,
+        session_id: &str,
+        controller: Option<RunController>,
+    ) -> Result<RunLease, ()> {
+        let mut active = self.active_runs.lock().await;
+        if active.contains_key(session_id) {
+            return Err(());
+        }
+        let lease_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (done_tx, done) = watch::channel(false);
+        let lease_controller = controller.clone();
+        active.insert(
+            session_id.to_string(),
+            ActiveRun {
+                lease_id,
+                controller,
+                done,
+            },
+        );
+        Ok(RunLease {
+            active_runs: Arc::clone(&self.active_runs),
+            session_id: session_id.to_string(),
+            lease_id,
+            controller: lease_controller,
+            done_tx: Some(done_tx),
+            released: false,
+        })
+    }
+
+    pub(super) async fn has_active_runs(&self) -> bool {
+        !self.active_runs.lock().await.is_empty()
+    }
+
+    pub(super) async fn cancel_run(&self, session_id: &str, reason: &str) -> CancelRunResult {
+        let controller = {
+            let active = self.active_runs.lock().await;
+            let Some(run) = active.get(session_id) else {
+                return CancelRunResult::NotFound;
+            };
+            run.controller.clone()
+        };
+        let Some(controller) = controller else {
+            return CancelRunResult::NotCancellable;
+        };
+        controller.cancel(reason);
+        CancelRunResult::Cancelling
+    }
+
+    pub(super) async fn cancel_run_and_wait(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> CancelRunResult {
+        let (controller, mut done) = {
+            let active = self.active_runs.lock().await;
+            let Some(run) = active.get(session_id) else {
+                return CancelRunResult::NotFound;
+            };
+            (run.controller.clone(), run.done.clone())
+        };
+        let Some(controller) = controller else {
+            return CancelRunResult::NotCancellable;
+        };
+        controller.cancel(reason);
+        if !*done.borrow() {
+            match tokio::time::timeout(RUN_CANCEL_WAIT_TIMEOUT, done.changed()).await {
+                Ok(Ok(())) if *done.borrow() => {}
+                _ => return CancelRunResult::TimedOut,
+            }
+        }
+        CancelRunResult::Cancelling
     }
 
     pub(super) async fn register_existing(
@@ -190,20 +391,18 @@ impl SessionHub {
     /// Accumulate real API token usage for a session (called when a run completes).
     /// Updates the in-memory cache and persists to the session JSONL file so the
     /// value survives server restarts.
-    pub(super) async fn accumulate_usage(
-        &self,
-        session_id: &str,
-        usage: &nonoclaw_core::Usage,
-    ) {
+    pub(super) async fn accumulate_usage(&self, session_id: &str, usage: &nonoclaw_core::Usage) {
         // 1. Update in-memory cache.
         let wire = {
             let mut cum = self.cumulative_usages.lock().await;
-            let entry = cum.entry(session_id.to_string()).or_insert_with(|| CumulativeUsageWire {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            });
+            let entry = cum
+                .entry(session_id.to_string())
+                .or_insert_with(|| CumulativeUsageWire {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                });
             entry.input_tokens += usage.input_tokens;
             entry.output_tokens += usage.output_tokens;
             entry.cache_creation_input_tokens += usage.cache_creation_input_tokens;

@@ -10,11 +10,12 @@
 //! REST contexts). Use `permission_mode: "auto"` or `"bypassPermissions"` in
 //! the request body or settings to allow autonomous operation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -25,7 +26,7 @@ use nonoclaw_engine::{
 };
 
 use super::connection::AppState;
-use super::session_hub::{create_new_session, resume_session};
+use super::session_hub::{create_new_session, resume_session, valid_session_id, CancelRunResult};
 
 /// Request body for `POST /api/run`.
 #[derive(Debug, Deserialize)]
@@ -51,10 +52,10 @@ pub struct RunRequest {
     /// Use "auto" or "bypassPermissions" for fully autonomous REST runs.
     #[serde(default)]
     pub permission_mode: Option<String>,
-    /// Internal: mark this run as a background AutoDream consolidation so the
-    /// created session is tagged and skipped by auto-resume. Not part of the
-    /// public REST contract (the dream scheduler sets it in-process).
-    #[serde(default)]
+    /// Internal-only: mark this run as a background AutoDream consolidation so
+    /// the created session is tagged and skipped by auto-resume. HTTP JSON
+    /// cannot set this flag; the in-process scheduler constructs it directly.
+    #[serde(default, skip_deserializing)]
     pub dream: bool,
 }
 
@@ -90,21 +91,90 @@ enum RunStreamItem {
 
 pub async fn run_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     axum::Json(req): axum::Json<RunRequest>,
 ) -> Response {
-    // Auth check: same token-based auth as other REST endpoints.
-    if !state.authorized(None) {
+    if !state.control_authorized(&headers, query.get("token").map(String::as_str)) {
         return super::http_error::error_response(
             StatusCode::UNAUTHORIZED,
             nonoclaw_core::AppError::new(
                 nonoclaw_core::ErrorCode::Authentication,
-                "this server requires authentication — include a token query parameter",
+                "a valid local ticket or access token is required",
                 false,
                 "rest_run_auth",
             ),
         );
     }
-    run_handler_inner(state, req).await
+    run_handler_inner(state, req, None).await
+}
+
+pub async fn cancel_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.control_authorized(&headers, query.get("token").map(String::as_str)) {
+        return super::http_error::error_response(
+            StatusCode::UNAUTHORIZED,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::Authentication,
+                "a valid local ticket or access token is required",
+                false,
+                "rest_cancel_auth",
+            ),
+        );
+    }
+    if !valid_session_id(&session_id) {
+        return super::http_error::error_response(
+            StatusCode::BAD_REQUEST,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::InvalidRequest,
+                "invalid session id",
+                false,
+                "rest_cancel_session",
+            ),
+        );
+    }
+
+    match state
+        .session_hub
+        .cancel_run(&session_id, "REST cancellation requested")
+        .await
+    {
+        CancelRunResult::Cancelling => super::http_error::json_response(
+            StatusCode::ACCEPTED,
+            &serde_json::json!({ "status": "cancelling", "session_id": session_id }),
+        ),
+        CancelRunResult::NotFound => super::http_error::error_response(
+            StatusCode::NOT_FOUND,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::NotFound,
+                "no active run exists for this session",
+                false,
+                "rest_cancel_run",
+            ),
+        ),
+        CancelRunResult::NotCancellable => super::http_error::error_response(
+            StatusCode::CONFLICT,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::InvalidRequest,
+                "the session is performing non-cancellable exclusive work",
+                true,
+                "rest_cancel_run",
+            ),
+        ),
+        CancelRunResult::TimedOut => super::http_error::error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::Internal,
+                "cancellation did not complete in time",
+                true,
+                "rest_cancel_run",
+            ),
+        ),
+    }
 }
 
 /// Programmatic entry for the in-process AutoDream scheduler: same path as
@@ -113,16 +183,51 @@ pub async fn run_handler(
 pub async fn run_handler_for_dream(
     state: Arc<AppState>,
     req: RunRequest,
+    expected_project_generation: u64,
 ) -> Result<Response, String> {
-    Ok(run_handler_inner(state, req).await)
+    Ok(run_handler_inner(state, req, Some(expected_project_generation)).await)
 }
 
-async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
-    // External REST runs count as user activity (AutoDream idle watcher).
-    *state.last_activity.lock().await = std::time::SystemTime::now();
+async fn run_handler_inner(
+    state: Arc<AppState>,
+    req: RunRequest,
+    expected_project_generation: Option<u64>,
+) -> Response {
+    let project_transition = state.projects.lock_transition().await;
+    let project = state.project();
+    if expected_project_generation.is_some_and(|generation| generation != project.generation()) {
+        return super::http_error::error_response(
+            StatusCode::CONFLICT,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::InvalidRequest,
+                "the project changed before the run could start",
+                true,
+                "rest_run_project_generation",
+            ),
+        );
+    }
+    // The scheduler's idle check is advisory; repeat the global run gate while
+    // holding the same transition mutex used by every run startup. This makes
+    // "no active foreground run at dream start" atomic with lease acquisition.
+    if req.dream && state.session_hub.has_active_runs().await {
+        return super::http_error::error_response(
+            StatusCode::CONFLICT,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::InvalidRequest,
+                "foreground work became active before the dream could start",
+                true,
+                "dream_run_gate",
+            ),
+        );
+    }
+    // Only external REST runs count as user activity. AutoDream must not reset
+    // the idle timer that triggered it.
+    if !req.dream {
+        *state.last_activity.lock().await = std::time::SystemTime::now();
+    }
     // Resolve or create a session.
     let session_handle = if let Some(ref id) = req.session_id {
-        match resume_session(&state.session_service, &state.cwd(), id) {
+        match resume_session(&state.session_service, project.cwd(), id) {
             Ok(handle) => handle,
             Err(e) => {
                 return super::http_error::error_response(
@@ -137,7 +242,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             }
         }
     } else {
-        match create_new_session(&state.session_service, &state.cwd(), &state.config) {
+        match create_new_session(&state.session_service, project.cwd(), project.config()) {
             Some(handle) => handle,
             None => {
                 return super::http_error::error_response(
@@ -155,6 +260,20 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
 
     let session = session_handle.session.clone();
     let session_id = session.id().to_string();
+    let mut run_lease = match state.session_hub.try_acquire_run(&session_id, None).await {
+        Ok(lease) => lease,
+        Err(()) => {
+            return super::http_error::error_response(
+                StatusCode::CONFLICT,
+                nonoclaw_core::AppError::new(
+                    nonoclaw_core::ErrorCode::InvalidRequest,
+                    "this session already has an active run",
+                    true,
+                    "rest_run_lease",
+                ),
+            )
+        }
+    };
     // Tag freshly created dream sessions so auto-resume skips them.
     if req.dream && req.session_id.is_none() {
         if let Err(e) = session
@@ -167,6 +286,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
     let session_snapshot = match session.snapshot().await {
         Ok(s) => s,
         Err(_) => {
+            run_lease.finish().await;
             return super::http_error::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 nonoclaw_core::AppError::new(
@@ -197,8 +317,8 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
     };
 
     // Build engine options via the same canonical path as WebSocket runs.
-    let mut options = state
-        .config
+    let mut options = project
+        .config()
         .resolve_run(RunConfigOverrides {
             source: ConfigSource::WebRequest {
                 field: "rest_run".into(),
@@ -219,16 +339,20 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
     // called, so this is just a safety net.
     let pending_perms = Arc::clone(&state.pending_permissions);
     let perm_meta = Arc::clone(&state.permission_meta);
+    let permission_session_id = session_id.clone();
     options.permission_resolver = Some(Arc::new(move |request| {
         let pending_perms = Arc::clone(&pending_perms);
         let perm_meta = Arc::clone(&perm_meta);
+        let session_id = permission_session_id.clone();
         Box::pin(async move {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let request_id = uuid::Uuid::new_v4().to_string();
-            pending_perms.lock().await.insert(request_id.clone(), sender);
+            let key = (session_id.clone(), request_id.clone());
+            pending_perms.lock().await.insert(key.clone(), sender);
             perm_meta.lock().await.insert(
-                request_id.clone(),
+                key,
                 super::permission_api::PendingPermissionInfo {
+                    session_id,
                     request_id,
                     tool_name: request.tool_name,
                     message: nonoclaw_core::redact_text(&request.message),
@@ -241,21 +365,22 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
         })
     }));
     options.is_non_interactive = true;
-    options.skills_manager = Some(Arc::clone(&state.skills_manager));
+    options.skills_manager = Some(Arc::clone(project.skills_manager()));
     options.background_registry = Some(Arc::clone(&state.background_registry));
 
     // Build the client.
-    let run_client = match state
-        .config
+    let run_client = match project
+        .config()
         .client_for(ClientPurpose::Conversation, Some(&model_used))
     {
         Ok(client) => client,
         Err(err) => {
             tracing::warn!(model = %model_used, error = %err, "rest run client build failed");
+            run_lease.finish().await;
             return super::http_error::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 super::http_error::model_client_error(
-                    &state.config,
+                    project.config(),
                     &model_used,
                     &err,
                     "rest_run_client",
@@ -273,7 +398,20 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
         session_snapshot,
     );
 
-    let controller = RunController::for_engine(&engine, state.cwd());
+    let controller = RunController::for_engine(&engine, project.cwd().to_path_buf());
+    if run_lease.set_controller(controller.clone()).await.is_err() {
+        run_lease.finish().await;
+        return super::http_error::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            nonoclaw_core::AppError::new(
+                nonoclaw_core::ErrorCode::Internal,
+                "the reserved run slot was lost",
+                true,
+                "rest_run_lease",
+            ),
+        );
+    }
+    drop(project_transition);
 
     // Channel for streaming events back to the HTTP response.
     let (event_tx, event_rx) = mpsc::unbounded_channel::<RunStreamItem>();
@@ -289,40 +427,44 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
         let session_for_events = session_for_run.clone();
         let event_tx_done = event_tx.clone();
         let completion = controller
-            .start(engine, MessageContent::from_text(&req.prompt), move |sequenced| {
-                let session_clone = session_for_events.clone();
-                let tx = event_tx.clone();
-                let stats = Arc::clone(&tool_stats_consumer);
-                async move {
-                    if let nonoclaw_core::RunEvent::ToolExecutionFinished { status, .. } =
-                        &sequenced.event
-                    {
-                        use nonoclaw_core::TechnicalStatus;
-                        let shift = match status {
-                            TechnicalStatus::Succeeded | TechnicalStatus::Repaired => 32,
-                            TechnicalStatus::Failed => 0,
-                            _ => {
-                                let revision = session_clone
-                                    .snapshot()
-                                    .await
-                                    .map(|s| s.revision)
-                                    .unwrap_or_default();
-                                let envelope = sequenced.with_session_revision(revision);
-                                let _ = tx.send(RunStreamItem::Event { envelope });
-                                return;
-                            }
-                        };
-                        stats.fetch_add(1u64 << shift, std::sync::atomic::Ordering::Relaxed);
+            .start(
+                engine,
+                MessageContent::from_text(&req.prompt),
+                move |sequenced| {
+                    let session_clone = session_for_events.clone();
+                    let tx = event_tx.clone();
+                    let stats = Arc::clone(&tool_stats_consumer);
+                    async move {
+                        if let nonoclaw_core::RunEvent::ToolExecutionFinished { status, .. } =
+                            &sequenced.event
+                        {
+                            use nonoclaw_core::TechnicalStatus;
+                            let shift = match status {
+                                TechnicalStatus::Succeeded | TechnicalStatus::Repaired => 32,
+                                TechnicalStatus::Failed => 0,
+                                _ => {
+                                    let revision = session_clone
+                                        .snapshot()
+                                        .await
+                                        .map(|s| s.revision)
+                                        .unwrap_or_default();
+                                    let envelope = sequenced.with_session_revision(revision);
+                                    let _ = tx.send(RunStreamItem::Event { envelope });
+                                    return;
+                                }
+                            };
+                            stats.fetch_add(1u64 << shift, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let revision = session_clone
+                            .snapshot()
+                            .await
+                            .map(|s| s.revision)
+                            .unwrap_or_default();
+                        let envelope = sequenced.with_session_revision(revision);
+                        let _ = tx.send(RunStreamItem::Event { envelope });
                     }
-                    let revision = session_clone
-                        .snapshot()
-                        .await
-                        .map(|s| s.revision)
-                        .unwrap_or_default();
-                    let envelope = sequenced.with_session_revision(revision);
-                    let _ = tx.send(RunStreamItem::Event { envelope });
-                }
-            })
+                },
+            )
             .wait()
             .await;
 
@@ -378,16 +520,17 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
         match terminal.status {
             RunTerminalStatus::Done => {
                 if let Some(r) = terminal.result {
-                    state_for_run.session_hub.accumulate_usage(&session_id, &r.usage).await;
+                    state_for_run
+                        .session_hub
+                        .accumulate_usage(&session_id, &r.usage)
+                        .await;
                     let finish = match &terminal.reason {
                         nonoclaw_engine::RunFinishReason::Completed { .. } => "completed",
                         nonoclaw_engine::RunFinishReason::MaxTurns { .. } => "max_turns",
                         nonoclaw_engine::RunFinishReason::BudgetExceeded { .. } => {
                             "budget_exceeded"
                         }
-                        nonoclaw_engine::RunFinishReason::ContextLimit { .. } => {
-                            "context_limit"
-                        }
+                        nonoclaw_engine::RunFinishReason::ContextLimit { .. } => "context_limit",
                         _ => "other",
                     }
                     .to_string();
@@ -421,9 +564,7 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
             RunTerminalStatus::Error => {
                 let reason = match &terminal.reason {
                     nonoclaw_engine::RunFinishReason::Error {
-                        message,
-                        retryable,
-                        ..
+                        message, retryable, ..
                     } => (nonoclaw_core::redact_text(message), *retryable),
                     other => (format!("{other:?}"), false),
                 };
@@ -435,16 +576,14 @@ async fn run_handler_inner(state: Arc<AppState>, req: RunRequest) -> Response {
                 });
             }
         }
+        run_lease.finish().await;
     });
 
     // Convert the mpsc receiver into an NDJSON stream using futures::stream.
     let stream = futures::stream::unfold(event_rx, |mut rx| async move {
         rx.recv().await.map(|item| {
             let line = serde_json::to_string(&item).unwrap_or_default();
-            (
-                Ok::<_, std::convert::Infallible>(format!("{line}\n")),
-                rx,
-            )
+            (Ok::<_, std::convert::Infallible>(format!("{line}\n")), rx)
         })
     });
 
