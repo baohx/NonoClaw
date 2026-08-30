@@ -4,12 +4,13 @@
  */
 
 import { buildLedgerLayout } from "./layout.ts";
-import { deriveTrajectoryTimeline, timelineSelectionForRange, IDLE_COMPRESS_SECONDS } from "./timeline.ts";
+import { deriveTrajectoryTimeline, timelineSelectionForRange, IDLE_COMPRESS_SECONDS, type TrajectoryTimelineSpan } from "./timeline.ts";
 import { TrajectorySearchIndex } from "./search.ts";
 import { projectLedgerRows, visibleLedgerRows } from "./virtual-rows.ts";
 import { formatDurationMillis, formatElapsedSeconds, formatTokenCount, ledgerRecordId } from "./types.ts";
 import type { ChatMessage, SubagentRun } from "../types.ts";
 import type { TraceEntry } from "../trace.ts";
+import { appendTraceEntry } from "../trace.ts";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`ledger invariant failed: ${message}`);
@@ -182,6 +183,17 @@ check(idleTimeline !== null && idleTimeline.idleBreaks.length > 0, "gap beyond t
   const rawSpan = (10 * IDLE_COMPRESS_SECONDS * 1000 + 100); // ~600.1s of wall clock
   const renderedSpan = idleTimeline!.domain[1] - idleTimeline!.domain[0];
   check(renderedSpan < rawSpan / 2, `idle compression shrinks the rendered domain (raw ${rawSpan}ms -> ${renderedSpan.toFixed(0)}ms)`);
+  // Idle gaps collapse to a thin seam: the compressed distance between the
+  // last span before a break and the first span after it must be ~1s (the
+  // seam), not the threshold-sized (60s) residual the old code left.
+  {
+    const ordered = [...idleTimeline!.spans].sort((a, b) => a.start - b.start);
+    const brk = idleTimeline!.idleBreaks[0];
+    const i = ordered.findIndex((s) => s.start >= brk.at - 1e-9);
+    check(i > 0, "a span follows the idle break in time mode");
+    const seamMs = (ordered[i].start - ordered[i - 1].end) * renderedSpan;
+    check(seamMs <= 1_000 + 50, `idle gap collapses to a ≤1s seam, not the 60s threshold (got ${seamMs.toFixed(0)}ms)`);
+  }
   // Idle mark must sit inside the rendered domain (normalized 0..1), not at the
   // raw far-future coordinate that the old code left behind.
   check(idleTimeline!.idleBreaks.every((b) => b.at >= 0 && b.at <= 1), "idle marks are normalized into the compressed domain");
@@ -274,23 +286,34 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
     subagentRunsById: {},
   });
   const plainAssistant = layoutNoTrace.turns[0].cells.find((c) => c.kind === "assistant");
-  check(plainAssistant !== undefined && plainAssistant.timeSeconds === null, "no trace → assistant duration stays null rather than guessing");
-  // Replay fallback: the thinking row must NOT take the same gap as the
-  // assistant row — adjacent thinking/assistant durations were identical
-  // (double-counted). With a following stamped record the assistant gap fills,
-  // thinking stays unknown.
-  const replayWithNext = buildLedgerLayout({
+  check(plainAssistant !== undefined && plainAssistant.timeSeconds !== null && Math.abs(plainAssistant.timeSeconds! - 1.5) < 1e-9, `no trace → assistant duration falls back to the backward commit gap (got ${plainAssistant?.timeSeconds}s, want 1.5s)`);
+  // Replay fallback: backward gap — an assistant step's duration is its own
+  // commit time minus the previous stamped record. The forward gap used to
+  // span the user's reading pause after the turn's final answer, blow past
+  // the 60s cap, and render "—" everywhere on replayed sessions.
+  const replayBackward = buildLedgerLayout({
     messages: [{ id: "u4", role: "user", content: "hi", timestamp: now },
                { id: "a3", role: "assistant", content: "answer", thinking: "reasoning", timestamp: stepEnd, streaming: false },
                { id: "t1", role: "tool", toolName: "Read", toolOk: true, content: "ok", timestamp: stepEnd + 1_500, durationMs: 900 } as unknown as ChatMessage],
     traceEntries: [],
     subagentRunsById: {},
   });
-  const filledAssistant = replayWithNext.turns[0].cells.find((c) => c.kind === "assistant");
-  check(filledAssistant !== undefined && filledAssistant.timeSeconds !== null && Math.abs(filledAssistant.timeSeconds! - 1.5) < 1e-9, `replay fallback still fills the assistant gap (got ${filledAssistant?.timeSeconds}s, want 1.5s)`);
-  const skippedThinking = replayWithNext.turns[0].cells.find((c) => c.kind === "thinking");
+  const filledAssistant = replayBackward.turns[0].cells.find((c) => c.kind === "assistant");
+  check(filledAssistant !== undefined && filledAssistant.timeSeconds !== null && Math.abs(filledAssistant.timeSeconds! - 1.5) < 1e-9, `replay fallback fills the assistant gap backward from the user prompt (got ${filledAssistant?.timeSeconds}s, want 1.5s)`);
+  // The final answer of a turn (next record is a user prompt minutes later)
+  // must still get its step time, not be dropped as idle.
+  const replayTurnEnd = buildLedgerLayout({
+    messages: [{ id: "u5", role: "user", content: "hi", timestamp: now },
+               { id: "a4", role: "assistant", content: "final answer", thinking: "reasoning", timestamp: now + 20_000, streaming: false },
+               { id: "u6", role: "user", content: "next question", timestamp: now + 300_000 }],
+    traceEntries: [],
+    subagentRunsById: {},
+  });
+  const turnEndAssistant = replayTurnEnd.turns[0].cells.find((c) => c.kind === "assistant");
+  check(turnEndAssistant !== undefined && turnEndAssistant.timeSeconds !== null && Math.abs(turnEndAssistant.timeSeconds! - 20) < 1e-9, `turn-final answer keeps its step time even with 280s user idle after it (got ${turnEndAssistant?.timeSeconds}s, want 20s)`);
+  const skippedThinking = replayBackward.turns[0].cells.find((c) => c.kind === "thinking");
   check(skippedThinking !== undefined && skippedThinking.timeSeconds === null, "replay fallback skips thinking rows — adjacent thinking/assistant durations no longer identical");
-  const replayUser = replayWithNext.turns[0].cells.find((c) => c.kind === "user");
+  const replayUser = replayBackward.turns[0].cells.find((c) => c.kind === "user");
   check(replayUser !== undefined && replayUser.timeSeconds === null, "replay fallback skips user rows — the gap is model latency, not prompt runtime");
 
   // Parallel tool_use in one replayed step: without per-tool trace both tool
@@ -345,6 +368,123 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   check(oooThinking !== undefined && oooAssistant !== undefined, "out-of-order thinking close still projects both records");
   check(oooAssistant!.timeSeconds !== null && oooAssistant!.timeSeconds! >= 0, `out-of-order thinking close never yields a negative assistant duration (got ${oooAssistant?.timeSeconds}s)`);
   check(oooThinking!.timeSeconds !== null && oooThinking!.timeSeconds! <= (earlyStepEnd - (now + 100)) / 1000 + 1e-9, `thinking duration clamps at the step end (got ${oooThinking?.timeSeconds}s, cap ${((earlyStepEnd - (now + 100)) / 1000).toFixed(3)}s)`);
+
+  // Cross-run interleaving: `sequence` is a per-run counter (each RunContext
+  // starts at 1), so globally sorting mixed-run entries by sequence shuffles
+  // them. Run A's late `thinking_state active:false` (seq 50, early ts) sorts
+  // AFTER run B's `model_request_started` (seq 1, later ts) → the old window
+  // stamp lands in the new run's window → thinkingEnd < start → NEGATIVE
+  // thinking duration. Windows must be built per run and merged by start.
+  const crossRunEntries: TraceEntry[] = [
+    // Run A: short errored run, wall clock earlier. Its MessageStop fallback
+    // `thinking_state active:false` (seq 2, early ts) is the straggler.
+    { id: "xa1", runId: "runA", sessionId: "s", sequence: 1, timestampMs: now, kind: "model_request_started", summary: "req", details: { turn: 1 }, category: "model", status: "active" },
+    { id: "xa2", runId: "runA", sessionId: "s", sequence: 2, timestampMs: now + 1_800, kind: "thinking_state", summary: "thinking", details: { active: false, turn: 1 }, category: "model", status: "success" },
+    // Run B: sequence restarts at 1, wall clock later
+    { id: "xb1", runId: "runB", sessionId: "s", sequence: 1, timestampMs: now + 10_000, kind: "model_request_started", summary: "req", details: { turn: 1 }, category: "model", status: "active" },
+    { id: "xb2", runId: "runB", sessionId: "s", sequence: 3, timestampMs: now + 11_200, kind: "thinking_state", summary: "thinking", details: { active: false, turn: 1 }, category: "model", status: "success" },
+    { id: "xb3", runId: "runB", sessionId: "s", sequence: 4, timestampMs: now + 11_400, kind: "usage_updated", summary: "usage", details: { turn: 1, turn_output: 10 }, category: "usage", status: "success" },
+  ];
+  const crossMsgs: ChatMessage[] = [
+    { id: "u1", role: "user", content: "first", timestamp: now - 100 },
+    { id: "a1", role: "assistant", content: "run A answer", thinking: "reasoning A", timestamp: now + 1_800, streaming: false },
+    { id: "u2", role: "user", content: "continue", timestamp: now + 9_900 },
+    { id: "a2", role: "assistant", content: "run B answer", thinking: "reasoning B", timestamp: now + 11_200, streaming: false },
+  ];
+  // entries fed through the store's append path (appendTraceEntry sorts ALL
+  // runs globally by sequence — per-run counters are not comparable) so the
+  // test reproduces exactly what the live UI sees.
+  let shuffled: TraceEntry[] = [];
+  for (const e of crossRunEntries) shuffled = appendTraceEntry(shuffled, e);
+  const layoutCross = buildLedgerLayout({ messages: crossMsgs, traceEntries: shuffled, subagentRunsById: {} });
+  const crossThinkingB = layoutCross.turns[1]?.cells.find((c) => c.kind === "thinking");
+  check(crossThinkingB !== undefined, "cross-run turn B still projects a thinking record");
+  check(crossThinkingB!.timeSeconds === null || crossThinkingB!.timeSeconds! >= 0, `run B thinking duration is never negative from run A's interleaved close (got ${crossThinkingB?.timeSeconds}s)`);
+  const crossAssistantB = layoutCross.turns[1]?.cells.find((c) => c.kind === "assistant");
+  check(crossAssistantB!.timeSeconds === null || crossAssistantB!.timeSeconds! >= 0, `run B assistant duration is never negative from interleaving (got ${crossAssistantB?.timeSeconds}s)`);
+}
+
+// ── duration mode stacks per lane instead of overlapping at 0 ─────────────
+// Regression: every bar anchored at 0 with width=duration, so only the
+// longest bar per lane was visible and the mode showed no cumulative sums.
+{
+  const durTurns = layoutSub.turns.length > 0 ? layoutSub.turns : layout.turns;
+  const tl = deriveTrajectoryTimeline(durTurns, "duration");
+  check(tl !== null, "duration timeline derives for stacking check");
+  // Group spans per lane; within a lane bars must tile consecutively (no
+  // zero-anchored overlap): sorted by start, each bar begins at or after the
+  // previous bar's end.
+  const byLane = new Map<string, TrajectoryTimelineSpan[]>();
+  for (const s of tl!.spans) {
+    byLane.set(s.lane, [...(byLane.get(s.lane) ?? []), s]);
+  }
+  check(byLane.size > 1, "duration mode renders multiple lanes");
+  for (const [lane, spans] of byLane) {
+    const sorted = [...spans].sort((a, b) => a.start - b.start);
+    for (let i = 1; i < sorted.length; i += 1) {
+      check(sorted[i].start >= sorted[i - 1].end - 1e-9,
+        `duration lane ${lane} bars stack end-to-end (bar ${i} starts ${sorted[i].start.toFixed(4)} < prev end ${sorted[i - 1].end.toFixed(4)})`);
+    }
+  }
+  // The lane total equals the sum of member bar durations (cumulative view).
+  for (const [lane, spans] of byLane) {
+    const laneTotal = Math.max(...spans.map((s) => s.end));
+    const sum = spans.reduce((acc, s) => acc + (s.end - s.start), 0);
+    check(Math.abs(laneTotal - sum) < 1e-6, `duration lane ${lane} total (${laneTotal.toFixed(4)}) equals the sum of its bars (${sum.toFixed(4)})`);
+  }
+}
+
+// ── collapsed turns keep their header row ─────────────────────────────────
+// Regression: collapsing a turn filtered it out before projection, so the
+// chevron click made the whole turn's data vanish instead of folding it.
+{
+  const collapsed = new Set([0]);
+  const p = projectLedgerRows(layout.turns, collapsed);
+  check(p.rows.some((r) => r.kind === "turn-header" && r.turn === 0), "collapsed turn keeps its header row (chevron stays clickable)");
+  check(!p.rows.some((r) => r.kind === "record" && r.turn === 0), "collapsed turn hides only its record rows");
+  check(p.rows.some((r) => r.kind === "record" && r.turn === 1), "other turns keep their record rows");
+  const pOpen = projectLedgerRows(layout.turns);
+  check(p.rows.length < pOpen.rows.length, "collapsed projection is strictly smaller than the open one");
+}
+
+// ── thinking/assistant span adjacency in time mode ────────────────────────
+// The assistant bar starts where the thinking bar ends (sequential halves of
+// one step). When the provider emits no `thinking_state active:false`, the
+// first streaming token is the thinking close: thinking = [step start, first
+// token], assistant = [first token, completed] — no overlap, no double count.
+{
+  const entries: TraceEntry[] = [
+    { id: "f1", runId: "r", sessionId: "s", sequence: 1, timestampMs: now + 100, kind: "model_request_started", summary: "req", details: { turn: 1 }, category: "model", status: "active" },
+    { id: "f2", runId: "r", sessionId: "s", sequence: 2, timestampMs: now + 900, kind: "stream_state_changed", summary: "stream", details: { state: "streaming", turn: 1 }, category: "model", status: "active" },
+    { id: "f3", runId: "r", sessionId: "s", sequence: 3, timestampMs: now + 1_500, kind: "usage_updated", summary: "usage", details: { turn: 1, turn_output: 10 }, category: "usage", status: "success" },
+  ];
+  const msgs: ChatMessage[] = [
+    { id: "u1", role: "user", content: "hi", timestamp: now },
+    { id: "a1", role: "assistant", content: "answer", thinking: "reasoning text", timestamp: now + 1_500, streaming: false },
+  ];
+  const l = buildLedgerLayout({ messages: msgs, traceEntries: entries, subagentRunsById: {} });
+  const tCell = l.turns[0].cells.find((c) => c.kind === "thinking");
+  const aCell = l.turns[0].cells.find((c) => c.kind === "assistant");
+  check(tCell !== undefined && aCell !== undefined, "no-close thinking step still projects both records");
+  // Thinking [step start → first token] = 800ms; assistant [first token →
+  // completed] = 600ms; the split sums to the step total (1.4s).
+  check(Math.abs((tCell!.timeSeconds ?? 0) - 0.8) < 1e-6, `thinking duration falls back to first token close (got ${tCell?.timeSeconds}s, want 0.8s)`);
+  check(Math.abs((aCell!.timeSeconds ?? 0) - 0.6) < 1e-6, `assistant duration is the post-first-token half (got ${aCell?.timeSeconds}s, want 0.6s)`);
+  // In time mode the two spans must tile without overlap.
+  const tl = deriveTrajectoryTimeline(l.turns, "time");
+  check(tl !== null, "time timeline derives for adjacency check");
+  const tSpan = tl!.spans.find((s) => s.kind === "thinking");
+  const aSpan = tl!.spans.find((s) => s.kind === "assistant");
+  check(tSpan !== undefined && aSpan !== undefined, "thinking + assistant spans both present in time mode");
+  check(aSpan!.start >= tSpan!.end - 1e-6, `assistant span starts at/after thinking end (a=${aSpan!.start.toFixed(4)}, t.end=${tSpan!.end.toFixed(4)})`);
+
+  // Variant with NO streaming marker at all (pure replay, no trace events):
+  // thinking keeps null (renders 0s), assistant keeps the whole replay gap.
+  const l2 = buildLedgerLayout({ messages: msgs, traceEntries: [], subagentRunsById: {} });
+  const t2 = l2.turns[0].cells.find((c) => c.kind === "thinking");
+  const a2 = l2.turns[0].cells.find((c) => c.kind === "assistant");
+  check(t2 !== undefined && (t2.timeSeconds === null || t2.timeSeconds === 0), `traceless thinking row stays 0s (got ${t2?.timeSeconds}s)`);
+  check(a2 !== undefined && (a2.timeSeconds ?? 0) > 0, `traceless assistant row takes the replay-fallback gap (got ${a2?.timeSeconds}s)`);
 }
 
 console.log("ledger invariants: all passed");

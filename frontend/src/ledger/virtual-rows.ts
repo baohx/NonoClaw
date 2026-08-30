@@ -61,7 +61,10 @@ function stepsOf(cells: readonly LedgerTurnModel["cells"][number][]): LedgerTurn
  * Project turns into flat measurable rows. Request-only records merge into
  * the next measurable row rather than emitting zero-height separators.
  */
-export function projectLedgerRows(turns: readonly LedgerTurnModel[]): VirtualLedgerProjection {
+export function projectLedgerRows(
+  turns: readonly LedgerTurnModel[],
+  collapsedTurns?: ReadonlySet<number>,
+): VirtualLedgerProjection {
   const rows: LedgerRow[] = [];
   const cells: LedgerTurnModel["cells"][number][] = [];
 
@@ -83,14 +86,18 @@ export function projectLedgerRows(turns: readonly LedgerTurnModel[]): VirtualLed
       request: turn.request,
       usage: turn.usage,
     });
-    const steps = stepsOf(turn.cells);
-    let stepNo = 0;
-    for (const step of steps) {
-      stepNo += 1;
-      for (const cell of step) {
-        const key = `t${turn.n}\u0000s${stepNo}\u0000${cell.index}`;
-        rows.push({ kind: "record", key, index: cell.index, turn: turn.n, height: RECORD_HEIGHT, cell });
-        cells.push(cell);
+    // Collapsed turns keep their header (so the chevron remains visible) but
+    // hide the record rows beneath it — never remove the whole turn.
+    if (!collapsedTurns?.has(turn.n)) {
+      const steps = stepsOf(turn.cells);
+      let stepNo = 0;
+      for (const step of steps) {
+        stepNo += 1;
+        for (const cell of step) {
+          const key = `t${turn.n}\u0000s${stepNo}\u0000${cell.index}`;
+          rows.push({ kind: "record", key, index: cell.index, turn: turn.n, height: RECORD_HEIGHT, cell });
+          cells.push(cell);
+        }
       }
     }
     rows.push({ kind: "turn-divider", key: `divider\u0000${turn.n}`, turn: turn.n, height: DIVIDER_HEIGHT });

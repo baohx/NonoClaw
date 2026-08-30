@@ -73,6 +73,14 @@ function cellRange(cell: LedgerCellLike): CellRange | null {
   return { start, end: start + duration };
 }
 
+/** Swimlane a cell belongs to, keyed off its ledger kind. */
+function laneOf(cell: LedgerCellLike): TrajectoryTimelineSpan["lane"] {
+  if (cell.kind === "assistant") return "assistant";
+  if (cell.kind === "thinking") return "thinking";
+  if (cell.kind === "tool") return "tool";
+  return "request";
+}
+
 /**
  * Derive the timeline model for the current mode.
  * Ported from DSH `deriveTrajectoryTimeline`.
@@ -84,6 +92,10 @@ export function deriveTrajectoryTimeline(
   const timed: { cell: LedgerCellLike; range: CellRange }[] = [];
   let seqCursor = 0;
   let seqEnd = 0;
+  // Duration mode stacks each lane's bars end-to-end (grouped cumulative
+  // consumption), instead of anchoring every bar at zero where only the
+  // longest per lane stays visible.
+  const durationCursor = new Map<TrajectoryTimelineSpan["lane"], number>();
 
   for (const turn of turns) {
     for (const cell of turn.cells) {
@@ -99,7 +111,11 @@ export function deriveTrajectoryTimeline(
       if (mode === "sequence") {
         timed.push({ cell, range: { start: seqCursor - 1, end: seqCursor } });
       } else if (mode === "duration") {
-        timed.push({ cell, range: { start: 0, end: Math.max(1, range.end - range.start) } });
+        const lane = laneOf(cell);
+        const dur = Math.max(1, range.end - range.start);
+        const start = durationCursor.get(lane) ?? 0;
+        durationCursor.set(lane, start + dur);
+        timed.push({ cell, range: { start, end: start + dur } });
       } else {
         timed.push({ cell, range });
       }
@@ -127,15 +143,19 @@ export function deriveTrajectoryTimeline(
   if (shouldCompress) {
     const sorted = [...timed].sort((a, b) => a.range.start - b.range.start);
     const IDLE_MS = IDLE_COMPRESS_SECONDS * 1000;
+    // Idle gaps are collapsed to a thin visible seam (not the 60s threshold
+    // itself): the mark plus this seam communicate "a long gap was here"
+    // without eating the chart, and activity blocks become contiguous.
+    const SEAM_MS = 1_000;
     let offset = 0; // cumulative compressed-out time (ms)
     let prevEnd = sorted[0].range.start;
     for (const item of sorted) {
       const gap = item.range.start - prevEnd;
       if (gap > IDLE_MS) {
-        const saved = gap - IDLE_MS;
-        // The mark sits at the end of the kept threshold gap, in compressed
+        const saved = gap - SEAM_MS;
+        // The mark sits at the end of the kept seam, in compressed
         // coordinates (offset is the amount collapsed *before* this gap).
-        idleBreaksRaw.push({ at: prevEnd + IDLE_MS - offset, savedSeconds: saved / 1000 });
+        idleBreaksRaw.push({ at: prevEnd + SEAM_MS - offset, savedSeconds: saved / 1000 });
         offset += saved;
       }
       compressedRange.set(item.cell, {
@@ -152,11 +172,7 @@ export function deriveTrajectoryTimeline(
   const renderSpan = renderDomain[1] - renderDomain[0] || 1;
 
   const spans: TrajectoryTimelineSpan[] = timed.map(({ cell, range }) => {
-    const lane: TrajectoryTimelineSpan["lane"] =
-      cell.kind === "assistant" ? "assistant"
-        : cell.kind === "thinking" ? "thinking"
-          : cell.kind === "tool" ? "tool"
-            : "request";
+    const lane = laneOf(cell);
     const r = shouldCompress ? (compressedRange.get(cell) ?? range) : range;
     return {
       index: cell.index,

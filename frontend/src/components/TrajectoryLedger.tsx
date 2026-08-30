@@ -27,6 +27,13 @@ const MODE_LABEL: Record<TrajectoryTimelineMode, string> = {
   time: "Time",
   actual: "Actual",
 };
+const LANES = ["assistant", "thinking", "tool", "request"] as const;
+const LANE_LABEL: Record<(typeof LANES)[number], string> = {
+  assistant: "assistant",
+  thinking: "thinking",
+  tool: "tool",
+  request: "request",
+};
 
 function clockTime(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms)) return "";
@@ -48,10 +55,14 @@ export default function TrajectoryLedger() {
   const [viewportH, setViewportH] = useState(480);
   const [collapsedTurns, setCollapsedTurns] = useState<Set<number>>(new Set());
   const [dragRange, setDragRange] = useState<{ start: number; end: number } | null>(null);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState(0);
+  // Overview zoom/pan: `zoom` is a magnification factor (1 = whole domain fits,
+  // 8 = 8x magnified) and `pan` is the domain start of the visible window
+  // (0..1-1/zoom). Both live in one atom so the pan clamp stays consistent with
+  // zoom during wheel updates.
+  const [view, setView] = useState({ zoom: 1, pan: 0 });
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const overviewRef = useRef<HTMLDivElement | null>(null);
   const indexRef = useRef<TrajectorySearchIndex>(new TrajectorySearchIndex());
 
   const layout = useMemo(
@@ -59,14 +70,12 @@ export default function TrajectoryLedger() {
     [messages, traceEntries, subagentRunsById],
   );
 
-  const visibleTurns = useMemo(
-    () => layout.turns.filter((t) => !collapsedTurns.has(t.n)),
+  const projection = useMemo(
+    () => projectLedgerRows(layout.turns, collapsedTurns),
     [layout, collapsedTurns],
   );
 
-  const projection = useMemo(() => projectLedgerRows(visibleTurns), [visibleTurns]);
-
-  const timeline = useMemo(() => deriveTrajectoryTimeline(visibleTurns, mode), [visibleTurns, mode]);
+  const timeline = useMemo(() => deriveTrajectoryTimeline(layout.turns, mode), [layout, mode]);
 
   useEffect(() => {
     indexRef.current.addCells(projection.cells);
@@ -76,13 +85,13 @@ export default function TrajectoryLedger() {
 
   const selected = useMemo(() => {
     if (selectedId === null) return null;
-    for (const turn of visibleTurns) {
+    for (const turn of layout.turns) {
       for (const cell of turn.cells) {
         if (ledgerRecordId(cell) === selectedId) return cell;
       }
     }
     return null;
-  }, [selectedId, visibleTurns]);
+  }, [selectedId, layout]);
 
   const window_ = useMemo(
     () => visibleLedgerRows(projection, scrollTop, viewportH),
@@ -106,18 +115,31 @@ export default function TrajectoryLedger() {
     else if (!atTop || el.scrollTop > 48) setFollowTail(false);
   }, []);
 
+  // Map a pointer x (px within the overview) to a normalized domain position.
+  const screenToDomain = useCallback((x: number, width: number) => {
+    if (width <= 0) return 0;
+    return Math.max(0, Math.min(1, view.pan + (x / width) * (1 / view.zoom)));
+  }, [view]);
+
+  // Map a normalized domain position to a 0..1 screen fraction of the overview.
+  const domainToScreen = useCallback((d: number) => {
+    return (d - view.pan) / (1 / view.zoom);
+  }, [view]);
+
   // Drag-select on the overview: focus records overlapping the range.
   const dragRef = useRef<{ x: number; width: number } | null>(null);
   const onMouseDownOverview = useCallback((e: React.MouseEvent) => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     dragRef.current = { x: e.clientX - rect.left, width: rect.width };
-    setDragRange({ start: (e.clientX - rect.left) / rect.width, end: (e.clientX - rect.left) / rect.width });
-  }, []);
+    const d = screenToDomain(e.clientX - rect.left, rect.width);
+    setDragRange({ start: d, end: d });
+  }, [screenToDomain]);
   const onMouseMoveOverview = useCallback((e: React.MouseEvent) => {
     if (dragRef.current === null) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    setDragRange({ start: dragRef.current.x / dragRef.current.width, end: (e.clientX - rect.left) / rect.width });
-  }, []);
+    const d = screenToDomain(e.clientX - rect.left, rect.width);
+    setDragRange((prev) => (prev === null ? { start: d, end: d } : { start: prev.start, end: d }));
+  }, [screenToDomain]);
   const onMouseUpOverview = useCallback(() => {
     if (dragRange !== null) {
       const sel = timelineSelectionForRange(timeline, dragRange);
@@ -131,12 +153,49 @@ export default function TrajectoryLedger() {
     setFocusedIndices(null);
   }, []);
 
-  // Wheel zoom on the overview (time modes only).
-  const onWheelOverview = useCallback((e: React.WheelEvent) => {
-    if (!timeline?.isTimeDomain) return;
-    e.preventDefault();
-    setZoom((z) => Math.min(8, Math.max(1, z * (e.deltaY < 0 ? 1.15 : 1 / 1.15))));
-  }, [timeline?.isTimeDomain]);
+  // Wheel zoom on the overview (time modes only). Attached as a non-passive
+  // listener so `preventDefault` actually stops the surrounding scroll — the
+  // synthetic React onWheel is passive and cannot cancel the page scroll.
+  // Plain wheel = zoom at cursor; Shift+wheel = pan.
+  const isTimeDomainRef = useRef(false);
+  isTimeDomainRef.current = timeline?.isTimeDomain ?? false;
+  useEffect(() => {
+    const el = overviewRef.current;
+    if (el === null) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!isTimeDomainRef.current) return;
+      e.preventDefault();
+      setView((v) => {
+        const maxPan = 1 - 1 / v.zoom;
+        if (e.shiftKey) {
+          // Pan: delta in px → normalized visible window, then domain units.
+          const step = (e.deltaY / Math.max(1, el.clientWidth)) / v.zoom;
+          return { zoom: v.zoom, pan: Math.max(0, Math.min(maxPan, v.pan + step)) };
+        }
+        const rect = el.getBoundingClientRect();
+        const frac = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5;
+        const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        const zoom = Math.min(8, Math.max(1, v.zoom * factor));
+        const newMaxPan = 1 - 1 / zoom;
+        // Keep the domain point under the cursor fixed while zooming.
+        const domainAtCursor = v.pan + frac / v.zoom;
+        const pan = Math.max(0, Math.min(newMaxPan, domainAtCursor - frac / zoom));
+        return { zoom, pan };
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // Double-click resets zoom/pan back to the full domain.
+  const onDoubleClickOverview = useCallback(() => {
+    setView({ zoom: 1, pan: 0 });
+  }, []);
+
+  // Reset zoom/pan whenever the view mode changes (the domain changes shape).
+  useEffect(() => {
+    setView({ zoom: 1, pan: 0 });
+  }, [mode]);
 
   const toggleTurn = useCallback((n: number) => {
     setCollapsedTurns((prev) => {
@@ -199,27 +258,29 @@ export default function TrajectoryLedger() {
 
       <div
         className="ledger-overview"
+        ref={overviewRef}
         onMouseDown={onMouseDownOverview}
         onMouseMove={onMouseMoveOverview}
         onMouseUp={onMouseUpOverview}
         onMouseLeave={onMouseUpOverview}
+        onDoubleClick={onDoubleClickOverview}
         onContextMenu={onContextMenuOverview}
-        onWheel={onWheelOverview}
       >
         {timeline === null ? (
           <div className="ledger-overview__empty">No measurable records yet</div>
         ) : (
           <>
             <div className="ledger-overview__lanes">
-              {(["assistant", "thinking", "tool", "request"] as const).map((lane) => (
+              {LANES.map((lane) => (
                 <div key={lane} className={`ledger-overview__lane ledger-overview__lane--${lane}`}>
+                  <span className={`ledger-overview__lane-label ledger-overview__lane-label--${lane}`}>{LANE_LABEL[lane]}</span>
                   {timeline.spans.filter((s) => s.lane === lane).map((span) => (
                     <span
                       key={span.index}
                       className={`ledger-overview__span ledger-overview__span--${lane}${span.isError ? " ledger-overview__span--error" : ""}`}
                       style={{
-                        left: `${(span.start / zoom) * 100}%`,
-                        width: `${Math.max(0.4, ((span.end - span.start) / zoom) * 100)}%`,
+                        left: `${domainToScreen(span.start) * 100}%`,
+                        width: `${Math.max(0.4, (domainToScreen(span.end) - domainToScreen(span.start)) * 100)}%`,
                       }}
                       title={`#${span.index} · ${span.kind}`}
                     />
@@ -228,14 +289,14 @@ export default function TrajectoryLedger() {
               ))}
             </div>
             {timeline.idleBreaks.map((brk, i) => (
-              <span key={i} className="ledger-overview__idle" style={{ left: `${(brk.at / zoom) * 100}%` }} title={`idle gap collapsed · saved ${Math.round(brk.savedSeconds)}s`}>⌁</span>
+              <span key={i} className="ledger-overview__idle" style={{ left: `${domainToScreen(brk.at) * 100}%` }} title={`idle gap collapsed · saved ${Math.round(brk.savedSeconds)}s`}>⌁</span>
             ))}
             {dragRange !== null && (
               <span
                 className="ledger-overview__selection"
                 style={{
-                  left: `${(Math.min(dragRange.start, dragRange.end) / zoom) * 100}%`,
-                  width: `${(Math.abs(dragRange.end - dragRange.start) / zoom) * 100}%`,
+                  left: `${domainToScreen(Math.min(dragRange.start, dragRange.end)) * 100}%`,
+                  width: `${Math.abs(domainToScreen(dragRange.end) - domainToScreen(dragRange.start)) * 100}%`,
                 }}
               />
             )}

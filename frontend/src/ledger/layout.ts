@@ -93,55 +93,79 @@ function collectTurnUsageRaw(ev: Record<string, unknown> | undefined): UsageRaw 
   return Object.keys(flat).length > 0 ? flat : null;
 }
 
-/** Build engine step windows from trace entries, in chronological order. */
+/** Build engine step windows from trace entries, in chronological order.
+ *
+ * `sequence` is a PER-RUN counter (each engine RunContext numbers its events
+ * from 1), so entries of different runs in one session are not comparable by
+ * sequence — a prior run's straggler event can sort after the next run's
+ * `model_request_started` and land in its window, producing window stamps
+ * before the window even opened (negative durations). Build windows per run
+ * (in-run sequence is causal) and merge the groups by window start. */
 function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
-  const windows: StepWindow[] = [];
-  let current: StepWindow | null = null;
+  const byRun = new Map<string, TraceEntry[]>();
   for (const entry of entries) {
-    const ev = entry.details as Record<string, unknown> | undefined;
-    if (entry.kind === "model_request_started") {
-      current = {
-        turn: finiteMs(ev?.turn) ?? (windows.length + 1),
-        start: entry.timestampMs,
-        firstToken: null,
-        completed: null,
-        thinkingEnd: null,
-        usage: null,
-        provider: typeof ev?.provider === "string" ? ev.provider : undefined,
-      };
-      windows.push(current);
-      continue;
-    }
-    if (current === null) continue;
-    if (entry.kind === "model_resolved") {
-      if (typeof ev?.model === "string" && current.model === undefined) current.model = ev.model;
-    } else if (entry.kind === "retry_scheduled") {
-      const attempt = finiteMs(ev?.attempt);
-      if (attempt !== null && (current.retryAttempt === undefined || attempt > current.retryAttempt)) current.retryAttempt = attempt;
-    } else if (entry.kind === "stream_state_changed" && ev?.state === "streaming") {
-      if (current.firstToken === null) current.firstToken = entry.timestampMs;
-    } else if (entry.kind === "thinking_state" && ev?.active === false) {
-      // Precise end of the reasoning block. The first (earliest) active:false
-      // wins — providers may emit both a block-level close and a MessageStop
-      // fallback; the block close is the accurate one.
-      if (current.thinkingEnd === null) current.thinkingEnd = entry.timestampMs;
-    } else if (entry.kind === "usage_updated") {
-      if (current.completed === null) current.completed = entry.timestampMs;
-      const raw = collectTurnUsageRaw(ev);
-      if (raw !== null) current.usage = raw;
-    } else if (entry.kind === "tool_use_start" || entry.kind === "run_finished") {
-      // The assistant step ends when its tool batch starts or the run ends.
-      if (current.completed === null) current.completed = entry.timestampMs;
+    const list = byRun.get(entry.runId) ?? [];
+    list.push(entry);
+    byRun.set(entry.runId, list);
+  }
+  const windows: StepWindow[] = [];
+  for (const runEntries of byRun.values()) {
+    let current: StepWindow | null = null;
+    for (const entry of runEntries) {
+      const ev = entry.details as Record<string, unknown> | undefined;
+      if (entry.kind === "model_request_started") {
+        current = {
+          turn: finiteMs(ev?.turn) ?? (windows.length + 1),
+          start: entry.timestampMs,
+          firstToken: null,
+          completed: null,
+          thinkingEnd: null,
+          usage: null,
+          provider: typeof ev?.provider === "string" ? ev.provider : undefined,
+        };
+        windows.push(current);
+        continue;
+      }
+      if (current === null) continue;
+      if (entry.kind === "model_resolved") {
+        if (typeof ev?.model === "string" && current.model === undefined) current.model = ev.model;
+      } else if (entry.kind === "retry_scheduled") {
+        const attempt = finiteMs(ev?.attempt);
+        if (attempt !== null && (current.retryAttempt === undefined || attempt > current.retryAttempt)) current.retryAttempt = attempt;
+      } else if (entry.kind === "stream_state_changed" && ev?.state === "streaming") {
+        if (current.firstToken === null) current.firstToken = entry.timestampMs;
+      } else if (entry.kind === "thinking_state" && ev?.active === false) {
+        // Precise end of the reasoning block. The first (earliest) active:false
+        // wins — providers may emit both a block-level close and a MessageStop
+        // fallback; the block close is the accurate one.
+        if (current.thinkingEnd === null) current.thinkingEnd = entry.timestampMs;
+      } else if (entry.kind === "usage_updated") {
+        if (current.completed === null) current.completed = entry.timestampMs;
+        const raw = collectTurnUsageRaw(ev);
+        if (raw !== null) current.usage = raw;
+      } else if (entry.kind === "tool_use_start" || entry.kind === "run_finished") {
+        // The assistant step ends when its tool batch starts or the run ends.
+        if (current.completed === null) current.completed = entry.timestampMs;
+      }
     }
   }
+  windows.sort((a, b) => a.start - b.start);
   // Thinking is a sequential half of the step, so its close can never extend
   // past the step end. Providers may flush `thinking_state active:false`
   // AFTER the step's completion event (usage_updated / tool_use_start /
   // run_finished), which would otherwise anchor the assistant window at a
   // thinkingEnd > completed → negative duration. Clamp to completed.
+  // Symmetrically, a stamp BEFORE the window opened belongs to another run's
+  // straggler → drop it rather than render a negative duration.
   for (const w of windows) {
     if (w.thinkingEnd !== null && w.completed !== null && w.thinkingEnd > w.completed) {
       w.thinkingEnd = w.completed;
+    }
+    if (w.thinkingEnd !== null && w.thinkingEnd < w.start) {
+      w.thinkingEnd = null;
+    }
+    if (w.firstToken !== null && w.firstToken < w.start) {
+      w.firstToken = null;
     }
   }
   return windows;
@@ -261,7 +285,7 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       // step. Both rows previously anchored at step start, so they rendered
       // identical "Started" stamps and overlapping timeline spans. Anchor the
       // assistant row where thinking closed (visible output begins there).
-      const thinkingEnd = timing?.thinkingEnd ?? null;
+      const thinkingEnd = timing?.thinkingEnd ?? timing?.firstToken ?? null;
       const assistantStart = thinkingEnd ?? startedAt;
       const metric: AssistantMetricDetail | undefined = timing === undefined
         ? undefined
@@ -326,40 +350,37 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
     }
   }
 
-  // Replay fallback: wall-clock gap to the next stamped record approximates
-  // the duration of records that have no measured span (no trace entries).
-  // Capped at 60s — matching the idle-compression threshold in the timeline,
-  // beyond which the gap is user idle, not this record's runtime.
+  // Replay fallback: for records with no measured span (no trace entries),
+  // the wall-clock gap BACK to the previous stamped record approximates the
+  // step latency — each assistant message's `ts` is its commit time, so the
+  // backward gap is pure model step time and never contains user idle.
+  // (The old forward gap spanned the user's reading pause after a turn's
+  // final answer, exceeded the 60s cap and rendered "—".)
   {
     const REPLAY_FALLBACK_CAP_SECONDS = 60;
     const stamped = messages
       .map((m) => (typeof m.timestamp === "number" && Number.isFinite(m.timestamp) ? m.timestamp : null))
       .filter((t): t is number => t !== null);
     if (stamped.length >= 2) {
-      const timelineMs = stamped.map((t, i) => ({ t, next: stamped[i + 1] as number | undefined }));
+      let prevTs: number | null = null;
       for (const turn of turns) {
         for (const cell of turn.cells) {
-          if (cell.timeSeconds != null || cell.startedAt == null) continue;
           // Thinking rows never take the fallback: without a trace there is no
           // recorded close event, and the gap belongs to the assistant row
           // (the whole step). Filling both made adjacent thinking/assistant
           // rows show the identical duration — double-counted.
-          if (cell.kind === "thinking") continue;
-          // User prompts are instantaneous; the gap to the next stamped
-          // record is model response latency that belongs to the following
-          // assistant step, not to the user row. Filling it made the USER bar
-          // span the whole model step and overlap the thinking/assistant rows.
-          if (cell.kind === "user") continue;
-          let cursor: { t: number; next: number | undefined } | null = null;
-          for (const entry of timelineMs) {
-            if (entry.t <= cell.startedAt) cursor = entry;
-            else break;
+          if (cell.kind !== "thinking" && cell.kind !== "user"
+            && cell.timeSeconds == null && cell.startedAt != null && prevTs !== null) {
+            const spanMs = cell.startedAt - prevTs;
+            if (spanMs > 0 && spanMs <= REPLAY_FALLBACK_CAP_SECONDS * 1000) {
+              cell.timeSeconds = spanMs / 1000;
+            }
           }
-          if (cursor === null || cursor.next === undefined) continue;
-          const spanMs = cursor.next - cursor.t;
-          if (spanMs > 0 && spanMs <= REPLAY_FALLBACK_CAP_SECONDS * 1000) {
-            cell.timeSeconds = spanMs / 1000;
-          }
+          // Every stamped record advances the cursor — user prompts included:
+          // the assistant step behind them is measured back to this instant.
+          // Thinking rows do NOT advance it: without a trace they share the
+          // assistant message's commit ts and would zero out the step gap.
+          if (cell.kind !== "thinking" && cell.startedAt != null) prevTs = cell.startedAt;
         }
       }
     }
