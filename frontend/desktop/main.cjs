@@ -18,7 +18,7 @@
 //   <dir> positional  same as --project (e.g. `nonoclaw-desktop ~/my-wiki`)
 
 const { app, BrowserWindow, shell } = require("electron");
-const { spawn, execSync } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const net = require("net");
 const path = require("path");
 const fs = require("fs");
@@ -40,7 +40,7 @@ function loginShellPath() {
   const shells = [process.env.SHELL, "/bin/bash"].filter(Boolean);
   for (const sh of shells) {
     try {
-      const out = execSync(`"${sh}" -ilc 'printf %s "$PATH"'`, {
+      const out = execFileSync(sh, ["-ilc", 'printf %s "$PATH"'], {
         encoding: "utf8",
         timeout: 5000,
         stdio: ["ignore", "pipe", "ignore"],
@@ -304,6 +304,25 @@ async function pickPort(start) {
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
+function allowedExternalUrl(target) {
+  try {
+    const protocol = new URL(target).protocol;
+    return protocol === "https:" || protocol === "mailto:";
+  } catch {
+    return false;
+  }
+}
+
+function openAllowedExternal(target) {
+  if (!allowedExternalUrl(target)) {
+    console.warn("[desktop] blocked external URL with an untrusted scheme");
+    return;
+  }
+  void shell.openExternal(target).catch(() => {
+    console.warn("[desktop] failed to open external URL");
+  });
+}
+
 function createWindow(url) {
   const win = new BrowserWindow({
     width: 1440,
@@ -321,10 +340,21 @@ function createWindow(url) {
   });
 
   // External links (docs, QR help, etc.) open in the system browser,
-  // never hijack the app window.
+  // never hijack the app window. Only explicitly safe schemes are allowed.
   win.webContents.setWindowOpenHandler(({ url: target }) => {
-    shell.openExternal(target);
+    openAllowedExternal(target);
     return { action: "deny" };
+  });
+
+  const appOrigin = new URL(url).origin;
+  win.webContents.on("will-navigate", (event, target) => {
+    try {
+      if (new URL(target).origin === appOrigin) return;
+    } catch {
+      // Malformed targets are blocked below.
+    }
+    event.preventDefault();
+    openAllowedExternal(target);
   });
 
   win.loadURL(url);
