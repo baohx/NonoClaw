@@ -102,7 +102,7 @@ if ! $SKIP_TEST; then
     echo "━━━ Step 1: 测试 ━━━"
     (
         cd "$RUST_DIR"
-        cargo test --workspace 2>&1 | grep -E "test result:" || echo "  (all passed)"
+        cargo test --workspace
     )
     echo ""
 fi

@@ -892,19 +892,22 @@ NonoClaw exposes HTTP endpoints for external system integration (CI/CD, webhooks
 
 ### Run Management
 
+State-changing/control endpoints require authentication. Browser requests use the local HttpOnly ticket established by the UI; automation should send `Authorization: Bearer $NONOCLAW_TOKEN` (or a `?token=` query parameter).
+
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/run` | Start a headless run with a prompt; returns SSE stream of `RunEvent` envelopes. Accepts `model`, `permissionMode`, `maxTurns`, `allowedTools`, `disallowedTools`, `contextWindow`, `compactThreshold` overrides. |
-| `POST` | `/api/sessions/:id/cancel` | Cancel a running session. |
+| `POST` | `/api/run` | Start a headless run with a required `prompt`; optional fields are `session_id`, `model`, `max_turns`, `append_system_prompt`, `arguments`, and `permission_mode`. Returns newline-delimited JSON. |
+| `POST` | `/api/sessions/:session_id/cancel` | Request cancellation of that session's active run. |
 
 **Example** — start a run via REST:
 ```bash
 curl -N http://127.0.0.1:8765/api/run \
+  -H "Authorization: Bearer $NONOCLAW_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"explain Rust ownership","model":"deepseek-v4-pro"}'
+  -d '{"prompt":"explain Rust ownership","model":"deepseek-v4-pro","max_turns":20,"permission_mode":"auto"}'
 ```
 
-The response is an SSE stream (`text/event-stream`) of JSON envelopes, one per `RunEvent`.
+The response uses `Content-Type: application/x-ndjson`. Each line is one complete JSON object: an `event` envelope followed by a terminal `done` or `error` object.
 
 ### Permission Management
 
@@ -913,11 +916,12 @@ The response is an SSE stream (`text/event-stream`) of JSON envelopes, one per `
 | `GET` | `/api/sessions/:id/permissions` | List pending permission requests (`request_id`, tool name, input, message). |
 | `POST` | `/api/sessions/:id/permissions/:request_id` | Approve or deny a pending request. Body: `{"decision":"allow"}` or `{"decision":"deny"}`. |
 
-Enables CI/CD pipelines and webhooks to manage agent permissions without an active WebSocket connection.
+Enables CI/CD pipelines and webhooks to manage agent permissions without an active WebSocket connection. These endpoints use the same local-ticket/Bearer/query-token authentication policy.
 
 **Example** — approve a pending permission:
 ```bash
 curl -X POST http://127.0.0.1:8765/api/sessions/$SESSION_ID/permissions/$REQUEST_ID \
+  -H "Authorization: Bearer $NONOCLAW_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"decision":"allow"}'
 ```
