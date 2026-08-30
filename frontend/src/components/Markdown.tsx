@@ -10,35 +10,84 @@ interface Props {
   content: string;
 }
 
-/** Render mermaid diagrams in a container after mount. */
+/** Remove active content from Mermaid's generated SVG even when the
+ * bundled Mermaid sanitizer changes behavior across versions. */
+function hardenRenderedDiagram(root: HTMLElement) {
+  root
+    .querySelectorAll("script, foreignObject, iframe, object, embed")
+    .forEach((node) => node.remove());
+  root.querySelectorAll("*").forEach((node) => {
+    for (const attribute of Array.from(node.attributes)) {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+      if (name.startsWith("on")) {
+        node.removeAttribute(attribute.name);
+      } else if (["href", "xlink:href", "src"].includes(name)
+        && (value.startsWith("javascript:") || value.startsWith("data:text/html"))) {
+        node.removeAttribute(attribute.name);
+      }
+    }
+  });
+}
+
+/** Render Mermaid from inert text after mount. */
 function MermaidBlock({ source }: { source: string }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [failed, setFailed] = React.useState(false);
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    // Clear previous render
-    el.innerHTML = "";
-    const id = `mermaid-${Math.random().toString(36).slice(2, 9)}`;
-    el.innerHTML = `<div class="mermaid" id="${id}">${source}</div>`;
-    // Give mermaid a wide canvas so diagrams fill the container.
-    const mermaidDiv = el.querySelector<HTMLElement>(`#${id}`);
-    if (mermaidDiv) {
-      const w = el.clientWidth || 800;
-      mermaidDiv.style.width = `${w}px`;
-    }
-    // Trigger mermaid if loaded
+    let disposed = false;
+    setFailed(false);
+    el.replaceChildren();
+
     const win = window as any;
-    if (win.mermaid) {
-      try {
-        win.mermaid.run({ nodes: [el.querySelector(`#${id}`)] });
-      } catch {
-        el.innerHTML = `<pre class="mermaid-raw">${source}</pre>`;
-      }
+    if (!win.mermaid) {
+      setFailed(true);
+      return;
     }
+
+    const node = document.createElement("div");
+    node.className = "mermaid";
+    node.id = `mermaid-${Math.random().toString(36).slice(2, 9)}`;
+    // Never parse model output as HTML. Mermaid reads its DSL from textContent.
+    node.textContent = source;
+    el.appendChild(node);
+
+    const render = async () => {
+      try {
+        win.mermaid.initialize({
+          startOnLoad: false,
+          theme: document.documentElement.getAttribute("data-color-scheme") === "dark"
+            ? "dark"
+            : "neutral",
+          securityLevel: "strict",
+          htmlLabels: false,
+        });
+        await win.mermaid.run({ nodes: [node], suppressErrors: true });
+        if (!disposed) hardenRenderedDiagram(el);
+      } catch {
+        if (!disposed) {
+          el.replaceChildren();
+          setFailed(true);
+        }
+      }
+    };
+    void render();
+
+    return () => {
+      disposed = true;
+      el.replaceChildren();
+    };
   }, [source]);
 
-  return <div ref={ref} className="mermaid-container" />;
+  return (
+    <div className="mermaid-container">
+      <div ref={ref} className="mermaid-render-target" hidden={failed} />
+      {failed && <pre className="mermaid-raw">{source}</pre>}
+    </div>
+  );
 }
 
 /** Recursively extract plain text from React children (pierces hljs spans). */
@@ -52,14 +101,13 @@ function extractText(node: ReactNode): string {
   return "";
 }
 
-/** Render an SVG code block inline as an image. */
+/** Raw SVG is active browser content, so show it as source until a strict
+ * allowlist renderer is available. */
 function SvgBlock({ source }: { source: string }) {
-  const svg = source.trim().replace(/^<\?xml[^>]*\?>\s*/i, "");
   return (
-    <div
-      className="svg-container"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <pre className="svg-source" aria-label="SVG source (preview disabled for security)">
+      <code>{source}</code>
+    </pre>
   );
 }
 
