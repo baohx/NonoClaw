@@ -1,7 +1,7 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import type { FileEntry } from "../types";
-import { getMobileAccessToken } from "../security";
+import { getBrowserAccessToken, getMobileAccessToken } from "../security";
 
 interface Props {
   root: string;
@@ -83,7 +83,10 @@ export default function FileTree({ root, entries, onOpen, onRefresh, collapsed, 
 
   const download = useCallback((entry: FileEntry) => {
     if (entry.is_dir) return;
-    const token = getMobileAccessToken();
+    // Remote launches already hold the explicit QR token in their URL and no
+    // longer receive it back in Info frames. Local launches use the separate
+    // token kept only in memory after HttpOnly-ticket authentication.
+    const token = getBrowserAccessToken(window.location.search) || getMobileAccessToken();
     if (!token) {
       window.alert("Download requires an active access token.");
       closeMenu();

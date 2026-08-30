@@ -66,11 +66,12 @@ export function getMobileAccessToken(): string {
   return mobileAccessToken;
 }
 
-/** Prefer the credential explicitly present in the launch URL. After a direct
- * loopback bootstrap, reuse the token delivered by the authenticated info
- * frame so reconnects and HTTP APIs do not lose credentials. */
+/** Return only the credential explicitly present in the launch URL.
+ * The QR token received by a trusted local UI is for sharing with another
+ * device; reusing it for local reconnects would expose it in every WS/API URL.
+ * Local reconnects authenticate with the HttpOnly bootstrap ticket instead. */
 export function getBrowserAccessToken(search: string): string {
-  return new URLSearchParams(search).get("token") || mobileAccessToken;
+  return new URLSearchParams(search).get("token") || "";
 }
 
 export function clearMobileAccessToken(): void {

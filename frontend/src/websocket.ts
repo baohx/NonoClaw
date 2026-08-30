@@ -19,6 +19,7 @@ interface SocketRuntime {
   mounted: boolean;
   lastMessageAt: number;
   firstConnect: boolean;
+  opening: boolean;
 }
 
 function websocketUrl(url: string): string {
@@ -40,11 +41,12 @@ export function useWebSocket(url: string) {
     mounted: false,
     lastMessageAt: 0,
     firstConnect: false,
+    opening: false,
   });
 
   const connect = useCallback(() => {
     const runtime = runtimeRef.current;
-    if (!runtime.mounted) return;
+    if (!runtime.mounted || runtime.opening) return;
     if (runtime.socket?.readyState === WebSocket.OPEN
       || runtime.socket?.readyState === WebSocket.CONNECTING) return;
     if (runtime.reconnectTimer) {
@@ -52,71 +54,113 @@ export function useWebSocket(url: string) {
       runtime.reconnectTimer = null;
     }
 
+    runtime.opening = true;
     const generation = useStore.getState().beginConnection();
     breathController.consumeConnection("connecting");
-    const socket = new WebSocket(websocketUrl(url));
-    runtime.socket = socket;
-    runtime.lastMessageAt = Date.now();
 
-    socket.onopen = () => {
-      const current = runtimeRef.current;
-      if (!current.mounted || current.socket !== socket
-        || !useStore.getState().markConnected(generation)) {
-        try { socket.close(); } catch {}
-        return;
-      }
-      current.firstConnect = true;
-      current.lastMessageAt = Date.now();
-      current.reconnectDelay = RECONNECT_DELAY_MS;
-      breathController.consumeConnection("connected");
-
-      // Remove a queued command only after this generation successfully sends
-      // it. A failed send remains queued for the next generation.
-      for (const entry of [...useStore.getState().outboundQueue]) {
-        try {
-          socket.send(JSON.stringify(entry.message));
-          useStore.getState().acknowledgeOutbound(entry.id);
-        } catch {
-          try { socket.close(); } catch {}
-          break;
-        }
-      }
-    };
-
-    socket.onmessage = (event) => {
-      const current = runtimeRef.current;
-      if (!current.mounted || current.socket !== socket
-        || generation !== useStore.getState().connectionGeneration) return;
-      current.lastMessageAt = Date.now();
+    void (async () => {
       try {
-        dispatchServerMessage(JSON.parse(event.data as string) as ServerMsg);
+        // A remote/mobile launch already carries its explicit QR token. A
+        // direct local page first obtains an independent HttpOnly ticket; the
+        // custom header prevents a cross-site form from minting that cookie.
+        if (!getBrowserAccessToken(window.location.search)) {
+          const response = await fetch("/api/auth/bootstrap", {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: { "X-NonoClaw-Bootstrap": "1" },
+          });
+          if (!response.ok) throw new Error("local authentication bootstrap failed");
+        }
+
+        const current = runtimeRef.current;
+        if (!current.mounted
+          || generation !== useStore.getState().connectionGeneration) {
+          current.opening = false;
+          return;
+        }
+
+        const socket = new WebSocket(websocketUrl(url));
+        current.socket = socket;
+        current.opening = false;
+        current.lastMessageAt = Date.now();
+
+        socket.onopen = () => {
+          const latest = runtimeRef.current;
+          if (!latest.mounted || latest.socket !== socket
+            || !useStore.getState().markConnected(generation)) {
+            try { socket.close(); } catch {}
+            return;
+          }
+          latest.firstConnect = true;
+          latest.lastMessageAt = Date.now();
+          latest.reconnectDelay = RECONNECT_DELAY_MS;
+          breathController.consumeConnection("connected");
+
+          // Remove a queued command only after this generation successfully sends
+          // it. A failed send remains queued for the next generation.
+          for (const entry of [...useStore.getState().outboundQueue]) {
+            try {
+              socket.send(JSON.stringify(entry.message));
+              useStore.getState().acknowledgeOutbound(entry.id);
+            } catch {
+              try { socket.close(); } catch {}
+              break;
+            }
+          }
+        };
+
+        socket.onmessage = (event) => {
+          const latest = runtimeRef.current;
+          if (!latest.mounted || latest.socket !== socket
+            || generation !== useStore.getState().connectionGeneration) return;
+          latest.lastMessageAt = Date.now();
+          try {
+            dispatchServerMessage(JSON.parse(event.data as string) as ServerMsg);
+          } catch {
+            // Never echo malformed frames: they may contain prompts, credentials,
+            // attachment data, or unsafe upstream errors.
+            console.error("[ws] message rejected");
+          }
+        };
+
+        socket.onclose = () => {
+          const latest = runtimeRef.current;
+          if (!latest.mounted || latest.socket !== socket
+            || !useStore.getState().markDisconnected(generation)) return;
+          latest.socket = null;
+          breathController.consumeConnection("disconnected");
+          if (latest.reconnectTimer) return;
+          const delay = latest.reconnectDelay;
+          latest.reconnectTimer = setTimeout(() => {
+            const next = runtimeRef.current;
+            next.reconnectTimer = null;
+            next.reconnectDelay = Math.min(next.reconnectDelay * 1.5, MAX_RECONNECT_DELAY_MS);
+            connect();
+          }, delay);
+        };
+
+        socket.onerror = () => {
+          if (runtimeRef.current.socket !== socket) return;
+          try { socket.close(); } catch {}
+        };
       } catch {
-        // Never echo malformed frames: they may contain prompts, credentials,
-        // attachment data, or unsafe upstream errors.
-        console.error("[ws] message rejected");
+        const current = runtimeRef.current;
+        current.opening = false;
+        if (!current.mounted
+          || generation !== useStore.getState().connectionGeneration
+          || !useStore.getState().markDisconnected(generation)) return;
+        breathController.consumeConnection("disconnected");
+        if (current.reconnectTimer) return;
+        const delay = current.reconnectDelay;
+        current.reconnectTimer = setTimeout(() => {
+          const next = runtimeRef.current;
+          next.reconnectTimer = null;
+          next.reconnectDelay = Math.min(next.reconnectDelay * 1.5, MAX_RECONNECT_DELAY_MS);
+          connect();
+        }, delay);
       }
-    };
-
-    socket.onclose = () => {
-      const current = runtimeRef.current;
-      if (!current.mounted || current.socket !== socket
-        || !useStore.getState().markDisconnected(generation)) return;
-      current.socket = null;
-      breathController.consumeConnection("disconnected");
-      if (current.reconnectTimer) return;
-      const delay = current.reconnectDelay;
-      current.reconnectTimer = setTimeout(() => {
-        const latest = runtimeRef.current;
-        latest.reconnectTimer = null;
-        latest.reconnectDelay = Math.min(latest.reconnectDelay * 1.5, MAX_RECONNECT_DELAY_MS);
-        connect();
-      }, delay);
-    };
-
-    socket.onerror = () => {
-      if (runtimeRef.current.socket !== socket) return;
-      try { socket.close(); } catch {}
-    };
+    })();
   }, [url]);
 
   /** Restart at most once: a generation already CONNECTING owns recovery. */
@@ -168,6 +212,7 @@ export function useWebSocket(url: string) {
     return () => {
       const current = runtimeRef.current;
       current.mounted = false;
+      current.opening = false;
       document.removeEventListener("visibilitychange", onVisibility);
       if (current.reconnectTimer) clearTimeout(current.reconnectTimer);
       current.reconnectTimer = null;
