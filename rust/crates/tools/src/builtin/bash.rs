@@ -61,8 +61,8 @@ impl Tool for BashTool {
     }
 
     fn is_read_only(&self, input: &Value) -> bool {
-        // Conservative: treat nothing as read-only unless explicitly classified.
-        // A real classifier lives in `src/utils/permissions/bashClassifier.ts`.
+        // Fail closed: only a very small set of commands with no shell
+        // control syntax can bypass an approval prompt.
         classify_readonly(input["command"].as_str().unwrap_or(""))
     }
     fn is_concurrency_safe(&self, _: &Value) -> bool {
@@ -122,11 +122,12 @@ impl Tool for BashTool {
         let (shell, arg) = ("bash", "-c");
 
         let mut cmd = Command::new(shell);
-        // `bash --login` loads the user's profile before executing -c; cmd /C
-        // doesn't need it.
+        // Do not load login/profile scripts: a nominally read-only command
+        // must not trigger arbitrary profile side effects. PATH and other
+        // required environment are inherited from the NonoClaw process.
         #[cfg(not(windows))]
         {
-            cmd.arg("--login");
+            cmd.arg("--noprofile").arg("--norc");
         }
         cmd.arg(arg).arg(command);
         // Close stdin so interactive commands (sudo, ssh, passwd, etc.)
@@ -248,26 +249,30 @@ fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
 #[cfg(not(target_os = "linux"))]
 fn apply_sandbox(_cmd: &mut Command, _mode: PermissionMode, _cwd: &Path) {}
 
-/// Very small read-only heuristic for common harmless commands. Not a security
-/// boundary — the real classifier is deferred. Conservative: any shell
-/// metacharacter, chaining operator, or risky subcommand -> treat as mutating.
+/// Fail-closed classifier for the handful of commands that may bypass a
+/// permission prompt. This is intentionally not a shell parser: anything
+/// requiring shell syntax or command-specific semantic analysis is treated as
+/// having side effects. In particular, every `git`, `find`, and `rg` command
+/// requires approval because those tools have destructive/execution options.
 fn classify_readonly(cmd: &str) -> bool {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return true;
     }
-    const RISKY: &[&str] = &[
-        "|", ">", ">>", "&&", "||", ";", "$(", "sudo", "rm ", "mv ", "cp ", "mkdir ", "touch ",
-        "chmod", "chown", "kill", "shutdown", "reboot", "dd ",
-    ];
-    if RISKY.iter().any(|t| trimmed.contains(t)) {
+
+    const SHELL_CONTROL: &[char] = &['|', '&', ';', '>', '<', '`', '$', '\n', '\r'];
+    if trimmed
+        .chars()
+        .any(|character| SHELL_CONTROL.contains(&character))
+    {
         return false;
     }
+
     let head = trimmed.split_whitespace().next().unwrap_or("");
-    const READONLY: &[&str] = &[
-        "ls", "cat", "head", "tail", "wc", "pwd", "echo", "grep", "rg", "find", "git",
-    ];
-    READONLY.contains(&head)
+    matches!(
+        head,
+        "pwd" | "ls" | "cat" | "head" | "tail" | "wc" | "grep" | "echo"
+    )
 }
 
 #[cfg(test)]
@@ -277,9 +282,16 @@ mod tests {
     #[test]
     fn classify_readonly_basic() {
         assert!(classify_readonly("ls -la"));
-        assert!(classify_readonly("git status"));
+        assert!(classify_readonly("cat README.md"));
+        assert!(!classify_readonly("git status"));
+        assert!(!classify_readonly("git clean -fdx"));
+        assert!(!classify_readonly("git reset --hard"));
+        assert!(!classify_readonly("git push"));
+        assert!(!classify_readonly("find . -delete"));
+        assert!(!classify_readonly("rg --pre dangerous pattern"));
         assert!(!classify_readonly("rm -rf /"));
         assert!(!classify_readonly("echo hi | sudo tee /etc/x"));
+        assert!(!classify_readonly("cat $HOME/.ssh/id_rsa"));
         assert!(classify_readonly(""));
     }
 
