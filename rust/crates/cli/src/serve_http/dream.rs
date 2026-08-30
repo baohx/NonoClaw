@@ -645,24 +645,32 @@ struct DreamState {
 /// Spawn the idle watcher. `last_activity` is updated by every inbound
 /// client message (WS + REST entrypoints touch it via `touch_activity`).
 pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mutex<SystemTime>>) {
-    // Config: enable + idle threshold. Read once at startup — dream cadence
-    // does not need hot reload.
-    let settings = state.config.settings();
-    let enabled = settings.dream_enabled.unwrap_or(true);
-    let idle_minutes = settings.dream_idle_minutes.unwrap_or(DEFAULT_IDLE_MINUTES);
-    if !enabled {
-        tracing::info!(idle_minutes, "dream scheduler disabled by settings");
-        return;
-    }
-
-    let cwd = state.cwd();
     tokio::spawn(async move {
         let mut dream = DreamState::default();
+        let mut project_generation = None;
         // Startup grace period: never dream in the first interval.
         tokio::time::sleep(TICK).await;
-        tracing::info!(idle_minutes, "dream scheduler watching for idle");
+        tracing::info!("dream scheduler watching for idle");
         loop {
             tokio::time::sleep(TICK).await;
+            let project = state.project();
+            if project_generation != Some(project.generation()) {
+                project_generation = Some(project.generation());
+                dream = DreamState::default();
+                tracing::debug!(
+                    generation = project.generation(),
+                    dir = %project.cwd().display(),
+                    "dream scheduler rebound to project"
+                );
+            }
+            let settings = project.config().settings();
+            if !settings.dream_enabled.unwrap_or(true) {
+                continue;
+            }
+            let idle_minutes = settings
+                .dream_idle_minutes
+                .unwrap_or(DEFAULT_IDLE_MINUTES);
+            let cwd = project.cwd().to_path_buf();
             if dream.dreaming {
                 continue;
             }
@@ -675,9 +683,10 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
             if idle_for < Duration::from_secs(idle_minutes * 60) {
                 continue;
             }
-            // Condition 2: no active work — no pending permissions/questions,
-            // no background bash tasks.
-            if !state.pending_permissions.lock().await.is_empty()
+            // Condition 2: no active run or auxiliary work. SessionHub is
+            // authoritative across WS, REST, and AutoDream entry points.
+            if state.session_hub.has_active_runs().await
+                || !state.pending_permissions.lock().await.is_empty()
                 || !state.pending_questions.lock().await.is_empty()
                 || state
                     .background_registry
@@ -732,7 +741,17 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
             dream.dreaming = true;
             let state2 = Arc::clone(&state);
             let truncations = dream.truncation_count;
-            let (outcome, listed_sessions) = run_dream(state2, truncations).await;
+            let (outcome, listed_sessions) =
+                run_dream(state2, Arc::clone(&project), truncations).await;
+            // A project replacement can publish immediately after the run's
+            // lease ends. Do not apply old-project post-processing after that
+            // boundary; the next tick starts with a fresh DreamState.
+            let latest_project = state.project();
+            if latest_project.generation() != project.generation() {
+                project_generation = Some(latest_project.generation());
+                dream = DreamState::default();
+                continue;
+            }
             let ok = outcome != DreamOutcome::Failed;
             // Refresh the session index (Layer 3) with anything new, then
             // stamp the fingerprint regardless of success so a failing
@@ -776,9 +795,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
             // proposals (skills / APPEND_SYSTEM.md). Commit them only when
             // the freshest outcome clears the default gate; reject discards.
             if ok {
-                if let Some(project) = nonoclaw_engine::session::project_dir(&cwd) {
-                    evolution_commit_gate(&cwd, &project, &sessions_dir);
-                }
+                evolution_commit_gate(&cwd, &sessions_dir);
             }
             // Fingerprint policy by outcome:
             // - Completed/Failed → stamp (finished, or avoid hot-looping).
@@ -940,8 +957,28 @@ fn truncation_marker(n: u32) -> String {
     }
 }
 
-async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome, Vec<String>) {
+fn dream_frame_outcome(line: &str) -> Option<DreamOutcome> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("done") => Some(match value.get("finish").and_then(|finish| finish.as_str()) {
+            Some("completed") => DreamOutcome::Completed,
+            Some("max_turns" | "budget_exceeded" | "context_limit") => {
+                DreamOutcome::Truncated
+            }
+            _ => DreamOutcome::Failed,
+        }),
+        Some("error") => Some(DreamOutcome::Failed),
+        _ => None,
+    }
+}
+
+async fn run_dream(
+    state: Arc<AppState>,
+    project: Arc<super::project_context::ProjectContext>,
+    truncation_count: u32,
+) -> (DreamOutcome, Vec<String>) {
     let model = state.active_model.lock().await.clone();
+    let cwd = project.cwd();
     // Reward-guided brief: aggregate Level-1 RL labels since the last dream
     // so the dream reviews the worst trajectories first. Falls back to the
     // plain prompt when the sessions dir is unavailable.
@@ -950,15 +987,13 @@ async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome
             let sessions_dir = root
                 .join("projects")
                 .join(
-                    state
-                        .cwd()
-                        .to_string_lossy()
+                    cwd.to_string_lossy()
                         .trim_start_matches('/')
                         .replace('/', "-"),
                 )
                 .join("sessions");
             let since = SystemTime::now() - DREAM_BRIEF_WINDOW;
-            let analyzed = dream_marker_path(&state.cwd())
+            let analyzed = dream_marker_path(cwd)
                 .map(|m| read_analyzed_sessions(&m))
                 .unwrap_or_default();
             let (text, listed) =
@@ -979,19 +1014,30 @@ async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome
         dream: true,
     };
     // Drive the NDJSON stream to completion; we only care that it finishes.
-    let resp = match super::run_api::run_handler_for_dream(Arc::clone(&state), req).await {
+    let resp = match super::run_api::run_handler_for_dream(
+        Arc::clone(&state),
+        req,
+        project.generation(),
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, "dream run failed to start");
             return (DreamOutcome::Failed, listed_sessions);
         }
     };
-    tracing::info!("dream run started");
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!(%status, "dream run was rejected before streaming");
+        return (DreamOutcome::Failed, listed_sessions);
+    }
+    tracing::info!(%status, "dream run started");
     // Consume the body so the run actually executes to completion: collect
     // via into_data_stream (the same stream type run_api built it from).
     let mut stream = resp.into_body().into_data_stream();
-    let mut outcome = DreamOutcome::Failed;
-    let mut last_line = String::new();
+    let mut terminal_outcome = None;
+    let mut stream_failed = false;
     use futures::StreamExt;
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
@@ -999,30 +1045,37 @@ async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome
             Ok(c) => c,
             Err(_) => {
                 tracing::warn!("dream run stream error");
-                outcome = DreamOutcome::Failed;
+                stream_failed = true;
                 break;
             }
         };
         buf.push_str(&String::from_utf8_lossy(&chunk));
         // Keep only the trailing partial line; completed NDJSON lines are
-        // scanned for the terminal `done` frame.
+        // parsed structurally so an event payload containing `\"type\":\"done\"`
+        // cannot be mistaken for the terminal frame.
         while let Some(pos) = buf.find('\n') {
             let line: String = buf.drain(..=pos).collect();
-            let trimmed = line.trim();
-            if trimmed.contains("\"type\":\"done\"") {
-                last_line = trimmed.to_string();
+            if let Some(outcome) = dream_frame_outcome(line.trim()) {
+                // Fail closed if the stream ever emits an error or malformed
+                // done frame, even if an unexpected later frame follows it.
+                if terminal_outcome != Some(DreamOutcome::Failed) {
+                    terminal_outcome = Some(outcome);
+                }
             }
         }
-        outcome = DreamOutcome::Completed; // provisional; refined below
     }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last_line) {
-        let finish = v.get("finish").and_then(|f| f.as_str()).unwrap_or("");
-        outcome = match finish {
-            "completed" => DreamOutcome::Completed,
-            "max_turns" | "budget_exceeded" | "context_limit" => DreamOutcome::Truncated,
-            _ => DreamOutcome::Failed,
-        };
+    if !stream_failed && !buf.trim().is_empty() {
+        if let Some(outcome) = dream_frame_outcome(buf.trim()) {
+            if terminal_outcome != Some(DreamOutcome::Failed) {
+                terminal_outcome = Some(outcome);
+            }
+        }
     }
+    let outcome = if stream_failed {
+        DreamOutcome::Failed
+    } else {
+        terminal_outcome.unwrap_or(DreamOutcome::Failed)
+    };
     (outcome, listed_sessions)
 }
 
@@ -1033,7 +1086,7 @@ async fn run_dream(state: Arc<AppState>, truncation_count: u32) -> (DreamOutcome
 /// When no outcome exists yet (first cycle), a bench pass substitutes; if
 /// neither is available the shadows are left in place for the next cycle
 /// (no data → no commit, no discard). All failures are soft.
-fn evolution_commit_gate(cwd: &Path, project_dir: &Path, sessions_dir: &Path) {
+fn evolution_commit_gate(cwd: &Path, sessions_dir: &Path) {
     let nonoclaw = cwd.join(".nonoclaw");
     let mut shadows = Vec::new();
     for root in [nonoclaw.join("skills"), nonoclaw.clone()] {
@@ -1048,41 +1101,59 @@ fn evolution_commit_gate(cwd: &Path, project_dir: &Path, sessions_dir: &Path) {
         .checked_sub(Duration::from_secs(3600 * 2))
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let recent = scan_run_outcomes(sessions_dir, window_start);
-    let latest = recent.iter().max_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap());
-    for live in shadows {
-        let resource = live
-            .strip_prefix(&nonoclaw)
-            .map(|p| p.to_string_lossy().replace(['/', '\\'], "_"))
-            .unwrap_or_else(|_| "resource".into());
-        // Strip the `.shadow` suffix: `foo.md.shadow` -> `foo.md`
-        let live_file = live.with_extension("");
-        let outcome = super::evolution::commit_gated(
-            &live_file,
-            project_dir,
-            &resource,
-            || match latest {
-                Some(o) => super::evolution::default_gate(&o.status, o.reward),
-                None => Err("no outcome since staging; deferring".into()),
-            },
-        );
+    let latest = recent
+        .iter()
+        .max_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap());
+    for shadow in shadows {
+        // Strip the `.shadow` suffix before deriving the canonical resource
+        // identity; history, logs, commit, and restore must name the live file.
+        let live_file = shadow.with_extension("");
+        let resource = match super::evolution::resource_identity(&nonoclaw, &live_file) {
+            Ok(resource) => resource,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "evolution: rejected unsafe shadow path");
+                continue;
+            }
+        };
+        let outcome = super::evolution::commit_gated(&live_file, &nonoclaw, || match latest {
+            Some(outcome) => super::evolution::default_gate(&outcome.status, outcome.reward),
+            None => Err("no outcome since staging; deferring".into()),
+        });
         match outcome {
             Ok(super::evolution::CommitOutcome::Committed) => {
                 tracing::info!(resource = %resource, "evolution: skill/system shadow committed")
             }
-            Ok(super::evolution::CommitOutcome::Rejected(r)) => {
-                tracing::info!(resource = %resource, reason = %r, "evolution: shadow rejected")
+            Ok(super::evolution::CommitOutcome::Rejected(reason)) => {
+                tracing::info!(resource = %resource, %reason, "evolution: shadow rejected")
             }
-            _ => {}
+            Ok(super::evolution::CommitOutcome::RecoveryRequired {
+                transaction,
+                live_state,
+            }) => tracing::error!(
+                resource = %resource,
+                %transaction,
+                ?live_state,
+                "evolution: atomic cutover needs explicit restore or manual recovery"
+            ),
+            Ok(super::evolution::CommitOutcome::NoShadow) => {}
+            Err(error) => {
+                tracing::warn!(resource = %resource, kind = ?error.kind(), "evolution: commit failed closed")
+            }
         }
     }
 }
 
 fn collect_shadows(root: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(root).ok().into_iter().flatten().flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_shadows(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("shadow") {
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("shadow")
+        {
             out.push(path);
         }
     }
