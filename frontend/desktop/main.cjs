@@ -35,6 +35,9 @@ const STARTUP_TIMEOUT_MS = 60_000;
 // login shell once for its full PATH and merge it in.
 let loginPathCache = null;
 function loginShellPath() {
+  // Windows has no login-shell concept; `/bin/bash` cannot exist and the
+  // execFileSync probe below would just burn ~5s in the timeout path.
+  if (process.platform === "win32") return "";
   if (loginPathCache !== null) return loginPathCache;
   loginPathCache = "";
   const shells = [process.env.SHELL, "/bin/bash"].filter(Boolean);
@@ -119,6 +122,90 @@ function parseCliArgs(argv) {
 }
 
 const CLI = parseCliArgs(process.argv);
+
+// ---------------------------------------------------------------------------
+// Portable (green) mode — Windows zero-install deployments.
+//
+// Layout produced by scripts/package-portable-electron.sh:
+//   NonoClaw.exe                  (electron-builder win-unpacked root)
+//   resources/app.asar            (SPA + this file)
+//   resources/nonoclaw/bin/...    (backend via extraResources)
+//   runtime/node|python|bin|git   (node, embeddable python, rg+markitdown
+//                                  shim, MinGit, poppler)
+//   templates/settings.json       (first-run seed)
+//
+// Data home resolution (user decision 2026-09-02): prefer a writable
+// `.nonoclaw-home/` next to NonoClaw.exe so the whole tree travels on a USB
+// drive; fall back to the platform default (~/...\.nonoclaw) when the
+// install dir is read-only (e.g. Program Files).
+// ---------------------------------------------------------------------------
+const PORTABLE_ROOT = (() => {
+  if (process.platform !== "win32" || app.isPackaged === false) return null;
+  const root = path.dirname(app.getPath("exe"));
+  return fs.existsSync(path.join(root, "runtime", "node", "node.exe"))
+    ? root
+    : null;
+})();
+
+function resolvePortableHome() {
+  if (!PORTABLE_ROOT) return null;
+  const bundled = path.join(PORTABLE_ROOT, ".nonoclaw-home");
+  try {
+    fs.mkdirSync(bundled, { recursive: true });
+    fs.accessSync(bundled, fs.constants.W_OK);
+    return bundled;
+  } catch {
+    // Read-only install dir (Program Files / admin-owned): fall back to the
+    // per-user data dir so nothing is silently lost.
+    return null;
+  }
+}
+
+// Env for the backend when running portable: NONOCLAW_HOME pinned into the
+// package + bundled runtimes first on PATH (node/npm/npx, python, rg,
+// markitdown shim, MinGit, poppler). Order matters — bundled wins over any
+// domain-machine system installs.
+function portableBackendEnv(home) {
+  const rt = path.join(PORTABLE_ROOT, "runtime");
+  const additions = [
+    path.join(rt, "node"),
+    path.join(rt, "python"),
+    path.join(rt, "bin"),
+    path.join(rt, "git", "cmd"),
+    path.join(rt, "git", "usr", "bin"),
+    path.join(rt, "poppler", "Library", "bin"),
+  ].filter((p) => fs.existsSync(p));
+  return {
+    ...process.env,
+    NONOCLAW_HOME: home,
+    // Exposed for templates/diagnostics; NOT read by mcp.rs's expander —
+    // the settings template's ${NONOCLAW_PORTABLE_ROOT} placeholders are
+    // pre-expanded by ensurePortableFirstRun() at seed time.
+    NONOCLAW_PORTABLE_ROOT: PORTABLE_ROOT,
+    PATH: `${additions.join(";")};${process.env.PATH || ""}`,
+  };
+}
+
+// First run: seed NONOCLAW_HOME with the bundled settings template when the
+// machine has no existing config. Never overwrite user edits. The template's
+// ${NONOCLAW_PORTABLE_ROOT} placeholders are resolved here because the
+// backend's MCP expander (mcp.rs) only knows NONOCLAW_HOME/HOME/USERPROFILE.
+function ensurePortableFirstRun(home) {
+  if (!PORTABLE_ROOT) return;
+  const target = path.join(home, "settings.json");
+  if (fs.existsSync(target)) return;
+  const template = path.join(PORTABLE_ROOT, "templates", "settings.json");
+  if (!fs.existsSync(template)) return;
+  try {
+    fs.mkdirSync(home, { recursive: true });
+    const raw = fs.readFileSync(template, "utf8");
+    const expanded = raw.split("${NONOCLAW_PORTABLE_ROOT}").join(PORTABLE_ROOT);
+    fs.writeFileSync(target, expanded);
+    console.log(`[desktop] portable first-run: seeded ${target}`);
+  } catch (err) {
+    console.warn(`[desktop] portable first-run seed failed: ${err}`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // nonoclaw binary resolution (first match wins)
@@ -215,9 +302,22 @@ function startServer(port) {
   }
 
   console.log(`[desktop] spawning: ${bin} --serve-http 127.0.0.1:${port} (cwd=${cwd})`);
+  // Portable mode: NONOCLAW_HOME inside the package (USB-travelling data) or
+  // user-dir fallback, bundled runtimes on PATH, first-run settings seed.
+  let env = backendEnv();
+  if (PORTABLE_ROOT) {
+    const home = resolvePortableHome();
+    if (home) {
+      ensurePortableFirstRun(home);
+      env = portableBackendEnv(home);
+      console.log(`[desktop] portable mode: NONOCLAW_HOME=${home}`);
+    } else {
+      console.log("[desktop] portable runtime detected but install dir is read-only — using default user data dir");
+    }
+  }
   serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`], {
     cwd,
-    env: backendEnv(),
+    env,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -368,6 +468,20 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // Portable: keep Chromium profile data inside the package too, so a domain
+  // machine is touched as little as possible. Falls back to the default
+  // %APPDATA% location when the install dir is read-only. Must run before
+  // `app.whenReady()` — userData is consumed during readiness.
+  if (PORTABLE_ROOT) {
+    try {
+      const userDataDir = path.join(PORTABLE_ROOT, ".electron-data");
+      fs.mkdirSync(userDataDir, { recursive: true });
+      fs.accessSync(userDataDir, fs.constants.W_OK);
+      app.setPath("userData", userDataDir);
+    } catch {
+      // Read-only install dir: keep default %APPDATA% userData.
+    }
+  }
   app.on("second-instance", () => {
     const [win] = BrowserWindow.getAllWindows();
     if (win) {
