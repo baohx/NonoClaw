@@ -77,7 +77,7 @@ function TreeNode({ node, anomalyIds, depth, expanded, toggle }: {
 
 export default function TrajectoryGovernance({ onClose }: { onClose: () => void }) {
   const messages = useStore((s) => s.messages);
-  const traceEntries = useStore((s) => s.traceEntries);
+  const traceEntries = useStore((s) => s.trajectoryTraceEntries);
   const subagentRunsById = useStore((s) => s.subagentRunsById);
   const childIdsByParentToolId = useStore((s) => s.childIdsByParentToolId);
 

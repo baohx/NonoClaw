@@ -274,6 +274,26 @@ export interface MessagesLoadedMsg {
   /** Total persisted messages in the session (≥ messages.length). When larger,
    * older history is available via `load_older` paging. */
   total?: number;
+  /** Persisted timing traces (one batch per completed run). Each event is a
+   * serialized engine EventEnvelope (same shape as live `event` frames), so
+   * replayed ledgers rebuild step windows from precise timestamps instead of
+   * inferring from message commit times. Absent for legacy sessions. */
+  traces?: TraceBatchWire[];
+}
+
+/** One run's persisted trace batch (session JSONL `trace` entries). */
+export interface TraceBatchWire {
+  /** Absent on legacy timing-only batches (interpreted as schema v1). */
+  schema_version?: number;
+  run_id: string;
+  events: TraceEventEnvelopeWire[];
+}
+
+/** A serialized EventEnvelope as persisted in the session JSONL — the same
+ * fields a live `event` frame carries (minus the type tag), so spreading it
+ * into an EventMsg rebuilds the live shape. */
+export interface TraceEventEnvelopeWire extends RunWireMeta {
+  event: EngineEvent;
 }
 
 export interface HistoryPageMsg {
@@ -378,6 +398,16 @@ export interface HookEntry {
 export interface ReferenceItem {
   name: string;
   description: string;
+  /** "argument" for CLI operands/options, "environment" for runtime variables. */
+  kind?: string;
+  /** Clap help heading; absent when connected to an older backend. */
+  group?: string;
+  default_values?: string[];
+  possible_values?: string[];
+  repeatable?: boolean;
+  value_delimiter?: string | null;
+  safety?: string | null;
+  advanced?: boolean;
 }
 export interface ConfigFieldReference {
   name: string;
@@ -572,7 +602,8 @@ export type ServerMsg =
   | SessionPromptsMsg
   | ProjectInfoMsg
   | SystemProbeMsg
-  | GitShowMsg;
+  | GitShowMsg
+  | ModelsHealthMsg;
 
 // ── Browser → Server messages ─────────────────────────────────────────────
 
@@ -660,6 +691,22 @@ export interface ProjectInfoRefreshRequest {
   type: "project_info_refresh";
 }
 
+export interface ModelsHealthCheckRequest {
+  type: "models_health_check";
+}
+
+export interface ModelHealthEntry {
+  name: string;
+  ok: boolean;
+  latency_ms?: number;
+  error?: string;
+}
+
+export interface ModelsHealthMsg {
+  type: "models_health";
+  results: ModelHealthEntry[];
+}
+
 export type ClientMsg =
   | RunRequest
   | CancelRequest
@@ -673,6 +720,7 @@ export type ClientMsg =
   | OpenFileRequest
   | SwitchProjectRequest
   | ProjectInfoRefreshRequest
+  | ModelsHealthCheckRequest
   | GitShowRequest
   | SessionPromptsRequest
   | LoadOlderRequest

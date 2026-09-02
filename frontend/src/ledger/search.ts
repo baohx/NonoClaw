@@ -3,7 +3,7 @@
  * Ported from DSH `ui-trajectory` `trajectory-search-index.ts`.
  */
 
-import type { LedgerCell } from "./types";
+import { ledgerRecordId, type LedgerCell } from "./types";
 
 /** Searchable text for one ledger record. */
 function searchableText(cell: LedgerCell): string {
@@ -18,14 +18,15 @@ export class TrajectorySearchIndex {
   private entries = new Map<string, string>();
   private version = 0;
 
-  /** Index cells not seen before; returns the number newly indexed. */
+  /** Index new or changed cells; returns the number added or refreshed. */
   addCells(cells: readonly LedgerCell[]): number {
     let added = 0;
     for (const cell of cells) {
       if (cell.requestOnly === true) continue;
-      const id = `${cell.index}`;
-      if (this.entries.has(id)) continue;
-      this.entries.set(id, searchableText(cell));
+      const id = ledgerRecordId(cell);
+      const text = searchableText(cell);
+      if (this.entries.get(id) === text) continue;
+      this.entries.set(id, text);
       added += 1;
     }
     if (added > 0) this.version += 1;

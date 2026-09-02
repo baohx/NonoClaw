@@ -10,7 +10,7 @@ import { projectLedgerRows, visibleLedgerRows } from "./virtual-rows.ts";
 import { formatDurationMillis, formatElapsedSeconds, formatTokenCount, ledgerRecordId } from "./types.ts";
 import type { ChatMessage, SubagentRun } from "../types.ts";
 import type { TraceEntry } from "../trace.ts";
-import { appendTraceEntry } from "../trace.ts";
+import { appendTraceEntry, traceEntryFromEvent } from "../trace.ts";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`ledger invariant failed: ${message}`);
@@ -97,8 +97,8 @@ check(multiLayout.turns[0].usage !== null && multiLayout.turns[0].usage!.input =
 
 // flattened usage keys (usageDetails() output) resolve too
 const flatEntries: TraceEntry[] = [...baseEntries,
-  { id: "e10", runId: "r", sessionId: "s", sequence: 10, timestampMs: now + 10_200, kind: "model_request_started", summary: "req", details: { turn: 2, provider: "anthropic" }, category: "model", status: "active" },
-  { id: "e6", runId: "r", sessionId: "s", sequence: 6, timestampMs: now + 11_500, kind: "usage_updated", summary: "u", details: { turn: 2, turn_input: 500, turn_output: 60, turn_cache_read: 20_000, turn_cache_write: 0 }, category: "usage", status: "info" },
+  { id: "e10", runId: "r2", sessionId: "s", sequence: 1, timestampMs: now + 10_200, kind: "model_request_started", summary: "req", details: { turn: 2, provider: "anthropic" }, category: "model", status: "active" },
+  { id: "e11", runId: "r2", sessionId: "s", sequence: 2, timestampMs: now + 11_500, kind: "usage_updated", summary: "u", details: { turn: 2, turn_input: 500, turn_output: 60, turn_cache_read: 20_000, turn_cache_write: 0 }, category: "usage", status: "info" },
 ];
 const layoutFlat = buildLedgerLayout({ messages: baseMessages, traceEntries: flatEntries, subagentRunsById: {} });
 check(layoutFlat.turns[1].usage !== null && layoutFlat.turns[1].usage!.input === 500 && layoutFlat.turns[1].usage!.cacheRead === 20_000, "flattened turn_* detail keys attach turn usage");
@@ -276,9 +276,9 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   check(thinkSec !== null && Math.abs(thinkSec - (thinkEnd - start) / 1000) < 1e-9, `thinking duration is block-close minus start (got ${thinkSec}s, want ${((thinkEnd - start) / 1000).toFixed(3)}s)`);
   check(assistantSec !== null && Math.abs(assistantSec - (stepEnd - thinkEnd) / 1000) < 1e-9, `assistant duration starts where thinking closed (got ${assistantSec}s, want ${((stepEnd - thinkEnd) / 1000).toFixed(3)}s)`);
   check(assistantCell!.startedAt === thinkEnd && thinkingCell!.startedAt === start, "assistant and thinking rows carry distinct sequential starts");
-  // No thinking close on record (restored session without trace): assistant
-  // falls back to anchoring at the message timestamp, not overlapping a
-  // synthetic thinking end.
+  // No thinking close on record (restored session without trace): persisted
+  // message timestamps are commit/end stamps only, so neither thinking nor
+  // assistant gets a fabricated start or duration.
   const layoutNoTrace = buildLedgerLayout({
     messages: [{ id: "u2", role: "user", content: "hi", timestamp: now },
                { id: "a2", role: "assistant", content: "plain answer", thinking: "reasoning without close event", timestamp: stepEnd, streaming: false }],
@@ -286,11 +286,9 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
     subagentRunsById: {},
   });
   const plainAssistant = layoutNoTrace.turns[0].cells.find((c) => c.kind === "assistant");
-  check(plainAssistant !== undefined && plainAssistant.timeSeconds !== null && Math.abs(plainAssistant.timeSeconds! - 1.5) < 1e-9, `no trace → assistant duration falls back to the backward commit gap (got ${plainAssistant?.timeSeconds}s, want 1.5s)`);
-  // Replay fallback: backward gap — an assistant step's duration is its own
-  // commit time minus the previous stamped record. The forward gap used to
-  // span the user's reading pause after the turn's final answer, blow past
-  // the 60s cap, and render "—" everywhere on replayed sessions.
+  check(plainAssistant !== undefined && plainAssistant.timeSeconds === null && plainAssistant.startedAt === null && plainAssistant.endedAt === stepEnd, "no trace leaves assistant start/duration unknown while retaining its commit endpoint");
+  // Additional replayed records do not make the user→assistant gap valid
+  // model latency evidence.
   const replayBackward = buildLedgerLayout({
     messages: [{ id: "u4", role: "user", content: "hi", timestamp: now },
                { id: "a3", role: "assistant", content: "answer", thinking: "reasoning", timestamp: stepEnd, streaming: false },
@@ -299,9 +297,9 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
     subagentRunsById: {},
   });
   const filledAssistant = replayBackward.turns[0].cells.find((c) => c.kind === "assistant");
-  check(filledAssistant !== undefined && filledAssistant.timeSeconds !== null && Math.abs(filledAssistant.timeSeconds! - 1.5) < 1e-9, `replay fallback fills the assistant gap backward from the user prompt (got ${filledAssistant?.timeSeconds}s, want 1.5s)`);
-  // The final answer of a turn (next record is a user prompt minutes later)
-  // must still get its step time, not be dropped as idle.
+  check(filledAssistant !== undefined && filledAssistant.timeSeconds === null && filledAssistant.startedAt === null, "later replay records do not backfill an unknown assistant start/duration");
+  // A later user prompt likewise cannot turn the preceding unknown operation
+  // into a measured duration.
   const replayTurnEnd = buildLedgerLayout({
     messages: [{ id: "u5", role: "user", content: "hi", timestamp: now },
                { id: "a4", role: "assistant", content: "final answer", thinking: "reasoning", timestamp: now + 20_000, streaming: false },
@@ -310,15 +308,15 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
     subagentRunsById: {},
   });
   const turnEndAssistant = replayTurnEnd.turns[0].cells.find((c) => c.kind === "assistant");
-  check(turnEndAssistant !== undefined && turnEndAssistant.timeSeconds !== null && Math.abs(turnEndAssistant.timeSeconds! - 20) < 1e-9, `turn-final answer keeps its step time even with 280s user idle after it (got ${turnEndAssistant?.timeSeconds}s, want 20s)`);
+  check(turnEndAssistant !== undefined && turnEndAssistant.timeSeconds === null && turnEndAssistant.startedAt === null, "turn-final replay assistant keeps unknown timing despite later user idle");
   const skippedThinking = replayBackward.turns[0].cells.find((c) => c.kind === "thinking");
-  check(skippedThinking !== undefined && skippedThinking.timeSeconds === null, "replay fallback skips thinking rows — adjacent thinking/assistant durations no longer identical");
+  check(skippedThinking !== undefined && skippedThinking.timeSeconds === null && skippedThinking.startedAt === null, "traceless thinking row keeps start/duration unknown");
   const replayUser = replayBackward.turns[0].cells.find((c) => c.kind === "user");
-  check(replayUser !== undefined && replayUser.timeSeconds === null, "replay fallback skips user rows — the gap is model latency, not prompt runtime");
+  check(replayUser !== undefined && replayUser.timeSeconds === null, "replay user rows remain point records without runtime");
 
   // Parallel tool_use in one replayed step: without per-tool trace both tool
-  // rows inherit the identical synthetic span and draw fully overlapping bars
-  // on the tool lane. Siblings must be serialized start-after-previous-end.
+  // rows inherit one synthetic interval. Actual must preserve that raw clock
+  // range, while Time may partition the shared window for legible markers.
   {
     const parallel = buildLedgerLayout({
       messages: [
@@ -332,15 +330,25 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
     });
     const tools = parallel.turns[0].cells.filter((c) => c.kind === "tool");
     check(tools.length === 2, `both parallel tool records projected (got ${tools.length})`);
-    const [first, second] = tools;
-    const fEnd = (first.startedAt ?? 0) + (first.timeSeconds ?? 0) * 1000;
-    const sStart = second.startedAt ?? 0;
     check(
-      first.startedAt !== null && second.startedAt !== null && sStart >= fEnd,
-      `parallel tool rows serialized, no overlap (first ends ${fEnd}, second starts ${sStart})`,
+      tools.every((tool) => tool.startedAt === now + 3_000 && tool.endedAt === now + 5_000 && tool.timeSeconds === 2),
+      "parallel synthetic tools preserve their raw Actual interval and duration",
     );
-    const laneEnd = (now + 3_000) + 2_000;
-    check(fEnd <= laneEnd && sStart + (second.timeSeconds ?? 0) * 1000 <= laneEnd, "serialized tools stay within the shared replay window");
+    const timeTools = deriveTrajectoryTimeline(parallel.turns, "time")!.spans
+      .filter((span) => span.kind === "tool")
+      .sort((a, b) => a.index - b.index);
+    check(
+      timeTools.length === 2 && timeTools[1].start >= timeTools[0].end - 1e-9,
+      "Time projection partitions identical synthetic siblings without overpainting",
+    );
+    const actualTools = deriveTrajectoryTimeline(parallel.turns, "actual")!.spans
+      .filter((span) => span.kind === "tool");
+    check(
+      actualTools.length === 2
+        && Math.abs(actualTools[0].start - actualTools[1].start) < 1e-9
+        && Math.abs(actualTools[0].end - actualTools[1].end) < 1e-9,
+      "Actual projection keeps parallel synthetic tools on their shared raw interval",
+    );
   }
 
   // Out-of-order thinking close: the provider flushes `thinking_state
@@ -438,7 +446,7 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
 // Regression: collapsing a turn filtered it out before projection, so the
 // chevron click made the whole turn's data vanish instead of folding it.
 {
-  const collapsed = new Set([0]);
+  const collapsed = new Set([ledgerRecordId(layout.turns[0].cells[0])]);
   const p = projectLedgerRows(layout.turns, collapsed);
   check(p.rows.some((r) => r.kind === "turn-header" && r.turn === 0), "collapsed turn keeps its header row (chevron stays clickable)");
   check(!p.rows.some((r) => r.kind === "record" && r.turn === 0), "collapsed turn hides only its record rows");
@@ -479,12 +487,91 @@ check(thinkSearch.search("inspect") !== null, "thinking text is searchable");
   check(aSpan!.start >= tSpan!.end - 1e-6, `assistant span starts at/after thinking end (a=${aSpan!.start.toFixed(4)}, t.end=${tSpan!.end.toFixed(4)})`);
 
   // Variant with NO streaming marker at all (pure replay, no trace events):
-  // thinking keeps null (renders 0s), assistant keeps the whole replay gap.
+  // both thinking and assistant timing remain unknown.
   const l2 = buildLedgerLayout({ messages: msgs, traceEntries: [], subagentRunsById: {} });
   const t2 = l2.turns[0].cells.find((c) => c.kind === "thinking");
   const a2 = l2.turns[0].cells.find((c) => c.kind === "assistant");
-  check(t2 !== undefined && (t2.timeSeconds === null || t2.timeSeconds === 0), `traceless thinking row stays 0s (got ${t2?.timeSeconds}s)`);
-  check(a2 !== undefined && (a2.timeSeconds ?? 0) > 0, `traceless assistant row takes the replay-fallback gap (got ${a2?.timeSeconds}s)`);
+  check(t2 !== undefined && t2.timeSeconds === null && t2.startedAt === null, `traceless thinking timing stays unknown (got ${t2?.timeSeconds}s)`);
+  check(a2 !== undefined && a2.timeSeconds === null && a2.startedAt === null, `traceless assistant timing stays unknown (got ${a2?.timeSeconds}s)`);
+}
+
+// ── persisted-trace replay: batches rehydrate accurate step windows ──────
+// `loadPersistedTraces` flattens per-run wire batches into the same TraceEntry
+// shape live events produce. This exercises the full replay path: batch →
+// entry mapping → per-run window building → thinking/assistant split.
+{
+  const now = Date.now();
+  // Two runs' wire batches, deliberately in reverse chronological order to
+  // prove the flatten+sort merge orders by wall-clock, not arrival order.
+  // Events are full serialized EventEnvelopes (what the server persists).
+  const runABatch = {
+    run_id: "runA",
+    events: [
+      { run_id: "runA", event_id: "a1", sequence: 1, timestamp_ms: now + 100, event: { kind: "model_request_started", requested_model: "m", provider: "p", turn: 1 } },
+      { run_id: "runA", event_id: "a2", sequence: 2, timestamp_ms: now + 200, event: { kind: "thinking_state", active: false, turn: 1 } },
+      { run_id: "runA", event_id: "a3", sequence: 3, timestamp_ms: now + 900, event: { kind: "stream_state_changed", state: "streaming", turn: 1 } },
+      { run_id: "runA", event_id: "a4", sequence: 4, timestamp_ms: now + 1_500, event: { kind: "stream_state_changed", state: "completed", turn: 1 } },
+    ],
+  };
+  const runBBatch = {
+    run_id: "runB",
+    events: [
+      { run_id: "runB", event_id: "b1", sequence: 1, timestamp_ms: now + 5_000, event: { kind: "model_request_started", requested_model: "m", provider: "p", turn: 1 } },
+      { run_id: "runB", event_id: "b2", sequence: 2, timestamp_ms: now + 5_200, event: { kind: "thinking_state", active: false, turn: 1 } },
+      { run_id: "runB", event_id: "b3", sequence: 3, timestamp_ms: now + 5_800, event: { kind: "stream_state_changed", state: "streaming", turn: 1 } },
+      { run_id: "runB", event_id: "b4", sequence: 4, timestamp_ms: now + 6_300, event: { kind: "stream_state_changed", state: "completed", turn: 1 } },
+    ],
+  };
+  const batches = [runBBatch, runABatch] as unknown as import("../types.ts").TraceBatchWire[];
+
+  // Rebuild the flatten+sort the store action performs: spread each
+  // serialized envelope into an EventMsg exactly like loadPersistedTraces.
+  const entries: TraceEntry[] = [];
+  for (const batch of batches) {
+    for (const envelope of batch.events) {
+      const entry = traceEntryFromEvent({ type: "event", ...envelope, run_id: batch.run_id } as import("../types.ts").EventMsg);
+      if (entry) entries.push(entry);
+    }
+  }
+  entries.sort((a, b) => a.timestampMs - b.timestampMs || a.sequence - b.sequence);
+
+  const msgs: ChatMessage[] = [
+    { id: "u1", role: "user", content: "one", timestamp: now },
+    { id: "a1", role: "assistant", content: "ans", thinking: "reasoning one", timestamp: now + 1_500, streaming: false },
+    { id: "u2", role: "user", content: "two", timestamp: now + 4_800 },
+    { id: "a2", role: "assistant", content: "ans2", thinking: "reasoning two", timestamp: now + 6_300, streaming: false },
+  ];
+  const layout = buildLedgerLayout({ messages: msgs, traceEntries: entries, subagentRunsById: {} });
+  check(layout.turns.length === 2, `two replayed turns expected (got ${layout.turns.length})`);
+
+  // Turn 1 thinking [100ms, 200ms] and assistant [900ms, 1500ms commit]:
+  // the persisted thinking-end lands BEFORE the assistant span, exactly like
+  // live streaming. Without persisted traces these stay null.
+  const t1 = layout.turns[0].cells.find((c) => c.kind === "thinking");
+  const a1cell = layout.turns[0].cells.find((c) => c.kind === "assistant");
+  check(t1 !== undefined && Math.abs((t1.timeSeconds ?? -1) - 0.1) < 1e-6, `replayed turn-1 thinking duration uses persisted window (got ${t1?.timeSeconds}s, want 0.1s)`);
+  check(a1cell !== undefined && Math.abs((a1cell.timeSeconds ?? -1) - 1.3) < 1e-6, `replayed turn-1 assistant duration uses persisted window (got ${a1cell?.timeSeconds}s, want 1.3s: thinking-end 200 → stream-completed 1500)`);
+
+  const t2cell = layout.turns[1].cells.find((c) => c.kind === "thinking");
+  const a2cell = layout.turns[1].cells.find((c) => c.kind === "assistant");
+  check(t2cell !== undefined && Math.abs((t2cell.timeSeconds ?? -1) - 0.2) < 1e-6, `replayed turn-2 thinking duration uses persisted window (got ${t2cell?.timeSeconds}s, want 0.2s)`);
+  check(a2cell !== undefined && Math.abs((a2cell.timeSeconds ?? -1) - 1.1) < 1e-6, `replayed turn-2 assistant duration uses persisted window (got ${a2cell?.timeSeconds}s, want 1.1s: thinking-end 5200 → stream-completed 6300)`);
+
+  // Baseline: the same messages WITHOUT traces keep the unknown-timing
+  // fallback (no negative, no fabricated numbers).
+  const fallback = buildLedgerLayout({ messages: msgs, traceEntries: [], subagentRunsById: {} });
+  const f1 = fallback.turns[0].cells.find((c) => c.kind === "thinking");
+  check(f1 !== undefined && f1.timeSeconds === null, `legacy session without traces falls back to unknown (got ${f1?.timeSeconds}s)`);
+
+  // Dedupe: re-flattening identical batches must not double entries.
+  const again: TraceEntry[] = [];
+  for (const batch of batches) {
+    for (const envelope of batch.events) {
+      const entry = traceEntryFromEvent({ type: "event", ...envelope, run_id: batch.run_id } as import("../types.ts").EventMsg);
+      if (entry) again.push(entry);
+    }
+  }
+  check(again.every((entry) => entries.filter((e) => e.id === entry.id).length === 1), "flattened entries have unique ids");
 }
 
 console.log("ledger invariants: all passed");

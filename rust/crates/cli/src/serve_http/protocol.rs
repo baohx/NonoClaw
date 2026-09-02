@@ -61,6 +61,10 @@ pub(super) enum ClientMsg {
         force_code: bool,
     },
     ProjectInfoRefresh,
+    /// Probe every conversation model with a minimal liveness request
+    /// (tiny max_tokens, one-word prompt). Results arrive as one
+    /// `models_health` server message.
+    ModelsHealthCheck,
     GitShow {
         sha: String,
     },
@@ -217,6 +221,11 @@ pub(super) enum ServerMsg {
         /// remainder with `load_older`.
         #[serde(default)]
         total: usize,
+        /// Persisted timing traces (one batch per completed run) so the
+        /// ledger rebuilds accurate step windows on replay. Empty for legacy
+        /// sessions recorded before traces existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        traces: Vec<nonoclaw_engine::session::PersistedTraceWire>,
     },
     /// One older page of a tail-windowed session, prepended by the client.
     HistoryPage {
@@ -250,6 +259,23 @@ pub(super) enum ServerMsg {
         sha: String,
         output: String,
     },
+    /// Per-model health results for the InsightRail "run all" probe. One
+    /// entry per conversation model, in request order.
+    ModelsHealth {
+        results: Vec<ModelHealthEntry>,
+    },
+}
+
+/// One model's outcome from a minimal liveness request (`max_tokens=8`,
+/// one-word prompt). `latency_ms` is present only on success.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ModelHealthEntry {
+    pub name: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -296,9 +322,15 @@ pub(super) fn messages_loaded(
     snapshot: SessionSnapshot,
     cumulative_usage: serde_json::Value,
 ) -> ServerMsg {
-    let total = snapshot.messages.len();
-    let (window, total) = tail_window(snapshot.messages, HISTORY_TAIL_MESSAGES);
-    messages_loaded_windowed(session_id, window, total, snapshot.revision, snapshot.started, cumulative_usage)
+    let SessionSnapshot {
+        messages,
+        revision,
+        started,
+        traces,
+        ..
+    } = snapshot;
+    let (window, total) = tail_window(messages, HISTORY_TAIL_MESSAGES);
+    messages_loaded_windowed(session_id, window, total, revision, started, cumulative_usage, traces)
 }
 
 /// Tail-windowed constructor used when restoring a session: send only the
@@ -311,8 +343,10 @@ pub(super) fn messages_loaded_windowed(
     revision: u64,
     started: Option<String>,
     cumulative_usage: serde_json::Value,
+    traces: Vec<nonoclaw_engine::session::PersistedTraceWire>,
 ) -> ServerMsg {
     let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
+    let first_index = total.saturating_sub(messages.len());
     ServerMsg::MessagesLoaded {
         protocol_version: WS_PROTOCOL_VERSION,
         session_id: session_id.to_string(),
@@ -320,10 +354,12 @@ pub(super) fn messages_loaded_windowed(
         timestamp_ms: timestamp_ms(),
         messages: messages
             .into_iter()
-            .map(|message| message_for_wire(message, started_ms, 0))
+            .enumerate()
+            .map(|(offset, message)| message_for_wire(message, started_ms, first_index + offset))
             .collect(),
         cumulative_usage,
         total,
+        traces,
     }
 }
 
@@ -338,7 +374,9 @@ pub(super) fn history_page(
     started: Option<String>,
 ) -> ServerMsg {
     let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
-    let remaining = before_index.saturating_sub(messages.len()).min(before_index);
+    let before_index = before_index.min(total);
+    let first_index = before_index.saturating_sub(messages.len());
+    let remaining = first_index;
     ServerMsg::HistoryPage {
         protocol_version: WS_PROTOCOL_VERSION,
         session_id: session_id.to_string(),
@@ -346,7 +384,8 @@ pub(super) fn history_page(
         timestamp_ms: timestamp_ms(),
         messages: messages
             .into_iter()
-            .map(|message| message_for_wire(message, started_ms, 0))
+            .enumerate()
+            .map(|(offset, message)| message_for_wire(message, started_ms, first_index + offset))
             .collect(),
         remaining,
     }
@@ -504,6 +543,7 @@ fn message_for_wire(
     let mut wire = serde_json::json!({
         "role": message.role,
         "content": safe_message_content(message.content),
+        "src_index": index,
     });
     // Real wall-clock commit time (v0.23.2+) takes precedence; fall back to
     // the synthetic started+index estimate for legacy entries without `ts`.
@@ -886,6 +926,7 @@ mod tests {
             ClientMsg::FileTree => "file_tree",
             ClientMsg::OpenFile { .. } => "open_file",
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
+            ClientMsg::ModelsHealthCheck => "models_health_check",
             ClientMsg::GitShow { .. } => "git_show",
             ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::LoadOlder { .. } => "load_older",
@@ -924,6 +965,7 @@ mod tests {
                 "open_file",
             ),
             (r#"{"type":"project_info_refresh"}"#, "project_info_refresh"),
+            (r#"{"type":"models_health_check"}"#, "models_health_check"),
             (r#"{"type":"git_show","sha":"abc123"}"#, "git_show"),
             (
                 r#"{"type":"set_permission_mode","mode":"plan"}"#,
@@ -967,6 +1009,7 @@ mod tests {
             messages: vec![],
             cumulative_usage: serde_json::json!({}),
             total: 0,
+            traces: vec![],
         };
         let history = ServerMsg::HistoryPage {
             protocol_version: 1,

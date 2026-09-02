@@ -36,6 +36,9 @@ export default function App() {
   const setShowApiLog = useStore((s) => s.setShowApiLog);
   const showGovernance = useStore((s) => s.showGovernance);
   const setShowGovernance = useStore((s) => s.setShowGovernance);
+  const historyOlderRemaining = useStore((s) => s.historyOlderRemaining);
+  const historyLoading = useStore((s) => s.historyLoading);
+  const requestOlderHistory = useStore((s) => s.requestOlderHistory);
   const compacting = useStore((s) => s.compacting);
   const pendingPermission = useStore((s) => s.pendingPermission);
   // Questions queue in FIFO order (parallel AskUserQuestion calls must not
@@ -58,6 +61,7 @@ export default function App() {
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
+  const [trajectoryHydrationSession, setTrajectoryHydrationSession] = useState<string | null>(null);
   const toolsHidden = useStore((s) => s.toolsHidden);
   const setToolsHidden = useStore((s) => s.setToolsHidden);
   const [railSections, setRailSections] = useState<{ files: boolean; sessions: boolean; git: boolean }>(() => {
@@ -171,6 +175,35 @@ export default function App() {
   const multiRun = useStore((s) => s.multiRun);
   const cancelling = useStore((s) => s.cancelling);
   const setCancelling = useStore((s) => s.setCancelling);
+
+  const hydrateTrajectoryHistory = useCallback(() => {
+    if (sessionId) setTrajectoryHydrationSession(sessionId);
+  }, [sessionId]);
+
+  // Governance is a modal entry point to the same trajectory data. Normal
+  // session restore remains tail-windowed; opening either trajectory surface
+  // opts this session into bounded 500-message pages until history is whole.
+  useEffect(() => {
+    if (showGovernance && sessionId) setTrajectoryHydrationSession(sessionId);
+  }, [showGovernance, sessionId]);
+
+  useEffect(() => {
+    if (trajectoryHydrationSession !== sessionId
+      || connectionStatus !== "connected"
+      || agentRunning
+      || historyLoading
+      || historyOlderRemaining <= 0) return;
+    requestOlderHistory(send, 500);
+  }, [
+    trajectoryHydrationSession,
+    sessionId,
+    connectionStatus,
+    agentRunning,
+    historyLoading,
+    historyOlderRemaining,
+    requestOlderHistory,
+    send,
+  ]);
 
   // ESC key during a run (foreground or background) sends an immediate
   // cancel. The backend CancellationToken tree stops provider streams,
@@ -465,6 +498,8 @@ export default function App() {
               info={projectInfo}
               onOpen={handleOpenFile}
               onRefresh={() => { useStore.getState().beginInsightRefresh(); send({ type: "project_info_refresh" }); }}
+              onTrajectoryOpen={hydrateTrajectoryHistory}
+              send={send}
             />
           </aside>
         </div>

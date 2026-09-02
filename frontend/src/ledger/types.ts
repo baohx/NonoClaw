@@ -53,6 +53,12 @@ export interface LedgerCell {
   timeSeconds: number | null;
   /** Unix epoch ms when this operation actually started, when known. */
   startedAt?: number | null;
+  /** Unix epoch ms when this operation actually ended, when known. */
+  endedAt?: number | null;
+  /** Optional projection-only interval used by the compressed Time view.
+   * Actual mode always uses startedAt/endedAt, preserving real-clock facts. */
+  timelineStartedAt?: number | null;
+  timelineEndedAt?: number | null;
   /** Message-only prompt token count. */
   input?: number;
   /** Input tokens served from provider cache. */

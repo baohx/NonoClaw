@@ -53,6 +53,15 @@ pub enum SessionEntry {
     Mode {
         mode: String,
     },
+    /// Versioned, redacted replay facts for one completed root run. Version 1
+    /// is the legacy timing-only batch; version 2 keeps the complete low-
+    /// frequency root stream plus scoped child lifecycle/tool facts.
+    Trace {
+        #[serde(default = "legacy_trace_schema_version")]
+        schema_version: u16,
+        run_id: String,
+        events: Vec<nonoclaw_core::run_event::EventEnvelope>,
+    },
     /// Outcome metadata for one completed run — the trajectory-level reward
     /// label (Level-1 RL data): terminal status, heuristic reward score,
     /// turn count, and a human-readable finish detail. Appended exactly once
@@ -96,6 +105,10 @@ pub struct SessionSnapshot {
     /// Cumulative real API token usage from all completed runs, persisted
     /// across server restarts. `None` if no runs have completed yet.
     pub cumulative_usage: Option<CumulativeUsageWire>,
+    /// Persisted timing traces (one batch per completed run) for accurate
+    /// ledger replay. Empty for legacy sessions recorded before traces
+    /// existed; the frontend falls back to message-`ts` inference.
+    pub traces: Vec<PersistedTraceWire>,
 }
 
 /// Wire-friendly representation of cumulative token usage, used in both
@@ -106,6 +119,23 @@ pub struct CumulativeUsageWire {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+}
+
+/// Current persisted replay schema. Older trace lines omit the field and are
+/// interpreted as version 1 without rewriting their original JSON.
+pub const TRACE_SCHEMA_VERSION: u16 = 2;
+
+fn legacy_trace_schema_version() -> u16 {
+    1
+}
+
+/// One run's versioned replay facts, as sent in `messages_loaded`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTraceWire {
+    #[serde(default = "legacy_trace_schema_version")]
+    pub schema_version: u16,
+    pub run_id: String,
+    pub events: Vec<nonoclaw_core::run_event::EventEnvelope>,
 }
 
 /// Metadata for a discovered session (for `--list-sessions`).
@@ -261,6 +291,22 @@ impl Session {
             reward,
             turns,
             detail: detail.to_string(),
+        })
+        .await
+    }
+
+    /// Persist one completed root run's complete low-frequency replay facts.
+    /// Content deltas are filtered by `TraceCollector`; durable boundaries are
+    /// intentionally not count-truncated because replay must remain exact.
+    pub async fn write_trace(
+        &self,
+        run_id: &str,
+        events: Vec<nonoclaw_core::run_event::EventEnvelope>,
+    ) -> SessionResult<u64> {
+        self.append_metadata(SessionEntry::Trace {
+            schema_version: TRACE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            events,
         })
         .await
     }
@@ -675,6 +721,9 @@ struct SessionState {
     tag: Option<String>,
     mode: Option<String>,
     cumulative_usage: Option<CumulativeUsageWire>,
+    /// Per-root-run versioned replay batches, keyed by run_id and retained in
+    /// JSONL insertion order (a duplicate run replaces the prior snapshot).
+    traces: Vec<PersistedTraceWire>,
     repairs: Vec<SessionRepair>,
     needs_rewrite: bool,
 }
@@ -698,6 +747,7 @@ impl SessionState {
             tag: None,
             mode: None,
             cumulative_usage: None,
+            traces: Vec::new(),
             repairs: Vec::new(),
             needs_rewrite: true,
         }
@@ -718,6 +768,7 @@ impl SessionState {
         let mut cumulative_usage = None;
         let mut repairs = Vec::new();
         let mut revision = 0;
+        let mut traces = Vec::new();
 
         for (index, raw) in text.lines().enumerate() {
             let line_number = index + 1;
@@ -749,6 +800,7 @@ impl SessionState {
                         | "tag"
                         | "mode"
                         | "cumulative_usage"
+                        | "trace"
                 )
             );
             if !known {
@@ -815,6 +867,21 @@ impl SessionState {
                 SessionEntry::RunOutcome { .. } => {
                     // Trajectory reward labels are append-only history: keep
                     // them in `preserved` verbatim; list_sessions counts them.
+                    preserved.push(value);
+                }
+                SessionEntry::Trace {
+                    schema_version,
+                    run_id,
+                    events,
+                } => {
+                    // Missing schema_version deserializes as legacy v1. Keep
+                    // the newest complete batch for duplicate root run ids.
+                    traces.retain(|existing: &PersistedTraceWire| existing.run_id != run_id);
+                    traces.push(PersistedTraceWire {
+                        schema_version,
+                        run_id,
+                        events,
+                    });
                     preserved.push(value);
                 }
                 SessionEntry::CumulativeUsage {
@@ -897,6 +964,7 @@ impl SessionState {
             tag,
             mode,
             cumulative_usage,
+            traces,
             repairs,
             needs_rewrite: missing_header || tool_pairing_repaired,
         })
@@ -912,6 +980,7 @@ impl SessionState {
             tag: self.tag.clone(),
             mode: self.mode.clone(),
             cumulative_usage: self.cumulative_usage.clone(),
+            traces: self.traces.clone(),
             repairs: self.repairs.clone(),
         }
     }
@@ -938,6 +1007,18 @@ impl SessionState {
             // RunOutcome entries are already pushed verbatim by the caller's
             // in-memory state; nothing to fold into snapshot fields.
             SessionEntry::RunOutcome { .. } => {}
+            SessionEntry::Trace {
+                schema_version,
+                run_id,
+                events,
+            } => {
+                self.traces.retain(|existing| existing.run_id != *run_id);
+                self.traces.push(PersistedTraceWire {
+                    schema_version: *schema_version,
+                    run_id: run_id.clone(),
+                    events: events.clone(),
+                });
+            }
             SessionEntry::CumulativeUsage {
                 input_tokens,
                 output_tokens,
@@ -1038,6 +1119,7 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
                         tag: None,
                         mode: None,
                         cumulative_usage: state.cumulative_usage.clone(),
+                        traces: Vec::new(),
                         repairs: state.repairs.clone(),
                         needs_rewrite: false,
                     };
@@ -1164,7 +1246,7 @@ pub fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nonoclaw_core::{ContentBlock, MessageContent, Role};
+    use nonoclaw_core::{ContentBlock, MessageContent, Role, RunEvent};
 
     fn tempdir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nonoclaw-session-{}", uuid::Uuid::new_v4()));
@@ -1224,6 +1306,64 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let third = service.list_sessions(&cwd).unwrap();
         assert!(third.is_empty(), "deleted session still listed");
+    }
+
+    #[tokio::test]
+    async fn trace_batch_roundtrips_through_disk() {
+        let cwd = tempdir();
+        let service = SessionService::new();
+        let s = service.create(&cwd, "trace-session", "model-x").unwrap();
+
+        let envelope = |sequence: u64, ms: u64| {
+            nonoclaw_core::EventEnvelope::at(
+                "run-1",
+                None,
+                "trace-session",
+                0,
+                sequence,
+                ms,
+                RunEvent::ThinkingState {
+                    active: false,
+                    turn: 1,
+                },
+            )
+        };
+        let events = vec![envelope(1, 1_000), envelope(2, 2_500)];
+        s.write_trace("run-1", events)
+            .await
+            .unwrap();
+
+        // Freshly read snapshot exposes the trace batch.
+        let snapshot = s.snapshot().await.unwrap();
+        assert_eq!(snapshot.traces.len(), 1);
+        assert_eq!(snapshot.traces[0].run_id, "run-1");
+        assert_eq!(snapshot.traces[0].events.len(), 2);
+
+        // And it survives a full reopen from disk (JSONL parse).
+        let path = s.path().to_path_buf();
+        drop(s);
+        let reopened = service.open_path(path, "trace-session", &cwd, "model-x").unwrap();
+        let reopened_snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(
+            reopened_snapshot.traces.len(),
+            1,
+            "trace batch must survive reopen"
+        );
+        let batch = &reopened_snapshot.traces[0];
+        assert_eq!(batch.run_id, "run-1");
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].timestamp_ms, 1_000);
+        assert_eq!(batch.events[1].sequence, 2);
+
+        // A re-write for the same run_id replaces, not duplicates.
+        reopened
+            .write_trace("run-1", vec![envelope(1, 9_999)])
+            .await
+            .unwrap();
+        let deduped = reopened.snapshot().await.unwrap();
+        assert_eq!(deduped.traces.len(), 1);
+        assert_eq!(deduped.traces[0].events.len(), 1);
+        assert_eq!(deduped.traces[0].events[0].timestamp_ms, 9_999);
     }
 
     #[tokio::test]

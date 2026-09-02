@@ -27,33 +27,88 @@ const MODE_LABEL: Record<TrajectoryTimelineMode, string> = {
   time: "Time",
   actual: "Actual",
 };
-const LANES = ["assistant", "thinking", "tool", "request"] as const;
+const TIME_COLUMN_LABEL: Record<TrajectoryTimelineMode, string> = {
+  sequence: "Order",
+  duration: "Duration",
+  time: "Elapsed range",
+  actual: "Actual range",
+};
+const LANES = ["assistant", "thinking", "tool", "user", "context"] as const;
 const LANE_LABEL: Record<(typeof LANES)[number], string> = {
   assistant: "assistant",
   thinking: "thinking",
   tool: "tool",
-  request: "request",
+  user: "user",
+  context: "context",
 };
+
+interface DisplayRange {
+  start: number;
+  end: number;
+}
 
 function clockTime(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms)) return "";
   const d = new Date(ms);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function cellEndTime(cell: LedgerCell): number | null {
+  if (cell.endedAt != null && Number.isFinite(cell.endedAt)) return cell.endedAt;
+  if (cell.startedAt == null || !Number.isFinite(cell.startedAt)
+    || cell.timeSeconds == null || !Number.isFinite(cell.timeSeconds)
+    || cell.timeSeconds < 0) return null;
+  return cell.startedAt + cell.timeSeconds * 1000;
+}
+
+function elapsedTime(ms: number): string {
+  return `+${(ms / 1000).toFixed(3)}s`;
+}
+
+function intervalLabel(start: string | null, end: string | null): string {
+  if (start !== null && end !== null) return start === end ? start : `${start}–${end}`;
+  if (start !== null) return `${start}–?`;
+  if (end !== null) return `?–${end}`;
+  return "—";
+}
+
+function eventTimeLabel(
+  cell: LedgerCell,
+  mode: TrajectoryTimelineMode,
+  compressedRange: DisplayRange | undefined,
+): string {
+  if (cell.requestOnly === true) return "…";
+  if (mode === "sequence") return `#${cell.index}`;
+  if (mode === "duration") return formatElapsedSeconds(cell.timeSeconds);
+
+  const hasStart = cell.startedAt != null && Number.isFinite(cell.startedAt);
+  const endAt = cellEndTime(cell);
+  if (mode === "time") {
+    if (compressedRange === undefined) return "—";
+    return intervalLabel(
+      hasStart ? elapsedTime(compressedRange.start) : null,
+      endAt !== null ? elapsedTime(compressedRange.end) : null,
+    );
+  }
+  return intervalLabel(
+    hasStart ? clockTime(cell.startedAt) : null,
+    endAt !== null ? clockTime(endAt) : null,
+  );
 }
 
 export default function TrajectoryLedger() {
   const messages = useStore((s) => s.messages);
-  const traceEntries = useStore((s) => s.traceEntries);
+  const traceEntries = useStore((s) => s.trajectoryTraceEntries);
   const subagentRunsById = useStore((s) => s.subagentRunsById);
 
   const [mode, setMode] = useState<TrajectoryTimelineMode>("sequence");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [focusedIndices, setFocusedIndices] = useState<Set<number> | null>(null);
+  const [focusedRecordIds, setFocusedRecordIds] = useState<Set<string> | null>(null);
   const [followTail, setFollowTail] = useState(true);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(480);
-  const [collapsedTurns, setCollapsedTurns] = useState<Set<number>>(new Set());
+  const [collapsedTurns, setCollapsedTurns] = useState<Set<string>>(new Set());
   const [dragRange, setDragRange] = useState<{ start: number; end: number } | null>(null);
   // Overview zoom/pan: `zoom` is a magnification factor (1 = whole domain fits,
   // 8 = 8x magnified) and `pan` is the domain start of the visible window
@@ -63,7 +118,6 @@ export default function TrajectoryLedger() {
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const overviewRef = useRef<HTMLDivElement | null>(null);
-  const indexRef = useRef<TrajectorySearchIndex>(new TrajectorySearchIndex());
 
   const layout = useMemo(
     () => buildLedgerLayout({ messages, traceEntries, subagentRunsById }),
@@ -77,11 +131,40 @@ export default function TrajectoryLedger() {
 
   const timeline = useMemo(() => deriveTrajectoryTimeline(layout.turns, mode), [layout, mode]);
 
-  useEffect(() => {
-    indexRef.current.addCells(projection.cells);
+  const timelineRanges = useMemo(() => {
+    const ranges = new Map<number, DisplayRange>();
+    if (timeline === null) return ranges;
+    const span = timeline.domain[1] - timeline.domain[0] || 1;
+    for (const item of timeline.spans) {
+      ranges.set(item.index, {
+        start: item.start * span,
+        end: item.end * span,
+      });
+    }
+    return ranges;
+  }, [timeline]);
+
+  const recordIdByIndex = useMemo(() => {
+    const ids = new Map<number, string>();
+    for (const turn of layout.turns) {
+      for (const cell of turn.cells) ids.set(cell.index, ledgerRecordId(cell));
+    }
+    return ids;
+  }, [layout]);
+
+  // Rebuild synchronously with each projection. Search keys are stable record
+  // identities, so causal insertion/renumbering cannot transfer old text to a
+  // different row, and streaming text updates are visible in the same render.
+  const searchIndex = useMemo(() => {
+    const next = new TrajectorySearchIndex();
+    next.addCells(projection.cells);
+    return next;
   }, [projection.cells]);
 
-  const matches = useMemo(() => (query.trim().length > 0 ? indexRef.current.search(query) : null), [query, projection.cells]);
+  const matches = useMemo(
+    () => (query.trim().length > 0 ? searchIndex.search(query) : null),
+    [query, searchIndex],
+  );
 
   const selected = useMemo(() => {
     if (selectedId === null) return null;
@@ -142,15 +225,20 @@ export default function TrajectoryLedger() {
   }, [screenToDomain]);
   const onMouseUpOverview = useCallback(() => {
     if (dragRange !== null) {
-      const sel = timelineSelectionForRange(timeline, dragRange);
-      setFocusedIndices(sel.size > 0 ? sel : null);
+      const selectedIndices = timelineSelectionForRange(timeline, dragRange);
+      const selectedRecordIds = new Set<string>();
+      for (const selectedIndex of selectedIndices) {
+        const recordId = recordIdByIndex.get(selectedIndex);
+        if (recordId !== undefined) selectedRecordIds.add(recordId);
+      }
+      setFocusedRecordIds(selectedRecordIds.size > 0 ? selectedRecordIds : null);
     }
     dragRef.current = null;
-  }, [dragRange, timeline]);
+  }, [dragRange, timeline, recordIdByIndex]);
   const onContextMenuOverview = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     setDragRange(null);
-    setFocusedIndices(null);
+    setFocusedRecordIds(null);
   }, []);
 
   // Wheel zoom on the overview (time modes only). Attached as a non-passive
@@ -197,20 +285,21 @@ export default function TrajectoryLedger() {
     setView({ zoom: 1, pan: 0 });
   }, [mode]);
 
-  const toggleTurn = useCallback((n: number) => {
+  const toggleTurn = useCallback((turnKey: string) => {
     setCollapsedTurns((prev) => {
       const next = new Set(prev);
-      if (next.has(n)) next.delete(n);
-      else next.add(n);
+      if (next.has(turnKey)) next.delete(turnKey);
+      else next.add(turnKey);
       return next;
     });
   }, []);
 
   const dimmed = useCallback((cell: LedgerCell) => {
-    if (matches !== null && !matches.has(`${cell.index}`)) return true;
-    if (focusedIndices !== null && !focusedIndices.has(cell.index)) return true;
+    const recordId = ledgerRecordId(cell);
+    if (matches !== null && !matches.has(recordId)) return true;
+    if (focusedRecordIds !== null && !focusedRecordIds.has(recordId)) return true;
     return false;
-  }, [matches, focusedIndices]);
+  }, [matches, focusedRecordIds]);
 
   const stats = useMemo(() => {
     let tools = 0;
@@ -308,7 +397,7 @@ export default function TrajectoryLedger() {
         <div className="ledger-table__head">
           <span className="ledger-table__h ledger-table__h--index">#</span>
           <span className="ledger-table__h ledger-table__h--event">Event</span>
-          <span className="ledger-table__h ledger-table__h--time">Time</span>
+          <span className="ledger-table__h ledger-table__h--time">{TIME_COLUMN_LABEL[mode]}</span>
         </div>
         <div
           className="ledger-table__body"
@@ -320,10 +409,11 @@ export default function TrajectoryLedger() {
             <div style={{ transform: `translateY(${window_.offsetY}px)` }}>
               {window_.rows.map((row) => {
                 if (row.kind === "turn-header") {
-                  const collapsed = collapsedTurns.has(row.turn);
+                  const turnKey = row.turnKey ?? `turn\u0000${row.turn}`;
+                  const collapsed = collapsedTurns.has(turnKey);
                   return (
                     <div key={row.key} className="ledger-turn-head" style={{ height: row.height }}>
-                      <button className="ledger-turn-head__toggle" onClick={() => toggleTurn(row.turn)} aria-expanded={!collapsed}>
+                      <button className="ledger-turn-head__toggle" onClick={() => toggleTurn(turnKey)} aria-expanded={!collapsed}>
                         {collapsed ? "▸" : "▾"}
                       </button>
                       <span className="ledger-turn-head__label">Turn {row.turn + 1}</span>
@@ -365,12 +455,10 @@ export default function TrajectoryLedger() {
                     <span className="ledger-row__event">
                       <span className={`ledger-row__kind ledger-row__kind--${cell.kind}`}>{cell.kind}</span>
                       <span className="ledger-row__text" title={cell.text}>{cell.text}</span>
-                      {matches !== null && matches.has(`${cell.index}`) && <span className="ledger-row__hit">●</span>}
+                      {matches !== null && matches.has(ledgerRecordId(cell)) && <span className="ledger-row__hit">●</span>}
                     </span>
                     <span className="ledger-row__time">
-                      {cell.requestOnly === true
-                        ? "…"
-                        : formatElapsedSeconds(cell.timeSeconds)}
+                      {eventTimeLabel(cell, mode, timelineRanges.get(cell.index))}
                     </span>
                   </div>
                 );
@@ -389,7 +477,8 @@ export default function TrajectoryLedger() {
           </div>
           <div className="ledger-inspector__facts">
             <Fact label="Duration" value={formatElapsedSeconds(selected.timeSeconds)} />
-            <Fact label="Started" value={selected.startedAt != null ? clockTime(selected.startedAt) : "—"} />
+            <Fact label="Start" value={selected.startedAt != null ? clockTime(selected.startedAt) : "—"} />
+            <Fact label="End" value={cellEndTime(selected) != null ? clockTime(cellEndTime(selected)) : "—"} />
             {selected.input !== undefined && <Fact label="Input tokens" value={formatTokenCount(selected.input)} />}
             {selected.cacheRead !== undefined && <Fact label="Cache read" value={formatTokenCount(selected.cacheRead)} />}
             {selected.cacheWrite !== undefined && <Fact label="Cache write" value={formatTokenCount(selected.cacheWrite)} />}

@@ -268,6 +268,7 @@ impl RunController {
 
         let controller = self.clone();
         let context = self.context.clone();
+        let trace_session = engine.trace_session();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let consumer = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
@@ -332,6 +333,11 @@ impl RunController {
         let supervisor = tokio::spawn(async move {
             let engine_join = engine_task.await;
             let consumer_join = consumer.await;
+
+            // One owner persists every terminal path exactly once. The cloned
+            // session actor survives engine-task panics, while the shared
+            // context still contains every envelope recorded before failure.
+            QueryEngine::persist_run_trace_to(trace_session.as_ref(), &context).await;
 
             if let Err(_consumer_error) = consumer_join {
                 let engine = match engine_join {

@@ -328,6 +328,10 @@ export function dispatchServerMessage(message: ServerMsg): void {
         : state.acceptLegacySnapshot();
       if (accepted) {
         state.loadMessages(message.messages, message.total);
+        // Rehydrate persisted per-run timing traces so the trajectory ledger
+        // replays with precise step windows (thinking spans, first token,
+        // tool boundaries) instead of inferring from message commit times.
+        state.loadPersistedTraces(message.traces);
         // Restore cumulative token usage so the right-rail in/out display
         // survives a page refresh. These are real API token counts accumulated
         // across all completed runs in this session.
@@ -358,6 +362,9 @@ export function dispatchServerMessage(message: ServerMsg): void {
       break;
     case "project_info":
       state.setProjectInfo(message.info);
+      break;
+    case "models_health":
+      state.setModelsHealth(message.results);
       break;
     case "system_probe":
       if (state.projectInfo) {
@@ -413,10 +420,10 @@ export function dispatchServerMessage(message: ServerMsg): void {
           scheduleDelta(event.text || "", true);
           break;
         case "tool_use_start":
-          state.addToolCard(event.id || "", event.name || "unknown", event.input);
+          state.addToolCard(event.id || "", event.name || "unknown", event.input, message.timestamp_ms);
           break;
         case "tool_result":
-          state.updateToolResult(event.id || "", event.ok ?? false, event.preview || "");
+          state.updateToolResult(event.id || "", event.ok ?? false, event.preview || "", message.timestamp_ms);
           break;
         case "assistant_done":
           flushDeltas();

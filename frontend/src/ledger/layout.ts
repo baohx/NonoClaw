@@ -60,6 +60,9 @@ interface UsageRaw {
  * ledger-turn index is WRONG (one ledger turn spans many engine turns),
  * so windows are paired by message timestamps instead. */
 export interface StepWindow {
+  runId: string;
+  /** Sequence of the model_request_started event within this run. */
+  requestSequence: number;
   turn: number;
   start: number;
   firstToken: number | null;
@@ -109,12 +112,30 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
     byRun.set(entry.runId, list);
   }
   const windows: StepWindow[] = [];
-  for (const runEntries of byRun.values()) {
+  const completionStrength = new Map<StepWindow, number>();
+  const setCompletion = (window: StepWindow, timestampMs: number, strength: number): void => {
+    const previousStrength = completionStrength.get(window) ?? -1;
+    if (strength > previousStrength
+      || (strength === previousStrength && timestampMs > (window.completed ?? Number.NEGATIVE_INFINITY))) {
+      window.completed = timestampMs;
+      completionStrength.set(window, strength);
+    }
+  };
+  for (const [runId, groupedEntries] of byRun) {
+    // appendTraceEntry retains global arrival order because sequence counters
+    // reset per run. Within one run, sequence is the causal clock guaranteed
+    // by the wire protocol; wall-clock timestamps can move backward and must
+    // never attach a close event to the preceding model window.
+    const runEntries = [...groupedEntries].sort((a, b) => (
+      a.sequence - b.sequence || a.timestampMs - b.timestampMs || a.id.localeCompare(b.id)
+    ));
     let current: StepWindow | null = null;
     for (const entry of runEntries) {
       const ev = entry.details as Record<string, unknown> | undefined;
       if (entry.kind === "model_request_started") {
         current = {
+          runId,
+          requestSequence: entry.sequence,
           turn: finiteMs(ev?.turn) ?? (windows.length + 1),
           start: entry.timestampMs,
           firstToken: null,
@@ -132,20 +153,34 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
       } else if (entry.kind === "retry_scheduled") {
         const attempt = finiteMs(ev?.attempt);
         if (attempt !== null && (current.retryAttempt === undefined || attempt > current.retryAttempt)) current.retryAttempt = attempt;
-      } else if (entry.kind === "stream_state_changed" && ev?.state === "streaming") {
-        if (current.firstToken === null) current.firstToken = entry.timestampMs;
+      } else if (entry.kind === "stream_state_changed") {
+        if (ev?.state === "streaming") {
+          if (current.firstToken === null) current.firstToken = entry.timestampMs;
+        } else if (ev?.state === "completed" || ev?.state === "interrupted") {
+          // Authoritative stream terminal. MessageStart emits an early
+          // usage_updated before any thinking deltas; that event remains a
+          // compatibility fallback, but must not truncate a long reasoning
+          // block when MessageStop later supplies the real completion time.
+          setCompletion(current, entry.timestampMs, 3);
+        }
       } else if (entry.kind === "thinking_state" && ev?.active === false) {
         // Precise end of the reasoning block. The first (earliest) active:false
         // wins — providers may emit both a block-level close and a MessageStop
         // fallback; the block close is the accurate one.
         if (current.thinkingEnd === null) current.thinkingEnd = entry.timestampMs;
       } else if (entry.kind === "usage_updated") {
-        if (current.completed === null) current.completed = entry.timestampMs;
+        // Usage can arrive at MessageStart and again near MessageStop. It is a
+        // provisional fallback only; later stream/tool/run boundaries carry
+        // stronger lifecycle semantics and must replace it.
+        setCompletion(current, entry.timestampMs, 0);
         const raw = collectTurnUsageRaw(ev);
         if (raw !== null) current.usage = raw;
-      } else if (entry.kind === "tool_use_start" || entry.kind === "run_finished") {
-        // The assistant step ends when its tool batch starts or the run ends.
-        if (current.completed === null) current.completed = entry.timestampMs;
+      } else if (entry.kind === "tool_use_start") {
+        // Tool dispatch is a stronger model-step boundary than provisional
+        // usage, but remains below an explicit stream terminal.
+        setCompletion(current, entry.timestampMs, 2);
+      } else if (entry.kind === "run_finished") {
+        setCompletion(current, entry.timestampMs, 1);
       }
     }
   }
@@ -158,6 +193,18 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
   // Symmetrically, a stamp BEFORE the window opened belongs to another run's
   // straggler → drop it rather than render a negative duration.
   for (const w of windows) {
+    if (w.completed !== null && w.completed < w.start) w.completed = null;
+    if (w.firstToken !== null && w.completed !== null && w.firstToken > w.completed) {
+      if ((completionStrength.get(w) ?? 0) === 0) {
+        // An early MessageStart usage cannot precede observed stream activity;
+        // promote the provisional boundary to the known activity timestamp.
+        w.completed = w.firstToken;
+      } else {
+        // A first-token stamp after a stronger terminal is inconsistent and
+        // cannot safely define the assistant split.
+        w.firstToken = null;
+      }
+    }
     if (w.thinkingEnd !== null && w.completed !== null && w.thinkingEnd > w.completed) {
       w.thinkingEnd = w.completed;
     }
@@ -169,6 +216,49 @@ function buildStepWindows(entries: TraceEntry[]): StepWindow[] {
     }
   }
   return windows;
+}
+
+/** Match a chat assistant to a model step without letting a later, unfinished
+ * concurrent run steal a completed message. Wall-clock timestamps choose
+ * between runs; within one run, request sequence remains authoritative when
+ * the system clock moves backward. */
+function selectStepWindow(windows: StepWindow[], message: ChatMessage): StepWindow | undefined {
+  if (windows.length === 0) return undefined;
+  const laterStarted = (best: StepWindow, candidate: StepWindow): StepWindow => {
+    if (candidate.runId === best.runId && candidate.requestSequence !== best.requestSequence) {
+      return candidate.requestSequence > best.requestSequence ? candidate : best;
+    }
+    return candidate.start > best.start ? candidate : best;
+  };
+  const msgTs = message.timestamp;
+  if (msgTs === undefined || !Number.isFinite(msgTs)) return windows.reduce(laterStarted);
+  const started = windows.filter((window) => window.start <= msgTs);
+  if (started.length === 0) return undefined;
+  const latestStarted = started.reduce(laterStarted);
+  if (message.streaming === true) return latestStarted;
+
+  const containing = started.filter((window) => window.completed !== null && window.completed >= msgTs);
+  if (containing.length > 0) return containing.reduce(laterStarted);
+
+  const completedBefore = started.filter((window) => window.completed !== null && window.completed <= msgTs);
+  if (completedBefore.length > 0) {
+    const completed = completedBefore.reduce((best, candidate) => {
+      if (candidate.runId === best.runId && candidate.requestSequence !== best.requestSequence) {
+        return candidate.requestSequence > best.requestSequence ? candidate : best;
+      }
+      return (candidate.completed as number) > (best.completed as number) ? candidate : best;
+    });
+    // A later causal request in the same run cannot be ignored merely because
+    // its terminal timestamp rolled behind its own start and was discarded.
+    // Prefer that successor over reusing the preceding completed window.
+    const causalSuccessors = started.filter((window) => (
+      window.runId === completed.runId
+      && window.requestSequence > completed.requestSequence
+    ));
+    if (causalSuccessors.length > 0) return causalSuccessors.reduce(laterStarted);
+    return completed;
+  }
+  return latestStarted;
 }
 
 function preview(text: string, limit = 400): string {
@@ -195,7 +285,6 @@ function toolUseIdOf(message: ChatMessage): string | null {
 export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult {
   const { messages, traceEntries, subagentRunsById } = input;
   const stepWindows = buildStepWindows(traceEntries);
-  let windowCursor = 0;
 
   const turns: LedgerTurnModel[] = [];
   let index = 0;
@@ -206,7 +295,8 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
     const placed = { ...cell, index: ++index } as LedgerCell;
     turn.cells.push(placed);
     if (cell.startedAt != null && (turn.startAt === null || cell.startedAt < turn.startAt)) turn.startAt = cell.startedAt;
-    const endGuess = cell.startedAt != null && cell.timeSeconds != null ? cell.startedAt + cell.timeSeconds * 1000 : null;
+    const endGuess = cell.endedAt
+      ?? (cell.startedAt != null && cell.timeSeconds != null ? cell.startedAt + cell.timeSeconds * 1000 : null);
     if (endGuess != null && endGuess > (turn.endAt ?? 0)) turn.endAt = endGuess;
     return placed;
   };
@@ -230,6 +320,7 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
         recordId: `user\u0000${message.id}`,
         timeSeconds: null,
         startedAt: message.timestamp ?? null,
+        endedAt: message.timestamp ?? null,
         ...(message.attachments && message.attachments.length > 0
           ? { preview: `${message.attachments.length} attachment(s)` }
           : {}),
@@ -237,24 +328,13 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
     } else if (message.role === "assistant") {
       const turnModel = current ?? (turns.length > 0 ? turns[turns.length - 1] : null);
       if (turnModel === null) continue;
-      // Pair this assistant message with the step window whose start is the
-      // latest one at or before the message timestamp. Streaming messages
-      // carry the streaming-start timestamp; tool-only turns have no message.
-      const msgTs = message.timestamp ?? Number.POSITIVE_INFINITY;
-      while (
-        windowCursor + 1 < stepWindows.length
-        && stepWindows[windowCursor + 1].start <= msgTs
-      ) windowCursor += 1;
-      let window = stepWindows[windowCursor];
-      if (window !== undefined && window.start > msgTs) {
-        // Message predates every window (restored sessions without trace);
-        // fall back to the nearest earlier window, else none.
-        window = stepWindows[Math.max(0, windowCursor)] ?? undefined;
-        if (window.start > msgTs) window = undefined as unknown as StepWindow;
-      }
+      // Completed messages prefer a completed window associated with their
+      // timestamp. This prevents a later concurrent run that is still open
+      // from stealing the assistant record merely because it started later.
+      const window = selectStepWindow(stepWindows, message);
       const timing = window;
       const usage = window?.usage ?? null;
-      if (usage !== null && turnModel.usage === null) {
+      if (window !== undefined && usage !== null && turnModel.usage === null) {
         // First assistant message of this ledger turn: sum usage of every
         // step window that starts within the turn (user prompt → next prompt).
         const turnStart = turnModel.startAt ?? window.start;
@@ -262,7 +342,7 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
         const turnEnd = nextTurn?.startAt ?? Number.POSITIVE_INFINITY;
         const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
         for (const w of stepWindows) {
-          if (w.usage === null) continue;
+          if (w.runId !== window.runId || w.usage === null) continue;
           if (w.start < turnStart || w.start >= turnEnd) continue;
           sum.input += w.usage.input_tokens ?? 0;
           sum.output += w.usage.output_tokens ?? 0;
@@ -279,14 +359,17 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           retryAttempt: window.retryAttempt,
         };
       }
-      const startedAt = timing?.start ?? message.timestamp ?? null;
-      const completedAt = timing?.completed ?? null;
+      const stepStart = timing?.start ?? null;
+      // Persisted assistant message timestamps are commit/end stamps. Live
+      // trace windows provide their own completion event and take precedence.
+      const completedAt = timing?.completed
+        ?? (timing === undefined ? message.timestamp ?? null : null);
       // The thinking block and the visible output are sequential halves of one
       // step. Both rows previously anchored at step start, so they rendered
       // identical "Started" stamps and overlapping timeline spans. Anchor the
       // assistant row where thinking closed (visible output begins there).
       const thinkingEnd = timing?.thinkingEnd ?? timing?.firstToken ?? null;
-      const assistantStart = thinkingEnd ?? startedAt;
+      const assistantStart = timing === undefined ? null : thinkingEnd ?? stepStart;
       const metric: AssistantMetricDetail | undefined = timing === undefined
         ? undefined
         : {
@@ -308,10 +391,11 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           text: preview(message.thinking, 200) || "(empty thinking)",
           thinkingDetail: message.thinking,
           recordId: `thinking\u0000${message.id}`,
-          timeSeconds: startedAt !== null && thinkingEnd !== null
-            ? (thinkingEnd - startedAt) / 1000
+          timeSeconds: stepStart !== null && thinkingEnd !== null && thinkingEnd >= stepStart
+            ? (thinkingEnd - stepStart) / 1000
             : null,
-          startedAt,
+          startedAt: stepStart,
+          endedAt: thinkingEnd,
         } as LedgerCell);
       }
       pushCell(turnModel, {
@@ -322,8 +406,11 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
           ? message.thinking
           : undefined,
         recordId: `assistant\u0000${message.id}`,
-        timeSeconds: assistantStart !== null && completedAt !== null ? (completedAt - assistantStart) / 1000 : null,
+        timeSeconds: assistantStart !== null && completedAt !== null && completedAt >= assistantStart
+          ? (completedAt - assistantStart) / 1000
+          : null,
         startedAt: assistantStart,
+        endedAt: completedAt,
         input: usage?.input_tokens,
         cacheRead: usage?.cache_read_input_tokens,
         cacheWrite: usage?.cache_creation_input_tokens,
@@ -343,108 +430,235 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
         outputDetail: message.content,
         isError: message.toolOk === false,
         startedAt: message.timestamp ?? null,
-        timeSeconds: message.durationMs != null && message.durationMs > 0
+        endedAt: message.timestamp != null && message.durationMs != null && message.durationMs >= 0
+          ? message.timestamp + message.durationMs
+          : null,
+        timeSeconds: message.durationMs != null && message.durationMs >= 0
           ? message.durationMs / 1000
           : null,
       });
     }
   }
 
-  // Replay fallback: for records with no measured span (no trace entries),
-  // the wall-clock gap BACK to the previous stamped record approximates the
-  // step latency — each assistant message's `ts` is its commit time, so the
-  // backward gap is pure model step time and never contains user idle.
-  // (The old forward gap spanned the user's reading pause after a turn's
-  // final answer, exceeded the 60s cap and rendered "—".)
-  {
-    const REPLAY_FALLBACK_CAP_SECONDS = 60;
-    const stamped = messages
-      .map((m) => (typeof m.timestamp === "number" && Number.isFinite(m.timestamp) ? m.timestamp : null))
-      .filter((t): t is number => t !== null);
-    if (stamped.length >= 2) {
-      let prevTs: number | null = null;
-      for (const turn of turns) {
-        for (const cell of turn.cells) {
-          // Thinking rows never take the fallback: without a trace there is no
-          // recorded close event, and the gap belongs to the assistant row
-          // (the whole step). Filling both made adjacent thinking/assistant
-          // rows show the identical duration — double-counted.
-          if (cell.kind !== "thinking" && cell.kind !== "user"
-            && cell.timeSeconds == null && cell.startedAt != null && prevTs !== null) {
-            const spanMs = cell.startedAt - prevTs;
-            if (spanMs > 0 && spanMs <= REPLAY_FALLBACK_CAP_SECONDS * 1000) {
-              cell.timeSeconds = spanMs / 1000;
-            }
-          }
-          // Every stamped record advances the cursor — user prompts included:
-          // the assistant step behind them is measured back to this instant.
-          // Thinking rows do NOT advance it: without a trace they share the
-          // assistant message's commit ts and would zero out the step gap.
-          if (cell.kind !== "thinking" && cell.startedAt != null) prevTs = cell.startedAt;
-        }
+  // Pair execution endpoints in two passes. Trace sequence numbers are only
+  // comparable inside a run, and tool ids can be reused by later runs, so a
+  // bare tool_use_id map can join unrelated executions or miss a finish that
+  // arrived in the input array before its start.
+  type ToolTraceTiming = {
+    key: string;
+    runId: string;
+    callId: string;
+    toolName?: string;
+    start: number | null;
+    end: number | null;
+    elapsed: number | null;
+  };
+  type ToolTraceGroup = {
+    runId: string;
+    callId: string;
+    toolName?: string;
+    starts: TraceEntry[];
+    finishes: TraceEntry[];
+  };
+  const toolTraceGroups = new Map<string, ToolTraceGroup>();
+  for (const entry of traceEntries) {
+    if (entry.kind !== "tool_execution_started" && entry.kind !== "tool_execution_finished") continue;
+    const ev = entry.details as Record<string, unknown> | undefined;
+    const callId = typeof ev?.tool_use_id === "string" ? ev.tool_use_id : null;
+    if (callId === null) continue;
+    const key = `${entry.runId}\u0000${callId}`;
+    let group = toolTraceGroups.get(key);
+    if (group === undefined) {
+      group = { runId: entry.runId, callId, starts: [], finishes: [] };
+      toolTraceGroups.set(key, group);
+    }
+    if (typeof ev?.tool_name === "string") group.toolName = ev.tool_name;
+    if (entry.kind === "tool_execution_started") group.starts.push(entry);
+    else group.finishes.push(entry);
+  }
+
+  const traceOrder = (a: TraceEntry, b: TraceEntry): number => (
+    a.sequence - b.sequence || a.timestampMs - b.timestampMs || a.id.localeCompare(b.id)
+  );
+  const toolTimings: ToolTraceTiming[] = [];
+  for (const [key, group] of toolTraceGroups) {
+    const startEntry = [...group.starts].sort(traceOrder)[0];
+    const finishes = [...group.finishes].sort(traceOrder);
+    // Input arrival order is irrelevant. Within one run, the matching finish
+    // is the first causal finish at/after the start sequence.
+    const finishEntry = startEntry === undefined
+      ? finishes[0]
+      : finishes.find((entry) => entry.sequence >= startEntry.sequence);
+    const rawElapsed = finishEntry === undefined
+      ? null
+      : finiteMs((finishEntry.details as Record<string, unknown> | undefined)?.elapsed_ms);
+    const elapsed = rawElapsed !== null && rawElapsed >= 0 ? rawElapsed : null;
+    let start = startEntry?.timestampMs ?? null;
+    let end = finishEntry?.timestampMs ?? null;
+    if (start === null && end !== null && elapsed !== null) start = end - elapsed;
+    // Keep real event endpoints when sane. If provider clocks put the finish
+    // before the start, elapsed_ms is the only safe way to reconstruct an end.
+    if (start !== null && end !== null && end < start) {
+      end = elapsed === null ? null : start + elapsed;
+    }
+    toolTimings.push({
+      key,
+      runId: group.runId,
+      callId: group.callId,
+      toolName: group.toolName,
+      start,
+      end,
+      elapsed: elapsed ?? (start !== null && end !== null ? end - start : null),
+    });
+  }
+
+  // A ledger turn has no run id on persisted messages. Bind scoped tool traces
+  // through the turn's wall-clock window; when timestamps are absent, only a
+  // globally unique candidate is safe. This prevents a reused id in run B from
+  // rewriting the cell (or running barrier) belonging to run A.
+  type TurnBounds = { start: number | null; end: number | null };
+  const realTurns = turns.filter((turn) => turn.n !== -1);
+  const turnBounds = new Map<LedgerTurnModel, TurnBounds>();
+  for (let i = 0; i < realTurns.length; i += 1) {
+    const turn = realTurns[i];
+    const userStart = turn.cells.find((cell) => cell.kind === "user")?.startedAt ?? turn.startAt;
+    const next = realTurns[i + 1];
+    const nextStart = next?.cells.find((cell) => cell.kind === "user")?.startedAt ?? next?.startAt ?? null;
+    turnBounds.set(turn, { start: userStart ?? null, end: nextStart });
+  }
+  const traceBelongsToTurn = (timing: ToolTraceTiming, bounds: TurnBounds | undefined): boolean => {
+    if (bounds === undefined) return false;
+    const anchor = timing.start ?? timing.end;
+    if (anchor === null) return false;
+    if (bounds.start !== null && anchor < bounds.start) return false;
+    if (bounds.end !== null && anchor >= bounds.end) return false;
+    return true;
+  };
+  const timingsByCallId = new Map<string, ToolTraceTiming[]>();
+  for (const timing of toolTimings) {
+    timingsByCallId.set(timing.callId, [...(timingsByCallId.get(timing.callId) ?? []), timing]);
+  }
+  const usedToolTimingKeys = new Set<string>();
+  const matchedToolTimingByCell = new Map<LedgerCell, ToolTraceTiming>();
+
+  for (const turn of realTurns) {
+    const bounds = turnBounds.get(turn);
+    for (const cell of turn.cells) {
+      if (cell.kind !== "tool" || cell.callId === undefined) continue;
+      const available = (timingsByCallId.get(cell.callId) ?? [])
+        .filter((timing) => !usedToolTimingKeys.has(timing.key));
+      let candidates = available.filter((timing) => traceBelongsToTurn(timing, bounds));
+      const hasTurnBoundary = bounds !== undefined && (bounds.start !== null || bounds.end !== null);
+      if (candidates.length === 0 && available.length === 1 && !hasTurnBoundary) {
+        candidates = available;
       }
+      if (candidates.length === 0) continue;
+      const cellAnchor = cell.startedAt ?? cell.endedAt ?? null;
+      candidates.sort((a, b) => {
+        const aAnchor = a.start ?? a.end;
+        const bAnchor = b.start ?? b.end;
+        const aDistance = cellAnchor === null || aAnchor === null ? 0 : Math.abs(aAnchor - cellAnchor);
+        const bDistance = cellAnchor === null || bAnchor === null ? 0 : Math.abs(bAnchor - cellAnchor);
+        return aDistance - bDistance
+          || (aAnchor ?? Number.POSITIVE_INFINITY) - (bAnchor ?? Number.POSITIVE_INFINITY)
+          || a.runId.localeCompare(b.runId);
+      });
+      const timing = candidates[0];
+      usedToolTimingKeys.add(timing.key);
+      matchedToolTimingByCell.set(cell, timing);
+
+      if (timing.start !== null) cell.startedAt = timing.start;
+      if (timing.end !== null) {
+        cell.endedAt = timing.end;
+      } else if (timing.start !== null && cell.timeSeconds !== null && cell.timeSeconds >= 0) {
+        // The message result supplies a known duration even if its trace finish
+        // was evicted; anchor that duration at the exact trace start.
+        cell.endedAt = timing.start + cell.timeSeconds * 1000;
+      }
+      if (timing.elapsed !== null) {
+        cell.timeSeconds = timing.elapsed / 1000;
+      } else if (cell.startedAt != null && cell.endedAt != null && cell.endedAt >= cell.startedAt) {
+        cell.timeSeconds = (cell.endedAt - cell.startedAt) / 1000;
+      }
+      if (cell.startedAt != null && (turn.startAt === null || cell.startedAt < turn.startAt)) {
+        turn.startAt = cell.startedAt;
+      }
+      if (cell.endedAt != null && cell.endedAt > (turn.endAt ?? 0)) turn.endAt = cell.endedAt;
+    }
+
+    // Replayed sibling tools can inherit one identical synthetic interval.
+    // Keep those raw endpoints untouched for Actual; Time gets a projection-
+    // only partition so every sibling remains visible instead of overpainting.
+    const syntheticGroups = new Map<string, LedgerCell[]>();
+    for (const cell of turn.cells) {
+      if (cell.kind !== "tool" || matchedToolTimingByCell.has(cell) || cell.startedAt == null) continue;
+      const rawEnd = cell.endedAt
+        ?? (cell.timeSeconds !== null && cell.timeSeconds >= 0
+          ? cell.startedAt + cell.timeSeconds * 1000
+          : null);
+      if (rawEnd === null) continue;
+      const key = `${cell.startedAt}\u0000${rawEnd}`;
+      syntheticGroups.set(key, [...(syntheticGroups.get(key) ?? []), cell]);
+    }
+    for (const siblings of syntheticGroups.values()) {
+      if (siblings.length < 2) continue;
+      siblings.sort((a, b) => a.index - b.index);
+      const start = siblings[0].startedAt as number;
+      const end = siblings[0].endedAt
+        ?? start + (siblings[0].timeSeconds ?? 0) * 1000;
+      const span = end - start;
+      siblings.forEach((cell, siblingIndex) => {
+        if (span > 0) {
+          cell.timelineStartedAt = start + span * siblingIndex / siblings.length;
+          cell.timelineEndedAt = start + span * (siblingIndex + 1) / siblings.length;
+        } else {
+          // Distinct one-millisecond point anchors remain minimum-width markers
+          // and avoid collapsing zero-duration siblings onto one pixel.
+          cell.timelineStartedAt = start + siblingIndex;
+          cell.timelineEndedAt = start + siblingIndex;
+        }
+      });
     }
   }
 
-  // Per-tool elapsed / start from tool_execution_started ↔ finished pairs.
-  const startsById = new Map<string, number>();
-  const execSpan = new Map<string, { start: number; elapsed: number }>();
-  for (const entry of traceEntries) {
-    const ev = entry.details as Record<string, unknown> | undefined;
-    const id = typeof ev?.tool_use_id === "string" ? ev.tool_use_id : null;
-    if (id === null) continue;
-    if (entry.kind === "tool_execution_started") {
-      if (!startsById.has(id)) startsById.set(id, entry.timestampMs);
-    } else if (entry.kind === "tool_execution_finished") {
-      const start = startsById.get(id);
-      const elapsed = finiteMs(ev?.elapsed_ms);
-      const span = elapsed !== null && elapsed >= 0
-        ? { start: start ?? entry.timestampMs - elapsed, elapsed }
-        : start !== undefined
-          ? { start, elapsed: Math.max(0, entry.timestampMs - start) }
-          : { start: entry.timestampMs, elapsed: 0 };
-      execSpan.set(id, span);
-    }
+  // Merge exact trace-only tools into message order. Appending these records
+  // afterward would break causal Sequence order for the following assistant.
+  for (const timing of toolTimings) {
+    const anchor = timing.start ?? timing.end;
+    if (anchor === null) continue;
+    const owner = realTurns.find((turn) => traceBelongsToTurn(timing, turnBounds.get(turn)))
+      ?? findTurnContainingAt(realTurns, anchor);
+    if (owner === null) continue;
+    const alreadyProjected = owner.cells.some((cell) => {
+      const matched = matchedToolTimingByCell.get(cell);
+      return matched?.key === timing.key
+        || (matched === undefined && cell.callId === timing.callId);
+    });
+    if (alreadyProjected) continue;
+
+    const insertAt = owner.cells.findIndex((cell) => {
+      const cellAnchor = cell.startedAt ?? cell.endedAt;
+      return cellAnchor != null && cellAnchor > anchor;
+    });
+    const position = insertAt < 0 ? owner.cells.length : insertAt;
+    const placed = pushCell(owner, {
+      kind: "tool",
+      text: `${timing.toolName ?? "Tool"}${timing.end === null ? " (running)" : ""}`,
+      callId: timing.callId,
+      recordId: `trace-tool\u0000${timing.runId}\u0000${timing.callId}`,
+      timeSeconds: timing.elapsed === null ? null : timing.elapsed / 1000,
+      startedAt: timing.start,
+      endedAt: timing.end,
+    });
+    owner.cells.pop();
+    owner.cells.splice(position, 0, placed);
+    usedToolTimingKeys.add(timing.key);
+    matchedToolTimingByCell.set(placed, timing);
   }
-  for (const turn of turns) {
-    for (const cell of turn.cells) {
-      if (cell.kind === "tool" && cell.callId !== undefined) {
-        const span = execSpan.get(cell.callId);
-        if (span !== undefined) {
-          cell.timeSeconds = span.elapsed / 1000;
-          cell.startedAt = span.start;
-          if (turn.startAt === null || span.start < turn.startAt) turn.startAt = span.start;
-          const end = span.start + span.elapsed;
-          if (end > (turn.endAt ?? 0)) turn.endAt = end;
-        }
-      }
-    }
-    // Replay sessions give every tool_use of one assistant message the same
-    // synthetic span [assistant ts, result ts] — parallel calls then draw as
-    // fully overlapping bars on the tool lane. With no per-tool trace there is
-    // no real start order, so serialize siblings: shift each tool's start to
-    // just after the previous one ends, shrinking durations to fit the shared
-    // window when needed.
-    const tools = turn.cells.filter((c) => c.kind === "tool" && c.startedAt !== null && c.timeSeconds !== null);
-    if (tools.length > 1) {
-      tools.sort((a, b) => a.index - b.index);
-      let prevEnd: number | null = null;
-      for (const cell of tools) {
-        const start = cell.startedAt as number;
-        const durMs = (cell.timeSeconds as number) * 1000;
-        if (prevEnd !== null && start < prevEnd) {
-          const windowEnd = start + durMs;
-          const newStart: number = prevEnd;
-          const newDur = Math.max(0, windowEnd - newStart);
-          cell.startedAt = newStart;
-          cell.timeSeconds = newDur / 1000;
-          prevEnd = newStart + newDur;
-        } else {
-          prevEnd = start + durMs;
-        }
-      }
-    }
-  }
+
+  // Persisted assistant timestamps are commit/end stamps only. Without a
+  // matching live trace window, keep thinking/model starts and durations
+  // unknown instead of converting message gaps or user idle into latency.
 
   // Subagent branches: child tool records ride under the parent's turn.
   for (const run of Object.values(subagentRunsById)) {
@@ -489,6 +703,7 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
       recordId: `compacted\u0000${entry.id}`,
       timeSeconds: null,
       startedAt: entry.timestampMs,
+      endedAt: entry.timestampMs,
     };
     // Compaction is a session-level event, not part of any single turn — it
     // always lands in the "Between turns" pseudo-turn.
@@ -498,31 +713,15 @@ export function buildLedgerLayout(input: LedgerLayoutInput): LedgerLayoutResult 
     if (entry.timestampMs > (target.endAt ?? 0)) target.endAt = entry.timestampMs;
   }
 
-  // In-flight tool calls with no tool message yet: emit running records.
-  const seenCallIds = new Set<string>();
+  // Trace-only insertion can place a newly allocated cell before an existing
+  // one. Re-number once after all auxiliary records are attached so row order,
+  // Sequence order, and displayed #N remain identical.
+  let finalIndex = 0;
   for (const turn of turns) {
-    for (const cell of turn.cells) if (cell.callId !== undefined) seenCallIds.add(cell.callId);
-  }
-  for (const entry of traceEntries) {
-    if (entry.kind !== "tool_execution_started") continue;
-    const ev = entry.details as Record<string, unknown> | undefined;
-    const id = typeof ev?.tool_use_id === "string" ? ev.tool_use_id : null;
-    if (id === null || seenCallIds.has(id)) continue;
-    const owner = findTurnContainingAt(turns, entry.timestampMs) ?? turns[turns.length - 1] ?? null;
-    if (owner === null) continue;
-    owner.cells.push({
-      index: ++index,
-      kind: "tool",
-      text: `${typeof ev?.tool_name === "string" ? ev.tool_name : "Tool"} (running)`,
-      callId: id,
-      recordId: `running\u0000${id}`,
-      timeSeconds: null,
-      startedAt: entry.timestampMs,
-    });
-    seenCallIds.add(id);
+    for (const cell of turn.cells) cell.index = ++finalIndex;
   }
 
-  return { turns, total: index };
+  return { turns, total: finalIndex };
 }
 
 function findTurnContainingAt(turns: LedgerTurnModel[], tsMs: number): LedgerTurnModel | null {

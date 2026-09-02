@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::CommandFactory;
+use clap::{ArgAction, CommandFactory};
 use nonoclaw_core::redact_text;
 use nonoclaw_engine::skills::Skill;
 use nonoclaw_engine::{
@@ -134,6 +134,14 @@ pub struct PathLayer {
 pub struct ReferenceItem {
     pub name: String,
     pub description: String,
+    pub kind: String,
+    pub group: String,
+    pub default_values: Vec<String>,
+    pub possible_values: Vec<String>,
+    pub repeatable: bool,
+    pub value_delimiter: Option<String>,
+    pub safety: Option<String>,
+    pub advanced: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -383,16 +391,24 @@ pub async fn gather(
 }
 
 fn cli_reference() -> Vec<ReferenceItem> {
-    crate::Cli::command()
+    let mut reference = crate::Cli::command()
         .get_arguments()
-        .filter(|argument| !argument.is_positional())
         .filter_map(|argument| {
-            let long = argument.get_long()?;
-            let mut name = argument
-                .get_short()
-                .map(|short| format!("-{short}, --{long}"))
-                .unwrap_or_else(|| format!("--{long}"));
-            if argument.get_action().takes_values() {
+            let id = argument.get_id().as_str();
+            let positional = argument.is_positional();
+            let mut name = if positional {
+                // NonoClaw has one variadic optional positional prompt. Keep
+                // it visible: filtering positional arguments made Insight omit
+                // the primary invocation form entirely.
+                "[PROMPT]...".to_string()
+            } else {
+                let long = argument.get_long()?;
+                argument
+                    .get_short()
+                    .map(|short| format!("-{short}, --{long}"))
+                    .unwrap_or_else(|| format!("--{long}"))
+            };
+            if !positional && argument.get_action().takes_values() {
                 let value_name = argument
                     .get_value_names()
                     .and_then(|names| names.first())
@@ -400,15 +416,140 @@ fn cli_reference() -> Vec<ReferenceItem> {
                     .unwrap_or_else(|| "VALUE".into());
                 name.push_str(&format!(" <{value_name}>"));
             }
+            let group = argument
+                .get_help_heading()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    if positional {
+                        "Input & headless".into()
+                    } else {
+                        "General".into()
+                    }
+                });
+            let default_values = argument
+                .get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let possible_values = argument
+                .get_value_parser()
+                .possible_values()
+                .map(|values| values.map(|value| value.get_name().to_string()).collect())
+                .unwrap_or_default();
+            let safety = match id {
+                "permission_mode" => Some(
+                    "bypass-permissions disables approval prompts; prefer plan or a sandbox mode for audits."
+                        .into(),
+                ),
+                "dangerously_skip_permissions" => Some(
+                    "Bypasses all permission prompts. Use only in an isolated, trusted workspace."
+                        .into(),
+                ),
+                "log_raw_api" => Some(
+                    "Writes complete unredacted prompts and raw provider responses to disk."
+                        .into(),
+                ),
+                "public_url" => Some(
+                    "Remote Web access is token-protected; keep the generated access token private."
+                        .into(),
+                ),
+                "tunnel" => Some(
+                    "Creates a public URL. Keep its access token private and stop the tunnel when finished."
+                        .into(),
+                ),
+                "serve" => Some(
+                    "The JSON-lines transport has no Web token layer; bind to loopback or a trusted network."
+                        .into(),
+                ),
+                _ => None,
+            };
             Some(ReferenceItem {
                 name,
                 description: argument
                     .get_help()
                     .map(ToString::to_string)
                     .unwrap_or_default(),
+                kind: "argument".into(),
+                advanced: group.starts_with("Advanced"),
+                group,
+                default_values,
+                possible_values,
+                repeatable: matches!(argument.get_action(), ArgAction::Append | ArgAction::Count),
+                value_delimiter: argument.get_value_delimiter().map(|value| value.to_string()),
+                safety,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    reference.extend(runtime_environment_reference());
+    reference
+}
+
+fn runtime_environment_reference() -> Vec<ReferenceItem> {
+    let item = |name: &str,
+                description: &str,
+                default_value: Option<&str>,
+                safety: Option<&str>| ReferenceItem {
+        name: name.into(),
+        description: description.into(),
+        kind: "environment".into(),
+        group: "Environment".into(),
+        default_values: default_value.into_iter().map(String::from).collect(),
+        possible_values: Vec::new(),
+        repeatable: false,
+        value_delimiter: None,
+        safety: safety.map(String::from),
+        advanced: true,
+    };
+    vec![
+        item(
+            "RUST_LOG",
+            "Override the tracing filter (for example: nonoclaw=debug,hyper=warn).",
+            None,
+            None,
+        ),
+        item(
+            "NONOCLAW_HOME",
+            "Override the runtime settings, sessions, memory, skills, and plugins root.",
+            Some("~/.nonoclaw"),
+            None,
+        ),
+        item(
+            "NONOCLAW_MAX_TOOL_CONCURRENCY",
+            "Maximum parallel tool executions; invalid values fall back to the default.",
+            Some("10"),
+            None,
+        ),
+        item(
+            "NONOCLAW_SUBAGENT_MAX_TURNS",
+            "Child-agent turn cap; clamped to the parent limit and a hard maximum of 200.",
+            Some("24"),
+            None,
+        ),
+        item(
+            "NONOCLAW_RAW_API_LOG",
+            "Enable full-fidelity request and raw SSE logging (same channel as --log-raw-api).",
+            Some("disabled"),
+            Some("Log files contain complete unredacted prompts and provider responses."),
+        ),
+        item(
+            "NONOCLAW_RAW_API_LOG_MAX_BYTES",
+            "Maximum raw-log content returned by the Web diagnostics endpoint (hard cap 64 MiB).",
+            Some("8 MiB"),
+            Some("Increasing the limit exposes more sensitive raw provider data in the browser."),
+        ),
+        item(
+            "NONOCLAW_RAW_API_LOG_RETENTION_DAYS",
+            "Prune raw API log files older than this many days; 0 disables pruning.",
+            Some("7"),
+            Some("Disabling pruning retains secret-bearing payloads indefinitely."),
+        ),
+        item(
+            "NONOCLAW_ALLOW_INSECURE_HTTP",
+            "Allow non-loopback plaintext provider base URLs.",
+            Some("disabled"),
+            Some("API keys and prompts will travel without transport encryption."),
+        ),
+    ]
 }
 
 fn command_source(command: &str, argument_count: usize) -> String {
@@ -784,13 +925,139 @@ mod security_tests {
     fn cli_reference_is_generated_from_the_clap_definition() {
         // **Validates: Requirements 12.2**
         let reference = cli_reference();
-        assert!(reference.iter().any(|item| item.name == "-p, --print"));
-        assert!(reference
-            .iter()
-            .any(|item| item.name == "--serve-http <ADDR>"));
-        assert!(reference.iter().any(|item| item.name == "--mcp-serve"));
+        let find = |name: &str| {
+            reference
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("missing CLI reference item: {name}"))
+        };
+
+        let prompt = find("[PROMPT]...");
+        assert_eq!(prompt.group, "Input & headless");
+        assert_eq!(prompt.kind, "argument");
+
+        let permission_mode = find("--permission-mode <MODE>");
+        assert_eq!(permission_mode.group, "Permissions");
+        assert_eq!(permission_mode.default_values, ["default"]);
+        assert_eq!(
+            permission_mode
+                .possible_values
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "default",
+                "accept-edits",
+                "auto",
+                "sandbox-workspace-write",
+                "sandbox-read-only",
+                "bypass-permissions",
+                "plan",
+            ]
+        );
+        assert!(permission_mode.safety.is_some());
+
+        let output_format = find("--output-format <OUTPUT_FORMAT>");
+        assert_eq!(output_format.default_values, ["text"]);
+        assert_eq!(output_format.possible_values, ["text", "json"]);
+
+        assert!(find("--add-dir <PATH>").repeatable);
+        assert_eq!(
+            find("--allowed-tools <LIST>").value_delimiter.as_deref(),
+            Some(",")
+        );
+
+        assert_eq!(find("--serve-http <ADDR>").group, "Web UI");
+        assert!(find("--mcp-serve").advanced);
+        assert!(find("--log-raw-api").safety.is_some());
+
+        let raw_log_env = find("NONOCLAW_RAW_API_LOG");
+        assert_eq!(raw_log_env.kind, "environment");
+        assert_eq!(raw_log_env.group, "Environment");
+        assert!(raw_log_env.advanced);
+        assert!(raw_log_env.safety.is_some());
+
         assert!(!reference.iter().any(|item| item.name.contains("--bridge")));
         assert!(reference.iter().all(|item| !item.description.is_empty()));
+    }
+
+    #[test]
+    fn clap_enforces_permission_values_and_operating_mode_relationships() {
+        use clap::{error::ErrorKind, Parser};
+
+        for mode in [
+            "default",
+            "accept-edits",
+            "acceptEdits",
+            "auto",
+            "sandbox-workspace-write",
+            "sandboxWorkspaceWrite",
+            "sandbox-read-only",
+            "sandboxReadOnly",
+            "bypass-permissions",
+            "bypassPermissions",
+            "plan",
+        ] {
+            assert!(
+                crate::Cli::try_parse_from(["nonoclaw", "--permission-mode", mode]).is_ok(),
+                "permission mode should parse: {mode}"
+            );
+        }
+        assert_eq!(
+            crate::Cli::try_parse_from(["nonoclaw", "--permission-mode", "unrestricted"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidValue
+        );
+        assert!(crate::Cli::try_parse_from(["nonoclaw", "--dangerously-skip-permissions"]).is_ok());
+        assert_eq!(
+            crate::Cli::try_parse_from([
+                "nonoclaw",
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "plan",
+            ])
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            crate::Cli::try_parse_from([
+                "nonoclaw",
+                "--serve-http",
+                "127.0.0.1:8765",
+                "--acp",
+            ])
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            crate::Cli::try_parse_from(["nonoclaw", "--public-url", "http://example.test"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            crate::Cli::try_parse_from(["nonoclaw", "--tunnel"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            crate::Cli::try_parse_from(["nonoclaw", "--resume", "session-id", "--continue"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert!(crate::Cli::try_parse_from([
+            "nonoclaw",
+            "--serve-http",
+            "127.0.0.1:8765",
+            "--public-url",
+            "http://example.test",
+        ])
+        .is_ok());
     }
 
     #[test]

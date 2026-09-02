@@ -93,7 +93,7 @@ The installer copies the release binary rather than symlinking the Cargo target,
 
 ```bash
 # Local-only Web UI: loopback is intentionally low-friction.
-nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
+nonoclaw --serve-http 127.0.0.1:8765 --model MODEL_ID
 
 # Headless CLI.
 nonoclaw -p "explain Rust ownership"
@@ -125,7 +125,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge**, **session-pinned keyword selection** (advertise only the relevant MCP-tool subset per session so the tools array stays cache-stable; `autoSelectMcp`/`autoSelectMcpTopK`) |
 | **Unified Model Profiles** | All models in single `models[]` array with `role` tags (`main`/`doc`/`compact`); `docModel` and `compactModel` reference by name; **per-model contextWindow / maxTokens / charsPerToken**; **compactModel** independent summarization model |
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
-| **Permissions** | 5 modes: Default / AcceptEdits / Auto / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
+| **Permissions** | 7 modes: Default / AcceptEdits / Auto / SandboxWorkspaceWrite / SandboxReadOnly / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
 | **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), **microCompact** (v0.19: cache-aware aggressive trim of old tool results — 2K threshold, head/tail kept, last 8 messages protected byte-for-byte; pushes autoCompact later without breaking the rolling cache breakpoint), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session) and **rolling `cache_control` breakpoints** (v0.19: last-message marker, 4-breakpoint cap, tool blocks marked directly — high cache hit rates on Anthropic-compatible providers), **exact BPE tokenization** via bundled `tiktoken` (OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax; heuristic fallback for Claude), **independent memory budget partitions** (beads/facts/wiki/index) |
 | **Token Efficiency** | **Exact BPE tokenizer** (`tiktoken` 3.8.3, pure-Rust with bundled rank tables — no runtime downloads); **cache hit-rate tracking** (DeepSeek `prompt_cache_hit_tokens` + standard `cached_tokens`); **cache hit-rate visualization** in Insight rail (segmented bar + percentage); **`extra_body` field** for provider-specific cache hints (OpenAI payload only) |
@@ -146,9 +146,9 @@ NonoClaw exposes verifiable runtime facts without exposing hidden model reasonin
 
 The BreathController maps connection and run events to `idle`, `connecting`, `thinking`, `streaming`, `tool`, `waiting`, `compacting`, `subagent`, `success`, `error`, and `reconnecting`. Animation uses continuous interpolation and throttled token energy, pauses when the page is hidden, and honors `prefers-reduced-motion` while retaining text status.
 
-Security boundaries are explicit: localhost remains low-friction, while public/tunnel WebSocket and media access require the generated mobile token; canonical-path checks constrain file operations; uploads are size/type bounded; full prompt logging is disabled unless explicitly enabled and then writes redacted metadata only.
+Security boundaries are explicit: localhost remains low-friction, while public/tunnel WebSocket and media access require the generated mobile token; canonical-path checks constrain file operations; uploads are size/type bounded. Full provider traffic logging is disabled by default. Enabling `--log-raw-api` or `NONOCLAW_RAW_API_LOG=1` writes complete, **unredacted** request bodies, raw SSE responses, and usage summaries under `.nonoclaw/logs/api/`; authorization headers/API keys are excluded, but prompts and provider payloads remain sensitive.
 
-Reference data shown in Insight is generated from authoritative owners: tools from `ToolRegistry`, CLI flags from Clap's `Cli` definition, and top-level settings fields from `ResolvedConfig` metadata. `nonoclaw --help` remains the command-line source of truth.
+Reference data shown in Insight is generated from authoritative owners: tools from `ToolRegistry`, CLI arguments and help groups from Clap's `Cli` definition, runtime environment entries from the CLI backend, and top-level settings fields from `ResolvedConfig` metadata. CLI Reference shows the positional prompt, defaults, possible values, repeatability/delimiters, safety notes, grouped common recipes, and a collapsed Advanced area for integrations, diagnostics, and environment variables. `nonoclaw --help` remains the command-line source of truth.
 
 ---
 
@@ -427,19 +427,27 @@ Inspired by [Andrej Karpathy's LLM Wiki pattern](https://github.com/karpathy/llm
 
 ## Permission Modes
 
-All modes switchable at runtime via UI dropdown (status bar, next to the model dropdown):
+All seven modes are switchable at runtime via the UI dropdown. The CLI presents canonical kebab-case values; existing camelCase settings/API values remain accepted as compatibility aliases.
 
-| Mode | Behavior | Color |
+| Canonical CLI value | Compatibility alias | Behavior |
 |---|---|---|
-| `default` | Read-only tools auto-allowed; writes prompt a dialog | Mint |
-| `acceptEdits` | Auto-allow Read + Write + Edit; Bash still prompts | Violet |
-| `auto` | Auto-allow **everything** — no prompts at all | Mint |
-| `bypassPermissions` | Skip ALL checks (= `--dangerously-skip-permissions`) | Red |
-| `plan` | Read-only: writes are **hard-denied** | Sky Blue |
+| `default` | — | Auto-allow configured/read-only operations; request approval for other tools |
+| `accept-edits` | `acceptEdits` | Auto-allow file edits; other operations such as Bash can still require approval |
+| `auto` | — | Auto-approve operations permitted by the rule engine/classifier |
+| `sandbox-workspace-write` | `sandboxWorkspaceWrite` | On supported Linux systems, allow writes inside the workspace under Landlock; outside writes still require approval |
+| `sandbox-read-only` | `sandboxReadOnly` | Apply a read-only Landlock posture; writes are denied |
+| `bypass-permissions` | `bypassPermissions` | Skip permission prompts (`--dangerously-skip-permissions`); trusted isolated workspaces only |
+| `plan` | — | Read-only planning posture; writes are hard-denied |
 
-Also configurable via `settings.json`:
+```bash
+nonoclaw --permission-mode sandbox-read-only "audit this repository"
+```
+
+`--dangerously-skip-permissions` conflicts with an explicit `--permission-mode`. Landlock modes require kernel support and degrade to the normal permission checks when unavailable.
+
+Also configurable via `settings.json` (camelCase remains the wire/config spelling):
 ```json
-{ "permissions": { "defaultMode": "auto" } }
+{ "permissions": { "defaultMode": "sandboxWorkspaceWrite" } }
 ```
 
 **REST API** (v0.10+): `GET /api/sessions/:id/permissions` lists pending permission requests; `POST /api/sessions/:id/permissions/:request_id` approves or denies. Enables CI/CD pipelines and webhooks to manage agent permissions without an active WebSocket connection.
@@ -937,43 +945,42 @@ curl -X POST http://127.0.0.1:8765/api/sessions/$SESSION_ID/permissions/$REQUEST
 
 ## CLI Reference
 
-`nonoclaw --help` is authoritative. The examples below cover the supported operating modes without hard-coding a tool count; available core tools and schemas are derived from `ToolRegistry`, and MCP tools are discovered dynamically.
+`nonoclaw --help` is authoritative. Insight → CLI Reference consumes the same Clap definition, groups common options by scenario, exposes defaults/possible values/repeatability/delimiters, and keeps integrations, diagnostics, and runtime environment variables in a collapsed **Advanced** area.
+
+Only one operating mode may be selected per invocation: `--plugin-add`, `--remote`, `--mcp-serve`, `--mcp-serve-memory`, `--list-sessions`, `--serve`, `--acp`, or `--serve-http`. `--public-url` and `--tunnel` require `--serve-http`; `--resume`, `--continue`, `--list-sessions`, and `--no-session` are mutually exclusive.
 
 ### Command cookbook
 
 ```bash
-# Web: local-only, LAN/public-token mode, or Cloudflare tunnel
-nonoclaw --serve-http 127.0.0.1:8765
-nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
-nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+# Positional prompt, stdin, and machine-readable output
+nonoclaw "summarize README.md"
+printf '%s\n' "review this workspace" | nonoclaw -p --output-format json
 
-# Agent Client Protocol server (drive NonoClaw from Zed etc.)
-nonoclaw --acp
-
-# Headless and piped input
-nonoclaw -p "summarize README"
-printf '%s\n' "review this workspace" | nonoclaw -p
-
-# Safer automation: read-only mode plus an explicit tool allowlist
-nonoclaw -p --permission-mode plan --allowed-tools Read,Grep,Glob "audit this repository"
+# Safer automation: read-only planning plus an explicit tool allowlist
+nonoclaw --permission-mode plan --allowed-tools Read,Grep,Glob "audit this repository"
+nonoclaw --permission-mode sandbox-read-only "inspect without writing"
 # Fully unattended execution bypasses prompts; use only in an isolated trusted workspace
-nonoclaw -p --dangerously-skip-permissions "apply the approved migration"
-
-# Machine-readable output
-nonoclaw -p --output-format json "summarize README"
+nonoclaw --dangerously-skip-permissions "apply the approved migration"
 
 # Sessions
 nonoclaw --list-sessions
 nonoclaw --continue "keep going"
 nonoclaw --resume SESSION_ID "resume this task"
-nonoclaw --no-session -p "one-off question"
+nonoclaw --no-session "one-off question"
 
 # Settings and model selection
-nonoclaw --settings ./settings.json --model deepseek-v4-pro -p "review src"
+nonoclaw --settings /path/to/settings.json --model MODEL_ID "review src"
 
-# MCP client and MCP stdio server
-nonoclaw --mcp-config ./mcp.json -p "use the configured weather tool"
+# Web UI: local-only, LAN/token mode, or Cloudflare tunnel
+nonoclaw --serve-http 127.0.0.1:8765 --model MODEL_ID
+nonoclaw --serve-http 0.0.0.0:8765 --public-url http://LAN_IP:8765
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+
+# ACP, MCP client/server, and memory-only MCP server
+nonoclaw --acp
+nonoclaw --mcp-config /path/to/mcp.json "use the configured tool"
 nonoclaw --mcp-serve
+nonoclaw --mcp-serve-memory
 
 # Remote JSON-lines server and client (run in separate terminals)
 nonoclaw --serve 127.0.0.1:8766
@@ -983,39 +990,47 @@ nonoclaw --remote 127.0.0.1:8766 "inspect the project"
 nonoclaw --plugin-add /absolute/path/to/plugin
 nonoclaw --plugin-add https://github.com/example/nonoclaw-plugin.git
 
-# Debug logging
-nonoclaw --verbose -p "diagnose this failure"
-RUST_LOG=debug nonoclaw -p "diagnose this failure"
+# Focused diagnostics
+nonoclaw --verbose "diagnose this failure"
+RUST_LOG=debug nonoclaw "diagnose this failure"
+nonoclaw --tag DIAGNOSTIC_TAG --log-raw-api "capture provider traffic"
 
 # Compaction, limits, and bounded tool concurrency
-nonoclaw -p --context-window 200000 --compact-threshold 150000 "long task"
-nonoclaw -p --no-auto-compact --max-turns 40 --max-tokens 4096 "bounded task"
-NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw -p "run independent checks"
+nonoclaw --context-window 200000 --compact-threshold 150000 "long task"
+nonoclaw --no-auto-compact --max-turns 40 --max-tokens 4096 "bounded task"
+NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "run independent checks"
 ```
+
+`--log-raw-api` is a sensitive diagnostics channel: files under `.nonoclaw/logs/api/` contain complete unredacted request bodies and raw provider responses. Authorization headers/API keys are excluded, but prompts, tool data, and model output are not. The remote JSON-lines transport has no Web-token layer, so bind `--serve` to loopback or a trusted network.
 
 ### Flags checked against `rust/crates/cli/src/main.rs`
 
-| Flag | Default | Purpose |
+| Argument | Default | Purpose |
 |---|---|---|
-| `-p`, `--print` | false | Explicit headless compatibility entry |
+| `[PROMPT]...` | stdin when omitted | Primary prompt; multiple words are joined |
+| `-p`, `--print` | false | Explicit headless compatibility marker; local prompt/stdin runs are already headless |
+| `--tag TAG` | unset | Tag a created session; tagged sessions are skipped by auto-resume and dream outcome scanning |
 | `--model ID` | configured model | Override the conversation model |
-| `--permission-mode MODE` | `default` | `default`, `acceptEdits`, `auto`, `bypassPermissions`, or `plan` |
+| `--permission-mode MODE` | `default` | Seven canonical values: `default`, `accept-edits`, `auto`, `sandbox-workspace-write`, `sandbox-read-only`, `bypass-permissions`, `plan`; legacy camelCase aliases remain accepted |
 | `--allowed-tools LIST` / `--disallowed-tools LIST` | unset | Comma-separated tool filters |
 | `--max-turns N` / `--max-tokens N` | resolved config | Bound loop turns and output tokens |
 | `--append-system-prompt TXT` | unset | Append system instructions |
 | `--add-dir PATH` | unset | Add a repeatable `NONOCLAW.md` discovery directory |
-| `--dangerously-skip-permissions` | false | Set bypass-permissions mode; trusted isolation only |
-| `--output-format text\|json` | `text` | Select human or machine-readable output |
+| `--dangerously-skip-permissions` | false | Bypass permission prompts; conflicts with explicit `--permission-mode` |
+| `--output-format text\|json` | `text` | Select human- or machine-readable output |
 | `--mcp-config PATH` | unset | Merge MCP client configuration |
-| `--resume ID` / `--continue` / `--list-sessions` | unset | Resume one, resume latest, or list sessions |
-| `--no-session` | false | Disable persistence for this run |
+| `--resume ID` / `--continue` / `--list-sessions` | unset | Resume one, resume latest, or list sessions; cannot be combined |
+| `--no-session` | false | Disable persistence; conflicts with resume/continue/list |
 | `--no-auto-compact` | false | Disable automatic transcript compaction |
+| `--log-raw-api` | false | Write full unredacted provider request/response traffic for diagnostics |
 | `--compact-threshold N` / `--context-window N` | resolved config | Configure compaction threshold/context budget |
 | `--settings PATH` | unset | Use an explicit highest-priority settings file after CLI flags |
 | `--serve ADDR` / `--remote ADDR` | unset | Run/connect to the remote JSON-lines service |
 | `--serve-http ADDR` | unset | Run the HTTP + WebSocket UI |
-| `--public-url URL` / `--tunnel` | unset / false | Advertise LAN URL or start `cloudflared`; both require Web token auth |
+| `--public-url URL` / `--tunnel` | unset / false | Advertise a LAN URL or start `cloudflared`; each requires `--serve-http` and enables Web token auth |
 | `--mcp-serve` | false | Expose built-in tools as an MCP stdio server |
+| `--mcp-serve-memory` | false | Expose only Mneme facts/beads/wiki/goals as an MCP stdio server |
+| `--acp` | false | Run an ACP stdio server for Zed and other ACP clients |
 | `--plugin-add SOURCE` | unset | Install a local-directory or Git-URL plugin and exit |
 | `--verbose` | false | Enable focused debug logging (`RUST_LOG` is also supported) |
 
@@ -1059,15 +1074,18 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 | `ANTHROPIC_API_KEY` | API key |
 | `ANTHROPIC_BASE_URL` | Custom API endpoint |
 | `ANTHROPIC_AUTH_TOKEN` | Bearer auth (alternative) |
-| `NONOCLAW_HOME` | Override runtime settings/session root (`~/.nonoclaw`) |
+| `NONOCLAW_HOME` | Override runtime settings, sessions, memory, skills, and plugins root (default `~/.nonoclaw`) |
 | `NONOCLAW_BIN_DIR` | `install.sh` executable destination (default `~/.local/bin`) |
 | `NONOCLAW_DATA_DIR` | `install.sh` Web asset root and runtime lookup root (`frontend/dist` is appended) |
 | `XDG_DATA_HOME` | Standard data root; used as `$XDG_DATA_HOME/nonoclaw` when `NONOCLAW_DATA_DIR` is unset |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch backends |
-| `NONOCLAW_MAX_TOOL_CONCURRENCY` | Max parallel tool executions (default: 10) |
-| `NONOCLAW_SUBAGENT_MAX_TURNS` | Child-agent autonomous turn cap (default: 24, hard max: 200; never exceeds the parent run limit) |
-| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Disable `run_in_background` (default: enabled) |
-| `RUST_LOG` | Log level (`debug`, `info`, `warn`) |
+| `NONOCLAW_MAX_TOOL_CONCURRENCY` | Maximum parallel tool executions (default `10`; invalid values fall back) |
+| `NONOCLAW_SUBAGENT_MAX_TURNS` | Child-agent turn cap (default `24`, hard maximum `200`, never above the parent limit) |
+| `NONOCLAW_RAW_API_LOG` | Set to `1`, `true`, or `yes` to enable full unredacted request/raw-SSE logging (same channel as `--log-raw-api`) |
+| `NONOCLAW_RAW_API_LOG_MAX_BYTES` | Maximum raw-log content returned by the Web diagnostics endpoint (default `8 MiB`, hard cap `64 MiB`) |
+| `NONOCLAW_RAW_API_LOG_RETENTION_DAYS` | Prune raw API log files after this many days (default `7`; `0` disables pruning) |
+| `NONOCLAW_ALLOW_INSECURE_HTTP` | If set, allow non-loopback plaintext provider URLs; API keys and prompts then travel without transport encryption |
+| `RUST_LOG` | Tracing filter, for example `nonoclaw=debug,hyper=warn` |
 
 ---
 
@@ -1141,7 +1159,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 ```bash
 # 仅本机：loopback 保持低摩擦，无需 token
-nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-v4-pro
+nonoclaw --serve-http 127.0.0.1:8765 --model MODEL_ID
 
 # Headless
 nonoclaw -p "解释 Rust 所有权机制"
@@ -1195,7 +1213,9 @@ NonoClaw 只展示可验证的运行事实，不展示隐藏思维链。统一 `
 
 BreathController 将连接与运行事件映射为 idle、connecting、thinking、streaming、tool、waiting、compacting、subagent、success、error、reconnecting；使用连续插值和节流 token 能量，页面隐藏时暂停，并支持 `prefers-reduced-motion` 与文本状态。
 
-Insight 中的工具、CLI 与顶层配置参考分别来自 `ToolRegistry`、Clap `Cli` 定义和 `ResolvedConfig` 共享元数据，避免手写数量与默认值漂移。公网/tunnel 访问强制移动 token，localhost 保持低摩擦。
+安全边界明确：公网/tunnel 访问强制移动 token，localhost 保持低摩擦；完整 provider 流量日志默认关闭。启用 `--log-raw-api` 或 `NONOCLAW_RAW_API_LOG=1` 后，`.nonoclaw/logs/api/` 会写入完整、**未脱敏**的请求正文、raw SSE 响应和 usage；Authorization headers/API keys 不写入，但 prompts 与 provider payload 仍是敏感数据。
+
+Insight 的工具、CLI 与顶层配置参考分别来自 `ToolRegistry`、Clap `Cli` 定义和 `ResolvedConfig` 共享元数据。CLI Reference 同步展示位置 prompt、默认/可选值、重复/分隔语义与安全提示；高频场景按组展示，协议集成、诊断项和运行时环境变量折叠在 Advanced 中。
 
 ---
 
@@ -1446,19 +1466,27 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 
 ## 权限模式
 
-所有模式可在运行时通过 UI 下拉框切换（状态栏，模型下拉框旁边）：
+七种模式都可在 UI 下拉框中动态切换。CLI 展示 canonical kebab-case 值；原有 settings/API 使用的 camelCase 值继续作为兼容别名接受。
 
-| 模式 | 行为 | 颜色 |
+| CLI 标准值 | 兼容别名 | 行为 |
 |---|---|---|
-| `default` | 只读工具自动允许；写入操作弹出对话框 | 薄荷绿 |
-| `acceptEdits` | 自动允许 Read + Write + Edit；Bash 仍弹出提示 | 紫罗兰 |
-| `auto` | 自动允许**所有操作**——无任何提示 | 薄荷绿 |
-| `bypassPermissions` | 跳过**所有**检查（= `--dangerously-skip-permissions`） | 红色 |
-| `plan` | 只读模式：写入操作被**硬拒绝** | 天蓝 |
+| `default` | — | 自动允许配置中已放行/只读的操作，其他工具请求审批 |
+| `accept-edits` | `acceptEdits` | 自动允许文件编辑；Bash 等其他操作仍可能请求审批 |
+| `auto` | — | 自动批准规则引擎/分类器允许的操作 |
+| `sandbox-workspace-write` | `sandboxWorkspaceWrite` | 在支持的 Linux 上通过 Landlock 允许工作区内写入；工作区外写入仍需审批 |
+| `sandbox-read-only` | `sandboxReadOnly` | 启用只读 Landlock 姿态，拒绝写入 |
+| `bypass-permissions` | `bypassPermissions` | 跳过权限提示（`--dangerously-skip-permissions`）；仅用于可信隔离工作区 |
+| `plan` | — | 只读规划姿态，写入被硬拒绝 |
 
-也可通过 `settings.json` 配置：
+```bash
+nonoclaw --permission-mode sandbox-read-only "审计这个仓库"
+```
+
+`--dangerously-skip-permissions` 与显式 `--permission-mode` 冲突。Landlock 模式依赖内核支持；不可用时降级为常规权限检查。
+
+也可通过 `settings.json` 配置（wire/config 继续使用 camelCase）：
 ```json
-{ "permissions": { "defaultMode": "auto" } }
+{ "permissions": { "defaultMode": "sandboxWorkspaceWrite" } }
 ```
 
 **REST API**（v0.10+）：`GET /api/sessions/:id/permissions` 列出待处理权限请求；`POST /api/sessions/:id/permissions/:request_id` 审批或拒绝。支持 CI/CD 流水线和 webhook 在无 WebSocket 连接下管理 Agent 权限。
@@ -1726,43 +1754,42 @@ nonoclaw --plugin-add https://github.com/... # Git URL
 
 ## CLI 参考
 
-`nonoclaw --help` 是参数权威来源。以下命令覆盖现有运行场景；核心工具名称与 schema 从 `ToolRegistry` 派生，MCP 工具在运行时动态发现，不在文档中手写工具数量。
+`nonoclaw --help` 是参数权威来源。Insight → CLI Reference 消费同一份 Clap 定义：主区按场景分组并展示默认值、可选值、重复/分隔语义；协议集成、诊断参数和运行时环境变量收纳在折叠的 **Advanced** 区域。
+
+每次调用只能选择一种运行模式：`--plugin-add`、`--remote`、`--mcp-serve`、`--mcp-serve-memory`、`--list-sessions`、`--serve`、`--acp` 或 `--serve-http`。`--public-url` 与 `--tunnel` 必须配合 `--serve-http`；`--resume`、`--continue`、`--list-sessions`、`--no-session` 互斥。
 
 ### 场景命令
 
 ```bash
-# Web：仅本机、LAN/token 模式、Cloudflare tunnel
-nonoclaw --serve-http 127.0.0.1:8765
-nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
-nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+# 位置参数、stdin 与机器可读输出
+nonoclaw "总结 README.md"
+printf '%s\n' "审查当前工作区" | nonoclaw -p --output-format json
 
-# Agent Client Protocol 服务端（供 Zed 等编辑器驱动���
-nonoclaw --acp
-
-# Headless 与管道输入
-nonoclaw -p "总结 README"
-printf '%s\n' "审查当前工作区" | nonoclaw -p
-
-# 安全自动化：只读模式 + 显式工具白名单
-nonoclaw -p --permission-mode plan --allowed-tools Read,Grep,Glob "审计这个仓库"
+# 安全自动化：只读规划 + 显式工具白名单
+nonoclaw --permission-mode plan --allowed-tools Read,Grep,Glob "审计这个仓库"
+nonoclaw --permission-mode sandbox-read-only "只检查，不写入"
 # 完全无人值守会绕过权限提示；仅在可信且隔离的工作区使用
-nonoclaw -p --dangerously-skip-permissions "执行已批准的迁移"
-
-# JSON 输出
-nonoclaw -p --output-format json "总结 README"
+nonoclaw --dangerously-skip-permissions "执行已批准的迁移"
 
 # Sessions
 nonoclaw --list-sessions
 nonoclaw --continue "继续"
 nonoclaw --resume SESSION_ID "恢复这个任务"
-nonoclaw --no-session -p "一次性问题"
+nonoclaw --no-session "一次性问题"
 
 # Settings 与模型
-nonoclaw --settings ./settings.json --model deepseek-v4-pro -p "审查 src"
+nonoclaw --settings /path/to/settings.json --model MODEL_ID "审查 src"
 
-# MCP client / stdio server
-nonoclaw --mcp-config ./mcp.json -p "调用已配置的天气工具"
+# Web：仅本机、LAN/token 模式、Cloudflare tunnel
+nonoclaw --serve-http 127.0.0.1:8765 --model MODEL_ID
+nonoclaw --serve-http 0.0.0.0:8765 --public-url http://LAN_IP:8765
+nonoclaw --serve-http 127.0.0.1:8765 --tunnel
+
+# ACP、MCP client/server 与仅记忆 MCP server
+nonoclaw --acp
+nonoclaw --mcp-config /path/to/mcp.json "调用已配置的工具"
 nonoclaw --mcp-serve
+nonoclaw --mcp-serve-memory
 
 # Remote JSON-lines server / client（在两个终端分别运行）
 nonoclaw --serve 127.0.0.1:8766
@@ -1772,39 +1799,47 @@ nonoclaw --remote 127.0.0.1:8766 "检查项目"
 nonoclaw --plugin-add /绝对路径/plugin
 nonoclaw --plugin-add https://github.com/example/nonoclaw-plugin.git
 
-# Debug
-nonoclaw --verbose -p "诊断这个错误"
-RUST_LOG=debug nonoclaw -p "诊断这个错误"
+# 聚焦诊断
+nonoclaw --verbose "诊断这个错误"
+RUST_LOG=debug nonoclaw "诊断这个错误"
+nonoclaw --tag DIAGNOSTIC_TAG --log-raw-api "捕获 provider 流量"
 
 # 压缩、限制与工具并发
-nonoclaw -p --context-window 200000 --compact-threshold 150000 "长任务"
-nonoclaw -p --no-auto-compact --max-turns 40 --max-tokens 4096 "受限任务"
-NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw -p "并行运行独立检查"
+nonoclaw --context-window 200000 --compact-threshold 150000 "长任务"
+nonoclaw --no-auto-compact --max-turns 40 --max-tokens 4096 "受限任务"
+NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "并行运行独立检查"
 ```
+
+`--log-raw-api` 是敏感诊断通道：`.nonoclaw/logs/api/` 中会保存完整、未脱敏的请求正文和 provider 原始响应。Authorization headers/API keys 不会写入，但 prompts、工具数据与模型输出都不会脱敏。Remote JSON-lines 传输没有 Web token 层，因此 `--serve` 应只绑定 loopback 或可信网络。
 
 ### 与 `rust/crates/cli/src/main.rs` 核对的参数
 
 | 参数 | 默认值 | 用途 |
 |---|---|---|
-| `-p`, `--print` | false | 显式 headless 兼容入口 |
+| `[PROMPT]...` | 省略时读 stdin | 主提示词；多个词会拼接 |
+| `-p`, `--print` | false | 显式 headless 兼容标记；本地 prompt/stdin 原本就是 headless |
+| `--tag TAG` | 未设置 | 给新 session 打标签；带标签 session 不参与自动恢复和 dream outcome 扫描 |
 | `--model ID` | 配置模型 | 覆盖会话模型 |
-| `--permission-mode MODE` | `default` | `default`、`acceptEdits`、`auto`、`bypassPermissions` 或 `plan` |
+| `--permission-mode MODE` | `default` | 七个标准值：`default`、`accept-edits`、`auto`、`sandbox-workspace-write`、`sandbox-read-only`、`bypass-permissions`、`plan`；兼容旧 camelCase 别名 |
 | `--allowed-tools LIST` / `--disallowed-tools LIST` | 未设置 | 逗号分隔的工具过滤器 |
 | `--max-turns N` / `--max-tokens N` | 解析后的配置 | 限制循环轮次和输出 tokens |
 | `--append-system-prompt TXT` | 未设置 | 追加系统提示词 |
 | `--add-dir PATH` | 未设置 | 追加可重复的 `NONOCLAW.md` 搜索目录 |
-| `--dangerously-skip-permissions` | false | 绕过权限；只用于可信隔离环境 |
+| `--dangerously-skip-permissions` | false | 绕过权限提示；与显式 `--permission-mode` 冲突 |
 | `--output-format text\|json` | `text` | 人类可读或机器可读输出 |
 | `--mcp-config PATH` | 未设置 | 合并 MCP client 配置 |
-| `--resume ID` / `--continue` / `--list-sessions` | 未设置 | 恢复指定/最近会话或列出会话 |
-| `--no-session` | false | 本次运行不持久化 session |
+| `--resume ID` / `--continue` / `--list-sessions` | 未设置 | 恢复指定/最近会话或列出会话；不可组合 |
+| `--no-session` | false | 本次运行不持久化 session；与恢复/继续/列出互斥 |
 | `--no-auto-compact` | false | 禁用自动压缩 |
+| `--log-raw-api` | false | 写入完整、未脱敏的 provider 请求/响应诊断日志 |
 | `--compact-threshold N` / `--context-window N` | 解析后的配置 | 配置压缩阈值与上下文预算 |
 | `--settings PATH` | 未设置 | 使用显式 settings 文件；CLI flags 优先级更高 |
 | `--serve ADDR` / `--remote ADDR` | 未设置 | 启动/连接 remote JSON-lines 服务 |
 | `--serve-http ADDR` | 未设置 | 启动 HTTP + WebSocket UI |
-| `--public-url URL` / `--tunnel` | 未设置 / false | 发布 LAN URL 或启动 `cloudflared`；两者均启用 Web token 鉴权 |
+| `--public-url URL` / `--tunnel` | 未设置 / false | 发布 LAN URL 或启动 `cloudflared`；都要求 `--serve-http` 并启用 Web token 鉴权 |
 | `--mcp-serve` | false | 以 MCP stdio server 暴露内建工具 |
+| `--mcp-serve-memory` | false | 仅以 MCP stdio server 暴露 Mneme facts/beads/wiki/goals |
+| `--acp` | false | 为 Zed 等 ACP client 启动 ACP stdio server |
 | `--plugin-add SOURCE` | 未设置 | 安装本地目录或 Git URL plugin 后退出 |
 | `--verbose` | false | 开启聚焦 debug 日志；也支持 `RUST_LOG` |
 
@@ -1825,15 +1860,18 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw -p "并行运行独立检查"
 | `ANTHROPIC_API_KEY` | API 密钥 |
 | `ANTHROPIC_BASE_URL` | 自定义 API 端点 |
 | `ANTHROPIC_AUTH_TOKEN` | Bearer 认证（替代方式） |
-| `NONOCLAW_HOME` | 覆盖运行时设置/session 根目录（`~/.nonoclaw`） |
+| `NONOCLAW_HOME` | 覆盖运行时 settings、sessions、memory、skills 与 plugins 根目录（默认 `~/.nonoclaw`） |
 | `NONOCLAW_BIN_DIR` | `install.sh` 可执行文件目标目录（默认 `~/.local/bin`） |
 | `NONOCLAW_DATA_DIR` | `install.sh` Web 资源根目录及运行时查找根目录（自动追加 `frontend/dist`） |
 | `XDG_DATA_HOME` | 标准数据根目录；未设置 `NONOCLAW_DATA_DIR` 时使用 `$XDG_DATA_HOME/nonoclaw` |
 | `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch 后端 |
-| `NONOCLAW_MAX_TOOL_CONCURRENCY` | 最大并行工具执行数（默认：10） |
-| `NONOCLAW_SUBAGENT_MAX_TURNS` | 子代理自主执行轮次上限（默认：24，硬上限：200，且不会超过父运行限制） |
-| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | 禁用 `run_in_background`（默认：启用） |
-| `RUST_LOG` | 日志级别（`debug`、`info`、`warn`） |
+| `NONOCLAW_MAX_TOOL_CONCURRENCY` | 最大并行工具执行数（默认 `10`；非法值回退默认） |
+| `NONOCLAW_SUBAGENT_MAX_TURNS` | 子代理轮次上限（默认 `24`，硬上限 `200`，且不超过父运行限制） |
+| `NONOCLAW_RAW_API_LOG` | 设为 `1`、`true` 或 `yes`，开启完整未脱敏请求/raw-SSE 日志（等同 `--log-raw-api` 通道） |
+| `NONOCLAW_RAW_API_LOG_MAX_BYTES` | Web 诊断端点返回的 raw log 最大内容量（默认 `8 MiB`，硬上限 `64 MiB`） |
+| `NONOCLAW_RAW_API_LOG_RETENTION_DAYS` | raw API 日志保留天数（默认 `7`；`0` 禁止清理） |
+| `NONOCLAW_ALLOW_INSECURE_HTTP` | 设置后允许非 loopback 明文 provider URL；API keys 与 prompts 将失去传输加密 |
+| `RUST_LOG` | tracing filter，例如 `nonoclaw=debug,hyper=warn` |
 
 ## License
 

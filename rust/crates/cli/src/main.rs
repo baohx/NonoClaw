@@ -15,8 +15,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result};
+use clap::{ArgGroup, Parser, ValueEnum};
 use nonoclaw_core::{MessageContent, PermissionMode, Usage};
 use nonoclaw_engine::{
     ClientPurpose, ConfigSource, EngineEvent, EngineSkillSource, EventEnvelope, QueryEngine,
@@ -24,6 +24,36 @@ use nonoclaw_engine::{
 };
 use nonoclaw_tools::register_all;
 use serde_json::json;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum PermissionModeArg {
+    Default,
+    #[value(alias = "acceptEdits")]
+    AcceptEdits,
+    Auto,
+    #[value(alias = "sandboxWorkspaceWrite")]
+    SandboxWorkspaceWrite,
+    #[value(alias = "sandboxReadOnly")]
+    SandboxReadOnly,
+    #[value(alias = "bypassPermissions")]
+    BypassPermissions,
+    Plan,
+}
+
+impl From<PermissionModeArg> for PermissionMode {
+    fn from(value: PermissionModeArg) -> Self {
+        match value {
+            PermissionModeArg::Default => Self::Default,
+            PermissionModeArg::AcceptEdits => Self::AcceptEdits,
+            PermissionModeArg::Auto => Self::Auto,
+            PermissionModeArg::SandboxWorkspaceWrite => Self::SandboxWorkspaceWrite,
+            PermissionModeArg::SandboxReadOnly => Self::SandboxReadOnly,
+            PermissionModeArg::BypassPermissions => Self::BypassPermissions,
+            PermissionModeArg::Plan => Self::Plan,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -36,147 +66,199 @@ enum OutputFormat {
 #[command(
     name = "nonoclaw",
     version,
-    about = "NonoClaw — Rust rewrite of Claude Code (agent CLI)"
+    about = "NonoClaw — Rust rewrite of Claude Code (agent CLI)",
+    group(
+        ArgGroup::new("operating_mode")
+            .args([
+                "plugin_add",
+                "remote",
+                "mcp_serve",
+                "mcp_serve_memory",
+                "list_sessions",
+                "serve",
+                "acp",
+                "serve_http",
+            ])
+            .multiple(false)
+    )
 )]
 struct Cli {
     /// The prompt. If omitted, read from stdin.
+    #[arg(help_heading = "Input & headless")]
     prompt: Vec<String>,
 
-    /// Preserve the `-p`/`--print` compatibility entry for explicit headless mode.
-    #[arg(short = 'p', long, default_value_t = false)]
+    /// Compatibility marker for explicit headless mode; local prompt/stdin runs are already headless.
+    #[arg(short = 'p', long, default_value_t = false, help_heading = "Input & headless")]
     print: bool,
 
     /// Tag the created session (e.g. `bench-smoke`, `eval`). Tagged sessions
     /// are skipped by auto-resume and by dream outcome scanning.
-    #[arg(long, value_name = "TAG")]
+    #[arg(long, value_name = "TAG", help_heading = "Advanced diagnostics")]
     tag: Option<String>,
 
     /// Override the main-loop model.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", help_heading = "Model & limits")]
     model: Option<String>,
 
     /// Permission mode.
-    #[arg(long, value_name = "MODE", default_value = "default")]
-    permission_mode: String,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value_t = PermissionModeArg::Default,
+        help_heading = "Permissions"
+    )]
+    permission_mode: PermissionModeArg,
 
     /// Comma-separated tool allowlist (e.g. "Read,Grep,Bash").
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Permissions")]
     allowed_tools: Vec<String>,
 
     /// Comma-separated tool denylist.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Permissions")]
     disallowed_tools: Vec<String>,
 
     /// Maximum agent turns.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", help_heading = "Model & limits")]
     max_turns: Option<u32>,
 
     /// Max output tokens per turn.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", help_heading = "Model & limits")]
     max_tokens: Option<u32>,
 
     /// Extra text appended to the system prompt.
-    #[arg(long, value_name = "TXT")]
+    #[arg(long, value_name = "TXT", help_heading = "Input & headless")]
     append_system_prompt: Option<String>,
 
     /// Additional directory for NONOCLAW.md discovery (repeatable).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = "Configuration & extensions")]
     add_dir: Vec<PathBuf>,
 
-    /// Skip all permission prompts (sets permission-mode = bypassPermissions).
-    #[arg(long)]
+    /// Skip all permission prompts (sets permission-mode = bypass-permissions).
+    #[arg(
+        long,
+        conflicts_with = "permission_mode",
+        help_heading = "Permissions"
+    )]
     dangerously_skip_permissions: bool,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help_heading = "Input & headless"
+    )]
     output_format: OutputFormat,
 
     /// MCP config path. Servers are merged into the canonical resolved config.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = "Configuration & extensions")]
     mcp_config: Option<PathBuf>,
 
     /// Resume a prior session by id (loads its transcript and continues).
-    #[arg(long, value_name = "ID")]
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["continue_session", "no_session", "list_sessions"],
+        help_heading = "Sessions"
+    )]
     resume: Option<String>,
 
     /// Resume the most recent session for this directory.
-    #[arg(long = "continue")]
+    #[arg(
+        long = "continue",
+        conflicts_with_all = ["no_session", "list_sessions"],
+        help_heading = "Sessions"
+    )]
     continue_session: bool,
 
     /// List stored sessions for this directory and exit.
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["resume", "continue_session", "no_session"],
+        help_heading = "Sessions"
+    )]
     list_sessions: bool,
 
     /// Disable session persistence for this run.
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["resume", "continue_session", "list_sessions"],
+        help_heading = "Sessions"
+    )]
     no_session: bool,
 
     /// Disable auto-compaction of long transcripts.
-    #[arg(long)]
+    #[arg(long, help_heading = "Model & limits")]
     no_auto_compact: bool,
 
     /// Log full unredacted API traffic (requests + raw SSE responses +
     /// usage summaries) to .nonoclaw/logs/api/. Diagnostics only: payloads
     /// contain complete prompts. API keys are never logged (headers only).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced diagnostics")]
     log_raw_api: bool,
 
     /// Estimated-token threshold above which auto-compact fires.
-    #[arg(long)]
+    #[arg(long, help_heading = "Model & limits")]
     compact_threshold: Option<usize>,
 
     /// Model context window in tokens. When set, auto-compact fires at
     /// window − maxTokens − margin (unless --compact-threshold is given).
-    #[arg(long)]
+    #[arg(long, help_heading = "Model & limits")]
     context_window: Option<usize>,
 
     /// Explicit settings file path (highest priority after CLI flags).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = "Configuration & extensions")]
     settings: Option<PathBuf>,
 
     /// Run as a remote session server (TCP, JSON-lines) on ADDR (e.g. 127.0.0.1:8765).
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", help_heading = "Advanced integrations")]
     serve: Option<String>,
 
     /// Start the web UI server (HTTP + WebSocket) on ADDR and open the browser.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", help_heading = "Web UI")]
     serve_http: Option<String>,
 
     /// Public URL used in the QR code for mobile access (e.g.
     /// http://192.168.1.42:8765). If not set, the QR defaults to
     /// `window.location.origin`.
-    #[arg(long, value_name = "URL")]
+    #[arg(
+        long,
+        value_name = "URL",
+        requires = "serve_http",
+        help_heading = "Web UI"
+    )]
     public_url: Option<String>,
 
     /// Auto-spawn cloudflared tunnel for public internet access. Requires
     /// cloudflared in PATH. The generated *.trycloudflare.com URL replaces
     /// --public-url automatically.
-    #[arg(long)]
+    #[arg(long, requires = "serve_http", help_heading = "Web UI")]
     tunnel: bool,
 
     /// Connect to a remote session server at ADDR and run the prompt.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", help_heading = "Advanced integrations")]
     remote: Option<String>,
 
     /// Run as an MCP server over stdio (expose tools to an MCP client).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced integrations")]
     mcp_serve: bool,
 
     /// Run as an Agent Client Protocol (ACP) server over stdio (Zed editor).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced integrations")]
     acp: bool,
 
     /// Run as an MCP server exposing only the Mneme memory system
     /// (facts/beads/wiki/goals) so an external harness can mount it.
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced integrations")]
     mcp_serve_memory: bool,
 
     /// Install a plugin from SOURCE (local dir or git URL) into .nonoclaw/plugins.
-    #[arg(long, value_name = "SOURCE")]
+    #[arg(long, value_name = "SOURCE", help_heading = "Configuration & extensions")]
     plugin_add: Option<String>,
 
     /// Verbose logging (RUST_LOG=debug also works).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced diagnostics")]
     verbose: bool,
 }
 
@@ -283,8 +365,7 @@ async fn main() -> Result<()> {
     let permission_mode = if cli.dangerously_skip_permissions {
         PermissionMode::BypassPermissions
     } else {
-        PermissionMode::from_kebab(&cli.permission_mode)
-            .ok_or_else(|| anyhow!("unknown --permission-mode `{}`", cli.permission_mode))?
+        cli.permission_mode.into()
     };
     let model = cli
         .model

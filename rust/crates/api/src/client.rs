@@ -257,15 +257,44 @@ impl ApiFormat {
 /// Join a provider base URL with its canonical endpoint without duplicating
 /// the common `/v1` suffix. Profiles in the wild use both host roots and
 /// versioned roots (for example `https://api.anthropic.com/v1`).
+/// Extract a leading version segment (`v1`, `v4`, `v3beta`) from a path, if any.
+fn leading_version_segment(path: &str) -> Option<&str> {
+    let seg = path.split('/').next()?;
+    let rest = seg.strip_prefix('v')?;
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    // Only letters/digits may follow the version digits (v3beta, v1_0).
+    if rest[digits..].chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(seg)
+    } else {
+        None
+    }
+}
+
+/// Join a provider base URL with its canonical endpoint without duplicating
+/// version segments. Profiles in the wild use host roots and versioned roots
+/// (`https://api.anthropic.com/v1`, `https://open.bigmodel.cn/api/paas/v4`).
+/// A base ending in any version segment is already the provider's versioned
+/// root: append only the endpoint's unversioned path so `/v4` +
+/// `v1/chat/completions` yields `/v4/chat/completions`, not `/v4/v1/...`.
 fn endpoint_url(base_url: &str, endpoint: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     let endpoint = endpoint.trim_start_matches('/');
     if base.ends_with(endpoint) {
         return base.to_string();
     }
-    if let Some(after_version) = endpoint.strip_prefix("v1/") {
-        if base.ends_with("/v1") {
-            return format!("{base}/{after_version}");
+    if let Some((_, base_seg)) = base.rsplit_once('/') {
+        if leading_version_segment(base_seg).is_some() {
+            if let Some(endpoint_version) = leading_version_segment(endpoint) {
+                if let Some(after) = endpoint
+                    .strip_prefix(endpoint_version)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
+                    return format!("{base}/{after}");
+                }
+            }
         }
     }
     format!("{base}/{endpoint}")
@@ -511,6 +540,92 @@ impl Client {
     /// On success, an optional raw-API logger is attached (only when
     /// `NONOCLAW_RAW_API_LOG` is enabled) so the stream fold can capture the
     /// raw SSE frames and final usage.
+    /// Send one tiny liveness request and return the raw HTTP status plus a
+    /// short provider snippet. Used by model health probes: no SSE parsing,
+    /// no retry, and the original status code (401/402/404/429/…) and
+    /// provider message survive to the caller.
+    pub async fn probe_liveness(&self, model: &str, max_tokens: u32) -> Result<(u16, String)> {
+        let (url, body) = match self.format {
+            ApiFormat::Anthropic => (
+                endpoint_url(&self.base_url, "v1/messages"),
+                serde_json::to_string(&serde_json::json!({
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))?,
+            ),
+            ApiFormat::OpenAI => (
+                endpoint_url(&self.base_url, "v1/chat/completions"),
+                serde_json::to_string(&serde_json::json!({
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))?,
+            ),
+            ApiFormat::Responses => (
+                endpoint_url(&self.base_url, "v1/responses"),
+                serde_json::to_string(&serde_json::json!({
+                    "model": model,
+                    "max_output_tokens": max_tokens,
+                    "input": "hi",
+                }))?,
+            ),
+            ApiFormat::Gemini => {
+                let base = self.base_url.trim().trim_end_matches('/');
+                let url = if base.contains("streamGenerateContent")
+                    || base.contains("generateContent")
+                {
+                    base.to_string()
+                } else if base.ends_with("/v1") || base.contains("/v1/") {
+                    format!("{}/models/{}:generateContent", base, model)
+                } else {
+                    format!("{}/v1/models/{}:generateContent", base, model)
+                };
+                (
+                    url,
+                    serde_json::to_string(&serde_json::json!({
+                        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                        "generationConfig": {"maxOutputTokens": max_tokens},
+                    }))?,
+                )
+            }
+        };
+        // Reuse the canonical header set (auth per format) via build_request's
+        // rules: keep this probe aligned with real request authentication.
+        let mut req = self.http.post(url).header("content-type", "application/json");
+        match self.format {
+            ApiFormat::Anthropic => {
+                req = req.header("anthropic-version", ANTHROPIC_VERSION);
+                if let Some(key) = &self.api_key {
+                    req = req.header("x-api-key", key);
+                }
+                if let Some(token) = &self.auth_token {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+            }
+            ApiFormat::OpenAI | ApiFormat::Responses => {
+                if let Some(key) = &self.api_key {
+                    req = req.header("Authorization", format!("Bearer {key}"));
+                } else if let Some(token) = &self.auth_token {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+            }
+            ApiFormat::Gemini => {
+                if let Some(key) = &self.api_key {
+                    req = req.header("x-goog-api-key", key);
+                }
+            }
+        }
+        let resp = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, probe_snippet(&text)))
+    }
+
     async fn send_request(
         &self,
         params: &RequestParams,
@@ -2969,7 +3084,43 @@ fn dump_prompt_openai(params: &RequestParams, _body: &str) {
 
 /// Translate a non-2xx response (or `event: error` payload) into an [`Error`],
 /// classifying retryability. Mirrors `src/services/api/errors.ts`.
-pub(crate) fn api_error_from_body(status: u16, text: &str) -> Error {
+/// Extract a short human-readable message from a liveness-probe response
+/// body. Prefers the provider's structured error `message` field; falls back
+/// to the raw text with HTML stripped. Empty for success bodies.
+pub fn probe_snippet(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // Anthropic: {"error":{"message":…}} · OpenAI/zen: {"error":{"message":…}}
+        if let Some(message) = value
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            return message.chars().take(160).collect();
+        }
+        // Nested zen form: {"type":"error","error":{"message":…}} is covered
+        // above; some gateways use {"message": …} directly.
+        if let Some(message) = value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            return message.chars().take(160).collect();
+        }
+    }
+    // HTML 404 pages and other non-JSON bodies: show a compact hint.
+    if trimmed.starts_with("<!") || trimmed.starts_with("<html") {
+        return "non-JSON response (HTML page — likely wrong endpoint path)".to_string();
+    }
+    trimmed.chars().take(120).collect()
+}
+
+/// Translate a non-2xx response (or `event: error` payload) into an [`Error`],
+/// classifying retryability. Mirrors `src/services/api/errors.ts`.
+fn api_error_from_body(status: u16, text: &str) -> Error {
     // Body shape: {"type":"error","error":{"type":"overloaded_error","message":"..."}}
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(err) = v.get("error").and_then(|e| e.as_object()) {
@@ -3033,6 +3184,26 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::*;
     use crate::sse::SseFrame;
+
+    #[test]
+    fn probe_snippet_extracts_provider_message_and_flags_html() {
+        // Nested provider error (zen/Anthropic shape).
+        assert_eq!(
+            probe_snippet(r#"{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}"#),
+            "Missing API key."
+        );
+        // OpenAI shape.
+        assert_eq!(
+            probe_snippet(r#"{"error":{"message":"Model not supported","code":404}}"#),
+            "Model not supported"
+        );
+        // Top-level message.
+        assert_eq!(probe_snippet(r#"{"message":"insufficient balance"}"#), "insufficient balance");
+        // HTML 404 pages collapse to a path hint, never raw markup.
+        assert!(probe_snippet("<!DOCTYPE html><html>404</html>").contains("wrong endpoint path"));
+        // Empty success body.
+        assert_eq!(probe_snippet("  "), "");
+    }
 
     #[test]
     fn responses_serialization_and_stream_folding() {
@@ -3244,6 +3415,20 @@ mod tests {
         assert_eq!(
             endpoint_url("https://gateway.example/anthropic", "v1/messages"),
             "https://gateway.example/anthropic/v1/messages"
+        );
+        // Versioned roots beyond v1 (GLM coding endpoint .../paas/v4): the
+        // endpoint's own v1 prefix must not be appended after the root.
+        assert_eq!(
+            endpoint_url(
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "v1/chat/completions"
+            ),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+        // Same-version dedup still collapses an explicit repeat.
+        assert_eq!(
+            endpoint_url("https://gateway.example/v3beta", "v3beta/chat/completions"),
+            "https://gateway.example/v3beta/chat/completions"
         );
     }
 

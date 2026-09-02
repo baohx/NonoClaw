@@ -96,6 +96,7 @@ function outboundKey(message: ClientMsg): string {
   switch (message.type) {
     case "file_tree":
     case "project_info_refresh":
+    case "models_health_check":
     case "cancel":
     case "clear":
     case "compact":
@@ -322,10 +323,14 @@ export function addToolCardTransition(
   toolId: string,
   name: string,
   input: unknown,
+  timestampMs?: number,
 ): ChatStreamState {
   const id = `tool-${toolId}`;
   if (state.messages.some((message) => message.id === id)) return state;
   const settled = finishStreamingTransition(state);
+  const timestamp = typeof timestampMs === "number" && Number.isFinite(timestampMs)
+    ? timestampMs
+    : undefined;
   return {
     ...settled,
     messages: [...settled.messages, {
@@ -335,6 +340,7 @@ export function addToolCardTransition(
       toolName: name,
       toolInput: input,
       streaming: true,
+      ...(timestamp !== undefined ? { timestamp } : {}),
     }],
   };
 }
@@ -344,16 +350,35 @@ export function updateToolResultTransition(
   toolId: string,
   ok: boolean,
   preview: string,
+  timestampMs?: number,
 ): ChatStreamState {
   const id = `tool-${toolId}`;
   const content = !preview ? (ok ? "[ok — no output]" : "Tool execution failed") : preview;
+  const completedAt = typeof timestampMs === "number" && Number.isFinite(timestampMs)
+    ? timestampMs
+    : undefined;
 
   let changed = false;
   const messages = state.messages.map((message) => {
     if (message.id !== id) return message;
-    if (message.content === content && message.toolOk === ok && message.streaming === false) return message;
+    const durationMs = completedAt !== undefined
+      && typeof message.timestamp === "number"
+      && Number.isFinite(message.timestamp)
+      && completedAt >= message.timestamp
+      ? completedAt - message.timestamp
+      : message.durationMs;
+    if (message.content === content
+      && message.toolOk === ok
+      && message.streaming === false
+      && message.durationMs === durationMs) return message;
     changed = true;
-    return { ...message, content, toolOk: ok, streaming: false };
+    return {
+      ...message,
+      content,
+      toolOk: ok,
+      streaming: false,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    };
   });
   return changed ? { ...state, messages } : state;
 }
@@ -425,7 +450,11 @@ function childToolId(event: EngineEvent): string {
     : event.tool_use_id);
 }
 
-function updateChildTool(run: SubagentRun, event: EngineEvent): SubagentRun {
+function updateChildTool(
+  run: SubagentRun,
+  event: EngineEvent,
+  toolLimit = MAX_SUBAGENT_TOOLS,
+): SubagentRun {
   const id = childToolId(event);
   if (!id) return run;
   const current = run.toolsById[id] ?? {
@@ -475,7 +504,7 @@ function updateChildTool(run: SubagentRun, event: EngineEvent): SubagentRun {
   const isNew = run.toolsById[id] === undefined;
   let toolOrder = isNew ? [...run.toolOrder, id] : run.toolOrder;
   const toolsById = { ...run.toolsById, [id]: tool };
-  while (toolOrder.length > MAX_SUBAGENT_TOOLS) {
+  while (toolOrder.length > Math.max(1, toolLimit)) {
     const removed = toolOrder[0];
     toolOrder = toolOrder.slice(1);
     delete toolsById[removed];
@@ -490,6 +519,7 @@ export function applySubagentEventTransition(
   state: SubagentState,
   raw: ScopedSubagentEvent,
   runLimit = MAX_SUBAGENT_RUNS,
+  toolLimit = MAX_SUBAGENT_TOOLS,
 ): { accepted: boolean; state: SubagentState } {
   const id = safeChildId(raw.subagent_id);
   const parentToolUseId = safeChildId(raw.parent_tool_use_id);
@@ -546,7 +576,7 @@ export function applySubagentEventTransition(
     "tool_use_start", "tool_result", "tool_queued", "tool_validation",
     "permission_requested", "permission_resolved", "tool_execution_started",
     "tool_execution_finished", "tool_result_normalized",
-  ].includes(inner.kind)) run = updateChildTool(run, inner);
+  ].includes(inner.kind)) run = updateChildTool(run, inner, toolLimit);
 
   const subagentRunsById = { ...state.subagentRunsById, [id]: run };
   const childIdsByParentToolId = { ...state.childIdsByParentToolId };

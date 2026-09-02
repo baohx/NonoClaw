@@ -30,6 +30,7 @@ use nonoclaw_engine::{
     RunEvent, RunLimits, RunTerminalStatus, SessionService, SkillsManager,
 };
 use nonoclaw_tools::tool::QuestionResolver;
+use nonoclaw_api::ClientConfig;
 use nonoclaw_tools::{TodoStore, ToolRegistry};
 use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
@@ -480,6 +481,93 @@ async fn list_sessions_wire_for(
 }
 
 // Project, media, and static responsibilities are delegated to their services.
+
+// ── Model health probe ──────────────────────────────────────────────────────
+
+/// Latency budget per model probe. Enough for cold starts on free gateways,
+/// short enough that "run all" finishes promptly.
+const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Parallel probes at once. Keeps us under gateway rate limits while
+/// finishing 78 models in ~4 waves instead of 78 serial round-trips.
+const MODEL_PROBE_CONCURRENCY: usize = 8;
+/// Output budget per probe. Several provider families reject small values:
+/// DeepSeek's Anthropic endpoint requires `max_tokens >= 16`, and OpenAI
+/// Responses-API reasoning models (zen `gpt-5.x`) require
+/// `max_output_tokens >= 256` (`integer_below_min_value` below that). 256
+/// is the smallest value every format accepts; actual probe output is a few
+/// tokens, so the cost difference is negligible.
+const MODEL_PROBE_MAX_TOKENS: u32 = 256;
+
+/// Fire one minimal liveness request at a single model profile.
+/// Returns (ok, latency_ms on success, short error on failure).
+async fn probe_model_health(
+    config: ClientConfig,
+) -> (bool, Option<u64>, Option<String>) {
+    let model = config.model.clone();
+    let started = std::time::Instant::now();
+    let client = match nonoclaw_api::Client::new(
+        config.api_key,
+        config.auth_token,
+        config.base_url,
+    ) {
+        Ok(client) => client.with_format(config.api_format),
+        Err(err) => return (false, None, Some(err.to_string())),
+    };
+    // One direct request: no retry loop, no SSE parse — the real status code
+    // (401/402/404/429/…) and provider message survive for display.
+    // Exception: transient 5xx/429 gateways (zen's free tier flips between
+    // 200 and 503 within seconds) get exactly one quick retry so the dot
+    // reflects steady-state availability, not a single unlucky packet.
+    let result = tokio::time::timeout(
+        MODEL_PROBE_TIMEOUT,
+        client.probe_liveness(&model, MODEL_PROBE_MAX_TOKENS),
+    )
+    .await;
+    let result = match result {
+        Ok(Ok((status, snippet)))
+            if nonoclaw_core::Error::classify_status(status)
+                == nonoclaw_core::ApiErrorKind::Retryable =>
+        {
+            tokio::time::timeout(
+                MODEL_PROBE_TIMEOUT,
+                client.probe_liveness(&model, MODEL_PROBE_MAX_TOKENS),
+            )
+            .await
+            .or(Ok(Ok((status, snippet))))
+        }
+        other => other,
+    };
+    match result {
+        Ok(Ok((status, snippet))) if (200..300).contains(&status) => {
+            (true, Some(started.elapsed().as_millis() as u64), None)
+        }
+        Ok(Ok((status, snippet))) => {
+            let error = if snippet.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                format!("HTTP {status}: {snippet}")
+            };
+            (false, None, Some(short_error(&error)))
+        }
+        Ok(Err(err)) => (false, None, Some(short_error(&err.to_string()))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("timeout ({}s)", MODEL_PROBE_TIMEOUT.as_secs())),
+        ),
+    }
+}
+
+fn short_error(err: &str) -> String {
+    let first = err.lines().next().unwrap_or("").trim();
+    if first.chars().count() > 160 {
+        format!("{}…", first.chars().take(160).collect::<String>())
+    } else {
+        first.to_string()
+    }
+}
+
+
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -1456,6 +1544,60 @@ async fn handle_ws(
                     &tx,
                     project_generation,
                     ServerMsg::ProjectInfo { info },
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+            ClientMsg::ModelsHealthCheck => {
+                let project_transition = state.projects.lock_transition().await;
+                let project = state.project();
+                if project.generation() != project_generation {
+                    drop(project_transition);
+                    let _ =
+                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    continue;
+                }
+                let config = project.config();
+                let configs: Vec<ClientConfig> = config
+                    .all_models()
+                    .iter()
+                    .filter(|p| p.is_conversation_model())
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|name| config.client_config(Some(&name)))
+                    .collect();
+                drop(project_transition);
+                tracing::info!(count = configs.len(), "models health check started");
+                let started = std::time::Instant::now();
+                let mut tasks = tokio::task::JoinSet::new();
+                for cfg in configs {
+                    tasks.spawn(async move {
+                        let name = cfg.model.clone();
+                        let (ok, latency_ms, error) = probe_model_health(cfg).await;
+                        super::protocol::ModelHealthEntry { name, ok, latency_ms, error }
+                    });
+                }
+                let mut results = Vec::new();
+                while let Some(entry) = tasks.join_next().await {
+                    if let Ok(entry) = entry {
+                        results.push(entry);
+                    }
+                }
+                results.sort_by(|a, b| a.name.cmp(&b.name));
+                tracing::info!(
+                    total = results.len(),
+                    ok = results.iter().filter(|r| r.ok).count(),
+                    elapsed_s = started.elapsed().as_secs(),
+                    "models health check finished"
+                );
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::ModelsHealth { results },
                 )
                 .await
                 {
@@ -3491,6 +3633,7 @@ mod characterization_tests {
             ClientMsg::FileTree => "file_tree",
             ClientMsg::OpenFile { .. } => "open_file",
             ClientMsg::ProjectInfoRefresh => "project_info_refresh",
+            ClientMsg::ModelsHealthCheck => "models_health_check",
             ClientMsg::GitShow { .. } => "git_show",
             ClientMsg::SessionPrompts { .. } => "session_prompts",
             ClientMsg::LoadOlder { .. } => "load_older",
@@ -3531,6 +3674,7 @@ mod characterization_tests {
                 "open_file",
             ),
             (r#"{"type":"project_info_refresh"}"#, "project_info_refresh"),
+            (r#"{"type":"models_health_check"}"#, "models_health_check"),
             (r#"{"type":"git_show","sha":"abc123"}"#, "git_show"),
             (
                 r#"{"type":"set_permission_mode","mode":"plan"}"#,
@@ -3694,6 +3838,7 @@ mod characterization_tests {
                 messages: vec![],
                 cumulative_usage: serde_json::json!({}),
                 total: 0,
+                traces: vec![],
             },
             ServerMsg::FileTree {
                 root: "/fixture".into(),

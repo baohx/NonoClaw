@@ -58,7 +58,7 @@ Profile 定义 Agent 行为；Skill 提供可激活工作流；Plugin 打包扩�
 
 BreathController 使用确定状态机驱动 idle/connecting/thinking/streaming/tool/waiting/compacting/subagent/success/error/reconnecting，采用连续插值、节流 token energy、hidden-page pause 和 `prefers-reduced-motion`，组件不直接维护第二套运行状态。
 
-安全约束：完整 Prompt dump 默认关闭；显式诊断只写脱敏元数据；API key、Authorization、附件正文和敏感工具输入不进入 ProjectInfo/trace/WebSocket/browser store；公网/tunnel WebSocket 与 media routes 强制 token；文件打开与上传经过 canonical path、大小和类型边界。
+安全约束：完整 provider 流量日志默认关闭；显式启用 `--log-raw-api` / `NONOCLAW_RAW_API_LOG=1` 会把完整未脱敏请求正文与 raw SSE 响应写到 `.nonoclaw/logs/api/`，仅 Authorization headers/API keys 排除。该敏感诊断通道与 ProjectInfo/trace/WebSocket/browser store 的脱敏边界相互独立；公网/tunnel WebSocket 与 media routes 强制 token；文件打开与上传经过 canonical path、大小和类型边界。
 
 ## 会话与兼容
 

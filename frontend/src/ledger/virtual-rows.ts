@@ -6,6 +6,7 @@
  */
 
 import type { LedgerTurnModel } from "./layout";
+import { ledgerRecordId } from "./types";
 
 /** Row kinds the table renders. */
 export type LedgerRowKind =
@@ -22,6 +23,8 @@ export interface LedgerRow {
   index?: number;
   /** Turn number the row belongs to. */
   turn: number;
+  /** Stable identity of the owning turn, independent of display ordinal. */
+  turnKey?: string;
   /** Estimated rendered height (px) used by the virtual scroller. */
   height: number;
   /** Record data for `record` rows. */
@@ -41,6 +44,12 @@ export interface VirtualLedgerProjection {
 const HEADER_HEIGHT = 34;
 const RECORD_HEIGHT = 30;
 const DIVIDER_HEIGHT = 18;
+
+/** Stable turn identity derived from its opening record, not mutable Turn N. */
+function ledgerTurnId(turn: LedgerTurnModel): string {
+  const opener = turn.cells.find((cell) => cell.opensTurn === true) ?? turn.cells[0];
+  return opener === undefined ? `empty-turn\u0000${turn.n}` : ledgerRecordId(opener);
+}
 
 /** Split a turn's record list into steps at assistant boundaries. */
 function stepsOf(cells: readonly LedgerTurnModel["cells"][number][]): LedgerTurnModel["cells"][number][][] {
@@ -63,7 +72,7 @@ function stepsOf(cells: readonly LedgerTurnModel["cells"][number][]): LedgerTurn
  */
 export function projectLedgerRows(
   turns: readonly LedgerTurnModel[],
-  collapsedTurns?: ReadonlySet<number>,
+  collapsedTurns?: ReadonlySet<string>,
 ): VirtualLedgerProjection {
   const rows: LedgerRow[] = [];
   const cells: LedgerTurnModel["cells"][number][] = [];
@@ -73,34 +82,34 @@ export function projectLedgerRows(
       if (turn.cells.length === 0) continue;
       rows.push({ kind: "between-header", key: "between-turns", turn: -1, height: HEADER_HEIGHT });
       for (const cell of turn.cells) {
-        rows.push({ kind: "record", key: `between\u0000${cell.index}`, index: cell.index, turn: -1, height: RECORD_HEIGHT, cell });
+        rows.push({ kind: "record", key: `record\u0000${ledgerRecordId(cell)}`, index: cell.index, turn: -1, height: RECORD_HEIGHT, cell });
         cells.push(cell);
       }
       continue;
     }
+    const turnKey = ledgerTurnId(turn);
     rows.push({
       kind: "turn-header",
-      key: `turn\u0000${turn.n}`,
+      key: `turn\u0000${turnKey}`,
       turn: turn.n,
+      turnKey,
       height: HEADER_HEIGHT,
       request: turn.request,
       usage: turn.usage,
     });
     // Collapsed turns keep their header (so the chevron remains visible) but
     // hide the record rows beneath it — never remove the whole turn.
-    if (!collapsedTurns?.has(turn.n)) {
+    if (!collapsedTurns?.has(turnKey)) {
       const steps = stepsOf(turn.cells);
-      let stepNo = 0;
       for (const step of steps) {
-        stepNo += 1;
         for (const cell of step) {
-          const key = `t${turn.n}\u0000s${stepNo}\u0000${cell.index}`;
-          rows.push({ kind: "record", key, index: cell.index, turn: turn.n, height: RECORD_HEIGHT, cell });
+          const key = `record\u0000${ledgerRecordId(cell)}`;
+          rows.push({ kind: "record", key, index: cell.index, turn: turn.n, turnKey, height: RECORD_HEIGHT, cell });
           cells.push(cell);
         }
       }
     }
-    rows.push({ kind: "turn-divider", key: `divider\u0000${turn.n}`, turn: turn.n, height: DIVIDER_HEIGHT });
+    rows.push({ kind: "turn-divider", key: `divider\u0000${turnKey}`, turn: turn.n, turnKey, height: DIVIDER_HEIGHT });
   }
 
   return { rows, totalHeight: rows.reduce((sum, row) => sum + row.height, 0), cells };

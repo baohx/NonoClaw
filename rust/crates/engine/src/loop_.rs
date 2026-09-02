@@ -1258,6 +1258,37 @@ impl QueryEngine {
         }
     }
 
+    /// Clone the session actor used by the run supervisor. Keeping this
+    /// handle outside the engine task lets panic/consumer-failure paths still
+    /// persist the partial, truthful replay stream.
+    pub(crate) fn trace_session(&self) -> Option<Session> {
+        self.session.clone()
+    }
+
+    /// Persist a root run's complete low-frequency replay stream. Child run
+    /// contexts share the collector, but `replay_snapshot` retains the same
+    /// scoped wrapper events the live browser received and excludes raw child
+    /// envelopes, so reload is behaviorally equivalent to live rendering.
+    pub(crate) async fn persist_run_trace_to(
+        session: Option<&Session>,
+        context: &RunContext,
+    ) {
+        let Some(session) = session else {
+            return;
+        };
+        let events = context.trace.replay_snapshot(&context.run_id);
+        if events.is_empty() {
+            return;
+        }
+        if let Err(error) = session.write_trace(&context.run_id, events).await {
+            tracing::warn!(%error, "failed to persist run trace");
+        }
+    }
+
+    pub(crate) async fn persist_run_trace(&self, context: &RunContext) {
+        Self::persist_run_trace_to(self.session.as_ref(), context).await;
+    }
+
     /// Atomically replace the persisted transcript only if no intervening
     /// session command has advanced the revision used by compaction.
     async fn persist_compaction(&mut self, messages: Vec<Message>, expected_revision: u64) -> bool {
@@ -1320,11 +1351,24 @@ impl QueryEngine {
         &mut self,
         user_content: MessageContent,
         cwd: &Path,
-        on_event: impl FnMut(&EngineEvent),
+        mut on_event: impl FnMut(&EngineEvent),
     ) -> Result<FinalResult> {
         let context = self.run_context(cwd.to_path_buf());
-        self.run_with_context(user_content, &context, on_event)
-            .await
+        // Direct-call entry (tests, embedders): record into the run's trace
+        // collector exactly like RunController::start's wrapper does, so the
+        // ledger timing subset persists regardless of who drives the loop.
+        // The controller path bypasses run() and records in its own wrapper —
+        // double counting is impossible by construction.
+        let on_event = |event: &EngineEvent| {
+            let envelope = context.envelope(event.clone());
+            context.trace.record(envelope);
+            on_event(event);
+        };
+        let result = self
+            .run_with_context(user_content, &context, on_event)
+            .await;
+        self.persist_run_trace(&context).await;
+        result
     }
 
     /// Run the agent loop inside the canonical run identity and token tree.
@@ -5010,6 +5054,84 @@ mod tests {
         assert!(request.contains("second question"));
         let persisted = session.snapshot().await.unwrap();
         assert_eq!(persisted.messages.len(), 4);
+    }
+
+    /// A completed run persists its ledger timing trace into the session
+    /// JSONL, so replayed sessions rebuild accurate step windows. Feature
+    /// Matrix: trajectory ledger replay fidelity.
+    #[tokio::test]
+    async fn completed_run_persists_timing_trace_to_session() {
+        let (client, _requests, fixture_task) =
+            spawn_provider_fixture(vec!["fixture answer"]).await;
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-trace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session_file = cwd.join("trace.jsonl");
+        let session = crate::session::SessionService::new()
+            .open_path(session_file, "trace-id", &cwd, "fixture-requested-model")
+            .unwrap();
+        let snapshot = session.snapshot().await.unwrap();
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = EngineOptions {
+            model: "fixture-requested-model".into(),
+            max_turns: 1,
+            auto_compact: false,
+            ..EngineOptions::default()
+        };
+        let mut engine = QueryEngine::with_session(
+            client,
+            Arc::new(registry),
+            todos,
+            options,
+            session.clone(),
+            snapshot,
+        );
+        let result = engine
+            .run(MessageContent::from_text("trace me"), &cwd, |_| {})
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+        assert_eq!(result.text, "fixture answer");
+
+        // In-memory snapshot exposes the persisted batch…
+        let persisted = session.snapshot().await.unwrap();
+        assert_eq!(
+            persisted.traces.len(),
+            1,
+            "exactly one trace batch for the completed run"
+        );
+        let batch = &persisted.traces[0];
+        assert!(!batch.run_id.is_empty());
+        let kind_of = |event: &nonoclaw_core::RunEvent| {
+            serde_json::to_value(event)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_owned)))
+                .unwrap_or_default()
+        };
+        let kinds: Vec<String> = batch.events.iter().map(|e| kind_of(&e.event)).collect();
+        assert!(
+            kinds.iter().any(|k| k == "model_request_started"),
+            "boundary events survive the filter (got {kinds:?})"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "text_delta"),
+            "content deltas are dropped (got {kinds:?})"
+        );
+
+        // …and reopening from disk (the actual replay path) restores it.
+        let path = session.path().to_path_buf();
+        drop(session);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.lines().any(|line| line.contains("\"kind\":\"trace\"")),
+            "trace entry present in JSONL"
+        );
+        let reopened = crate::session::SessionService::new()
+            .open_path(path, "trace-id", &cwd, "fixture-requested-model")
+            .unwrap();
+        let reopened_snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(reopened_snapshot.traces.len(), 1);
+        assert_eq!(reopened_snapshot.traces[0].events.len(), batch.events.len());
+        std::fs::remove_dir_all(cwd).ok();
     }
 
     // ========================================================================

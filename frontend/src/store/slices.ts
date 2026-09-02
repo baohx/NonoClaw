@@ -5,6 +5,7 @@ import type {
   ClientMsg,
   FileEntry,
   ImageRef,
+  ModelHealthEntry,
   ModelInfo,
   PermissionMode,
   PermissionRequired,
@@ -15,9 +16,17 @@ import type {
   SessionRunPrompt,
   SubagentRun,
   TaskChange,
+  TraceBatchWire,
 } from "../types";
 import { sanitizeBrowserText, sanitizeBrowserValue, sanitizeMediaAttachment, sanitizeProjectInfo } from "../security";
-import { appendTraceEntry, type TraceEntry } from "../trace";
+import {
+  appendTraceEntry,
+  appendTrajectoryTraceEntry,
+  traceEntryFromEvent,
+  trajectoryTraceEntries as selectTrajectoryTraceEntries,
+  trimTraceEntries,
+  type TraceEntry,
+} from "../trace";
 import {
   acceptLegacySnapshotTransition,
   acceptRunTransition,
@@ -95,6 +104,10 @@ export interface ConnectionSlice extends ConnectionState {
 
 export interface SessionSlice {
   messages: ChatMessage[];
+  /** Sanitized wire messages accumulated across restored history pages. They
+   * are remapped as one transcript so tool_use/tool_result pairs may cross a
+   * page boundary without producing duplicate or orphan tool cards. */
+  historyRawMessages: unknown[];
   streamingIdx: number | null;
   nextMessageId: number;
   model: string;
@@ -117,6 +130,8 @@ export interface SessionSlice {
   acceptLegacySnapshot: () => boolean;
   prepareSessionSwitch: (sessionId?: string) => void;
   loadMessages: (messages: unknown[], total?: number) => void;
+  /** Replace traceEntries from persisted per-run batches (session replay). */
+  loadPersistedTraces: (batches: TraceBatchWire[] | undefined) => void;
   /** Prepend one `history_page` payload; returns the new remaining count. */
   prependHistory: (messages: unknown[], remaining: number) => void;
   /** Older-history window state for the active session. */
@@ -142,7 +157,10 @@ export interface RunSlice {
   agentRunning: boolean;
   cancelling: boolean;
   taskChanges: TaskChange[];
+  /** Bounded redacted facts for the Technical Trace rail. */
   traceEntries: TraceEntry[];
+  /** Complete low-frequency timing facts for Trajectory/Governance/Ledger. */
+  trajectoryTraceEntries: TraceEntry[];
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -172,8 +190,8 @@ export interface RunSlice {
 
 export interface ToolSlice {
   toolCards: Record<string, true>;
-  addToolCard: (id: string, name: string, input: unknown) => string;
-  updateToolResult: (toolId: string, ok: boolean, preview: string) => void;
+  addToolCard: (id: string, name: string, input: unknown, timestampMs?: number) => string;
+  updateToolResult: (toolId: string, ok: boolean, preview: string, timestampMs?: number) => void;
 }
 
 export interface SubagentSlice {
@@ -191,9 +209,15 @@ export interface ProjectSlice {
   insightRefreshing: boolean;
   /** Run-boundary prompts per session id, lazily fetched from the server. */
   sessionPrompts: Record<string, SessionRunPrompt[]>;
+  /** Per-model liveness from the last "run all" probe (name → entry). */
+  modelsHealth: Record<string, ModelHealthEntry>;
+  /** Probe sweep in flight — drives the button spin/disabled state. */
+  modelsHealthChecking: boolean;
   setFileTree: (root: string, entries: FileEntry[]) => void;
   setProjectInfo: (info: ProjectInfo) => void;
   beginInsightRefresh: () => void;
+  beginModelsHealthCheck: () => void;
+  setModelsHealth: (results: ModelHealthEntry[]) => void;
   setSessionPrompts: (sessionId: string, prompts: SessionRunPrompt[]) => void;
 }
 
@@ -302,8 +326,12 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
   return {
     ...prepareSessionBoundary(orderingState(state), sessionId),
     messages: [],
+    historyRawMessages: [],
     streamingIdx: null,
     nextMessageId: 1,
+    historyOlderRemaining: 0,
+    historyTotal: 0,
+    historyLoading: false,
     activeRunId: null,
     agentRunning: false,
     cancelling: false,
@@ -311,6 +339,7 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
     multiRun: null,
     taskChanges: [],
     traceEntries: [],
+    trajectoryTraceEntries: [],
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
@@ -379,6 +408,7 @@ export const createConnectionSlice: Slice<ConnectionSlice> = (set, get) => ({
 
 export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   messages: [],
+  historyRawMessages: [],
   streamingIdx: null,
   nextMessageId: 1,
   model: "",
@@ -439,6 +469,65 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     return accepted;
   },
   prepareSessionSwitch: (sessionId) => set((state) => boundaryCleanup(state, sessionId ?? state.sessionId)),
+  loadPersistedTraces: (batches) => {
+    const entries: TraceEntry[] = [];
+    const rootEntries: TraceEntry[] = [];
+    const scopedEvents: ScopedSubagentEvent[] = [];
+
+    for (const batch of batches ?? []) {
+      for (const envelope of batch.events) {
+        // Never replace an envelope's child/root identity with the batch key.
+        // Legacy v1 batches may contain raw child envelopes because their
+        // collector was shared; those remain visible in bounded diagnostics
+        // but are excluded from the root trajectory to match the live stream.
+        const envelopeRunId = envelope.run_id ?? batch.run_id;
+        const entry = traceEntryFromEvent({
+          type: "event",
+          ...envelope,
+          run_id: envelopeRunId,
+        });
+        if (entry) {
+          entries.push(entry);
+          if (envelopeRunId === batch.run_id) rootEntries.push(entry);
+        }
+        if (envelope.event.kind === "subagent_event") {
+          scopedEvents.push(envelope.event as ScopedSubagentEvent);
+        }
+      }
+    }
+
+    entries.sort((a, b) => a.timestampMs - b.timestampMs
+      || a.runId.localeCompare(b.runId)
+      || a.sequence - b.sequence
+      || a.id.localeCompare(b.id));
+    rootEntries.sort((a, b) => a.timestampMs - b.timestampMs
+      || a.runId.localeCompare(b.runId)
+      || a.sequence - b.sequence
+      || a.id.localeCompare(b.id));
+    scopedEvents.sort((a, b) => a.subagent_id.localeCompare(b.subagent_id)
+      || a.child_sequence - b.child_sequence
+      || a.parent_tool_use_id.localeCompare(b.parent_tool_use_id));
+
+    const replayRunLimit = Math.max(1, new Set(scopedEvents.map((event) => event.subagent_id)).size);
+    let childState = {
+      subagentRunsById: {} as Record<string, SubagentRun>,
+      childIdsByParentToolId: {} as Record<string, string[]>,
+    };
+    for (const event of scopedEvents) {
+      childState = applySubagentEventTransition(
+        childState,
+        event,
+        replayRunLimit,
+        Number.MAX_SAFE_INTEGER,
+      ).state;
+    }
+
+    set({
+      traceEntries: trimTraceEntries(entries),
+      trajectoryTraceEntries: selectTrajectoryTraceEntries(rootEntries),
+      ...childState,
+    });
+  },
   loadMessages: (messages, total) => {
     const mapped = engineMessagesToChat(messages);
     const nextMessageId = mapped.reduce((next, message) => {
@@ -448,6 +537,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     const toolCards = Object.fromEntries(mapped.filter((message) => message.role === "tool").map((message) => [message.id, true as const]));
     set({
       messages: mapped,
+      historyRawMessages: [...messages],
       streamingIdx: null,
       nextMessageId,
       toolCards,
@@ -461,16 +551,32 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   },
   prependHistory: (messages, remaining) => {
     const state = get();
-    const mapped = engineMessagesToChat(messages);
-    if (!mapped.length) {
+    if (!messages.length) {
       set({ historyLoading: false, historyOlderRemaining: 0 });
       return;
     }
-    // Re-base message ids so prepended rows never collide with live ones.
-    const rebase = state.messages.length;
-    const rebased = mapped.map((message, index) => ({ ...message, id: `msg-h${rebase + index}` }));
+
+    // Re-map every restored wire message together. Tool use and tool result
+    // blocks can straddle a page boundary; mapping pages independently creates
+    // duplicate cards and loses duration/status information. Messages created
+    // live after the snapshot have no srcIndex and remain appended unchanged.
+    const historyRawMessages = [...messages, ...state.historyRawMessages];
+    const mapped = engineMessagesToChat(historyRawMessages);
+    const liveMessages = state.messages.filter((message) => message.srcIndex === undefined);
+    const merged = [...mapped, ...liveMessages];
+    const nextMessageId = merged.reduce((next, message) => {
+      const match = String(message.id).match(/^msg-(\d+)$/);
+      return match ? Math.max(next, Number.parseInt(match[1], 10) + 1) : next;
+    }, 1);
+    const toolCards = Object.fromEntries(merged
+      .filter((message) => message.role === "tool")
+      .map((message) => [message.id, true as const]));
+
     set({
-      messages: [...rebased, ...state.messages],
+      messages: merged,
+      historyRawMessages,
+      nextMessageId,
+      toolCards,
       historyOlderRemaining: remaining,
       historyLoading: false,
     });
@@ -487,11 +593,14 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   clearMessages: () => set((state) => ({
     ...prepareSessionBoundary(orderingState(state)),
     messages: [],
+    historyRawMessages: [],
     streamingIdx: null,
     nextMessageId: 1,
     toolCards: {},
     subagentRunsById: {},
     childIdsByParentToolId: {},
+    traceEntries: [],
+    trajectoryTraceEntries: [],
     historyOlderRemaining: 0,
     historyTotal: 0,
     historyLoading: false,
@@ -516,6 +625,7 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
   cancelling: false,
   taskChanges: [],
   traceEntries: [],
+  trajectoryTraceEntries: [],
   inputTokens: 0,
   outputTokens: 0,
   cacheReadTokens: 0,
@@ -554,8 +664,11 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
     : {}),
   cancelMultiRun: () => set({ multiRun: null }),
   addTaskChange: (change) => set((state) => ({ taskChanges: [...state.taskChanges, change] })),
-  addTraceEntry: (entry) => set((state) => ({ traceEntries: appendTraceEntry(state.traceEntries, entry) })),
-  clearTrace: () => set({ traceEntries: [] }),
+  addTraceEntry: (entry) => set((state) => ({
+    traceEntries: appendTraceEntry(state.traceEntries, entry),
+    trajectoryTraceEntries: appendTrajectoryTraceEntry(state.trajectoryTraceEntries, entry),
+  })),
+  clearTrace: () => set({ traceEntries: [], trajectoryTraceEntries: [] }),
   addUsage: (run) => set((state) => accumulateUsage(state, run)),
   setUsageTotal: (t) => set({
     inputTokens: t.input,
@@ -567,16 +680,18 @@ export const createRunSlice: Slice<RunSlice> = (set, get) => ({
 
 export const createToolSlice: Slice<ToolSlice> = (set, get) => ({
   toolCards: {},
-  addToolCard: (toolId, name, input) => {
+  addToolCard: (toolId, name, input, timestampMs) => {
     const id = `tool-${toolId}`;
     const safeInput = sanitizeBrowserValue(input);
     set((state) => {
-      const next = addToolCardTransition(state, toolId, name, safeInput);
+      const next = addToolCardTransition(state, toolId, name, safeInput, timestampMs);
       return next === state ? {} : { ...next, toolCards: { ...state.toolCards, [id]: true as const } };
     });
     return id;
   },
-  updateToolResult: (toolId, ok, preview) => set((state) => updateToolResultTransition(state, toolId, ok, preview)),
+  updateToolResult: (toolId, ok, preview, timestampMs) => set((state) => (
+    updateToolResultTransition(state, toolId, ok, preview, timestampMs)
+  )),
 });
 
 export const createSubagentSlice: Slice<SubagentSlice> = (set) => ({
@@ -603,9 +718,17 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
   projectInfo: null,
   insightRefreshing: false,
   sessionPrompts: {},
+  modelsHealth: {},
+  modelsHealthChecking: false,
   setFileTree: (fileTreeRoot, fileTree) => set({ fileTreeRoot, fileTree }),
   beginInsightRefresh: () => set({ insightRefreshing: true }),
   setProjectInfo: (projectInfo) => set({ projectInfo: sanitizeProjectInfo(projectInfo), insightRefreshing: false }),
+  beginModelsHealthCheck: () => set({ modelsHealthChecking: true, modelsHealth: {} }),
+  setModelsHealth: (results) => set(() => {
+    const modelsHealth: Record<string, ModelHealthEntry> = {};
+    for (const r of results) modelsHealth[r.name] = r;
+    return { modelsHealth, modelsHealthChecking: false };
+  }),
   setSessionPrompts: (sessionId, prompts) => set((state) => ({
     sessionPrompts: { ...state.sessionPrompts, [sessionId]: prompts },
   })),
@@ -775,7 +898,8 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
   ) => {
     if (!text) return;
     const previous = output[output.length - 1];
-    if (previous?.role === role && !previous.streaming && !previous.toolName
+    if (previous?.role === role && previous.srcIndex === currentSrcIndex
+      && !previous.streaming && !previous.toolName
       && !previous.attachments?.length && !attachments.length) previous.content += text;
     else output.push({
       id: nextId(),
@@ -789,8 +913,9 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
 
   for (let srcIndex = 0; srcIndex < messages.length; srcIndex++) {
     const raw = messages[srcIndex];
-    currentSrcIndex = srcIndex;
-    const message = raw as { role?: string; content?: unknown; attachments?: unknown; ts?: unknown };
+    const message = raw as { role?: string; content?: unknown; attachments?: unknown; ts?: unknown; src_index?: unknown };
+    currentSrcIndex = typeof message.src_index === "number" && Number.isSafeInteger(message.src_index)
+      && message.src_index >= 0 ? message.src_index : srcIndex;
     currentTs = typeof message.ts === "number" && Number.isFinite(message.ts) ? message.ts : undefined;
     const attachments = Array.isArray(message.attachments)
       ? message.attachments.flatMap((value) => {
@@ -859,7 +984,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
           streaming: false,
           srcIndex: currentSrcIndex,
           ...(currentTs !== undefined ? { timestamp: currentTs } : {}),
-          ...(currentTs !== undefined && resultTs !== undefined && resultTs > currentTs ? { durationMs: resultTs - currentTs } : {}),
+          ...(currentTs !== undefined && resultTs !== undefined && resultTs >= currentTs ? { durationMs: resultTs - currentTs } : {}),
         });
         if (duplicateUses.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool call ignored: ${callId}` });
         if (duplicateResults.has(callId)) output.push({ id: nextId(), role: "system", content: `Duplicate tool results resolved to the last result: ${callId}` });

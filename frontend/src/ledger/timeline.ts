@@ -20,7 +20,7 @@ export interface TrajectoryTimelineSpan {
   isError: boolean;
   kind: string;
   /** Lane the span renders on. */
-  lane: "assistant" | "thinking" | "tool" | "request";
+  lane: "assistant" | "thinking" | "tool" | "user" | "context";
 }
 
 export interface TrajectoryTimelineModel {
@@ -59,16 +59,28 @@ type LedgerCellLike = {
   isError?: boolean;
   requestOnly?: boolean;
   startedAt?: number | null;
+  endedAt?: number | null;
+  /** Presentation-only interval for synthetic siblings in Time mode. */
+  timelineStartedAt?: number | null;
+  timelineEndedAt?: number | null;
   timeSeconds?: number | null;
 };
 
 interface CellRange { start: number; end: number }
 
-function cellRange(cell: LedgerCellLike): CellRange | null {
+function cellRange(cell: LedgerCellLike, useTimelineProjection = false): CellRange | null {
   if (cell.requestOnly === true) return null;
-  const start = cellStart(cell);
+  const projectedStart = useTimelineProjection ? finite(cell.timelineStartedAt) : null;
+  const projectedEnd = useTimelineProjection ? finite(cell.timelineEndedAt) : null;
+  const start = projectedStart ?? cellStart(cell);
+  const explicitEnd = projectedEnd ?? finite(cell.endedAt);
+  if (start === null) {
+    return explicitEnd === null ? null : { start: explicitEnd, end: explicitEnd };
+  }
+  if (explicitEnd !== null) {
+    return explicitEnd >= start ? { start, end: explicitEnd } : { start, end: start };
+  }
   const duration = cellDurationMs(cell);
-  if (start === null) return null;
   if (duration === null || duration < 0) return { start, end: start };
   return { start, end: start + duration };
 }
@@ -78,7 +90,8 @@ function laneOf(cell: LedgerCellLike): TrajectoryTimelineSpan["lane"] {
   if (cell.kind === "assistant") return "assistant";
   if (cell.kind === "thinking") return "thinking";
   if (cell.kind === "tool") return "tool";
-  return "request";
+  if (cell.kind === "user") return "user";
+  return "context";
 }
 
 /**
@@ -99,26 +112,35 @@ export function deriveTrajectoryTimeline(
 
   for (const turn of turns) {
     for (const cell of turn.cells) {
-      const range = cellRange(cell);
-      if (range === null) {
-        if (cell.requestOnly === true) continue;
-        // Sequence lane still counts unmeasured records.
+      if (cell.requestOnly === true) continue;
+      const lane = laneOf(cell);
+
+      // Sequence is event order, not a time projection: every visible record
+      // occupies exactly one slot even when historical timing was not stored.
+      if (mode === "sequence") {
+        const start = seqCursor;
         seqCursor += 1;
+        seqEnd = seqCursor;
+        timed.push({ cell, range: { start, end: seqCursor } });
         continue;
       }
-      seqCursor += 1;
-      seqEnd = seqCursor;
-      if (mode === "sequence") {
-        timed.push({ cell, range: { start: seqCursor - 1, end: seqCursor } });
-      } else if (mode === "duration") {
-        const lane = laneOf(cell);
-        const dur = Math.max(1, range.end - range.start);
+
+      // Duration also remains complete. Unknown/running durations get a
+      // one-unit marker instead of disappearing or pretending to be measured.
+      if (mode === "duration") {
+        const measured = cellDurationMs(cell);
+        const duration = measured === null || measured < 0 ? 1 : Math.max(1, measured);
         const start = durationCursor.get(lane) ?? 0;
-        durationCursor.set(lane, start + dur);
-        timed.push({ cell, range: { start, end: start + dur } });
-      } else {
-        timed.push({ cell, range });
+        durationCursor.set(lane, start + duration);
+        timed.push({ cell, range: { start, end: start + duration } });
+        continue;
       }
+
+      // Time and Actual require a real wall-clock anchor. Unknown durations
+      // remain zero-width point events and are made visible by the renderer's
+      // minimum marker width.
+      const range = cellRange(cell, mode === "time");
+      if (range !== null) timed.push({ cell, range });
     }
   }
   if (timed.length === 0) return null;

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useStore } from "../store";
-import type { ProjectInfo, ToolInfo } from "../types";
+import type { ClientMsg, ProjectInfo, ToolInfo } from "../types";
 import TechnicalTrace from "./TechnicalTrace";
 import ContextXray from "./ContextXray";
 import TrajectoryReplay from "./TrajectoryReplay";
@@ -9,6 +9,8 @@ interface Props {
   info: ProjectInfo | null;
   onOpen: (path: string, forceCode: boolean) => void;
   onRefresh: () => void;
+  onTrajectoryOpen: () => void;
+  send: (msg: ClientMsg) => void;
 }
 
 const DEFAULT_OPEN = new Set<string>();
@@ -18,16 +20,18 @@ function isFsPath(source: string): boolean {
   return source.startsWith("/") || source.startsWith("~") || source.startsWith(".");
 }
 
-export default function InsightRail({ info, onOpen, onRefresh }: Props) {
+export default function InsightRail({ info, onOpen, onRefresh, onTrajectoryOpen, send }: Props) {
   const [open, setOpen] = useState<Set<string>>(DEFAULT_OPEN);
   const refreshing = useStore((s) => s.insightRefreshing);
-  const toggle = (id: string) =>
+  const toggle = (id: string) => {
+    if (id === "trajectory" && !open.has(id)) onTrajectoryOpen();
     setOpen((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+  };
 
   const tools = info?.tools ?? [];
   const builtin = tools.filter((t) => t.kind === "builtin");
@@ -131,7 +135,7 @@ export default function InsightRail({ info, onOpen, onRefresh }: Props) {
           )}
         </Section>
 
-        <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} />
+        <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} send={send} />
 
         <Section
           id="cache"
@@ -354,6 +358,7 @@ function Section({
   count,
   open,
   onToggle,
+  headerExtra,
   children,
 }: {
   id: string;
@@ -361,6 +366,8 @@ function Section({
   count: number | null;
   open: boolean;
   onToggle: (id: string) => void;
+  /** Optional inline control rendered in the section header row. */
+  headerExtra?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -370,6 +377,11 @@ function Section({
         <span className="acc-head__label">{label}</span>
         {count !== null && (
           <span className={`acc-head__count${count === 0 ? " zero" : ""}`}>{count}</span>
+        )}
+        {headerExtra && (
+          <span className="acc-head__extra" onClick={(e) => e.stopPropagation()}>
+            {headerExtra}
+          </span>
         )}
       </button>
       {open && <div className="acc-body">{children}</div>}
@@ -568,9 +580,11 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
 
 // ── Models section ──────────────────────────────────────────────────────────
 
-function ModelsSection({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () => void; send: (msg: ClientMsg) => void }) {
   const models = useStore((s) => s.availableModels);
   const active = useStore((s) => s.model);
+  const health = useStore((s) => s.modelsHealth);
+  const checking = useStore((s) => s.modelsHealthChecking);
   const projectInfo = useStore((s) => s.projectInfo);
   const balances = projectInfo?.provider_balances ?? [];
   const modelProviders = projectInfo?.model_providers ?? [];
@@ -586,20 +600,52 @@ function ModelsSection({ open, onToggle }: { open: boolean; onToggle: () => void
 
   if (models.length === 0) return null;
   return (
-    <Section id="models" label="Models" count={models.length} open={open} onToggle={onToggle}>
+    <Section id="models" label="Models" count={models.length} open={open} onToggle={onToggle}
+      headerExtra={
+        <button
+          className="models-probe-btn"
+          title="对所有模型发最小探测请求（~8 tokens/个），测连通性与延迟"
+          disabled={checking}
+          onClick={(e) => {
+            e.stopPropagation();
+            useStore.getState().beginModelsHealthCheck();
+            send({ type: "models_health_check" });
+          }}
+        >{checking ? "测速中…" : "▶ 全部测速"}</button>
+      }
+    >
       <div className="acc-body">
         {models.map((m) => {
           const prov = providerForModel.get(m.name);
           const bal = prov ? balanceMap.get(prov) : undefined;
+          const h = health[m.name];
+          const isActive = m.name === active;
+          // Dot color: active keeps its green "on"; others show probe outcome
+          // (blue = ok + latency, red = fail, faint = untested).
+          const dotClass = isActive ? "on" : h ? (h.ok ? "probe-ok" : "bad") : (checking ? "probe-pending" : "off");
+          const dotTitle = isActive
+            ? "active model"
+            : h
+              ? (h.ok ? `连通 · ${h.latency_ms}ms` : `失败 · ${h.error || "unknown"}`)
+              : (checking ? "排队测速中…" : "未测速");
           return (
           <div key={m.name} className="insight-row">
             <div className="insight-row__top">
-              <span className={`dot ${m.name === active ? "on" : "off"}`} />
+              <span className={`dot ${dotClass}`} title={dotTitle} />
               <span className="insight-row__name">{m.label || m.name}</span>
-              {m.name === active && <span className="tag mcp">active</span>}
+              {isActive && <span className="tag mcp">active</span>}
               {prov && <span className="tag">{prov}</span>}
+              {h?.ok && !isActive && <span className="tag" title={dotTitle}>{h.latency_ms}ms</span>}
+              {h && !h.ok && h.error && (
+                <span className="tag" style={{ color: "var(--rose)" }} title={h.error}>
+                  {/^HTTP (\d+)/.exec(h.error)?.[1] ?? "fail"}
+                </span>
+              )}
             </div>
             <div className="insight-row__meta">{m.name}</div>
+            {h && !h.ok && h.error && (
+              <div className="insight-row__meta" style={{ color: "var(--rose)" }} title={h.error}>{h.error}</div>
+            )}
             {bal && <div className="insight-row__meta" style={{ color: "var(--clr-accent)", fontWeight: 500 }}>余额 {bal}</div>}
           </div>
           );
@@ -702,27 +748,138 @@ function SlashRef() {
 
 // ── Generated CLI/config references ────────────────────────────────────────
 
-function CliRef({ items }: { items: { name: string; description: string }[] }) {
+type CliReferenceItem = ProjectInfo["cli_reference"][number];
+
+const CLI_PRIMARY_GROUPS = [
+  "Input & headless",
+  "Model & limits",
+  "Permissions",
+  "Sessions",
+  "Configuration & extensions",
+  "Web UI",
+  "General",
+];
+
+const CLI_ADVANCED_GROUPS = ["Advanced integrations", "Advanced diagnostics", "Environment"];
+
+const CLI_EXAMPLES = [
+  ["positional prompt", 'nonoclaw "summarize README.md"'],
+  ["stdin + JSON", 'printf \'%s\\n\' "review this diff" | nonoclaw -p --output-format json'],
+  ["plan before editing", 'nonoclaw --permission-mode plan "review the migration"'],
+  ["resume a session", 'nonoclaw --resume SESSION_ID "continue the task"'],
+  ["resume the latest session", 'nonoclaw --continue "keep going"'],
+  ["local web UI", "nonoclaw --serve-http 127.0.0.1:8765 --model MODEL_ID"],
+  ["LAN web UI", "nonoclaw --serve-http 0.0.0.0:8765 --public-url http://LAN_IP:8765"],
+  [
+    "explicit settings",
+    'nonoclaw --settings /path/to/settings.json --model MODEL_ID "explain this project"',
+  ],
+] as const;
+
+function cliReferenceGroup(item: CliReferenceItem): string {
+  if (item.kind === "environment") return "Environment";
+  return item.group?.trim() || "General";
+}
+
+function isAdvancedCliReference(item: CliReferenceItem): boolean {
+  const group = cliReferenceGroup(item);
+  return item.advanced === true || group === "Environment" || group.startsWith("Advanced");
+}
+
+function groupCliReference(
+  items: CliReferenceItem[],
+  preferredOrder: readonly string[],
+): [string, CliReferenceItem[]][] {
+  const groups = new Map<string, CliReferenceItem[]>();
+  for (const item of items) {
+    const group = cliReferenceGroup(item);
+    const groupItems = groups.get(group) ?? [];
+    groupItems.push(item);
+    groups.set(group, groupItems);
+  }
+  const preferred = preferredOrder.filter((group) => groups.has(group));
+  const remaining = [...groups.keys()]
+    .filter((group) => !preferred.includes(group))
+    .sort((left, right) => left.localeCompare(right));
+  return [...preferred, ...remaining].map((group) => [group, groups.get(group)!]);
+}
+
+function CliReferenceRow({ item }: { item: CliReferenceItem }) {
+  const metadata = [
+    item.kind === "environment" ? "environment variable" : null,
+    item.default_values?.length ? `default: ${item.default_values.join(", ")}` : null,
+    item.possible_values?.length ? `values: ${item.possible_values.join(" | ")}` : null,
+    item.repeatable ? "repeatable" : null,
+    item.value_delimiter ? `delimiter: ${JSON.stringify(item.value_delimiter)}` : null,
+  ].filter((value): value is string => Boolean(value));
+
+  return (
+    <div className="cli-ref__flag cli-ref__flag--rich">
+      <div className="cli-ref__row">
+        <span className="cli-ref__name">{item.name}</span>
+        <span className="cli-ref__desc">{item.description}</span>
+      </div>
+      {metadata.length > 0 && (
+        <div className="cli-ref__meta">
+          {metadata.map((value) => (
+            <span key={value} className="cli-ref__chip">{value}</span>
+          ))}
+        </div>
+      )}
+      {item.safety && <div className="cli-ref__safety"><strong>Safety:</strong> {item.safety}</div>}
+    </div>
+  );
+}
+
+function CliReferenceGroups({ groups }: { groups: [string, CliReferenceItem[]][] }) {
+  return (
+    <>
+      {groups.map(([group, groupItems]) => (
+        <div key={group} className="cli-ref__group">
+          <div className="cli-ref__group-title">
+            <span>{group}</span>
+            <span className="cli-ref__group-count">{groupItems.length}</span>
+          </div>
+          {groupItems.map((item) => <CliReferenceRow key={item.name} item={item} />)}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function CliRef({ items }: { items: CliReferenceItem[] }) {
+  const primaryItems = items.filter((item) => !isAdvancedCliReference(item));
+  const advancedItems = items.filter(isAdvancedCliReference);
+  const primaryGroups = groupCliReference(primaryItems, CLI_PRIMARY_GROUPS);
+  const advancedGroups = groupCliReference(advancedItems, CLI_ADVANCED_GROUPS);
+
   return (
     <div className="cli-ref">
       <div className="cli-ref__ex">
-{`# web UI
-nonoclaw --serve-http 127.0.0.1:8765 --model deepseek-chat
-
-# headless
-nonoclaw -p "summarize rust/README.md"
-echo "fix the bug" | nonoclaw -p --allowed-tools Read,Edit,Bash
-
-# sessions
-nonoclaw --continue "keep going"
-nonoclaw --list-sessions`}
+        <div className="cli-ref__ex-title">Common recipes</div>
+        {CLI_EXAMPLES.map(([label, command]) => (
+          <div key={label} className="cli-ref__example">
+            <span className="cli-ref__example-label"># {label}</span>
+            <code className="cli-ref__example-command">{command}</code>
+          </div>
+        ))}
       </div>
-      {items.map((item) => (
-        <div key={item.name} className="cli-ref__flag">
-          <span className="cli-ref__name">{item.name}</span>
-          <span className="cli-ref__desc">{item.description}</span>
-        </div>
-      ))}
+      <div className="cli-ref__constraint">
+        Operating modes are mutually exclusive. <code>--public-url</code> and <code>--tunnel</code>{" "}
+        require <code>--serve-http</code>; resume, continue, list, and no-session choices cannot be mixed.
+      </div>
+      <CliReferenceGroups groups={primaryGroups} />
+      {advancedItems.length > 0 && (
+        <details className="cli-ref__advanced">
+          <summary>
+            <span>Advanced</span>
+            <span className="cli-ref__group-count">{advancedItems.length}</span>
+          </summary>
+          <div className="cli-ref__advanced-body">
+            <CliReferenceGroups groups={advancedGroups} />
+          </div>
+        </details>
+      )}
       {items.length === 0 && <div className="acc-empty">CLI metadata unavailable</div>}
     </div>
   );

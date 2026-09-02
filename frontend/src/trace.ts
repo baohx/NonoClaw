@@ -134,7 +134,15 @@ export function eventToSafeFact(event: EngineEvent): Fact | null {
     case "model_info": return { category: "model", status: "success", summary: `Actual model · ${text(event.model, "unknown")}`, details: detail({ model: event.model }) };
     case "provider_diagnostic": return { category: "provider", status: status(event.status), summary: `${text(event.provider, "provider")} · ${text(event.category, "diagnostic")}`, details: detail({ provider: event.provider, category: event.category, status: event.status, detail: event.detail }) };
     case "stream_state_changed": return { category: "model", status: status(event.state, event.state === "thinking" || event.state === "streaming" ? "active" : "info"), summary: `Stream ${text(event.state, "changed")} · turn ${number(event.turn)}`, details: detail({ state: event.state, turn: event.turn }) };
-    case "thinking_state": return { category: "model", status: bool(event.active) ? "active" : "success", summary: bool(event.active) ? `Thinking · turn ${number(event.turn)}` : `Thinking complete · turn ${number(event.turn)}`, details: detail({ active: event.active, turn: event.turn }) };
+    case "thinking_state": {
+      // The engine emits active:true before every ThinkingDelta. The delta is
+      // intentionally omitted from trace, so retaining each matching state
+      // pulse can evict the model_request_started anchor during a long
+      // reasoning stream. The close transition is the timing fact Ledger
+      // needs; live UI/breath handling still consumes every raw event.
+      if (bool(event.active)) return null;
+      return { category: "model", status: "success", summary: `Thinking complete · turn ${number(event.turn)}`, details: detail({ active: false, turn: event.turn }) };
+    }
     case "retry_scheduled": return { category: "provider", status: "waiting", summary: `Retry ${number(event.attempt)} in ${number(event.delay_ms)} ms`, details: detail({ attempt: event.attempt, delay_ms: event.delay_ms, category: event.category, operation: event.operation }) };
     case "tool_use_start": return { category: "tool", status: "active", summary: `${text(event.name, "Tool")} started`, details: detail({ tool_use_id: event.id, tool_name: event.name }) };
     case "tool_result": return { category: "tool", status: bool(event.ok) ? "success" : "failure", summary: `${bool(event.ok) ? "Tool succeeded" : "Tool failed"} · ${text(event.id, "unknown")}`, details: detail({ tool_use_id: event.id, ok: event.ok }) };
@@ -206,12 +214,137 @@ export function traceTerminalEntry(meta: RunWireMeta, kind: "done" | "wire_error
   };
 }
 
-/** Append with deterministic de-duplication, ordering, and bounded retention. */
+/** Stable per-run/turn key for high-frequency stream state transitions. */
+function traceTurnKey(entry: TraceEntry): string {
+  const turn = entry.details.turn;
+  return `${entry.runId}\u0000${typeof turn === "number" || typeof turn === "string" ? String(turn) : "?"}`;
+}
+
+/** Remove wire-level state pulses that carry no new trace information. */
+function compactTracePulses(entries: TraceEntry[]): TraceEntry[] {
+  const compacted: TraceEntry[] = [];
+  const latestStreamState = new Map<string, TraceDetail>();
+  const thinkingClosed = new Set<string>();
+  for (const entry of entries) {
+    const key = traceTurnKey(entry);
+    if (entry.kind === "thinking_state") {
+      if (entry.details.active === true) continue;
+      // ThinkingEnd and MessageStop may both emit active:false. Ledger uses the
+      // first close because it is the precise block boundary.
+      if (thinkingClosed.has(key)) continue;
+      thinkingClosed.add(key);
+    } else if (entry.kind === "stream_state_changed") {
+      const state = entry.details.state;
+      if (state === "streaming" && latestStreamState.get(key) === "streaming") continue;
+      latestStreamState.set(key, state ?? null);
+    }
+    compacted.push(entry);
+  }
+  return compacted;
+}
+
+function isTimingBoundary(entry: TraceEntry): boolean {
+  if (entry.kind === "model_request_started"
+    || entry.kind === "usage_updated"
+    || entry.kind === "retry_scheduled"
+    || entry.kind === "tool_use_start"
+    || entry.kind === "tool_execution_started"
+    || entry.kind === "tool_execution_finished"
+    || entry.kind === "run_finished"
+    || entry.kind === "done"
+    || entry.kind === "wire_error") return true;
+  if (entry.kind === "thinking_state") return entry.details.active === false;
+  return entry.kind === "stream_state_changed"
+    && (entry.details.state === "streaming"
+      || entry.details.state === "completed"
+      || entry.details.state === "interrupted");
+}
+
+function closesModelWindow(entry: TraceEntry): boolean {
+  if (entry.kind === "tool_use_start"
+    || entry.kind === "run_finished"
+    || entry.kind === "done"
+    || entry.kind === "wire_error") return true;
+  return entry.kind === "stream_state_changed"
+    && (entry.details.state === "completed" || entry.details.state === "interrupted");
+}
+
+/**
+ * Retain newest arrival-ordered facts while pinning the model-request start of
+ * every represented per-run window. This avoids keeping orphan close/end facts
+ * that buildStepWindows cannot interpret after a high-volume stream.
+ */
+export function trimTraceEntries(entries: TraceEntry[]): TraceEntry[] {
+  if (entries.length <= MAX_TRACE_EVENTS) return entries;
+
+  const startForEntry = new Map<string, TraceEntry>();
+  const currentStartByRun = new Map<string, TraceEntry>();
+  const openStartByRun = new Map<string, TraceEntry>();
+  for (const entry of entries) {
+    if (entry.kind === "model_request_started") {
+      currentStartByRun.set(entry.runId, entry);
+      openStartByRun.set(entry.runId, entry);
+    }
+    const start = currentStartByRun.get(entry.runId);
+    if (start !== undefined) startForEntry.set(entry.id, start);
+    if (closesModelWindow(entry)) openStartByRun.delete(entry.runId);
+  }
+
+  const kept = entries.slice(-MAX_TRACE_EVENTS);
+  // Open windows must retain their start before any close exists to pull it
+  // back into the bounded tail. Once closed, represented endpoint facts below
+  // keep requiring the same start.
+  const requiredStarts = new Map<string, TraceEntry>();
+  for (const start of openStartByRun.values()) requiredStarts.set(start.id, start);
+  for (const entry of kept) {
+    const start = startForEntry.get(entry.id);
+    if (start !== undefined) requiredStarts.set(start.id, start);
+  }
+  const keptIds = new Set(kept.map((entry) => entry.id));
+  const newestEntryId = entries[entries.length - 1]?.id;
+  for (const start of requiredStarts.values()) {
+    if (keptIds.has(start.id)) continue;
+    let evictAt = kept.findIndex((entry) => (
+      entry.id !== newestEntryId
+      && !requiredStarts.has(entry.id)
+      && !isTimingBoundary(entry)
+    ));
+    // If every older candidate is itself a boundary, discard the oldest
+    // non-required boundary rather than rejecting the newly arrived fact.
+    // This can leave an old window start-only (honest unknown end), but never
+    // starves a newer run or manufactures an orphan end without its start.
+    if (evictAt < 0) evictAt = kept.findIndex((entry) => (
+      entry.id !== newestEntryId && !requiredStarts.has(entry.id)
+    ));
+    if (evictAt < 0) break;
+    keptIds.delete(kept[evictAt].id);
+    kept[evictAt] = start;
+    keptIds.add(start.id);
+  }
+
+  const arrivalOrder = new Map(entries.map((entry, position) => [entry.id, position]));
+  kept.sort((a, b) => (arrivalOrder.get(a.id) ?? 0) - (arrivalOrder.get(b.id) ?? 0));
+  return kept;
+}
+
+/** Build the unbounded, low-frequency fact stream used only by trajectory
+ * analysis. TechnicalTrace keeps its separate bounded list, so preserving all
+ * model/tool boundaries here does not make the live diagnostics rail grow. */
+export function trajectoryTraceEntries(entries: TraceEntry[]): TraceEntry[] {
+  return compactTracePulses(entries.filter(isTimingBoundary));
+}
+
+/** Add one live fact to the trajectory stream without applying the diagnostic
+ * trace cap. Event ids provide deterministic replay/live de-duplication. */
+export function appendTrajectoryTraceEntry(entries: TraceEntry[], entry: TraceEntry): TraceEntry[] {
+  if (!isTimingBoundary(entry) || entries.some((existing) => existing.id === entry.id)) return entries;
+  return compactTracePulses([...entries, entry]);
+}
+
+/** Append with deterministic de-duplication and bounded arrival retention. */
 export function appendTraceEntry(entries: TraceEntry[], entry: TraceEntry): TraceEntry[] {
   if (entries.some((existing) => existing.id === entry.id)) return entries;
-  return [...entries, entry]
-    .sort((a, b) => a.sequence - b.sequence || a.timestampMs - b.timestampMs || a.id.localeCompare(b.id))
-    .slice(-MAX_TRACE_EVENTS);
+  return trimTraceEntries(compactTracePulses([...entries, entry]));
 }
 
 export function groupTraceRuns(entries: TraceEntry[]): TraceRun[] {
