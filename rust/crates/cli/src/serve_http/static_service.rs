@@ -97,8 +97,20 @@ pub(super) async fn spawn_tunnel(local_addr: &str) -> Option<String> {
     let port = local_addr.rsplit(':').next()?;
     let target = format!("http://127.0.0.1:{port}");
     tracing::info!(%target, %local_addr, "spawning cloudflared tunnel");
+    // --protocol http2: force TCP-only edge registration. Behind transparent
+    // proxies that hijack UDP (v2rayA etc.), cloudflared's default QUIC path
+    // registers HA connections but the quick-tunnel hostname is never
+    // published at the edge — every QR code scans to NXDOMAIN. HTTP/2 keeps
+    // registration and hostname publishing on the same TCP connection.
     let mut child = match tokio::process::Command::new("cloudflared")
-        .args(["tunnel", "--no-autoupdate", "--url", &target])
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "--protocol",
+            "http2",
+            "--url",
+            &target,
+        ])
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .kill_on_drop(true)
