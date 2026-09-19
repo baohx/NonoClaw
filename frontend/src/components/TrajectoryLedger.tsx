@@ -307,11 +307,13 @@ export default function TrajectoryLedger() {
     let tokensIn = 0;
     let tokensOut = 0;
     let cacheRead = 0;
+    let cacheWrite = 0;
     for (const turn of layout.turns) {
       if (turn.usage !== null) {
         tokensIn += turn.usage.input;
         tokensOut += turn.usage.output;
         cacheRead += turn.usage.cacheRead;
+        cacheWrite += turn.usage.cacheWrite;
       }
       for (const cell of turn.cells) {
         // Subagent-internal tools ride under the parent turn but are a
@@ -322,7 +324,11 @@ export default function TrajectoryLedger() {
         if (cell.isError) errors += 1;
       }
     }
-    return { tools, errors, tokensIn, tokensOut, cacheRead };
+    // Same formula as InsightRail CacheSection: Anthropic `input_tokens`
+    // excludes cache reads/writes, so the billable base sums all three.
+    const base = tokensIn + cacheRead + cacheWrite;
+    const hitRate = base > 0 ? (cacheRead / base) * 100 : 0;
+    return { tools, errors, tokensIn, tokensOut, cacheRead, hitRate };
   }, [layout]);
 
   return (
@@ -330,7 +336,7 @@ export default function TrajectoryLedger() {
       <div className="ledger-toolbar">
         <span className="ledger-toolbar__title">Trajectory ledger</span>
         <span className="ledger-toolbar__stats">
-          {layout.turns.length} turns · {stats.tools} tools · {stats.errors} errors · in {formatTokenCount(stats.tokensIn)} · out {formatTokenCount(stats.tokensOut)} · cache {formatTokenCount(stats.cacheRead)}
+          {layout.turns.length} turns · {stats.tools} tools · {stats.errors} errors · in {formatTokenCount(stats.tokensIn)} · out {formatTokenCount(stats.tokensOut)} · cache {stats.hitRate.toFixed(1)}% hit
         </span>
         <input
           className="ledger-search"
@@ -424,7 +430,12 @@ export default function TrajectoryLedger() {
                       )}
                       {row.usage && (
                         <span className="ledger-turn-head__meta">
-                          {formatTokenCount(row.usage.input)} in / {formatTokenCount(row.usage.output)} out{row.usage.cacheRead > 0 ? ` · ${formatTokenCount(row.usage.cacheRead)} cached` : ""}
+                          {formatTokenCount(row.usage.input)} in / {formatTokenCount(row.usage.output)} out
+                          {(() => {
+                            const base = row.usage.input + row.usage.cacheRead + row.usage.cacheWrite;
+                            if (base <= 0) return null;
+                            return ` · ${((row.usage.cacheRead / base) * 100).toFixed(1)}% cached`;
+                          })()}
                         </span>
                       )}
                     </div>
@@ -482,6 +493,12 @@ export default function TrajectoryLedger() {
             {selected.input !== undefined && <Fact label="Input tokens" value={formatTokenCount(selected.input)} />}
             {selected.cacheRead !== undefined && <Fact label="Cache read" value={formatTokenCount(selected.cacheRead)} />}
             {selected.cacheWrite !== undefined && <Fact label="Cache write" value={formatTokenCount(selected.cacheWrite)} />}
+            {selected.cacheRead !== undefined && selected.cacheWrite !== undefined && selected.input !== undefined && (() => {
+              const base = selected.input + selected.cacheRead + selected.cacheWrite;
+              return base > 0
+                ? <Fact label="Cache hit rate" value={`${((selected.cacheRead / base) * 100).toFixed(1)}%`} />
+                : null;
+            })()}
             {selected.output !== undefined && <Fact label="Output tokens" value={formatTokenCount(selected.output)} />}
             {selected.assistantMetrics?.timingRecorded === true && (
               <>

@@ -160,15 +160,22 @@ fn payload_history_chars(messages: &[Message]) -> usize {
     messages.iter().map(payload_message_chars).sum()
 }
 
+/// Marker prefix of engine-appended live-git messages (2026-09-18 cache-fix).
+/// Consumers that classify user messages (run boundaries, history windows)
+/// treat these as engine bookkeeping, not as user prompts.
+const GIT_STATUS_PREFIX: &str = "<git_status";
+
 fn is_plain_history_user(message: &Message) -> bool {
     if message.role != Role::User {
         return false;
     }
     match &message.content {
-        MessageContent::Text(_) => true,
-        MessageContent::Blocks(blocks) => !blocks
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+        MessageContent::Text(text) => !text.starts_with(GIT_STATUS_PREFIX),
+        MessageContent::Blocks(blocks) => !blocks.iter().any(|block| match block {
+            ContentBlock::ToolResult { .. } => true,
+            ContentBlock::Text { text, .. } => text.starts_with(GIT_STATUS_PREFIX),
+            _ => false,
+        }),
     }
 }
 
@@ -472,12 +479,17 @@ fn prepare_messages_for_request(
     supports_images: bool,
     history_max_chars: usize,
     attachment_max_chars: usize,
+    frozen_idx: usize,
 ) -> Vec<Message> {
     let compatible = strip_unsupported_blocks(messages, supports_images);
     let sanitized = redact_tool_result_credentials(&compatible);
     let attachment_bounded = limit_attachment_images(&sanitized, attachment_max_chars);
+    let fits = payload_history_chars(&attachment_bounded) <= history_max_chars;
     let windowed = history_window(&attachment_bounded, history_max_chars);
-    apply_cache_breakpoints(windowed)
+    // The frozen breakpoint only stays valid when the window kept the
+    // sealed prefix verbatim (no summary substitution / no head truncation).
+    let effective_frozen = if fits { frozen_idx } else { 0 };
+    apply_cache_breakpoints(windowed, effective_frozen)
 }
 
 /// Content-layer credential gate: scrub credential-shaped material out of
@@ -594,7 +606,25 @@ fn redact_inner_text_blocks(inner: &[ContentBlock]) -> Option<Vec<ContentBlock>>
 /// Only affects Anthropic-format providers; the OpenAI serializer ignores
 /// `cache_control` on content blocks (OpenAI-compatible endpoints use
 /// automatic prefix caching with no request-side breakpoints).
-fn apply_cache_breakpoints(mut messages: Vec<Message>) -> Vec<Message> {
+///
+/// `frozen_idx` is the message boundary at which this run started (the
+/// cross-run history length at entry). Everything before it is sealed
+/// history whose bytes must never change during the run, so a breakpoint
+/// placed there lets the next turn (and, thanks to byte-stability, later
+/// runs) hit a prefix that spans the whole prior conversation instead of
+/// falling back to the system+tools prefix when mid-history bytes drift.
+fn apply_cache_breakpoints(mut messages: Vec<Message>, frozen_idx: usize) -> Vec<Message> {
+    // Frozen-prefix breakpoint: only meaningful when the request actually
+    // carries the sealed history (windowed requests and fresh sessions
+    // start at message 0, where a breakpoint would duplicate Block 1's).
+    if frozen_idx >= 1 && frozen_idx < messages.len() {
+        // Not the same message as the rolling breakpoint below (guarded by
+        // `< messages.len()`), and at least one message of new work sits
+        // after it, so the two breakpoints never collide.
+        if let Some(sealed) = messages.get_mut(frozen_idx - 1) {
+            mark_last_block_cache_control(sealed);
+        }
+    }
     // Rolling breakpoint on the final message: the prefix up to and including
     // this message is what the NEXT turn will read from cache.
     if let Some(last) = messages.last_mut() {
@@ -641,6 +671,25 @@ fn mark_last_block_cache_control(msg: &mut Message) {
                 _ => {}
             }
         }
+    }
+}
+
+/// Does a provider/stream error message indicate an output-length limit?
+/// Used to split the graceful-truncation notice: transient stream failures
+/// (connection reset, decode errors) must not be reported as length errors.
+fn error_indicates_length_limit(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("max_tokens")
+        || lower.contains("maximum length")
+        || lower.contains("output limit")
+        || lower.contains("context length")
+}
+
+fn truncation_notice(is_length_limit: bool) -> &'static str {
+    if is_length_limit {
+        "\n\n---\n⚠️ 输出被截断（已达到输出长度上限）\n[Output truncated — output length limit reached]"
+    } else {
+        "\n\n---\n⚠️ 输出被截断（流式响应中断）\n[Output truncated — streaming response interrupted]"
     }
 }
 
@@ -701,30 +750,84 @@ fn selected_tool_names(
     )
 }
 
-fn tool_payload_priority(
-    visible: &std::collections::HashSet<String>,
-    core_tools: &[String],
-    activated: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut priority = vec!["ToolSearch".to_string()];
-    let mut activated = activated.iter().cloned().collect::<Vec<_>>();
-    activated.sort();
-    priority.extend(activated);
+/// Plain user prompt texts (time-ordered) that sticky tool selection replays
+/// over. Engine bookkeeping (git snapshots, tool results) is excluded so the
+/// replayed intent is what the user actually asked.
+fn plain_user_texts(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| is_plain_history_user(message))
+        .filter_map(|message| match &message.content {
+            MessageContent::Text(text) => Some(text.clone()),
+            MessageContent::Blocks(blocks) => Some(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+        })
+        .filter(|text| !text.is_empty())
+        .collect()
+}
 
-    let core = core_tools
+/// Sticky tool selection across a session (prompt-cache fix, 2026-09-19).
+/// Replays every plain user text through the intent selector in time order
+/// and unions the results, so a follow-up like "继续" cannot shrink the
+/// visible tool set that earlier prompts established. `extras_order` lists
+/// intent-selected tools (core/ToolSearch/activated excluded) in first-seen
+/// order, which is append-only by construction and therefore cache-stable.
+fn sticky_selected_tools(
+    registry: &ToolRegistry,
+    options: &EngineOptions,
+    texts: &[String],
+    activated: &std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Vec<String>) {
+    let core: std::collections::HashSet<&str> = options
+        .core_tools
         .iter()
         .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let mut selected = visible
-        .iter()
-        .filter(|name| name.as_str() != "ToolSearch")
-        .filter(|name| !core.contains(name.as_str()))
-        .filter(|name| !priority.contains(name))
-        .cloned()
-        .collect::<Vec<_>>();
-    selected.sort();
-    priority.extend(selected);
+        .chain(std::iter::once("ToolSearch"))
+        .collect();
+    let mut visible = std::collections::HashSet::new();
+    let mut extras_order: Vec<String> = Vec::new();
+    for text in texts {
+        let selected = selected_tool_names(registry, options, text, activated);
+        visible.extend(selected.iter().cloned());
+        // HashSet iteration order is nondeterministic; sort per text so the
+        // first-seen scan below is byte-stable for identical inputs.
+        let mut names = selected.into_iter().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if !core.contains(name.as_str())
+                && !activated.contains(&name)
+                && !extras_order.contains(&name)
+            {
+                extras_order.push(name);
+            }
+        }
+    }
+    (visible, extras_order)
+}
+
+fn tool_payload_priority(
+    core_tools: &[String],
+    activated_order: &[String],
+    extras_order: &[String],
+) -> Vec<String> {
+    // Append-only layout: [ToolSearch] + core_tools (fixed) + activated
+    // (first-seen) + extras (first-seen). Everything that can grow sits at
+    // the tail, so an older cached tools prefix stays a valid prefix of the
+    // new request and only newly appended schemas miss the cache.
+    let mut priority = vec!["ToolSearch".to_string()];
     priority.extend(core_tools.iter().cloned());
+    for name in activated_order.iter().chain(extras_order.iter()) {
+        if !priority.contains(name) {
+            priority.push(name.clone());
+        }
+    }
     priority
 }
 
@@ -1082,6 +1185,13 @@ struct EngineCache {
     /// Used as the primary compact-threshold signal; falls back to the
     /// chars/4 heuristic when zero (e.g. before the first turn).
     last_input_tokens: usize,
+    /// Message boundary where this run started: messages `[0, frozen_idx)`
+    /// are sealed cross-run history. `apply_cache_breakpoints` places a
+    /// cache breakpoint there and `micro_compact`/pruners must not rewrite
+    /// sealed messages, so the prefix bytes stay stable for prompt-cache
+    /// hits across turns (and, once persisted, across runs). Reset to 0
+    /// after any compaction rewrite that replaces the sealed prefix.
+    frozen_idx: usize,
     /// Background compaction task spawned when tokens reach 80% threshold.
     pending_compact: Option<tokio::task::JoinHandle<Result<Vec<Message>>>>,
     /// Message count when background compact was spawned (for correct delta).
@@ -1149,6 +1259,7 @@ impl Default for EngineCache {
         EngineCache {
             total_usage: Usage::default(),
             last_input_tokens: 0,
+            frozen_idx: 0,
             pending_compact: None,
             pending_compact_msg_count: 0,
             pending_compact_revision: 0,
@@ -1434,6 +1545,22 @@ impl QueryEngine {
         for repair in std::mem::take(&mut self.session_repairs) {
             on_event(&EngineEvent::SessionRepair { repair });
         }
+        // Seal the cross-run history: everything before this run's first
+        // user message is frozen for cache purposes (see EngineCache).
+        // Before sealing, micro-compact the inherited history ONCE (past
+        // run-start the seal forbids rewrites): oversized sealed results
+        // would otherwise never be trimmed, and the rewrite happens at the
+        // run boundary so the in-run prefix bytes stay stable.
+        {
+            let (microd, micro_count) =
+                crate::compact::micro_compact(&self.messages, 0);
+            if micro_count > 0 {
+                if self.persist_compaction(microd.clone(), self.session_revision).await {
+                    self.messages = microd;
+                }
+            }
+        }
+        self.cache.frozen_idx = self.messages.len();
         let user_msg = Message::user(user_content.clone());
         self.messages.push(user_msg.clone());
         self.persist(user_msg).await;
@@ -1483,6 +1610,20 @@ impl QueryEngine {
         };
         let system_ctx = get_system_context_with_limit(cwd, prompt_limits.git_chars).await;
         self.cache.cached_git_context = Some(system_ctx.clone());
+        // Tail-append the start-of-run git snapshot (2026-09-18 cache-fix:
+        // dynamic content must never sit in the pre-history system blocks).
+        // It lands after the user message — i.e. inside this run's new work,
+        // past the frozen boundary — so it participates in the rolling
+        // breakpoint normally and old snapshots in history are reclaimed by
+        // micro-compact instead of invalidating the cache prefix.
+        if !system_ctx.git_summary.trim().is_empty() {
+            let git_msg = Message::user(MessageContent::from_text(format!(
+                "<git_status turn=\"0\">\n{}\n</git_status>",
+                system_ctx.git_summary.trim()
+            )));
+            self.messages.push(git_msg.clone());
+            self.persist(git_msg).await;
+        }
         let user_ctx = get_user_context_with_limit(
             cwd,
             &self.options.add_dirs,
@@ -1506,16 +1647,29 @@ impl QueryEngine {
         } else {
             context.session_id.clone()
         };
-        let activated_tools = nonoclaw_tools::builtin::tool_search::activated_tools(&tool_scope);
-        let mut visible_tools =
-            selected_tool_names(&self.registry, &self.options, &user_text, &activated_tools);
+        let activated_order =
+            nonoclaw_tools::builtin::tool_search::activated_tools_ordered(&tool_scope);
+        let activated_tools: std::collections::HashSet<String> =
+            activated_order.iter().cloned().collect();
+        // Sticky selection: union over every plain user text so far. The
+        // current user message is already in self.messages, so a follow-up
+        // like "继续" cannot shrink tools that earlier prompts established.
+        let (mut visible_tools, extras_order) = sticky_selected_tools(
+            &self.registry,
+            &self.options,
+            &plain_user_texts(&self.messages),
+            &activated_tools,
+        );
         // Static MCP contract (AutoGenesis borrow): refresh the disk-cached
         // inventory only when registry content changed; hash-gated no-op.
         if context.parent_run_id.is_none() {
             crate::tool_selector::refresh_mcp_contract(cwd, &self.registry.search_entries());
         }
-        let priority =
-            tool_payload_priority(&visible_tools, &self.options.core_tools, &activated_tools);
+        let priority = tool_payload_priority(
+            &self.options.core_tools,
+            &activated_order,
+            &extras_order,
+        );
         let tool_schema_max_chars =
             crate::budget::ContextBudget::chars(context_budget.tool_schema_tokens, chars_per_token);
         let (mut tool_defs, tool_prompts) = build_tool_payload(
@@ -1804,20 +1958,27 @@ impl QueryEngine {
             // ToolSearch `select:<name>` mutates the session activation set.
             // Rebuild the advertised schemas before the next model request so
             // the selected tool becomes callable within the same user run.
-            let next_activated = nonoclaw_tools::builtin::tool_search::activated_tools(&tool_scope);
-            let next_visible =
-                selected_tool_names(&self.registry, &self.options, &user_text, &next_activated);
-            if next_visible != visible_tools {
-                visible_tools = next_visible;
+            // Monotonic union only — never re-run the full selection, which
+            // could displace history-derived extras and shrink the payload
+            // (cache-breaking). Extras are fixed for the whole run.
+            let next_activated =
+                nonoclaw_tools::builtin::tool_search::activated_tools_ordered(&tool_scope);
+            if !next_activated
+                .iter()
+                .all(|name| visible_tools.contains(name))
+            {
+                for name in &next_activated {
+                    visible_tools.insert(name.clone());
+                }
                 let refreshed_allow_filter = if self.options.allowed_tools.is_empty() {
                     None
                 } else {
                     Some(self.options.allowed_tools.as_slice())
                 };
                 let priority = tool_payload_priority(
-                    &visible_tools,
                     &self.options.core_tools,
                     &next_activated,
+                    &extras_order,
                 );
                 let (next_defs, next_prompts) = build_tool_payload(
                     &self.registry,
@@ -1856,26 +2017,15 @@ impl QueryEngine {
             // Activated skill metadata flows through the uncached Block 2
             // (refreshed below), so the cached prefix stays byte-stable.
 
-            // Refresh the uncached context block with live git status
-            // each turn so the model sees up-to-date working-tree state.
-            // Dynamic skill metadata is rendered into this uncached block, so
-            // skill activations surface without invalidating the cached Block 1.
-            //
-            // T7.3: skip the git subprocess when no mutating tool ran on the
-            // previous turn — the cached snapshot is still accurate.
+            // Refresh the uncached context block each turn (date + dynamic
+            // skill metadata). Git status is no longer refreshed here — it
+            // flows through conversation-tail messages (see the
+            // ran_mutating_tool append below) so the cacheable prefix
+            // survives mutating turns.
             {
-                let live_git = match self.cache.cached_git_context.take() {
-                    Some(cached) => cached,
-                    None => {
-                        let fresh =
-                            get_system_context_with_limit(cwd, prompt_limits.git_chars).await;
-                        self.cache.cached_git_context = Some(fresh.clone());
-                        fresh
-                    }
-                };
                 system_blocks = crate::prompt::refresh_context_block_with_limits(
                     &system_blocks,
-                    &live_git,
+                    &self.cache.cached_git_context.clone().unwrap_or_default(),
                     &user_ctx,
                     &memory,
                     &self.options.skills_manager,
@@ -1931,6 +2081,7 @@ impl QueryEngine {
                             let tokens_after =
                                 ratio_tokens(tokens_at_spawn, chars_at_spawn, chars_after);
                             self.messages = compacted;
+                            self.cache.frozen_idx = 0;
                             on_event(&EngineEvent::Compacted {
                                 removed,
                                 kept,
@@ -2012,8 +2163,21 @@ impl QueryEngine {
                 // the full re-read a compaction summary would cause.
                 {
                     let (microd, micro_count) =
-                        crate::compact::micro_compact(&self.messages);
+                        crate::compact::micro_compact(&self.messages, self.cache.frozen_idx);
                     if micro_count > 0 {
+                        // Persist the pruned transcript so the next run
+                        // hydrates the same bytes this run sent to the
+                        // provider. Without this, every run re-pruned from
+                        // the full on-disk text and turn-1 re-sent the
+                        // entire history uncached (empirically ~8% turn-1
+                        // cache hit). CAS: on revision conflict the
+                        // concurrent winner stays authoritative on disk and
+                        // `persist_compaction` re-syncs `session_revision`;
+                        // the in-memory pruning below stays safe because
+                        // markers make it idempotent.
+                        let micro_revision = self.session_revision;
+                        self.persist_compaction(microd.clone(), micro_revision)
+                            .await;
                         self.messages = microd;
                         self.cache.last_input_tokens = 0;
                         on_event(&EngineEvent::Compacted {
@@ -2057,7 +2221,7 @@ impl QueryEngine {
                 // under their thresholds, skip the summarizer call entirely.
                 let mut pruned_results = 0usize;
                 if should_prefire || should_compact {
-                    let (pruned, pruned_count) = crate::compact::prune_tool_results(&self.messages);
+                    let (pruned, pruned_count) = crate::compact::prune_tool_results(&self.messages, self.cache.frozen_idx);
                     if pruned_count > 0 {
                         let est_after = estimate_total_for_model(
                             Some(&self.options.model),
@@ -2219,6 +2383,7 @@ impl QueryEngine {
                             .await
                     {
                         self.messages = compacted;
+                        self.cache.frozen_idx = 0;
                         on_event(&EngineEvent::Compacted {
                             removed,
                             kept,
@@ -2287,6 +2452,7 @@ impl QueryEngine {
                     context_budget.attachment_tokens,
                     chars_per_token,
                 ),
+                self.cache.frozen_idx,
             );
             if request_messages.len() < self.messages.len() {
                 on_event(&RunEvent::RecoveryApplied {
@@ -2368,6 +2534,7 @@ impl QueryEngine {
                     &self.session_id[..8.min(self.session_id.len())],
                     turn_label
                 )),
+                session_id: Some(self.session_id.clone()),
             };
 
             // Snapshot the live request so a later compaction summarizer can
@@ -2422,12 +2589,22 @@ impl QueryEngine {
                             partial_blocks = failure.partial.content.len(),
                             "stream interrupted mid-response, using partial output with truncation notice"
                         );
-                        let notice = "\n\n---\n⚠️ 输出被截断（流式响应中断，可能已达到最大长度限制）\n[Output truncated — streaming response interrupted]";
+                        // Blame the actual cause: only length-limit errors get
+                        // the "max length" wording; transient stream failures
+                        // (connection reset, decode errors) must not be
+                        // reported as output-limit errors.
+                        let is_length_limit =
+                            error_indicates_length_limit(&failure.error.message);
+                        let notice = truncation_notice(is_length_limit);
                         on_event(&RunEvent::TextDelta {
                             text: notice.to_string(),
                         });
                         on_event(&RunEvent::RecoveryApplied {
-                            category: "stream_truncation".into(),
+                            category: if is_length_limit {
+                                "stream_truncation_length".into()
+                            } else {
+                                "stream_truncation_network".into()
+                            },
                             detail: format!(
                                 "stream error: {}; partial output preserved with truncation notice",
                                 failure.error.message,
@@ -2471,6 +2648,7 @@ impl QueryEngine {
                                             context_budget.attachment_tokens,
                                             chars_per_token,
                                         ),
+                                        self.cache.frozen_idx,
                                     ),
                                     trace_label: Some(format!(
                                         "{}:retry",
@@ -2702,10 +2880,8 @@ impl QueryEngine {
                 return Err(nonoclaw_core::Error::Cancelled);
             }
 
-            // T7.3: a mutating tool ran → next turn must refresh git context.
-            if ran_mutating_tool {
-                self.cache.cached_git_context = None;
-            }
+            // T7.3 mutating-tool git refresh now happens in the tail append
+            // below (see the <git_status> message pushed after tool results).
             drop(execution);
             drop(execution_context);
             // RunController waits for each child event consumer before the
@@ -2893,6 +3069,25 @@ impl QueryEngine {
             let tr_msg = Message::user(MessageContent::from_blocks(blocks));
             self.messages.push(tr_msg.clone());
             self.persist(tr_msg).await;
+
+            // 2026-09-18 cache-fix: after a mutating tool, append a fresh git
+            // snapshot to the conversation TAIL instead of refreshing the
+            // pre-history context block in place. Appending preserves the
+            // cacheable prefix; the superseded snapshot earlier in history
+            // gets reclaimed by micro-compact (2K threshold).
+            if ran_mutating_tool {
+                let fresh =
+                    get_system_context_with_limit(cwd, prompt_limits.git_chars).await;
+                let body = format!(
+                    "<git_status turn=\"{turns_made}\">\n{}\n</git_status>",
+                    fresh.git_summary.trim()
+                );
+                if !fresh.git_summary.trim().is_empty() {
+                    let git_msg = Message::user(MessageContent::from_text(body));
+                    self.messages.push(git_msg.clone());
+                    self.persist(git_msg).await;
+                }
+            }
         };
 
         // Stop is the main-agent completion boundary; SessionEnd follows it.
@@ -3032,6 +3227,7 @@ impl QueryEngine {
                 .await
         {
             self.messages = compacted;
+            self.cache.frozen_idx = 0;
             let removed = before - kept;
             runtime
                 .run(
@@ -3928,7 +4124,7 @@ mod tests {
                 false,
             )])),
         ];
-        let prepared = prepare_messages_for_request(&messages, true, 1_000_000, 10_000);
+        let prepared = prepare_messages_for_request(&messages, true, 1_000_000, 10_000, 0);
         let serialized = serde_json::to_string(&prepared).unwrap();
         assert!(!serialized.contains("hunter2"), "kv secret leaked");
         assert!(!serialized.contains("MIIEow"), "private key body leaked");
@@ -3965,7 +4161,7 @@ mod tests {
             image(&"a".repeat(100)),
             image(&"b".repeat(100)),
         ]))];
-        let projected = prepare_messages_for_request(&messages, true, 10_000, 120);
+        let projected = prepare_messages_for_request(&messages, true, 10_000, 120, 0);
         assert_eq!(count_images(&projected), 0);
 
         // A budget covering two image estimates keeps both — image count is
@@ -3975,6 +4171,7 @@ mod tests {
             true,
             10_000,
             crate::tokens::image_budget_chars() * 2,
+            0,
         );
         assert_eq!(count_images(&projected), 2);
 
@@ -4090,7 +4287,7 @@ mod tests {
 
         let activated = std::collections::HashSet::new();
         let visible = selected_tool_names(&registry, &options, "hello", &activated);
-        let priority = tool_payload_priority(&visible, &options.core_tools, &activated);
+        let priority = tool_payload_priority(&options.core_tools, &[], &[]);
         let (schemas, tool_prompts) = build_tool_payload(
             &registry,
             &visible,
@@ -4217,6 +4414,70 @@ mod tests {
     }
 
     #[test]
+    fn sticky_tool_selection_only_appends_across_user_texts() {
+        let (mut registry, _) = nonoclaw_tools::register_all();
+        registry.register(Arc::new(nonoclaw_tools::builtin::ToolSearchTool::new(
+            registry.search_entries(),
+        )));
+        let mut options = EngineOptions::default();
+        options.core_tools = Vec::new();
+        options.tool_auto_select_top_k = 3;
+        options.mcp_no_match_policy = crate::tool_selector::McpNoMatchPolicy::None;
+        let activated = std::collections::HashSet::new();
+
+        let text1 = "search the web for rust async docs".to_string();
+        let text2 = "read the memory notes and grep the codebase".to_string();
+        let single1 = sticky_selected_tools(&registry, &options, &[text1.clone()], &activated);
+        let single2 = sticky_selected_tools(&registry, &options, &[text2.clone()], &activated);
+
+        // Fixture sanity: both texts must select non-empty extras, otherwise
+        // the prefix assertions below are vacuous.
+        assert!(
+            !single1.1.is_empty() && !single2.1.is_empty(),
+            "fixture texts must produce non-empty extras"
+        );
+
+        // Determinism: identical input, identical output (no HashSet-iteration
+        // leakage into the ordered payload).
+        let repeat = sticky_selected_tools(&registry, &options, &[text1.clone()], &activated);
+        assert_eq!(repeat.0, single1.0);
+        assert_eq!(repeat.1, single1.1);
+
+        // Union across texts: sticky([t1]) then sticky([t1,t2]) is append-only.
+        let both = sticky_selected_tools(
+            &registry,
+            &options,
+            &[text1.clone(), text2.clone()],
+            &activated,
+        );
+        let union12: std::collections::HashSet<_> =
+            single1.0.union(&single2.0).cloned().collect();
+        assert_eq!(both.0, union12);
+        assert_eq!(
+            &both.1[..single1.1.len()],
+            single1.1.as_slice(),
+            "extras must be append-only: sticky([t1,t2]) extends sticky([t1])"
+        );
+        assert!(both.1.len() > single1.1.len());
+
+        // Priority prefix property: new texts append, never reorder.
+        let p1 = tool_payload_priority(&options.core_tools, &[], &single1.1);
+        let pboth = tool_payload_priority(&options.core_tools, &[], &both.1);
+        assert_eq!(&pboth[..p1.len()], p1.as_slice());
+
+        // Activated order is honored ahead of extras and deduped.
+        let p = tool_payload_priority(
+            &options.core_tools,
+            &["Agent".to_string()],
+            &["Agent".to_string(), single1.1[0].clone()],
+        );
+        assert_eq!(
+            p,
+            vec!["ToolSearch".to_string(), "Agent".to_string(), single1.1[0].clone()]
+        );
+    }
+
+    #[test]
     fn activated_schema_is_visible_in_the_next_request_payload() {
         let (mut registry, _) = nonoclaw_tools::register_all();
         registry.register(Arc::new(nonoclaw_tools::builtin::ToolSearchTool::new(
@@ -4236,9 +4497,12 @@ mod tests {
         assert!(nonoclaw_tools::builtin::tool_search::activate_tool(
             &scope, "Agent"
         ));
-        let activated = nonoclaw_tools::builtin::tool_search::activated_tools(&scope);
+        let activated_order =
+            nonoclaw_tools::builtin::tool_search::activated_tools_ordered(&scope);
+        let activated: std::collections::HashSet<String> =
+            activated_order.iter().cloned().collect();
         let visible = selected_tool_names(&registry, &options, "hello", &activated);
-        let priority = tool_payload_priority(&visible, &options.core_tools, &activated);
+        let priority = tool_payload_priority(&options.core_tools, &activated_order, &[]);
         let (schemas, _) = build_tool_payload(
             &registry,
             &visible,
@@ -5056,6 +5320,93 @@ mod tests {
         assert_eq!(persisted.messages.len(), 4);
     }
 
+    /// Micro-compact results are persisted to the session JSONL so the next
+    /// run hydrates the same pruned bytes this run sent to the provider.
+    /// Before this behavior, every run re-pruned from the full on-disk text
+    /// and turn-1 re-sent the entire history uncached (empirically ~8%
+    /// turn-1 cache hit). Regression anchor for the 2026-09-18 fix.
+    #[tokio::test]
+    async fn micro_compact_rewrites_are_persisted_to_session() {
+        let (client, _requests, fixture_task) =
+            spawn_provider_fixture(vec!["fixture answer"]).await;
+        let cwd = std::env::temp_dir().join(format!(
+            "nonoclaw-micro-persist-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session_file = cwd.join("micro-persist.jsonl");
+        let session = crate::session::SessionService::new()
+            .open_path(session_file, "micro-persist-id", &cwd, "fixture-requested-model")
+            .unwrap();
+        // Seed a session whose old tail already holds a large tool result
+        // (>2048 chars, more than MICRO_PROTECT_RECENT messages from the end).
+        let large_result = "x".repeat(crate::compact::MICRO_THRESHOLD_CHARS + 500);
+        session
+            .append(Message::user(MessageContent::from_text("old question")))
+            .await
+            .unwrap();
+        // The tool_result must be paired with a preceding assistant tool_use,
+        // or with_session's repair_tool_pairing drops it as an orphan.
+        session
+            .append(Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "micro-t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "seed"}),
+                    cache_control: None,
+                },
+            ])))
+            .await
+            .unwrap();
+        session
+            .append(Message::user(MessageContent::from_blocks(vec![
+                ContentBlock::tool_result(
+                    "micro-t1".into(),
+                    large_result,
+                    false,
+                ),
+            ])))
+            .await
+            .unwrap();
+        // Pad the protected window: MICRO_PROTECT_RECENT recent messages.
+        for i in 0..crate::compact::MICRO_PROTECT_RECENT {
+            session
+                .append(Message::assistant(MessageContent::from_text(format!(
+                    "recent {i}"
+                ))))
+                .await
+                .unwrap();
+        }
+        let snapshot = session.snapshot().await.unwrap();
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = EngineOptions {
+            model: "fixture-requested-model".into(),
+            max_turns: 1,
+            auto_compact: true,
+            ..EngineOptions::default()
+        };
+        let mut engine =
+            QueryEngine::with_session(client, Arc::new(registry), todos, options, session, snapshot);
+        engine
+            .run(MessageContent::from_text("new question"), &cwd, |_event| {})
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+
+        // On-disk transcript must now contain the micro marker — the pruned
+        // bytes, not the original full text.
+        let disk = std::fs::read_to_string(cwd.join("micro-persist.jsonl")).unwrap();
+        assert!(
+            disk.contains(crate::compact::MICRO_MARKER),
+            "micro-compact rewrites must be persisted to disk"
+        );
+        assert!(
+            !disk.contains(&"x".repeat(crate::compact::MICRO_THRESHOLD_CHARS + 100)),
+            "the oversized original text must not remain on disk"
+        );
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
     /// A completed run persists its ledger timing trace into the session
     /// JSONL, so replayed sessions rebuild accurate step windows. Feature
     /// Matrix: trajectory ledger replay fidelity.
@@ -5139,6 +5490,34 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn truncation_notice_splits_length_limit_from_stream_failure() {
+        // Length-limit provider errors get the explicit length wording…
+        assert!(error_indicates_length_limit(
+            "max_tokens reached: request exceeded output limit"
+        ));
+        assert!(error_indicates_length_limit("Maximum Length exceeded"));
+        assert!(error_indicates_length_limit("context length too long"));
+        assert!(truncation_notice(true).contains("输出长度上限"));
+        assert!(truncation_notice(true).contains("length limit reached"));
+        // …while transient stream failures must NOT be misreported as
+        // output-limit errors (2026-09-18: network faults were rendered as
+        // "可能已达到最大长度限制", inflating perceived limit-hit frequency).
+        assert!(!error_indicates_length_limit(
+            "error decoding response body"
+        ));
+        assert!(!error_indicates_length_limit(
+            "connection reset by peer"
+        ));
+        assert!(!error_indicates_length_limit("stream closed before completion"));
+        let network_notice = truncation_notice(false);
+        assert!(network_notice.contains("流式响应中断"));
+        assert!(
+            !network_notice.contains("长度限制") && !network_notice.contains("最大长度"),
+            "network-failure notice must not mention length limits"
+        );
+    }
+
+    #[test]
     fn mutating_tool_names_invalidate_git_cache() {
         // T7.3 acceptance: the set of "mutating" tool names must include the
         // file-modifying tools. If a new mutating tool is added, extend this
@@ -5185,7 +5564,7 @@ mod tests {
                 ts: None,
             });
         }
-        let result = apply_cache_breakpoints(messages);
+        let result = apply_cache_breakpoints(messages, 0);
         // The single rolling breakpoint must be on the LAST message.
         let check_idx = |idx: usize| -> bool {
             if let MessageContent::Blocks(blocks) = &result[idx].content {
@@ -5204,6 +5583,64 @@ mod tests {
     }
 
     #[test]
+    fn frozen_prefix_gets_breakpoint_and_rolling_keeps_last() {
+        use nonoclaw_core::ContentBlock;
+        // 20 messages, this run started at index 10 → sealed history [0,10).
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            messages.push(Message {
+                role,
+                content: MessageContent::from_text(format!("m{i}")),
+                ts: None,
+            });
+        }
+        let result = apply_cache_breakpoints(messages, 10);
+        let check_idx = |idx: usize| -> bool {
+            if let MessageContent::Blocks(blocks) = &result[idx].content {
+                if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
+                    return cache_control.is_some();
+                }
+            }
+            false
+        };
+        assert!(check_idx(9), "frozen boundary message (frozen_idx-1) carries the sealed breakpoint");
+        assert!(check_idx(19), "rolling breakpoint stays on the last message");
+        for idx in 0..19 {
+            if idx != 9 {
+                assert!(!check_idx(idx), "idx {idx} should not carry a breakpoint");
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_boundary_zero_or_tail_disables_sealed_breakpoint() {
+        use nonoclaw_core::ContentBlock;
+        let mk = |i: usize| Message {
+            role: Role::User,
+            content: MessageContent::from_text(format!("m{i}")),
+            ts: None,
+        };
+        let count = |msgs: &[Message]| {
+            msgs.iter()
+                .filter(|m| {
+                    matches!(
+                        &m.content,
+                        MessageContent::Blocks(blocks)
+                            if matches!(blocks.last(), Some(ContentBlock::Text { cache_control: Some(_), .. }))
+                    )
+                })
+                .count()
+        };
+        // frozen_idx == 0 (fresh session / windowed request): only rolling.
+        let fresh = apply_cache_breakpoints(vec![mk(0), mk(1)], 0);
+        assert_eq!(count(&fresh), 1);
+        // frozen_idx == len (no new work yet): only rolling, no duplicate.
+        let tail = apply_cache_breakpoints(vec![mk(0), mk(1)], 2);
+        assert_eq!(count(&tail), 1);
+    }
+
+    #[test]
     fn cache_breakpoint_covers_tool_ending_messages() {
         use nonoclaw_core::ContentBlock;
         // Agent conversations overwhelmingly end in tool_result / tool_use
@@ -5219,7 +5656,7 @@ mod tests {
             ContentBlock::tool_result("t1".to_string(), "result text".to_string(), false),
             Role::User,
         );
-        let result = apply_cache_breakpoints(vec![tool_result]);
+        let result = apply_cache_breakpoints(vec![tool_result], 0);
         match &result[0].content {
             MessageContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 1, "no synthetic blocks: {blocks:?}");
@@ -5243,7 +5680,7 @@ mod tests {
             },
             Role::Assistant,
         );
-        let result2 = apply_cache_breakpoints(vec![tool_use]);
+        let result2 = apply_cache_breakpoints(vec![tool_use], 0);
         match &result2[0].content {
             MessageContent::Blocks(blocks) => {
                 assert!(matches!(
@@ -5261,7 +5698,7 @@ mod tests {
         // there is no minimum length for "this turn's prefix should be
         // cached for the next turn".
         let messages = vec![Message::user(MessageContent::from_text("hi"))];
-        let result = apply_cache_breakpoints(messages);
+        let result = apply_cache_breakpoints(messages, 0);
         if let MessageContent::Blocks(blocks) = &result[0].content {
             if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
                 assert!(cache_control.is_some(), "single message must carry the rolling breakpoint");

@@ -22,7 +22,7 @@ pub struct ToolSearchEntry {
 
 const MAX_ACTIVATION_SCOPES: usize = 64;
 const MAX_ACTIVATED_TOOLS_PER_SCOPE: usize = 16;
-type ActivationStore = RwLock<HashMap<String, HashSet<String>>>;
+type ActivationStore = RwLock<HashMap<String, Vec<String>>>;
 
 fn activation_store() -> &'static ActivationStore {
     static STORE: OnceLock<ActivationStore> = OnceLock::new();
@@ -38,17 +38,24 @@ pub fn activate_tool(scope: &str, name: &str) -> bool {
         store.clear();
     }
     let activated = store.entry(scope.to_string()).or_default();
-    if activated.contains(name) {
+    if activated.iter().any(|n| n == name) {
         return true;
     }
     if activated.len() >= MAX_ACTIVATED_TOOLS_PER_SCOPE {
         return false;
     }
-    activated.insert(name.to_string());
+    activated.push(name.to_string());
     true
 }
 
 pub fn activated_tools(scope: &str) -> HashSet<String> {
+    activated_tools_ordered(scope).into_iter().collect()
+}
+
+/// First-seen activation order for this scope. The tools array must only
+/// ever grow at its tail across requests (prompt-cache fix, 2026-09-19), so
+/// payload layout follows activation order, not set-iteration order.
+pub fn activated_tools_ordered(scope: &str) -> Vec<String> {
     activation_store()
         .read()
         .unwrap()

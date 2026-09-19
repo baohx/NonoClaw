@@ -107,6 +107,9 @@ pub struct RequestParams {
     /// Optional safe trace label used in redacted diagnostics (for example
     /// `sess-abc:turn-3`). It never enables raw prompt persistence.
     pub trace_label: Option<String>,
+    /// Stable per-conversation id sent as `x-opencode-session` on OpenCode
+    /// Go endpoints (hard requirement there; ignored by other providers).
+    pub session_id: Option<String>,
 }
 
 /// Events surfaced to the caller as the stream progresses. The final folded
@@ -532,6 +535,12 @@ impl Client {
                 }
             }
         }
+        // OpenCode Go endpoints hard-require a stable per-conversation id
+        // (`x-opencode-session`) for routing; other providers ignore it.
+        if self.base_url.contains("opencode.ai/zen/go") {
+            let session = params.session_id.as_deref().unwrap_or("nonoclaw");
+            req = req.header("x-opencode-session", session);
+        }
         Ok((req.body(body), logger))
     }
 
@@ -615,6 +624,9 @@ impl Client {
                     req = req.header("x-goog-api-key", key);
                 }
             }
+        }
+        if self.base_url.contains("opencode.ai/zen/go") {
+            req = req.header("x-opencode-session", "nonoclaw");
         }
         let resp = req
             .body(body)
@@ -3236,6 +3248,7 @@ mod tests {
             betas: vec![],
             extra_body: None,
             trace_label: None,
+            session_id: None,
         };
         let body = serialize_body_responses(&params).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3323,6 +3336,7 @@ mod tests {
             betas: vec![],
             extra_body: None,
             trace_label: None,
+            session_id: None,
         };
         let body = serialize_body_gemini(&params).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3591,6 +3605,7 @@ mod tests {
             betas: vec![],
             extra_body: None,
             trace_label: Some("provider-fixture".into()),
+            session_id: None,
         }
     }
 
@@ -4221,6 +4236,7 @@ mod security_tests {
             betas: vec![],
             extra_body: None,
             trace_label: Some("fixture/../../trace".into()),
+            session_id: None,
         };
         let encoded = redacted_prompt_metadata(&params).to_string();
         assert!(encoded.contains("fixture-model"));
@@ -4258,6 +4274,7 @@ mod security_tests {
             betas: vec![],
             extra_body: None,
             trace_label: Some("sess-abc:turn-3".into()),
+            session_id: None,
         };
 
         let original_cwd = std::env::current_dir().unwrap();
@@ -4374,6 +4391,7 @@ mod security_tests {
             betas: vec![],
             extra_body: None,
             trace_label: None,
+            session_id: None,
         };
         let (builder, _logger) = client.build_request(&params).unwrap();
         let req = builder.build().unwrap();

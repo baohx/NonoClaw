@@ -489,6 +489,11 @@ pub(super) fn session_run_prompts(
                 if text_body.is_empty() {
                     continue;
                 }
+                // Engine-appended live-git snapshots (2026-09-18 cache-fix)
+                // are bookkeeping, not user prompts: never a run boundary.
+                if text_body.trim_start().starts_with("<git_status") {
+                    continue;
+                }
                 let preview = truncate_chars(text_body.trim(), max_chars);
                 prompts.push(SessionRunPrompt {
                     preview,
@@ -798,6 +803,8 @@ mod tests {
             r#"{"kind":"message","role":"assistant","content":[{"type":"text","text":"more"}]}"#,
             r#"{"kind":"message","role":"user","content":"second question that is deliberately quite a bit longer than forty characters"}"#,
             r#"{"kind":"message","role":"assistant","content":[{"type":"text","text":"done"}]}"#,
+            // Engine-appended live-git snapshot: bookkeeping, NOT a run prompt.
+            r#"{"kind":"message","role":"user","content":"<git_status turn=\"1\">\nCurrent branch: main\n</git_status>"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
         let prompts = session_run_prompts(&dir, id, 40);

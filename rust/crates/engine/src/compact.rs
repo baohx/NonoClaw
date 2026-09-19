@@ -198,6 +198,9 @@ pub async fn compact_messages(
         betas: vec![],
         extra_body: None,
         trace_label: Some("compact".into()),
+        // Inherit the conversation id from the live-request template so Go
+        // endpoints keep routing the compaction summary to the same session.
+        session_id: prefix_template.and_then(|tpl| tpl.session_id.clone()),
     };
     let turn = client.run_turn(&params, |_| {}).await?;
     let summary: String = turn
@@ -235,7 +238,7 @@ pub const MICRO_THRESHOLD_CHARS: usize = 2_048;
 /// Head chars kept by micro-compact (aggressive: a quarter of the threshold).
 pub const MICRO_HEAD_CHARS: usize = 512;
 pub const MICRO_TAIL_CHARS: usize = 256;
-const MICRO_MARKER: &str = "[micro-compact]";
+pub const MICRO_MARKER: &str = "[micro-compact]";
 /// Messages at the tail (most recent) are never micro-compacted: the active
 /// turn's tool results are still being reasoned about.
 pub const MICRO_PROTECT_RECENT: usize = 8;
@@ -253,14 +256,18 @@ const AGING_MARKER_TEXT: &str = "[aged]";
 /// threshold and skips the most recent `MICRO_PROTECT_RECENT` messages so
 /// active work is untouched. Idempotent via `MICRO_MARKER`. Returns rewritten
 /// messages and the number of results trimmed.
-pub fn micro_compact(messages: &[Message]) -> (Vec<Message>, usize) {
+///
+/// `frozen_from` seals messages `[0, frozen_from)`: they are never rewritten
+/// here so the prompt-cache prefix stays byte-stable (2026-09-18 cache-fix).
+/// Sealed oversized results are the full compactor's problem, not micro's.
+pub fn micro_compact(messages: &[Message], frozen_from: usize) -> (Vec<Message>, usize) {
     let protect_from = messages.len().saturating_sub(MICRO_PROTECT_RECENT);
     let mut trimmed = 0usize;
     let out: Vec<Message> = messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i >= protect_from {
+            if i >= protect_from || i < frozen_from {
                 return m.clone();
             }
             let MessageContent::Blocks(blocks) = &m.content else {
@@ -343,11 +350,21 @@ pub fn micro_compact(messages: &[Message]) -> (Vec<Message>, usize) {
 /// Returns the rewritten messages and the number of results pruned. The
 /// persisted session transcript is never modified — pruning only shrinks the
 /// in-memory projection fed to the next provider request.
-pub fn prune_tool_results(messages: &[Message]) -> (Vec<Message>, usize) {
+///
+/// `frozen_from` seals messages `[0, frozen_from)` from rewriting (cache
+/// prefix stability); see `micro_compact`.
+pub fn prune_tool_results(
+    messages: &[Message],
+    frozen_from: usize,
+) -> (Vec<Message>, usize) {
     let mut pruned_count = 0usize;
     let out: Vec<Message> = messages
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
+            if i < frozen_from {
+                return m.clone();
+            }
             let MessageContent::Blocks(blocks) = &m.content else {
                 return m.clone();
             };
@@ -645,6 +662,7 @@ mod tests {
             betas: vec![],
             extra_body: None,
             trace_label: None,
+            session_id: None,
         }
     }
 
@@ -686,7 +704,7 @@ mod tests {
         let small = tool_result("t1");
         let big = big_tool_result("t2", PRUNE_THRESHOLD_CHARS + 10);
         let msgs = vec![small.clone(), big.clone(), user("plain prompt")];
-        let (pruned, pruned_count) = prune_tool_results(&msgs);
+        let (pruned, pruned_count) = prune_tool_results(&msgs, 0);
         assert_eq!(pruned_count, 1);
 
         // Small result and plain prompt are untouched.
@@ -721,10 +739,10 @@ mod tests {
     fn prune_is_idempotent_and_ignores_small_results() {
         let small = tool_result("t1");
         let big = big_tool_result("t2", PRUNE_THRESHOLD_CHARS + 10);
-        let (pruned, pruned_count) = prune_tool_results(&[small.clone(), big]);
+        let (pruned, pruned_count) = prune_tool_results(&[small.clone(), big], 0);
         assert_eq!(pruned_count, 1);
         // Second pass: no further change.
-        let (again, second_count) = prune_tool_results(&pruned);
+        let (again, second_count) = prune_tool_results(&pruned, 0);
         assert_eq!(second_count, 0, "pruning must be idempotent");
         assert_eq!(
             serde_json::to_string(&again).unwrap(),
@@ -749,7 +767,7 @@ mod tests {
         // 20 messages of 3K chars each: only those older than the last 8
         // are eligible.
         let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
-        let (out, count) = micro_compact(&msgs);
+        let (out, count) = micro_compact(&msgs, 0);
         assert_eq!(count, 12, "20 - 8 protected = 12 trimmed");
         // Eligible ones now carry the marker and are far smaller.
         for (i, m) in out.iter().take(12).enumerate() {
@@ -776,11 +794,28 @@ mod tests {
     }
 
     #[test]
+    fn micro_compact_never_rewrites_sealed_prefix() {
+        // frozen_from seals messages [0, frozen) from rewriting (2026-09-18
+        // cache-fix): the prompt-cache prefix must stay byte-stable.
+        let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
+        let frozen = 6;
+        let (out, count) = micro_compact(&msgs, frozen);
+        assert_eq!(count, 6, "only the 6 eligible between seal and protection zone");
+        for (i, (a, b)) in out.iter().take(frozen).zip(msgs.iter()).enumerate() {
+            assert_eq!(
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap(),
+                "sealed msg {i} must be untouched"
+            );
+        }
+    }
+
+    #[test]
     fn micro_compact_is_idempotent() {
         let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
-        let (first, n1) = micro_compact(&msgs);
+        let (first, n1) = micro_compact(&msgs, 0);
         assert_eq!(n1, 12);
-        let (second, n2) = micro_compact(&first);
+        let (second, n2) = micro_compact(&first, 0);
         assert_eq!(n2, 0, "second pass trims nothing");
         assert_eq!(
             serde_json::to_string(&second).unwrap(),
@@ -792,17 +827,17 @@ mod tests {
     fn micro_compact_skips_prune_marked_results() {
         // A result already pruned by the 8K pruner must not be re-trimmed
         // (it carries PRUNE_MARKER and stays as-is).
-        let (pruned, _) = prune_tool_results(&[big_tool_result(
-            "t0",
-            PRUNE_THRESHOLD_CHARS + 10,
-        )]);
+        let (pruned, _) = prune_tool_results(
+            &[big_tool_result("t0", PRUNE_THRESHOLD_CHARS + 10)],
+            0,
+        );
         let msgs: Vec<Message> = pruned
             .into_iter()
             .chain(many_messages(10, MICRO_THRESHOLD_CHARS + 1000))
             .collect();
         // 11 total messages, protect last 8 → 3 eligible: the prune-marked
         // one is skipped, only the 2 new big ones in that window get trimmed.
-        let (_, count) = micro_compact(&msgs);
+        let (_, count) = micro_compact(&msgs, 0);
         assert_eq!(count, 2, "prune-marked skipped, 2 eligible trimmed");
     }
 
@@ -810,7 +845,7 @@ mod tests {
     fn micro_compact_noop_on_short_history() {
         // Fewer than the protect window: nothing is ever trimmed.
         let msgs = many_messages(5, MICRO_THRESHOLD_CHARS + 1000);
-        let (out, count) = micro_compact(&msgs);
+        let (out, count) = micro_compact(&msgs, 0);
         assert_eq!(count, 0);
         assert_eq!(
             serde_json::to_string(&out).unwrap(),
@@ -824,16 +859,16 @@ mod tests {
         // outside the protect window; a second pass folds the aged tail of
         // that window (distance ≥ AGING_FOLD_FROM) down to a 200-char stub.
         let msgs = many_messages(60, MICRO_THRESHOLD_CHARS + 1000);
-        let (first, n1) = micro_compact(&msgs);
+        let (first, n1) = micro_compact(&msgs, 0);
         assert_eq!(n1, 52, "all messages outside protect window trimmed");
-        let (second, n2) = micro_compact(&first);
+        let (second, n2) = micro_compact(&first, 0);
         // protect_from = 52; aged window = indices 0..=12 (distance ≥ 40) → 13 stubs.
         assert_eq!(n2, 13, "aged results folded to stubs");
         let aged = serde_json::to_string(&second[0]).unwrap();
         assert!(aged.contains(AGING_MARKER_TEXT));
         assert!(!aged.contains(MICRO_MARKER), "stub replaces micro-compact text");
         // Third pass is fully idempotent.
-        let (third, n3) = micro_compact(&second);
+        let (third, n3) = micro_compact(&second, 0);
         assert_eq!(n3, 0);
         assert_eq!(
             serde_json::to_string(&third).unwrap(),

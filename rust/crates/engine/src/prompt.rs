@@ -340,7 +340,7 @@ pub fn build_system_blocks_with_profile_measured(
 #[allow(clippy::too_many_arguments)]
 pub fn build_system_blocks_with_profile_measured_and_limits(
     cwd: &std::path::Path,
-    system: &SystemContext,
+    _system: &SystemContext,
     user: &UserContext,
     memory: &Option<String>,
     tool_prompts: &[ToolPromptEntry],
@@ -489,16 +489,23 @@ pub fn build_system_blocks_with_profile_measured_and_limits(
     let project_context = bounded_project_context(&user.nonoclaw_md, limits.project_context_chars);
     if !project_context.is_empty() {
         budget.push("project_context", &project_context);
+        // No breakpoint here (2026-09-18 cache-fix): the 4-breakpoint quota
+        // is tools / Block 1 / frozen-history / rolling. This block sits in
+        // the prefix covered by deeper breakpoints, so leaving it unmarked
+        // costs nothing while marking it would evict the frozen-history one.
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: project_context,
-            cache_control: Some(CacheControl {
-                kind: nonoclaw_core::CacheControlKind::Ephemeral,
-            }),
+            cache_control: None,
         });
     }
 
-    // Memory is stable within a run, so it gets its own cached block.
+    // Memory is stable within a run, but it does NOT get its own cache
+    // breakpoint: the 4-breakpoint provider quota is spent as
+    // tools / Block 1 / frozen-history / rolling (see apply_cache_breakpoints),
+    // and the memory block is covered by whichever deeper breakpoint hits.
+    // Keeping it uncached never breaks the prefix chain; marking it would
+    // evict the frozen-history breakpoint (2026-09-18 cache-fix).
     if let Some(memory) = memory {
         let rendered = bounded_wrapped("<memory>\n", memory, "\n</memory>\n", limits.memory_chars);
         if !rendered.is_empty() {
@@ -506,9 +513,7 @@ pub fn build_system_blocks_with_profile_measured_and_limits(
             blocks.push(SystemBlock {
                 kind: "text".into(),
                 text: rendered,
-                cache_control: Some(CacheControl {
-                    kind: nonoclaw_core::CacheControlKind::Ephemeral,
-                }),
+                cache_control: None,
             });
         }
     }
@@ -518,20 +523,10 @@ pub fn build_system_blocks_with_profile_measured_and_limits(
     budget.push("current_date", &date);
     context.push_str(&date);
 
-    let git = if system.git_summary.is_empty() {
-        String::new()
-    } else {
-        bounded_wrapped(
-            "# Git status (snapshot at conversation start)\n```\n",
-            &system.git_summary,
-            "```\n\n",
-            limits.git_chars,
-        )
-    };
-    if !git.is_empty() {
-        budget.push("git_context", &git);
-        context.push_str(&git);
-    }
+    // Git status is NOT rendered into the system prompt (2026-09-18
+    // cache-fix): any byte change before the message history (different
+    // snapshot per run) truncates the cacheable prefix. Live git flows
+    // through conversation-tail messages appended by the engine loop.
 
     if !context.is_empty() {
         blocks.push(SystemBlock {
@@ -565,29 +560,32 @@ pub fn refresh_context_block(
 /// (Block 1, project context, memory) are preserved verbatim.
 pub fn refresh_context_block_with_limits(
     old_blocks: &[SystemBlock],
-    system: &SystemContext,
+    _system: &SystemContext,
     user: &UserContext,
     _memory: &Option<String>,
     skills_manager: &Option<Arc<RwLock<SkillsManager>>>,
     limits: PromptBuildLimits,
 ) -> Vec<SystemBlock> {
     let mut blocks = Vec::with_capacity(old_blocks.len());
+    // Preserve every earlier block verbatim — cached or not. Since the
+    // 2026-09-18 cache-fix the memory / project-context blocks carry no
+    // breakpoint of their own, so filtering on `cache_control` would drop
+    // them on every refresh and change the system bytes mid-run. Only the
+    // uncached date/skills tail block is rebuilt below.
     for block in old_blocks
         .iter()
-        .filter(|block| block.cache_control.is_some())
+        .filter(|block| !block.text.starts_with("# Current date"))
     {
         blocks.push(block.clone());
     }
 
     let mut context = format!("# Current date\n{}\n\n", user.date);
-    if !system.git_summary.is_empty() {
-        context.push_str(&bounded_wrapped(
-            "# Git status (live)\n```\n",
-            &system.git_summary,
-            "```\n\n",
-            limits.git_chars,
-        ));
-    }
+    // Git status is deliberately NOT rendered here (2026-09-18 cache-fix):
+    // this block sits BEFORE the message history, so refreshing git bytes in
+    // place truncated the cacheable prefix every mutating turn. Live git
+    // snapshots are instead appended to the conversation tail as user
+    // messages by the engine loop (append-only → prefix preserved; the old
+    // snapshot in history gets reclaimed by micro-compact).
     if let Some(manager) = skills_manager {
         let dynamic = manager.read().unwrap().render_dynamic_skill_metadata();
         context.push_str(&bounded_wrapped(
@@ -1167,8 +1165,8 @@ mod tests {
             "Block 2 must contain the actual date"
         );
         assert!(
-            b2.text.contains("Current branch: main"),
-            "Block 2 must contain git summary"
+            !b2.text.contains("Current branch: main"),
+            "git summary must NOT be in system blocks (2026-09-18 cache-fix: it flows through conversation-tail messages)"
         );
     }
 
@@ -1587,8 +1585,8 @@ mod tests {
         assert!(mem_block.text.contains("fact: user prefers Rust"));
         assert!(mem_block.text.contains("</memory>"), "must close </memory>");
         assert!(
-            mem_block.cache_control.is_some(),
-            "memory block must be cached"
+            mem_block.cache_control.is_none(),
+            "memory block carries no breakpoint (2026-09-18 cache-fix: quota is tools/Block1/frozen/rolling)"
         );
         assert!(
             !mem_block.text.contains("# Memory"),
@@ -1615,16 +1613,17 @@ mod tests {
 
     #[test]
     fn refresh_context_block_preserves_memory_as_cached() {
-        // Memory is now cached: refresh must preserve it verbatim rather
-        // than re-rendering it in the uncached block.
+        // Memory renders before the uncached tail block: refresh must
+        // preserve the initially rendered bytes verbatim rather than
+        // re-rendering it (byte stability even without its own breakpoint).
         let cwd = Path::new("/proj");
         let sys = SystemContext::default();
         let user = make_user("2026/07/28");
         let tools: Vec<ToolPromptEntry> = vec![];
         let memory = Some("bead: work in progress".to_string());
         let initial = build_system_blocks(cwd, &sys, &user, &memory, &tools, &None, &None);
-        // Memory block must exist and be cached in the initial build.
-        assert!(initial.iter().any(|b| b.text.contains("<memory>") && b.cache_control.is_some()));
+        // Memory block must exist in the initial build.
+        assert!(initial.iter().any(|b| b.text.contains("<memory>")));
 
         // Refresh with different memory — cached blocks (including memory)
         // must be preserved from initial, NOT re-rendered.

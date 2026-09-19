@@ -543,6 +543,7 @@ impl HookRuntime {
             betas: Vec::new(),
             extra_body: None,
             trace_label: Some(format!("hook-{hook_type}")),
+            session_id: None,
         };
         let output = client
             .run_turn_with_cancel(&params, |_| {}, self.cancel.child_token())
