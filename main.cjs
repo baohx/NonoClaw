@@ -21,8 +21,6 @@ const { app, BrowserWindow, shell } = require("electron");
 const { spawn, execFileSync } = require("child_process");
 const net = require("net");
 const path = require("path");
-const crypto = require("crypto");
-
 const fs = require("fs");
 
 const DEFAULT_PORT = 8799;
@@ -169,7 +167,6 @@ function portableBackendEnv(home) {
   const additions = [
     path.join(rt, "node"),
     path.join(rt, "python"),
-    path.join(rt, "python", "Scripts"),
     path.join(rt, "bin"),
     path.join(rt, "git", "cmd"),
     path.join(rt, "git", "usr", "bin"),
@@ -178,10 +175,6 @@ function portableBackendEnv(home) {
   return {
     ...process.env,
     NONOCLAW_HOME: home,
-    // static_service.rs checks NONOCLAW_DATA_DIR/frontend/dist. The backend
-    // executable lives one directory deeper under resources/nonoclaw/bin, so
-    // relying on executable-relative discovery misses the packaged SPA.
-    NONOCLAW_DATA_DIR: path.join(process.resourcesPath, "nonoclaw"),
     // Exposed for templates/diagnostics; NOT read by mcp.rs's expander —
     // the settings template's ${NONOCLAW_PORTABLE_ROOT} placeholders are
     // pre-expanded by ensurePortableFirstRun() at seed time.
@@ -192,30 +185,19 @@ function portableBackendEnv(home) {
 
 // First run: seed NONOCLAW_HOME with the bundled settings template when the
 // machine has no existing config. Never overwrite user edits. The template's
-// ${NONOCLAW_HOME} placeholders stay verbatim — the backend expands them at
-// request time (mcp.rs + toolchain.rs), so the seeded settings.json keeps
-// working when the whole package moves between drives (C:, D:, USB) or is
-// renamed. Re-seeding only happens when the template itself changes.
+// ${NONOCLAW_PORTABLE_ROOT} placeholders are resolved here because the
+// backend's MCP expander (mcp.rs) only knows NONOCLAW_HOME/HOME/USERPROFILE.
 function ensurePortableFirstRun(home) {
   if (!PORTABLE_ROOT) return;
   const target = path.join(home, "settings.json");
+  if (fs.existsSync(target)) return;
   const template = path.join(PORTABLE_ROOT, "templates", "settings.json");
   if (!fs.existsSync(template)) return;
   try {
     fs.mkdirSync(home, { recursive: true });
     const raw = fs.readFileSync(template, "utf8");
-    const templateHash = crypto.createHash("sha256").update(raw).digest("hex");
-    const marker = path.join(home, ".settings-seed");
-    const knownHash = fs.existsSync(marker)
-      ? fs.readFileSync(marker, "utf8").trim()
-      : null;
-    if (fs.existsSync(target) && knownHash === templateHash) return;
-    if (fs.existsSync(target)) {
-      fs.copyFileSync(target, `${target}.previous`);
-      console.log("[desktop] settings template changed — re-seeding (old copy at settings.json.previous)");
-    }
-    fs.writeFileSync(target, raw);
-    fs.writeFileSync(marker, templateHash);
+    const expanded = raw.split("${NONOCLAW_PORTABLE_ROOT}").join(PORTABLE_ROOT);
+    fs.writeFileSync(target, expanded);
     console.log(`[desktop] portable first-run: seeded ${target}`);
   } catch (err) {
     console.warn(`[desktop] portable first-run seed failed: ${err}`);
@@ -274,7 +256,6 @@ function resolveNonoclawBin() {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 let serverProc = null;
-let lastBackendExit = null;
 let kiroProxyProc = null;
 let shuttingDown = false;
 
@@ -305,8 +286,6 @@ function startKiroProxy(env) {
 }
 
 function startServer(port) {
-  lastBackendExit = null;
-  const backendErrChunks = [];
   const bin = resolveNonoclawBin();
   // static_service.rs resolves the SPA from cwd/frontend/dist first, so run
   // from the repo root in dev; when packaged we ship dist next to the binary
@@ -355,16 +334,10 @@ function startServer(port) {
   if (PORTABLE_ROOT) {
     const home = resolvePortableHome();
     fs.mkdirSync(cwd, { recursive: true });
-    // Seed only on first run, or when a NEW package (different template
-    // hash) is unpacked over the old folder. User edits between releases
-    // are preserved; a stale seed from an older broken build is replaced
-    // exactly once, with the previous file kept for manual recovery.
     ensurePortableFirstRun(home);
     env = portableBackendEnv(home);
     startKiroProxy(env);
     console.log(`[desktop] portable mode: NONOCLAW_HOME=${home}`);
-    const seeded = fs.existsSync(path.join(home, "settings.json"));
-    console.log(`[desktop] settings.json seeded=${seeded}`);
   }
   serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`], {
     cwd,
@@ -374,13 +347,9 @@ function startServer(port) {
 
   const forward = (buf) => process.stderr.write(`[nonoclaw] ${buf}`);
   serverProc.stdout.on("data", forward);
-  serverProc.stderr.on("data", (buf) => {
-    forward(buf);
-    backendErrChunks.push(buf);
-  });
+  serverProc.stderr.on("data", forward);
   serverProc.on("exit", (code, signal) => {
     console.log(`[desktop] nonoclaw exited code=${code} signal=${signal}`);
-    lastBackendExit = { code, signal, stderr: backendErrChunks.join("").slice(-4000) };
     serverProc = null;
     // If the backend dies unexpectedly, close windows so the user notices
     // instead of staring at a dead page. Skip during intentional shutdown.
@@ -429,10 +398,7 @@ function waitForServer(port, timeoutMs) {
       sock.once("error", () => {
         sock.destroy();
         if (Date.now() > deadline) {
-          const detail = lastBackendExit
-            ? `\n后端退出码：${lastBackendExit.code}${lastBackendExit.signal ? ` (${lastBackendExit.signal})` : ""}\n${lastBackendExit.stderr.trim().slice(-1500)}`
-            : "\n后端进程仍在运行；请检查端口或安全软件拦截。";
-          reject(new Error(`server did not come up within ${timeoutMs}ms${detail}`));
+          reject(new Error(`server did not come up within ${timeoutMs}ms`));
         } else {
           setTimeout(attempt, 250);
         }
@@ -440,10 +406,7 @@ function waitForServer(port, timeoutMs) {
       sock.once("timeout", () => {
         sock.destroy();
         if (Date.now() > deadline) {
-          const detail = lastBackendExit
-            ? `\n后端退出码：${lastBackendExit.code}${lastBackendExit.signal ? ` (${lastBackendExit.signal})` : ""}\n${lastBackendExit.stderr.trim().slice(-1500)}`
-            : "\n后端进程仍在运行；请检查端口或安全软件拦截。";
-          reject(new Error(`server did not come up within ${timeoutMs}ms${detail}`));
+          reject(new Error(`server did not come up within ${timeoutMs}ms`));
         } else {
           setTimeout(attempt, 250);
         }
@@ -494,9 +457,8 @@ function createWindow(url) {
     height: 900,
     minWidth: 960,
     minHeight: 600,
-    backgroundColor: "#f5f5f7",
+    backgroundColor: "#101418",
     autoHideMenuBar: true,
-    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -523,58 +485,13 @@ function createWindow(url) {
     openAllowedExternal(target);
   });
 
-  let loadFinished = false;
-  const showWindow = () => {
-    if (!win.isDestroyed() && !win.isVisible()) win.show();
-  };
-  win.once("ready-to-show", showWindow);
-  // Never leave an invisible or black window if Chromium does not emit
-  // ready-to-show on an unusual graphics stack.
-  setTimeout(showWindow, 5000).unref();
-
-  win.webContents.on("did-finish-load", () => {
-    loadFinished = true;
-    showWindow();
-  });
-  win.webContents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
-    if (!isMainFrame) return;
-    const message = `页面加载失败 (${code})：${description}\n${failedUrl}`;
-    console.error(`[desktop] ${message}`);
-    const { dialog } = require("electron");
-    dialog.showErrorBox("NonoClaw 启动失败", message);
-    showWindow();
-  });
-  win.webContents.on("render-process-gone", (_event, details) => {
-    const message = `页面渲染进程异常退出：${details.reason} (${details.exitCode})`;
-    console.error(`[desktop] ${message}`);
-    const { dialog } = require("electron");
-    dialog.showErrorBox("NonoClaw 渲染失败", message);
-  });
-
-  void win.loadURL(url).catch((err) => {
-    console.error(`[desktop] loadURL failed: ${err}`);
-    showWindow();
-  });
-  setTimeout(() => {
-    if (!loadFinished && !win.isDestroyed()) {
-      console.error("[desktop] page did not finish loading within 20 seconds");
-      win.webContents.reloadIgnoringCache();
-    }
-  }, 20_000).unref();
+  win.loadURL(url);
   return win;
 }
 
 // ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
-// Chromium GPU compositing is a frequent black-window failure mode on
-// domain-managed Windows 11 machines, Remote Desktop, VMs, and older drivers.
-// Portable mode favors reliable software rendering over GPU acceleration.
-if (PORTABLE_ROOT) {
-  app.disableHardwareAcceleration();
-  app.commandLine.appendSwitch("disable-gpu-compositing");
-}
-
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();

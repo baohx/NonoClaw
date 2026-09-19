@@ -216,7 +216,17 @@ async fn probe_one(
             )
         }
     };
-    if !is_executable_file(&canonical) {
+    // Windows PATH entries routinely hold several candidates for one tool
+    // (node distributions ship an extension-less bash shim beside npm.cmd).
+    // When the first-existing candidate is not executable, fails to spawn,
+    // or prints no version, try the remaining sibling candidates before
+    // declaring the entry invalid.
+    let mut candidates = vec![canonical.clone()];
+    if !explicit {
+        candidates.extend(sibling_candidates(name, &candidates[0]));
+    }
+    candidates.retain(|candidate| is_executable_file(candidate));
+    if candidates.is_empty() {
         return failed(
             name,
             "invalid",
@@ -227,31 +237,42 @@ async fn probe_one(
             "Point this entry to an executable regular file.",
         );
     }
-    let output = match bounded_command(&canonical, &["--version"], timeout, output_limit).await {
-        Ok(output) => output,
-        Err(failure) => {
-            return failed(
-                name,
-                "invalid",
-                Some(canonical),
-                expected,
-                source,
-                failure.code,
-                failure.suggestion,
-            )
+    let mut last_failure: Option<ProbeFailure> = None;
+    let mut last_path = candidates[0].clone();
+    let mut last_output: Option<String> = None;
+    for candidate in &candidates {
+        last_path = candidate.clone();
+        match bounded_command(candidate, &["--version"], timeout, output_limit).await {
+            Ok(output) => match parse_version(&output) {
+                Some(version) => {
+                    last_output = Some(version);
+                    last_path = candidate.clone();
+                    last_failure = None;
+                    break;
+                }
+                None => {
+                    last_failure = Some(ProbeFailure {
+                        code: "version_unrecognized",
+                        suggestion: "Use an executable whose --version output contains a numeric version.",
+                    });
+                }
+            },
+            Err(failure) => last_failure = Some(failure),
         }
-    };
-    let Some(actual) = parse_version(&output) else {
+    }
+    if last_output.is_none() {
+        let failure = last_failure.expect("at least one candidate was attempted");
         return failed(
             name,
             "invalid",
-            Some(canonical),
+            Some(last_path),
             expected,
             source,
-            "version_unrecognized",
-            "Use an executable whose --version output contains a numeric version.",
+            failure.code,
+            failure.suggestion,
         );
-    };
+    }
+    let actual = last_output.expect("checked above");
     let comparison = expected
         .as_deref()
         .map(|value| (normalize_version(value), normalize_version(&actual)));
@@ -260,7 +281,7 @@ async fn probe_one(
             return failed(
                 name,
                 "version mismatch",
-                Some(canonical),
+                Some(last_path),
                 expected,
                 source,
                 "version_mismatch",
@@ -274,7 +295,7 @@ async fn probe_one(
     ExecutableProbe {
         name: name.into(),
         status: "available".into(),
-        path: Some(display_path(&canonical)),
+        path: Some(display_path(&last_path)),
         version: Some(actual),
         expected_version: expected,
         resolution_source: source,
@@ -371,6 +392,11 @@ fn resolve_candidate(
 fn expand_configured_path(raw: &str, workspace: &Path) -> Option<PathBuf> {
     let expanded = if let Some(rest) = raw.strip_prefix("${HOME}") {
         nonoclaw_core::home_dir()?.join(rest.trim_start_matches(['/', '\\']))
+    } else if let Some(rest) = raw.strip_prefix("${NONOCLAW_HOME}") {
+        // Portable deployments reference bundled runtimes relative to the
+        // NONOCLAW_HOME env var, so settings.json survives moving the whole
+        // package between drives without re-baking absolute paths.
+        nonoclaw_core::nonoclaw_data_dir()?.join(rest.trim_start_matches(['/', '\\']))
     } else if let Some(rest) = raw.strip_prefix("${WORKSPACE}") {
         workspace.join(rest.trim_start_matches(['/', '\\']))
     } else {
@@ -396,17 +422,89 @@ fn primary_name(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Additional sibling executable candidates for a probe name, used to retry
+/// when the first-existing candidate fails to spawn (Windows shims, .cmd
+/// wrappers, or missing interpreters). Excludes the already-attempted path.
+fn sibling_candidates(name: &str, attempted: &Path) -> Vec<PathBuf> {
+    let Some(parent) = attempted.parent() else {
+        return Vec::new();
+    };
+    candidate_names(name)
+        .iter()
+        .map(|candidate| parent.join(candidate))
+        .filter(|path| path != attempted && path.is_file())
+        .collect()
+}
+
 fn candidate_names(name: &str) -> &'static [&'static str] {
+    // Order matters: PATH discovery returns the FIRST candidate that exists.
+    // On Windows, node/npm distributions ship both extension-less bash shims
+    // (for Git Bash) and .cmd/.exe launchers. Spawning the bash shim through
+    // CreateProcess fails, so platform executables must come first.
     match name {
-        "rust.rustc" => &["rustc", "rustc.exe"],
-        "rust.cargo" => &["cargo", "cargo.exe"],
-        "rust.rustup" => &["rustup", "rustup.exe"],
-        "node.node" => &["node", "node.exe"],
-        "node.npm" => &["npm", "npm.cmd", "npm.exe"],
-        "node.npx" => &["npx", "npx.cmd", "npx.exe"],
-        "node.corepack" => &["corepack", "corepack.cmd", "corepack.exe"],
-        "python.python" => &["python3", "python", "python.exe"],
-        "python.pip" => &["pip3", "pip", "pip.exe"],
+        "rust.rustc" => {
+            if cfg!(windows) {
+                &["rustc.exe", "rustc"]
+            } else {
+                &["rustc", "rustc.exe"]
+            }
+        }
+        "rust.cargo" => {
+            if cfg!(windows) {
+                &["cargo.exe", "cargo"]
+            } else {
+                &["cargo", "cargo.exe"]
+            }
+        }
+        "rust.rustup" => {
+            if cfg!(windows) {
+                &["rustup.exe", "rustup"]
+            } else {
+                &["rustup", "rustup.exe"]
+            }
+        }
+        "node.node" => {
+            if cfg!(windows) {
+                &["node.exe", "node"]
+            } else {
+                &["node", "node.exe"]
+            }
+        }
+        "node.npm" => {
+            if cfg!(windows) {
+                &["npm.cmd", "npm.exe", "npm"]
+            } else {
+                &["npm", "npm.cmd", "npm.exe"]
+            }
+        }
+        "node.npx" => {
+            if cfg!(windows) {
+                &["npx.cmd", "npx.exe", "npx"]
+            } else {
+                &["npx", "npx.cmd", "npx.exe"]
+            }
+        }
+        "node.corepack" => {
+            if cfg!(windows) {
+                &["corepack.cmd", "corepack.exe", "corepack"]
+            } else {
+                &["corepack", "corepack.cmd", "corepack.exe"]
+            }
+        }
+        "python.python" => {
+            if cfg!(windows) {
+                &["python.exe", "python", "python3"]
+            } else {
+                &["python3", "python", "python.exe"]
+            }
+        }
+        "python.pip" => {
+            if cfg!(windows) {
+                &["pip.exe", "pip3.exe", "pip", "pip3"]
+            } else {
+                &["pip3", "pip", "pip.exe", "pip3.exe"]
+            }
+        }
         _ => &[],
     }
 }
@@ -699,6 +797,66 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn broken_first_path_candidate_falls_back_to_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Reproduces the Windows npm layout: an extension-less shim that
+        // cannot execute sits next to a working versioned candidate.
+        let temp =
+            std::env::temp_dir().join(format!("nonoclaw-toolchain-fb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("node"), "this is not an executable").unwrap();
+        let real = temp.join("node.exe");
+        std::fs::write(&real, "#!/bin/sh\nprintf 'node 22.14.0\\n'\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = temp.clone().into_os_string();
+        joined.push(":");
+        joined.push(&old_path);
+        std::env::set_var("PATH", &joined);
+
+        let config = crate::settings::resolve_layers(
+            &[],
+            &crate::settings::ConfigEnvironment::default(),
+            &std::env::temp_dir(),
+        );
+        let report = probe_one(
+            &config,
+            config.executable_settings(),
+            "node.node",
+            Duration::from_secs(2),
+            1024,
+        )
+        .await;
+
+        std::env::set_var("PATH", &old_path);
+        let _ = std::fs::remove_dir_all(&temp);
+
+        assert_eq!(report.status, "available");
+        assert!(report.path.as_deref().unwrap().ends_with("node.exe"));
+        assert_eq!(report.version.as_deref(), Some("22.14.0"));
+    }
+
+    #[test]
+    fn sibling_candidates_skips_attempted_and_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp =
+            std::env::temp_dir().join(format!("nonoclaw-toolchain-sc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("node"), "x").unwrap();
+        std::fs::set_permissions(temp.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let siblings = sibling_candidates("node.node", &temp.join("node"));
+        assert!(siblings.is_empty(), "node.exe absent, only sibling candidate");
+        std::fs::write(temp.join("node.exe"), "x").unwrap();
+        let siblings = sibling_candidates("node.node", &temp.join("node"));
+        assert_eq!(siblings, vec![temp.join("node.exe")]);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn probes_classify_output_limit_and_only_explicit_mismatch_blocks() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -830,5 +988,22 @@ mod tests {
             expand_configured_path("/usr/bin/node", workspace),
             Some(PathBuf::from("/usr/bin/node"))
         );
+    }
+
+    #[test]
+    fn configured_path_expansion_resolves_nonoclaw_home() {
+        // Portable packages reference bundled runtimes via ${NONOCLAW_HOME}\..
+        // so settings.json survives moving the package between drives.
+        std::env::set_var("NONOCLAW_HOME", "/x/NonoClawPortable/.nonoclaw-home");
+        assert_eq!(
+            expand_configured_path(
+                "${NONOCLAW_HOME}/../runtime/node/node.exe",
+                Path::new("/irrelevant"),
+            ),
+            Some(PathBuf::from(
+                "/x/NonoClawPortable/.nonoclaw-home/../runtime/node/node.exe"
+            ))
+        );
+        std::env::remove_var("NONOCLAW_HOME");
     }
 }
