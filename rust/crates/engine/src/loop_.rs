@@ -3893,7 +3893,11 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
         };
 
         if orphans.is_empty() {
-            i += 2; // skip past the user message too
+            // Advance by one (not two): the next message (a user message with
+            // tool_results) is skipped by the role check anyway, but skipping
+            // two could jump past a *following* assistant message, deferring
+            // its own orphan repair to the next resume.
+            i += 1;
             continue;
         }
 
@@ -3942,7 +3946,9 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
             // Don't advance i — we removed messages, so the next iteration
             // starts at the same position.
         } else {
-            i += 2;
+            // Same reasoning as pass-1: advance by one only, never skip past
+            // an adjacent assistant message.
+            i += 1;
         }
     }
 
@@ -3994,6 +4000,63 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_tool_pairing_converges_in_one_pass() {
+        // Regression (bead 0115630a): pass-1 used to advance i += 2 after a
+        // repaired assistant, skipping a following assistant message whose
+        // own orphans then survived until the NEXT resume — total counts
+        // drifted upward across resumes (636→672→672 in production).
+        // Layout: A1 has text + an orphan tool_use (keeps substance), A2 has
+        // only an orphan tool_use, U is plain text. A single repair pass must
+        // reach the fixed point: A1 keeps its text, A2 and its orphan vanish.
+        let mut messages = vec![
+            Message::assistant(MessageContent::from_blocks(vec![
+                ContentBlock::text("kept answer"),
+                ContentBlock::ToolUse {
+                    id: "orphan-1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ])),
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::ToolUse {
+                id: "orphan-2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }])),
+            Message::user(MessageContent::from_text("q")),
+        ];
+
+        repair_tool_pairing(&mut messages);
+        let first_pass = messages.clone();
+        assert_eq!(
+            first_pass.len(),
+            2,
+            "A2 (orphan tool_use only) must be removed in one pass"
+        );
+        assert!(
+            matches!(&first_pass[0].content, MessageContent::Blocks(blocks)
+                if blocks.len() == 1
+                    && matches!(blocks[0], ContentBlock::Text { .. }))
+        );
+        assert!(
+            !matches!(&first_pass[0].content, MessageContent::Blocks(blocks)
+                if blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })))
+        );
+
+        // Second repair run is a no-op (fixed point → stable total counts).
+        repair_tool_pairing(&mut messages);
+        let second_pass = messages.clone();
+        let ser = |msgs: &[Message]| serde_json::to_string(msgs).unwrap();
+        assert_eq!(
+            ser(&first_pass),
+            ser(&second_pass),
+            "second pass changes nothing"
+        );
+        assert_eq!(second_pass.len(), 2);
+    }
 
     #[test]
     fn text_only_provider_strips_persisted_images_but_keeps_text() {
