@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
 use nonoclaw_core::{
-    redact_text, redact_value, AppError, ContentBlock, ErrorCode, Message, MessageContent,
+    redact_text, redact_text_per_line, redact_value, AppError, ContentBlock, ErrorCode,
+    Message, MessageContent,
     ToolResultContent,
 };
 use nonoclaw_engine::{
@@ -679,10 +680,13 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
         })),
         // Thinking text is surfaced (live runs already stream it via
         // ThinkingDelta, and restored sessions/ledger views render it); only
-        // the provider signature is dropped.
+        // the provider signature is dropped. Per-line redaction: agent
+        // thinking routinely references absolute paths (one line among
+        // hundreds); all-or-nothing redaction made ~2% of replayed sessions
+        // fully unreadable.
         ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({
             "type": "thinking",
-            "thinking": redact_text(&thinking),
+            "thinking": redact_text_per_line(&thinking),
         })),
     }
 }

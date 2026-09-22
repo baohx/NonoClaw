@@ -23,7 +23,8 @@ pub use message::{
 };
 pub use permissions::{PermissionDecision, PermissionMode, PermissionResult, ValidationResult};
 pub use run_event::{
-    redact_text, redact_value, timestamp_ms, EventEnvelope, RunEvent, RunId, SessionRepair,
+    redact_text, redact_text_per_line, redact_value, timestamp_ms, EventEnvelope, RunEvent,
+    RunId, SessionRepair,
     SessionRepairKind, StreamState, TechnicalStatus, TokenBudgetComponent, EVENT_PROTOCOL_VERSION,
 };
 pub use task::{TaskChange, TaskChangeKind, TaskChangeSource, TaskSnapshot, TaskStatus};

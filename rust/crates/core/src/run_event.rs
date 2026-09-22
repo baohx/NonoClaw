@@ -471,9 +471,9 @@ pub fn redact_text(value: &str) -> String {
     redact_string(value)
 }
 
-fn redact_string(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("bearer ")
+/// Sensitive-substring detector shared by the whole-value and per-line paths.
+fn contains_sensitive_substring(lower: &str) -> bool {
+    lower.contains("bearer ")
         || lower.contains("authorization:")
         || lower.contains("\"authorization\"")
         || lower.contains("x-api-key")
@@ -490,7 +490,45 @@ fn redact_string(value: &str) -> String {
         || lower.contains("/home/")
         || lower.contains("/users/")
         || lower.contains("c:\\users\\")
-    {
+}
+
+/// Per-line redaction for long-form text (agent thinking, logs): only lines
+/// containing sensitive substrings are replaced, so a single absolute path in
+/// a 500-line thinking block no longer renders the whole block unreadable.
+/// Short values keep the original all-or-nothing behavior — they are likely
+/// a single credential or path themselves, where partial redaction would
+/// leak structure.
+pub fn redact_text_per_line(value: &str) -> String {
+    const PER_LINE_MIN_LINES: usize = 3;
+    if value.lines().count() < PER_LINE_MIN_LINES {
+        return redact_string(value);
+    }
+    let mut bounded: String = String::new();
+    let mut chars = 0usize;
+    for (idx, line) in value.lines().enumerate() {
+        if idx > 0 {
+            bounded.push('\n');
+        }
+        let line_out = if contains_sensitive_substring(&line.to_ascii_lowercase()) {
+            "[REDACTED]"
+        } else {
+            line
+        };
+        chars += line_out.chars().count();
+        if chars > MAX_EVENT_STRING_CHARS {
+            bounded.push_str("…[truncated]");
+            return bounded;
+        }
+        bounded.push_str(line_out);
+    }
+    if value.ends_with('\n') {
+        bounded.push('\n');
+    }
+    bounded
+}
+
+fn redact_string(value: &str) -> String {
+    if contains_sensitive_substring(&value.to_ascii_lowercase()) {
         return "[REDACTED]".into();
     }
     let mut bounded: String = value.chars().take(MAX_EVENT_STRING_CHARS).collect();
@@ -504,6 +542,38 @@ fn redact_string(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn redact_text_per_line_keeps_clean_lines_and_redacts_sensitive_ones() {
+        // Multi-line thinking with one absolute-path line: only that line is
+        // replaced; surrounding reasoning stays readable.
+        let thinking = "I need to inspect the loop code first.\n\
+                        Let me read /home/baohx/NonoClaw/rust/crates/engine/src/loop_.rs.\n\
+                        The recovery branch is around line 2772.";
+        let out = redact_text_per_line(thinking);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "I need to inspect the loop code first.");
+        assert_eq!(lines[1], "[REDACTED]");
+        assert_eq!(lines[2], "The recovery branch is around line 2772.");
+
+        // Credential in the middle of a long block: same per-line behavior.
+        let with_creds = "step one\nstep two uses sk-ant-abc123 key\nstep three";
+        let out = redact_text_per_line(with_creds);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "step one");
+        assert_eq!(lines[1], "[REDACTED]");
+        assert_eq!(lines[2], "step three");
+
+        // Short values (fewer than 3 lines) keep all-or-nothing behavior —
+        // they are likely a single credential/path themselves.
+        let short = "open /home/baohx/secret.txt";
+        assert_eq!(redact_text_per_line(short), "[REDACTED]");
+
+        // Clean text passes through unchanged.
+        let clean = "one\nplain\nblock";
+        assert_eq!(redact_text_per_line(clean), clean);
+    }
 
     #[test]
     fn subagent_event_preserves_scope_and_recursively_redacts_child() {
