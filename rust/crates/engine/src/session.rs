@@ -76,6 +76,11 @@ pub enum SessionEntry {
         turns: u32,
         /// Short finish detail (completed message / cancel reason / error kind).
         detail: String,
+        /// Wall-clock unix seconds when this outcome was appended. Used by
+        /// the dream ledger to distinguish new runs appended to an
+        /// already-analyzed session. `default` keeps old JSONL parseable.
+        #[serde(default)]
+        ts: u64,
     },
     /// Running total of real API token usage (accumulated across all
     /// completed runs). Used to restore the frontend right-rail in/out
@@ -291,6 +296,10 @@ impl Session {
             reward,
             turns,
             detail: detail.to_string(),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         })
         .await
     }

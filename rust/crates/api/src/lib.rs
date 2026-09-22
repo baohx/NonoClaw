@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod factory;
+pub mod jev;
 pub mod provider;
 pub mod retry;
 pub mod sse;

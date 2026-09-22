@@ -25,6 +25,27 @@ use nonoclaw_engine::{
 use nonoclaw_tools::register_all;
 use serde_json::json;
 
+/// `--jev` mode: which path assigns run-outcome reward labels.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq)]
+enum JevMode {
+    /// Follow settings.json (on when jev.apiKey is present and enabled).
+    Auto,
+    /// Force Jev classification (requires a configured key).
+    On,
+    /// Force the traditional heuristic path.
+    Off,
+}
+
+impl JevMode {
+    fn override_flag(self) -> Option<bool> {
+        match self {
+            JevMode::Auto => None,
+            JevMode::On => Some(true),
+            JevMode::Off => Some(false),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum PermissionModeArg {
@@ -211,6 +232,12 @@ struct Cli {
     #[arg(long, value_name = "PATH", help_heading = "Configuration & extensions")]
     settings: Option<PathBuf>,
 
+    /// Jev (TypeSafe AI System One) mode for run-outcome reward labels:
+    /// `auto` follows settings.json (on when jev.apiKey is set), `on` forces
+    /// Jev classification, `off` forces the traditional heuristic path.
+    #[arg(long, value_enum, default_value_t = JevMode::Auto, help_heading = "Configuration & extensions")]
+    jev: JevMode,
+
     /// Run as a remote session server (TCP, JSON-lines) on ADDR (e.g. 127.0.0.1:8765).
     #[arg(long, value_name = "ADDR", help_heading = "Advanced integrations")]
     serve: Option<String>,
@@ -357,6 +384,11 @@ async fn main() -> Result<()> {
     // Export proxy env vars before any reqwest client is built (reqwest
     // snapshots proxy config at client build time).
     nonoclaw_engine::apply_proxy_env(resolved.settings());
+
+    // Initialize the Jev decision-model client for run-outcome reward
+    // labels (process-wide; every write site degrades to heuristics when
+    // this leaves it unset).
+    nonoclaw_engine::jev_reward::init_global_jev(&resolved, cli.jev.override_flag());
 
     if let Some(addr) = &cli.serve {
         return remote::serve(addr, Arc::clone(&resolved)).await;
@@ -521,7 +553,13 @@ async fn main() -> Result<()> {
                 ("error", detail, 0)
             }
         };
-        let reward = nonoclaw_engine::session::run_reward(status, &detail);
+        let (reward, detail) = nonoclaw_engine::jev_reward::run_reward_with_jev(
+            status,
+            &detail,
+            turns,
+            &nonoclaw_engine::session::RewardSignals::default(),
+        )
+        .await;
         if let Err(e) = outcome_session
             .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
             .await

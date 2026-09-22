@@ -24,13 +24,13 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
+use nonoclaw_api::ClientConfig;
 use nonoclaw_core::{AppError, ErrorCode, MessageContent, PermissionDecision};
 use nonoclaw_engine::{
     substitute_arguments, ClientPurpose, QueryEngine, ResolvedConfig, RunContext, RunController,
     RunEvent, RunLimits, RunTerminalStatus, SessionService, SkillsManager,
 };
 use nonoclaw_tools::tool::QuestionResolver;
-use nonoclaw_api::ClientConfig;
 use nonoclaw_tools::{TodoStore, ToolRegistry};
 use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
@@ -38,14 +38,14 @@ use uuid::Uuid;
 
 // ── Shared protocol and resolver aliases ───────────────────────────────────
 
+#[allow(unused_imports)]
+use super::protocol::history_page;
 #[cfg(test)]
 use super::protocol::WS_PROTOCOL_VERSION;
 use super::protocol::{
     event_message, messages_loaded, safe_error, send_msg, send_msg_ok, synthetic_event_message,
     terminal_fields, ClientMsg, ModelInfo, ServerMsg, SessionInfoWire,
 };
-#[allow(unused_imports)]
-use super::protocol::history_page;
 use crate::attachments;
 #[cfg(test)]
 use crate::project_info::ProjectInfo;
@@ -174,10 +174,7 @@ impl AppState {
         let metas = self.permission_meta.lock().await;
         let entries: Vec<_> = metas.values().cloned().collect();
         drop(metas);
-        if let Err(e) = std::fs::write(
-            &path,
-            serde_json::to_vec(&entries).unwrap_or_default(),
-        ) {
+        if let Err(e) = std::fs::write(&path, serde_json::to_vec(&entries).unwrap_or_default()) {
             tracing::warn!(kind = ?e.kind(), "failed to persist pending permissions");
         }
     }
@@ -190,9 +187,9 @@ impl AppState {
         let Ok(data) = std::fs::read(&path) else {
             return;
         };
-        let Ok(entries) = serde_json::from_slice::<
-            Vec<super::permission_api::PendingPermissionInfo>,
-        >(&data) else {
+        let Ok(entries) =
+            serde_json::from_slice::<Vec<super::permission_api::PendingPermissionInfo>>(&data)
+        else {
             return;
         };
         if entries.is_empty() {
@@ -459,10 +456,7 @@ fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) ->
             .unwrap_or(true)
 }
 
-async fn list_sessions_wire_for(
-    service: SessionService,
-    cwd: PathBuf,
-) -> Vec<SessionInfoWire> {
+async fn list_sessions_wire_for(service: SessionService, cwd: PathBuf) -> Vec<SessionInfoWire> {
     let sessions = match tokio::task::spawn_blocking(move || service.list_sessions(&cwd)).await {
         Ok(sessions) => sessions.unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -487,9 +481,6 @@ async fn list_sessions_wire_for(
 /// Latency budget per model probe. Enough for cold starts on free gateways,
 /// short enough that "run all" finishes promptly.
 const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-/// Parallel probes at once. Keeps us under gateway rate limits while
-/// finishing 78 models in ~4 waves instead of 78 serial round-trips.
-const MODEL_PROBE_CONCURRENCY: usize = 8;
 /// Output budget per probe. Several provider families reject small values:
 /// DeepSeek's Anthropic endpoint requires `max_tokens >= 16`, and OpenAI
 /// Responses-API reasoning models (zen `gpt-5.x`) require
@@ -500,16 +491,11 @@ const MODEL_PROBE_MAX_TOKENS: u32 = 256;
 
 /// Fire one minimal liveness request at a single model profile.
 /// Returns (ok, latency_ms on success, short error on failure).
-async fn probe_model_health(
-    config: ClientConfig,
-) -> (bool, Option<u64>, Option<String>) {
+async fn probe_model_health(config: ClientConfig) -> (bool, Option<u64>, Option<String>) {
     let model = config.model.clone();
     let started = std::time::Instant::now();
-    let client = match nonoclaw_api::Client::new(
-        config.api_key,
-        config.auth_token,
-        config.base_url,
-    ) {
+    let client = match nonoclaw_api::Client::new(config.api_key, config.auth_token, config.base_url)
+    {
         Ok(client) => client.with_format(config.api_format),
         Err(err) => return (false, None, Some(err.to_string())),
     };
@@ -538,7 +524,7 @@ async fn probe_model_health(
         other => other,
     };
     match result {
-        Ok(Ok((status, snippet))) if (200..300).contains(&status) => {
+        Ok(Ok((status, _snippet))) if (200..300).contains(&status) => {
             (true, Some(started.elapsed().as_millis() as u64), None)
         }
         Ok(Ok((status, snippet))) => {
@@ -566,8 +552,6 @@ fn short_error(err: &str) -> String {
         first.to_string()
     }
 }
-
-
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -736,10 +720,7 @@ pub async fn serve(
             "/api/sessions/:session_id/permissions/:request_id",
             axum::routing::post(super::permission_api::resolve_permission),
         )
-        .route(
-            "/api/run",
-            axum::routing::post(super::run_api::run_handler),
-        )
+        .route("/api/run", axum::routing::post(super::run_api::run_handler))
         .route(
             "/api/sessions/:session_id/cancel",
             axum::routing::post(super::run_api::cancel_handler),
@@ -938,12 +919,7 @@ async fn handle_ws(
     if let Some(ref sid) = shared_sid {
         state
             .session_hub
-            .register_existing(
-                &state.session_service,
-                initial_project.cwd(),
-                sid,
-                &tx,
-            )
+            .register_existing(&state.session_service, initial_project.cwd(), sid, &tx)
             .await;
     }
 
@@ -968,15 +944,13 @@ async fn handle_ws(
         // If sharing an existing session, replay its messages so the connecting
         // peer (e.g. mobile) sees the same conversation. Otherwise, fresh.
         let existing = session.lock().await.clone();
-        let Some(handle) = existing
-            .or_else(|| {
-                create_new_session(
-                    &state.session_service,
-                    initial_project.cwd(),
-                    initial_project.config(),
-                )
-            })
-        else {
+        let Some(handle) = existing.or_else(|| {
+            create_new_session(
+                &state.session_service,
+                initial_project.cwd(),
+                initial_project.config(),
+            )
+        }) else {
             drop(initial_transition);
             if !ensure_ws_project_generation(&state, &tx, project_generation).await {
                 return;
@@ -1230,15 +1204,12 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
-                let Some(handle) = create_new_session(
-                    &state.session_service,
-                    project.cwd(),
-                    project.config(),
-                ) else {
+                let Some(handle) =
+                    create_new_session(&state.session_service, project.cwd(), project.config())
+                else {
                     drop(project_transition);
                     if !ensure_ws_project_generation(&state, &tx, project_generation).await {
                         continue;
@@ -1347,8 +1318,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let handle = match resume_session(&state.session_service, project.cwd(), &id) {
@@ -1466,8 +1436,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let root = nonoclaw_core::display_path(project.cwd());
@@ -1492,8 +1461,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let current_model = state.active_model.lock().await.clone();
@@ -1555,8 +1523,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let config = project.config();
@@ -1577,7 +1544,12 @@ async fn handle_ws(
                     tasks.spawn(async move {
                         let name = cfg.model.clone();
                         let (ok, latency_ms, error) = probe_model_health(cfg).await;
-                        super::protocol::ModelHealthEntry { name, ok, latency_ms, error }
+                        super::protocol::ModelHealthEntry {
+                            name,
+                            ok,
+                            latency_ms,
+                            error,
+                        }
                     });
                 }
                 let mut results = Vec::new();
@@ -1609,8 +1581,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 drop(project_transition);
@@ -1636,8 +1607,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 const PROMPT_PREVIEW_CHARS: usize = 40;
@@ -1789,13 +1759,10 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
-                let result = state
-                    .project_service
-                    .open_for(&project, &path, force_code);
+                let result = state.project_service.open_for(&project, &path, force_code);
                 drop(project_transition);
                 if let Err(error) = result {
                     if !ensure_ws_project_generation(&state, &tx, project_generation).await {
@@ -1896,14 +1863,10 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
-                let mut run_lease = match state
-                    .session_hub
-                    .try_acquire_run(&session_id, None)
-                    .await
+                let mut run_lease = match state.session_hub.try_acquire_run(&session_id, None).await
                 {
                     Ok(lease) => lease,
                     Err(()) => {
@@ -2041,12 +2004,8 @@ async fn handle_ws(
                                 if let Some(ready) = ready_tx.take() {
                                     let _ = ready.send(());
                                 }
-                                if ensure_ws_project_generation(
-                                    &s,
-                                    &tx2,
-                                    project.generation(),
-                                )
-                                .await
+                                if ensure_ws_project_generation(&s, &tx2, project.generation())
+                                    .await
                                 {
                                     let _ = send_ws_project_msg(
                                         &s,
@@ -2083,22 +2042,12 @@ async fn handle_ws(
                             model_used.clone(),
                             fork_limits,
                         ));
-                        if run_lease
-                            .set_controller(controller.clone())
-                            .await
-                            .is_err()
-                        {
+                        if run_lease.set_controller(controller.clone()).await.is_err() {
                             drop(project_transition);
                             if let Some(ready) = ready_tx.take() {
                                 let _ = ready.send(());
                             }
-                            if ensure_ws_project_generation(
-                                &s,
-                                &tx2,
-                                project.generation(),
-                            )
-                            .await
-                            {
+                            if ensure_ws_project_generation(&s, &tx2, project.generation()).await {
                                 let _ = send_ws_project_msg(
                                     &s,
                                     &tx2,
@@ -2280,13 +2229,7 @@ async fn handle_ws(
                             if let Some(ready) = ready_tx.take() {
                                 let _ = ready.send(());
                             }
-                            if ensure_ws_project_generation(
-                                &s,
-                                &tx2,
-                                project.generation(),
-                            )
-                            .await
-                            {
+                            if ensure_ws_project_generation(&s, &tx2, project.generation()).await {
                                 let _ = send_ws_project_msg(
                                     &s,
                                     &tx2,
@@ -2334,15 +2277,9 @@ async fn handle_ws(
                         include_attachment_images,
                         attachment_max_chars,
                     );
-                    let controller = RunController::for_engine(
-                        &engine,
-                        project.cwd().to_path_buf(),
-                    );
-                    if run_lease
-                        .set_controller(controller.clone())
-                        .await
-                        .is_err()
-                    {
+                    let controller =
+                        RunController::for_engine(&engine, project.cwd().to_path_buf());
+                    if run_lease.set_controller(controller.clone()).await.is_err() {
                         drop(project_transition);
                         if let Some(ready) = ready_tx.take() {
                             let _ = ready.send(());
@@ -2402,8 +2339,7 @@ async fn handle_ws(
                     {
                         let (status, detail, turns) = match (&terminal.status, &terminal.reason) {
                             (RunTerminalStatus::Done, reason) => {
-                                let turns =
-                                    terminal.result.as_ref().map(|r| r.turns).unwrap_or(0);
+                                let turns = terminal.result.as_ref().map(|r| r.turns).unwrap_or(0);
                                 let detail = match reason {
                                     nonoclaw_engine::RunFinishReason::Completed { detail } => {
                                         detail.clone()
@@ -2431,8 +2367,13 @@ async fn handle_ws(
                                 ("error", detail, 0)
                             }
                         };
-                        let reward =
-                            nonoclaw_engine::session::run_reward(status, &detail);
+                        let (reward, detail) = nonoclaw_engine::jev_reward::run_reward_with_jev(
+                            status,
+                            &detail,
+                            turns,
+                            &nonoclaw_engine::session::RewardSignals::default(),
+                        )
+                        .await;
                         if let Err(e) = session_for_wire
                             .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
                             .await
@@ -2655,8 +2596,7 @@ async fn handle_ws(
                 let project_transition = state.projects.lock_transition().await;
                 if state.project().generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let new_mode = match mode.as_str() {
@@ -2687,16 +2627,10 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
-                if project
-                    .config()
-                    .all_models()
-                    .iter()
-                    .any(|p| p.name == name)
-                {
+                if project.config().all_models().iter().any(|p| p.name == name) {
                     // Only session state changes. Client credentials are derived
                     // per run from ResolvedConfig, avoiding process-wide races.
                     *state.active_model.lock().await = name.clone();
@@ -2727,14 +2661,7 @@ async fn handle_ws(
                             .map(|handle| handle.session.id().to_string())
                             .unwrap_or_default(),
                     };
-                    if !send_ws_project_msg(
-                        &state,
-                        &tx,
-                        project_generation,
-                        info_message,
-                    )
-                    .await
-                    {
+                    if !send_ws_project_msg(&state, &tx, project_generation, info_message).await {
                         continue;
                     }
                     let info = state
@@ -2768,8 +2695,7 @@ async fn handle_ws(
                 let project_transition = state.projects.lock_transition().await;
                 if state.project().generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 if state.session_hub.has_active_runs().await {
@@ -3001,11 +2927,9 @@ async fn handle_ws(
                 {
                     continue;
                 }
-                let sessions = list_sessions_wire_for(
-                    state.session_service.clone(),
-                    next.cwd().to_path_buf(),
-                )
-                .await;
+                let sessions =
+                    list_sessions_wire_for(state.session_service.clone(), next.cwd().to_path_buf())
+                        .await;
                 if !ensure_ws_project_generation(&state, &tx, project_generation).await {
                     continue;
                 }
@@ -3067,8 +2991,7 @@ async fn handle_ws(
                 let project_transition = state.projects.lock_transition().await;
                 if state.project().generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
 
@@ -3250,8 +3173,7 @@ async fn handle_ws(
                 let project = state.project();
                 if project.generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 // Reserve the session before reading its transcript. The
@@ -3465,8 +3387,7 @@ async fn handle_ws(
                 let project_transition = state.projects.lock_transition().await;
                 if state.project().generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let Some(session_id) = shared_sid.as_ref() else {
@@ -3489,8 +3410,7 @@ async fn handle_ws(
                 let project_transition = state.projects.lock_transition().await;
                 if state.project().generation() != project_generation {
                     drop(project_transition);
-                    let _ =
-                        ensure_ws_project_generation(&state, &tx, project_generation).await;
+                    let _ = ensure_ws_project_generation(&state, &tx, project_generation).await;
                     continue;
                 }
                 let Some(session_id) = shared_sid.as_ref() else {

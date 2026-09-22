@@ -130,8 +130,6 @@ pub async fn fork_session(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn fork_copies_prefix_and_stamps_lineage() {
         use nonoclaw_core::{Message, MessageContent};

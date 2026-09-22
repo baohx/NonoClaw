@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod loop_;
 pub mod prompt;
 pub mod run;
+pub mod jev_reward;
 pub mod session;
 pub mod settings;
 pub mod skills;

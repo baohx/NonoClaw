@@ -8,6 +8,7 @@ description = "Tool trait, registry, permission engine, and core tool implementa
 
 [dependencies]
 nonoclaw-core = { workspace = true }
+nonoclaw-api = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

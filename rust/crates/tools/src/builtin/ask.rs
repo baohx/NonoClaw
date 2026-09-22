@@ -77,6 +77,12 @@ impl Tool for AskUserQuestionTool {
                 _ => None,
             })
             .unwrap_or_default();
+        // Jev calibration: a model-declared `high` urgency is a known source
+        // of interruption fatigue. When the decision model is configured and
+        // an interactive channel exists, one noul question downgrades
+        // high→medium unless it agrees the situation is genuinely urgent.
+        // Only-down, never-up; any failure/timeout keeps High.
+        let urgency = calibrate_urgency(urgency, question, context.as_deref(), ctx).await;
 
         let format = input["format"]
             .as_str()
@@ -156,5 +162,80 @@ impl Tool for AskUserQuestionTool {
                     .to_string(),
             ),
         })
+    }
+}
+
+/// P(yes) below this downgrades High → Medium. Calibrated: noul is P(yes),
+/// so "not clearly urgent" (< 0.5) is the demotion bar — a coin-flip answer
+/// is not evidence of genuine urgency.
+const URGENCY_DEMOTE_THRESHOLD: f64 = 0.5;
+
+/// Budget for the calibration question before it can delay a user-visible
+/// prompt. JevClient's own HTTP timeout is 5s; this bounds added latency.
+const URGENCY_CALIBRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Downgrade rule as a pure function: only High can move, only downward.
+fn apply_urgency_calibration(urgency: QuestionUrgency, p_urgent: Option<f64>) -> QuestionUrgency {
+    match (urgency, p_urgent) {
+        (QuestionUrgency::High, Some(p)) if p < URGENCY_DEMOTE_THRESHOLD => {
+            QuestionUrgency::Medium
+        }
+        (u, _) => u,
+    }
+}
+
+/// Ask Jev whether this High-urgency question is genuinely high-stakes /
+/// time-sensitive. No-op (returns input unchanged) when: urgency isn't High,
+/// no interactive resolver (headless), Jev unconfigured, call fails, or the
+/// 2s budget elapses. Fail-open keeps the model's original claim.
+async fn calibrate_urgency(
+    urgency: QuestionUrgency,
+    question: &str,
+    context: Option<&str>,
+    ctx: &ToolCtx<'_>,
+) -> QuestionUrgency {
+    if urgency != QuestionUrgency::High || ctx.question.is_none() {
+        return urgency;
+    }
+    let state = format!(
+        "An AI coding agent is about to interrupt the user with an \
+         urgent-marked question.\nQuestion: {question}\nContext: {}",
+        context.unwrap_or("(none)")
+    );
+    let instructions = "Is this a genuinely high-stakes or time-sensitive \
+        situation where interrupting the user now is warranted (data loss, \
+        destructive action, blocking failure), rather than a routine \
+        clarification the agent could handle more patiently?";
+    let p_urgent = tokio::time::timeout(URGENCY_CALIBRATION_BUDGET, async {
+        nonoclaw_api::jev::global_noul(&state, instructions).await
+    })
+    .await
+    .unwrap_or_default();
+    if let Some(p) = p_urgent {
+        tracing::debug!(p, "ask: jev urgency calibration answered");
+    } else {
+        tracing::debug!("ask: jev urgency calibration unavailable — keeping High");
+    }
+    apply_urgency_calibration(urgency, p_urgent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_only_downgrades_high_below_threshold() {
+        use QuestionUrgency::*;
+        // High + clearly-not-urgent → Medium.
+        assert_eq!(apply_urgency_calibration(High, Some(0.1)), Medium);
+        // High + clearly-urgent stays High.
+        assert_eq!(apply_urgency_calibration(High, Some(0.9)), High);
+        // High + no answer (unconfigured/failed/timeout) stays High.
+        assert_eq!(apply_urgency_calibration(High, None), High);
+        // Never upgrades lower urgencies.
+        assert_eq!(apply_urgency_calibration(Medium, Some(0.99)), Medium);
+        assert_eq!(apply_urgency_calibration(Low, Some(0.99)), Low);
+        // Default (unspecified → Medium) untouched.
+        assert_eq!(apply_urgency_calibration(QuestionUrgency::default(), None), Medium);
     }
 }

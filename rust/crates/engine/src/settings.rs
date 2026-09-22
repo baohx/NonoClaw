@@ -265,6 +265,11 @@ pub struct SettingsFile {
     pub dream_idle_minutes: Option<u64>,
     #[serde(rename = "elevenlabsApiKey", default)]
     pub elevenlabs_api_key: Option<String>,
+    /// Jev (TypeSafe AI System One) decision-model settings. Off unless a
+    /// key is present and enabled; powers calibrated classification of run
+    /// outcomes (Level-1 reward labels) with the heuristic path as fallback.
+    #[serde(default)]
+    pub jev: Option<JevSettings>,
     /// Outbound proxy URL (e.g. "http://127.0.0.1:20171") applied to all
     /// HTTP clients (API providers, WebFetch, WebSearch, uploads, OCR) by
     /// exporting HTTP_PROXY/HTTPS_PROXY/ALL_PROXY before any client is
@@ -290,6 +295,49 @@ pub struct SettingsFile {
     pub provider_billing: Option<ProviderBilling>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+/// Jev (TypeSafe AI System One) integration settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JevSettings {
+    /// API key from console.typesafe.ai. Absent ⇒ Jev disabled.
+    #[serde(rename = "apiKey", default)]
+    pub api_key: Option<String>,
+    /// Master switch. Default (None) follows the key: enabled when a key is
+    /// present. Explicit false keeps the key on file but forces the
+    /// heuristic path (e.g. for A/B comparison).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Override endpoint (enterprise gateway / proxy). Defaults to
+    /// https://api.typesafe.ai
+    #[serde(rename = "baseUrl", default)]
+    pub base_url: Option<String>,
+    /// Model alias. Defaults to "jev-latest".
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl JevSettings {
+    /// Debug form with the API key redacted (mirrors elevenlabs handling).
+    fn redacted_debug(&self) -> String {
+        format!(
+            "JevSettings {{ enabled: {:?}, base_url: {:?}, model: {:?}, api_key: {} }}",
+            self.enabled,
+            self.base_url,
+            self.model,
+            if self.api_key.is_some() {
+                "[REDACTED]"
+            } else {
+                "-"
+            }
+        )
+    }
+
+    /// Effective on/off state: explicit flag wins, otherwise a present key
+    /// enables the integration.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or_else(|| self.api_key.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -434,6 +482,7 @@ impl fmt::Debug for SettingsFile {
                 "elevenlabs_api_key",
                 &self.elevenlabs_api_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("jev", &self.jev.as_ref().map(|j| j.redacted_debug()))
             .field("chars_per_token", &self.chars_per_token)
             .field(
                 "doc_model",
@@ -485,6 +534,7 @@ impl Default for SettingsFile {
             dream_enabled: None,
             dream_idle_minutes: None,
             elevenlabs_api_key: None,
+            jev: None,
             proxy: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
@@ -1159,6 +1209,29 @@ impl ResolvedConfig {
             .map(|value| self.resolve_reference(value))
     }
 
+    /// Resolved Jev settings when the integration is effectively enabled
+    /// (key present and not explicitly disabled). Returns a ready-to-use
+    /// `(base_url, api_key, model)` triple.
+    pub fn jev_enabled_config(&self) -> Option<(String, String, String)> {
+        let jev = self.settings.jev.as_ref()?;
+        if !jev.effective_enabled() {
+            return None;
+        }
+        let api_key = self.resolve_reference(jev.api_key.as_deref()?);
+        if api_key.is_empty() {
+            return None;
+        }
+        Some((
+            jev.base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.typesafe.ai".to_string()),
+            api_key,
+            jev.model
+                .clone()
+                .unwrap_or_else(|| "jev-latest".to_string()),
+        ))
+    }
+
     pub fn client_config(&self, model: Option<&str>) -> ResolvedClientConfig {
         let model = model.unwrap_or(&self.active_model.value).to_string();
         if let Some(profile) = self
@@ -1785,6 +1858,21 @@ fn merge_settings_value(
     if present("elevenlabsApiKey", overlay.elevenlabs_api_key.is_some()) {
         base.elevenlabs_api_key
             .clone_from(&overlay.elevenlabs_api_key);
+    }
+    if present("jev", overlay.jev.is_some()) {
+        // Deep-merge like executables: a partial overlay (e.g. only
+        // "enabled": false) must not wipe a key set at the base layer.
+        let overlay_jev = overlay.jev.clone().expect("checked is_some");
+        base.jev = Some(match &base.jev {
+            Some(existing) => {
+                let existing = serde_json::to_value(existing).unwrap_or_default();
+                let merged =
+                    remove_null_values(serde_json::to_value(&overlay_jev).unwrap_or_default());
+                serde_json::from_value(deep_merge_values(Some(&existing), &merged))
+                    .unwrap_or(overlay_jev)
+            }
+            None => overlay_jev,
+        });
     }
     if present(
         "charsPerToken",
@@ -3960,11 +4048,23 @@ mod tests {
 
     #[test]
     fn apply_proxy_env_exports_proxy_variables() {
-        let saved: Vec<_> = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "no_proxy"]
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "no_proxy"] {
+        let saved: Vec<_> = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "no_proxy",
+        ]
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect();
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
             std::env::remove_var(key);
         }
 
@@ -3973,21 +4073,39 @@ mod tests {
         assert!(std::env::var_os("HTTP_PROXY").is_none());
 
         // Configured proxy → all three exported, NO_PROXY defaults to loopback.
-        let settings = serde_json::from_str::<SettingsFile>(r#"{"proxy":"http://127.0.0.1:20171"}"#)
-            .unwrap();
+        let settings =
+            serde_json::from_str::<SettingsFile>(r#"{"proxy":"http://127.0.0.1:20171"}"#).unwrap();
         apply_proxy_env(&settings);
-        assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:20171");
-        assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), "http://127.0.0.1:20171");
-        assert_eq!(std::env::var("ALL_PROXY").unwrap(), "http://127.0.0.1:20171");
-        assert_eq!(std::env::var("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1");
+        assert_eq!(
+            std::env::var("HTTP_PROXY").unwrap(),
+            "http://127.0.0.1:20171"
+        );
+        assert_eq!(
+            std::env::var("HTTPS_PROXY").unwrap(),
+            "http://127.0.0.1:20171"
+        );
+        assert_eq!(
+            std::env::var("ALL_PROXY").unwrap(),
+            "http://127.0.0.1:20171"
+        );
+        assert_eq!(
+            std::env::var("NO_PROXY").unwrap(),
+            "localhost,127.0.0.1,::1"
+        );
 
         // Process-provided variables win over the settings file.
         std::env::set_var("HTTPS_PROXY", "http://corporate:3128");
         std::env::remove_var("HTTP_PROXY");
         std::env::remove_var("ALL_PROXY");
         apply_proxy_env(&settings);
-        assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), "http://corporate:3128");
-        assert_eq!(std::env::var("HTTP_PROXY").unwrap(), "http://127.0.0.1:20171");
+        assert_eq!(
+            std::env::var("HTTPS_PROXY").unwrap(),
+            "http://corporate:3128"
+        );
+        assert_eq!(
+            std::env::var("HTTP_PROXY").unwrap(),
+            "http://127.0.0.1:20171"
+        );
 
         for (key, value) in saved {
             match value {

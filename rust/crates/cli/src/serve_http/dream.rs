@@ -86,10 +86,6 @@ impl DreamLock {
 const BENCH_SMOKE_SCRIPT: &str = "bench/terminal-bench/run_local_smoke.py";
 /// History file (per project dir) tracking the last accepted pass rate.
 const BENCH_HISTORY_FILE: &str = "bench_history.json";
-/// Pass-rate drop (absolute) that triggers a fact rollback.
-const BENCH_REGRESSION_THRESHOLD: f64 = 0.34; // 1 of 3 tasks
-/// Timeout for one harness invocation.
-const BENCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Latest line of the harness stdout: `=== N/M tasks passed ===`.
 fn parse_pass_rate(stdout: &str) -> Option<f64> {
@@ -196,7 +192,11 @@ fn bench_validate_facts(workspace_root: &Path, project_dir: &Path) {
         Some(prev) => {
             if rate + f64::EPSILON >= prev {
                 write_pass_rate(&history_path, rate, false);
-                tracing::info!(pass_rate = rate, previous = prev, "bench validated, facts kept");
+                tracing::info!(
+                    pass_rate = rate,
+                    previous = prev,
+                    "bench validated, facts kept"
+                );
                 return;
             }
             // Regression: roll back the newest fact.
@@ -224,13 +224,16 @@ fn bench_validate_facts(workspace_root: &Path, project_dir: &Path) {
                     }
                 }
             } else {
-                tracing::warn!(previous = prev, now = rate, "bench regression but no fact to roll back");
+                tracing::warn!(
+                    previous = prev,
+                    now = rate,
+                    "bench regression but no fact to roll back"
+                );
                 write_pass_rate(&history_path, rate, true);
             }
         }
     }
 }
-
 
 /// Default idle threshold before a dream may start.
 const DEFAULT_IDLE_MINUTES: u64 = 10;
@@ -268,6 +271,19 @@ fn read_analyzed_sessions(marker: &Path) -> std::collections::HashSet<String> {
                 })
         })
         .unwrap_or_default()
+}
+
+/// `finished_at` (unix secs) of the last completed dream, 0 when absent.
+/// A `run_outcome` timestamped AFTER this belongs to a run appended to an
+/// already-analyzed session — the increment the ledger must still surface.
+fn read_dream_finished_at(marker: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(marker) else {
+        return 0;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("finished_at").and_then(|s| s.as_u64()))
+        .unwrap_or(0)
 }
 
 /// Stamp the marker, extending it into an analyzed-sessions ledger. The dream
@@ -349,16 +365,37 @@ struct OutcomeSummary {
     reward: f64,
     turns: u64,
     detail: String,
+    /// Unix secs when the outcome was appended (0 for legacy entries written
+    /// before the field existed — treated as "older than any dream").
+    ts: u64,
+}
+
+/// Truncate a run-outcome `detail` for the dream brief, but never cut the
+/// trailing `[jev: …]` annotation — the brief relies on it to tell real
+/// failure trajectories from noise. Only the prose prefix is trimmed; the
+/// annotation is always preserved in full.
+fn truncate_keeping_jev_annotation(detail: &str) -> String {
+    const PROSE_BUDGET: usize = 80;
+    match detail.find(" [jev:") {
+        Some(idx) => {
+            let prefix = &detail[..idx];
+            let trimmed: String = prefix.chars().take(PROSE_BUDGET).collect();
+            let ellipsis = if trimmed.chars().count() < prefix.chars().count() {
+                "…"
+            } else {
+                ""
+            };
+            format!("{trimmed}{ellipsis}{}", &detail[idx..])
+        }
+        None => detail.chars().take(PROSE_BUDGET).collect(),
+    }
 }
 
 /// Scan session files for `run_outcome` entries (Level-1 RL labels) newer
 /// than `since`, skipping dream-tagged sessions (a dream's own outcome would
 /// inflate the brief). Returns outcomes sorted by reward ascending — the
 /// lowest-reward trajectories first, since those deserve the deepest review.
-fn scan_run_outcomes(
-    dir: &Path,
-    since: SystemTime,
-) -> Vec<OutcomeSummary> {
+fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).ok().into_iter().flatten().flatten() {
         let path = entry.path();
@@ -374,13 +411,13 @@ fn scan_run_outcomes(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         // Skip dream sessions (self-counting) and bench-smoke harness
         // sessions (low-value marker runs after every dream) so the brief
         // only describes real work.
-        if text.contains("\"tag\":\"dream\"")
-            || text.contains("\"tag\":\"bench-smoke\"")
-        {
+        if text.contains("\"tag\":\"dream\"") || text.contains("\"tag\":\"bench-smoke\"") {
             continue;
         }
         for line in text.lines() {
@@ -404,13 +441,10 @@ fn scan_run_outcomes(
                     .to_string(),
                 reward: value.get("reward").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 turns: value.get("turns").and_then(|v| v.as_u64()).unwrap_or(0),
-                detail: value
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect(),
+                detail: truncate_keeping_jev_annotation(
+                    value.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
+                ),
+                ts: value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
             });
         }
     }
@@ -419,7 +453,11 @@ fn scan_run_outcomes(
     // decisions to review, yet its -1.0 reward monopolizes the worst-N board
     // (see fact: reward-brief-zero-turn-outcome-noise). Filter before ranking.
     out.retain(|o| o.status == "done" || o.turns > 0);
-    out.sort_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        a.reward
+            .partial_cmp(&b.reward)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -504,7 +542,11 @@ fn aggregate_sessions(outcomes: &[OutcomeSummary]) -> Vec<SessionStats> {
         b.priority
             .partial_cmp(&a.priority)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.mean
+                    .partial_cmp(&b.mean)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     sessions
 }
@@ -518,7 +560,9 @@ fn elbow_select(priorities_desc: &[f64]) -> usize {
     if n < 3 {
         return n;
     }
-    let deltas: Vec<f64> = (0..n - 1).map(|j| priorities_desc[j] - priorities_desc[j + 1]).collect();
+    let deltas: Vec<f64> = (0..n - 1)
+        .map(|j| priorities_desc[j] - priorities_desc[j + 1])
+        .collect();
     let mut best_j = n; // fallback: keep everything
     let mut best = 1e-12; // curvature must be non-trivial to count as an elbow
     for j in 0..deltas.len() - 1 {
@@ -547,13 +591,19 @@ fn has_headroom(outcomes: &[OutcomeSummary]) -> bool {
 /// blended priority, elbow-truncate to the most informative subset, and
 /// instruct contrastive (high-vs-low trajectory) reflection.
 fn reward_brief(dir: &Path, since: SystemTime) -> String {
-    reward_brief_with_ledger(dir, since, &Default::default()).0
+    reward_brief_with_ledger(dir, since, &Default::default(), 0).0
 }
 
 /// Brief variant honouring the analyzed-sessions ledger: sessions already
 /// covered by a completed dream are excluded from the review board (their
 /// aggregates still count toward the done/cancelled/error tally so the
 /// "nothing new" signal stays honest).
+///
+/// Ledger granularity is per-run, not per-session: an outcome stamped AFTER
+/// `last_finished_at` (the previous dream's completion time) belongs to a
+/// run appended to an already-analyzed session, and is surfaced again so
+/// its trajectory is not silently lost. Legacy outcomes without a `ts`
+/// (parsed as 0) count as pre-dream and stay excluded.
 ///
 /// Returns the brief text plus the FULL session ids it presents for review —
 /// the caller stamps these into the ledger when the dream completes so the
@@ -562,11 +612,12 @@ fn reward_brief_with_ledger(
     dir: &Path,
     since: SystemTime,
     analyzed: &std::collections::HashSet<String>,
+    last_finished_at: u64,
 ) -> (String, Vec<String>) {
     let all = scan_run_outcomes(dir, since);
     let outcomes: Vec<_> = all
         .iter()
-        .filter(|o| !analyzed.contains(&o.session_id))
+        .filter(|o| !analyzed.contains(&o.session_id) || o.ts > last_finished_at)
         .cloned()
         .collect();
     if outcomes.is_empty() {
@@ -590,10 +641,7 @@ fn reward_brief_with_ledger(
         );
     }
     let done = all.iter().filter(|o| o.status == "done").count();
-    let cancelled = all
-        .iter()
-        .filter(|o| o.status == "cancelled")
-        .count();
+    let cancelled = all.iter().filter(|o| o.status == "cancelled").count();
     let error = all.iter().filter(|o| o.status == "error").count();
     let sessions = aggregate_sessions(&outcomes);
     let mut brief = format!(
@@ -667,19 +715,13 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
             if !settings.dream_enabled.unwrap_or(true) {
                 continue;
             }
-            let idle_minutes = settings
-                .dream_idle_minutes
-                .unwrap_or(DEFAULT_IDLE_MINUTES);
+            let idle_minutes = settings.dream_idle_minutes.unwrap_or(DEFAULT_IDLE_MINUTES);
             let cwd = project.cwd().to_path_buf();
             if dream.dreaming {
                 continue;
             }
             // Condition 1: idle long enough.
-            let idle_for = last_activity
-                .lock()
-                .await
-                .elapsed()
-                .unwrap_or_default();
+            let idle_for = last_activity.lock().await.elapsed().unwrap_or_default();
             if idle_for < Duration::from_secs(idle_minutes * 60) {
                 continue;
             }
@@ -691,11 +733,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                 || state
                     .background_registry
                     .lock()
-                    .map(|r| {
-                        r.list_tasks()
-                            .iter()
-                            .any(|t| !t.status.is_terminal())
-                    })
+                    .map(|r| r.list_tasks().iter().any(|t| !t.status.is_terminal()))
                     .unwrap_or(false)
             {
                 continue;
@@ -786,8 +824,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                 if let (Some(project), Some(workspace)) = (
                     nonoclaw_engine::session::project_dir(&cwd),
                     workspace_root_of(&cwd),
-                )
-                {
+                ) {
                     bench_validate_facts(&workspace, &project);
                 }
             }
@@ -814,8 +851,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                     );
                 }
                 _ => {
-                    dream.last_fingerprint =
-                        session_fingerprint(&sessions_dir).or(Some(fp));
+                    dream.last_fingerprint = session_fingerprint(&sessions_dir).or(Some(fp));
                     dream.truncation_count = 0;
                 }
             }
@@ -830,8 +866,7 @@ pub(super) fn spawn_dream_scheduler(state: Arc<AppState>, last_activity: Arc<Mut
                 let pending = nonoclaw_tools::memory::load_beads(&cwd)
                     .into_iter()
                     .filter(|b| {
-                        b.priority >= 5
-                            && b.status != nonoclaw_tools::memory::BeadStatus::Done
+                        b.priority >= 5 && b.status != nonoclaw_tools::memory::BeadStatus::Done
                     })
                     .count();
                 if pending > 0 {
@@ -960,13 +995,13 @@ fn truncation_marker(n: u32) -> String {
 fn dream_frame_outcome(line: &str) -> Option<DreamOutcome> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match value.get("type").and_then(|kind| kind.as_str()) {
-        Some("done") => Some(match value.get("finish").and_then(|finish| finish.as_str()) {
-            Some("completed") => DreamOutcome::Completed,
-            Some("max_turns" | "budget_exceeded" | "context_limit") => {
-                DreamOutcome::Truncated
-            }
-            _ => DreamOutcome::Failed,
-        }),
+        Some("done") => Some(
+            match value.get("finish").and_then(|finish| finish.as_str()) {
+                Some("completed") => DreamOutcome::Completed,
+                Some("max_turns" | "budget_exceeded" | "context_limit") => DreamOutcome::Truncated,
+                _ => DreamOutcome::Failed,
+            },
+        ),
         Some("error") => Some(DreamOutcome::Failed),
         _ => None,
     }
@@ -993,12 +1028,15 @@ async fn run_dream(
                 )
                 .join("sessions");
             let since = SystemTime::now() - DREAM_BRIEF_WINDOW;
-            let analyzed = dream_marker_path(cwd)
-                .map(|m| read_analyzed_sessions(&m))
+            let (analyzed, last_finished_at) = dream_marker_path(cwd)
+                .map(|m| (read_analyzed_sessions(&m), read_dream_finished_at(&m)))
                 .unwrap_or_default();
             let (text, listed) =
-                reward_brief_with_ledger(&sessions_dir, since, &analyzed);
-            (format!("{}{}", truncation_marker(truncation_count), text), listed)
+                reward_brief_with_ledger(&sessions_dir, since, &analyzed, last_finished_at);
+            (
+                format!("{}{}", truncation_marker(truncation_count), text),
+                listed,
+            )
         })
         .unwrap_or_default();
     let req = super::run_api::RunRequest {
@@ -1014,19 +1052,16 @@ async fn run_dream(
         dream: true,
     };
     // Drive the NDJSON stream to completion; we only care that it finishes.
-    let resp = match super::run_api::run_handler_for_dream(
-        Arc::clone(&state),
-        req,
-        project.generation(),
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, "dream run failed to start");
-            return (DreamOutcome::Failed, listed_sessions);
-        }
-    };
+    let resp =
+        match super::run_api::run_handler_for_dream(Arc::clone(&state), req, project.generation())
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(error = %e, "dream run failed to start");
+                return (DreamOutcome::Failed, listed_sessions);
+            }
+        };
     let status = resp.status();
     if !status.is_success() {
         tracing::warn!(%status, "dream run was rejected before streaming");
@@ -1298,16 +1333,35 @@ mod tests {
         drop(old);
 
         let brief = reward_brief(&dir, now - DREAM_BRIEF_WINDOW);
-        assert!(brief.contains("done × 1"), "done count excludes dream+stale+smoke: {brief}");
+        assert!(
+            brief.contains("done × 1"),
+            "done count excludes dream+stale+smoke: {brief}"
+        );
         assert!(brief.contains("cancelled × 1"), "cancelled count: {brief}");
-        assert!(brief.contains("error × 0"), "0-turn error filtered as noise: {brief}");
-        assert!(brief.contains("work1111"), "worst-first pointer to work session: {brief}");
-        assert!(brief.contains("other222"), "pointer to cancelled session: {brief}");
-        assert!(!brief.contains("provider 500"), "0-turn error detail not surfaced: {brief}");
+        assert!(
+            brief.contains("error × 0"),
+            "0-turn error filtered as noise: {brief}"
+        );
+        assert!(
+            brief.contains("work1111"),
+            "worst-first pointer to work session: {brief}"
+        );
+        assert!(
+            brief.contains("other222"),
+            "pointer to cancelled session: {brief}"
+        );
+        assert!(
+            !brief.contains("provider 500"),
+            "0-turn error detail not surfaced: {brief}"
+        );
         assert!(!brief.contains("dream3333"), "dream session excluded");
         assert!(!brief.contains("smoke5555"), "bench-smoke session excluded");
         assert!(!brief.contains("r5"), "stale outcome excluded");
-        assert!(brief.chars().count() <= 620, "brief capped: {}", brief.chars().count());
+        assert!(
+            brief.chars().count() <= 620,
+            "brief capped: {}",
+            brief.chars().count()
+        );
     }
 
     #[test]
@@ -1327,7 +1381,11 @@ mod tests {
         )
         .unwrap();
         let out = scan_run_outcomes(&dir, now - DREAM_BRIEF_WINDOW);
-        assert_eq!(out.len(), 1, "only the 4-turn cancelled run survives: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the 4-turn cancelled run survives: {out:?}"
+        );
         assert_eq!(out[0].turns, 4);
         assert_eq!(out[0].detail, "real aborted trajectory");
     }
@@ -1347,7 +1405,7 @@ mod tests {
         let mut analyzed = std::collections::HashSet::new();
         analyzed.insert("sess11111111-aaaa".to_string());
         let (brief, listed) =
-            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &analyzed);
+            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &analyzed, 0);
         assert!(
             brief.contains("均已被此前 dream 完整分析"),
             "no-increment brief: {brief}"
@@ -1356,9 +1414,48 @@ mod tests {
 
         // Without the ledger entry the session is listed with its full id.
         let (brief2, listed2) =
-            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &Default::default());
-        assert!(brief2.contains("boom"), "unanalyzed session surfaces: {brief2}");
+            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &Default::default(), 0);
+        assert!(
+            brief2.contains("boom"),
+            "unanalyzed session surfaces: {brief2}"
+        );
         assert_eq!(listed2, vec!["sess11111111-aaaa".to_string()]);
+    }
+
+    #[test]
+    fn ledger_resurfaces_runs_appended_after_last_dream() {
+        // Regression for the per-session ledger blind spot: a session
+        // already in the ledger receives a NEW run (user hits "continue").
+        // The new run's outcome is stamped after the last dream finished, so
+        // it must be surfaced despite the session-level exclusion.
+        let dir = std::env::temp_dir().join("dream_ledger_new_runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let f = dir.join("sess22222222-aaaa.jsonl");
+        let old_ts = 1000u64;
+        let new_ts = 2000u64;
+        std::fs::write(
+            &f,
+            format!(
+                concat!(
+                    "{{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"done\",\"reward\":1.0,\"turns\":4,\"detail\":\"ok\",\"ts\":{old}}}\n",
+                    "{{\"kind\":\"run_outcome\",\"run_id\":\"r2\",\"status\":\"error\",\"reward\":-1.0,\"turns\":6,\"detail\":\"max_tokens\",\"ts\":{new}}}\n"
+                ),
+                old = old_ts,
+                new = new_ts,
+            ),
+        )
+        .unwrap();
+        let mut analyzed = std::collections::HashSet::new();
+        analyzed.insert("sess22222222-aaaa".to_string());
+        let (brief, listed) =
+            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &analyzed, 1500);
+        assert!(
+            brief.contains("max_tokens"),
+            "post-dream run on analyzed session must surface: {brief}"
+        );
+        assert_eq!(listed, vec!["sess22222222-aaaa".to_string()]);
     }
 
     #[test]
@@ -1389,7 +1486,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
-        assert!(brief.contains("没有"), "degraded brief explains absence: {brief}");
+        assert!(
+            brief.contains("没有"),
+            "degraded brief explains absence: {brief}"
+        );
     }
 
     fn outcome(session: &str, status: &str, reward: f64) -> OutcomeSummary {
@@ -1400,6 +1500,7 @@ mod tests {
             reward,
             turns: 5,
             detail: "d".into(),
+            ts: 0,
         }
     }
 
@@ -1419,7 +1520,10 @@ mod tests {
         // Both must outrank the clean session; the clean one sorts last.
         assert_eq!(names.last(), Some(&"s-steady-good"));
         assert!(names.contains(&"s-flat-bad") && names.contains(&"s-volatile"));
-        let vol = sessions.iter().find(|s| s.session_id == "s-volatile").unwrap();
+        let vol = sessions
+            .iter()
+            .find(|s| s.session_id == "s-volatile")
+            .unwrap();
         assert!((vol.std - 1.0).abs() < 1e-9, "std was {}", vol.std);
     }
 
@@ -1446,7 +1550,10 @@ mod tests {
         std::fs::write(dir.join("abc.jsonl"), lines.join("\n") + "\n").unwrap();
         let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
         assert!(brief.contains("重点复盘"), "has review section: {brief}");
-        assert!(brief.contains("对比反思"), "has contrastive instruction: {brief}");
+        assert!(
+            brief.contains("对比反思"),
+            "has contrastive instruction: {brief}"
+        );
         assert!(brief.contains("boom"), "cites worst detail: {brief}");
     }
 
@@ -1459,7 +1566,10 @@ mod tests {
         // The brief (with its 【Reward 简报】 header) only appears when provided;
         // the plain prompt mentions "Reward 简报" only in phase-1 guidance,
         // never as an actual injected section.
-        assert!(!plain.contains("【Reward 简报】"), "plain prompt has no brief section");
+        assert!(
+            !plain.contains("【Reward 简报】"),
+            "plain prompt has no brief section"
+        );
         let guided = dream_prompt_with_brief(Some(
             "【Reward 简报】done × 3，cancelled × 1，error × 0。\n重点复盘：\n- session abcdef12 · run 12345678（cancelled，reward -0.3）：user stop\n".into(),
         ));
@@ -1471,10 +1581,16 @@ mod tests {
 
     #[test]
     fn truncation_marker_dedup_hint() {
-        assert!(truncation_marker(0).is_empty(), "first attempt has no marker");
+        assert!(
+            truncation_marker(0).is_empty(),
+            "first attempt has no marker"
+        );
         let m = truncation_marker(2);
         assert!(m.contains("已被截断的 dream 分析过 2 次"), "marker: {m}");
-        assert!(m.contains("增量"), "marker should point at delta collection");
+        assert!(
+            m.contains("增量"),
+            "marker should point at delta collection"
+        );
     }
 
     #[test]
@@ -1548,21 +1664,59 @@ mod tests {
         // `memory/facts/` wording caused agents to write to the repo top level,
         // where the engine never loads them (silent strays).
         for bare in ["写入 memory/", "写入 memory/facts"] {
-            assert!(!p.contains(bare), "prompt must not use bare relative path: {bare}");
+            assert!(
+                !p.contains(bare),
+                "prompt must not use bare relative path: {bare}"
+            );
         }
-        assert!(p.contains(".nonoclaw/memory/facts/"), "facts path needs .nonoclaw prefix");
+        assert!(
+            p.contains(".nonoclaw/memory/facts/"),
+            "facts path needs .nonoclaw prefix"
+        );
     }
 
     #[test]
     fn headroom_gate_skips_all_clean_windows() {
         let clean = vec![
-            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
-            OutcomeSummary { session_id: "b".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
+            OutcomeSummary {
+                session_id: "a".into(),
+                run_id: "r".into(),
+                status: "done".into(),
+                reward: 1.0,
+                turns: 2,
+                detail: String::new(),
+                ts: 0,
+            },
+            OutcomeSummary {
+                session_id: "b".into(),
+                run_id: "r".into(),
+                status: "done".into(),
+                reward: 1.0,
+                turns: 2,
+                detail: String::new(),
+                ts: 0,
+            },
         ];
         assert!(!has_headroom(&clean), "saturated window skips dreaming");
         let dirty = vec![
-            OutcomeSummary { session_id: "a".into(), run_id: "r".into(), status: "done".into(), reward: 1.0, turns: 2, detail: String::new() },
-            OutcomeSummary { session_id: "c".into(), run_id: "r".into(), status: "error".into(), reward: -1.0, turns: 3, detail: String::new() },
+            OutcomeSummary {
+                session_id: "a".into(),
+                run_id: "r".into(),
+                status: "done".into(),
+                reward: 1.0,
+                turns: 2,
+                detail: String::new(),
+                ts: 0,
+            },
+            OutcomeSummary {
+                session_id: "c".into(),
+                run_id: "r".into(),
+                status: "error".into(),
+                reward: -1.0,
+                turns: 3,
+                detail: String::new(),
+                ts: 0,
+            },
         ];
         assert!(has_headroom(&dirty), "one non-done outcome is headroom");
         // Empty windows are handled by the scheduler guard (`!fresh.is_empty()`),

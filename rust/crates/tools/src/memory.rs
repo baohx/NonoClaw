@@ -47,7 +47,11 @@ pub struct Fact {
     #[serde(default)]
     pub sources: Vec<String>,
     /// Name of a fact this one supersedes (old fact keeps `superseded_by`).
-    #[serde(default, deserialize_with = "de_supersedes_forgiving", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_supersedes_forgiving",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub supersedes: Option<String>,
     /// Free-form tags for search.
     #[serde(default)]
@@ -77,7 +81,6 @@ fn de_priority_forgiving<'de, D>(d: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     let v = serde_yaml::Value::deserialize(d)?;
     match v {
         serde_yaml::Value::Number(n) => {
@@ -122,7 +125,6 @@ fn de_supersedes_forgiving<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     let v = serde_yaml::Value::deserialize(d)?;
     match v {
         serde_yaml::Value::Null => Ok(None),
@@ -677,11 +679,7 @@ pub fn load_or_build_vector_index(cwd: &Path, facts: &[Fact]) -> VectorIndex {
 
 /// Search facts by vector similarity, boosted by `importance` (mirrors the
 /// hybrid rank used by the BM25 path: relevance first, importance breaks ties).
-pub fn search_facts_vector<'a>(
-    facts: &'a [Fact],
-    query: &str,
-    limit: usize,
-) -> Vec<&'a Fact> {
+pub fn search_facts_vector<'a>(facts: &'a [Fact], query: &str, limit: usize) -> Vec<&'a Fact> {
     if query.trim().is_empty() {
         return facts.iter().take(limit).collect();
     }
@@ -1262,4 +1260,3 @@ mod tests {
         assert!(ctx.contains("pip use tsinghua"));
     }
 }
-
