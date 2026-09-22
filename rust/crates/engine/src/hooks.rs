@@ -931,7 +931,10 @@ mod tests {
                 ],
                 prompt: None,
                 http: None,
-                timeout_secs: Some(1),
+                // Generous budget: the real subprocess spawn (sh -c printf) is
+                // fast, but under parallel test load a 1s window gets squeezed
+                // and the timeout path (failure_policy: Deny) fires spuriously.
+                timeout_secs: Some(10),
                 failure_policy: HookFailurePolicy::Deny,
             },
         )];
