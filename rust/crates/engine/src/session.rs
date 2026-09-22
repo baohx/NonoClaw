@@ -677,6 +677,12 @@ fn run_reward_base(status: &str, finish_detail: &str) -> f64 {
         0.4
     } else if d.contains("budget") {
         0.3
+    } else if d.contains("max_tokens") {
+        // Bare per-turn output cap (detail produced by the engine for both a
+        // genuine max_tokens stop and the graceful stream-truncation path,
+        // which fabricates MaxTokens). Partial output usually survived, so
+        // same weight as budget exhaustion — but never a clean 1.0.
+        0.3
     } else if d.contains("context limit") || d.contains("context_limit") {
         0.2
     } else {
@@ -1404,6 +1410,11 @@ mod tests {
             run_reward("done", "model stop reason: max_tokens (truncated mid-thinking; per-turn output budget exhausted before any answer)"),
             0.6,
             "mid-thinking truncation penalized like max-turns exhaustion"
+        );
+        assert_eq!(
+            run_reward("done", "model stop reason: max_tokens"),
+            0.7,
+            "bare max_tokens (turn budget hit, but partial output survived) penalized like budget exhaustion"
         );
         assert_eq!(run_reward("cancelled", "user pressed stop"), -0.3);
         assert_eq!(run_reward("error", "boom"), -1.0);
