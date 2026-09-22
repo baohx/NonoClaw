@@ -2879,6 +2879,7 @@ impl QueryEngine {
                     "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
                 )
             });
+            let ran_todo_write = calls.iter().any(|c| c.name.as_str() == "TodoWrite");
             let execution_context = ToolExecutionContext {
                 cwd,
                 options: &tool_options,
@@ -3124,6 +3125,25 @@ impl QueryEngine {
                     let git_msg = Message::user(MessageContent::from_text(body));
                     self.messages.push(git_msg.clone());
                     self.persist(git_msg).await;
+                }
+            }
+
+            // Todo recitation (Manus-style): after a TodoWrite, re-render the
+            // full task list at the conversation tail so the global plan stays
+            // in recent attention. Append-only like <git_status> — the cached
+            // prefix is untouched. Superseded recaps age out with history
+            // (micro-compact threshold + compaction).
+            if ran_todo_write {
+                let rendered = nonoclaw_tools::builtin::todo::render(&self.todos, &tool_scope);
+                let nonempty = rendered
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("["))
+                    .count();
+                if nonempty >= TODO_RECAP_MIN_ITEMS {
+                    let body = format!("<todo_recap>\n{}\n</todo_recap>", rendered.trim_end());
+                    let recap_msg = Message::user(MessageContent::from_text(body));
+                    self.messages.push(recap_msg.clone());
+                    self.persist(recap_msg).await;
                 }
             }
         };
@@ -3425,6 +3445,15 @@ const MAX_THINKING_TRUNCATION_RECOVERIES: u32 = 2;
 /// nudge — the draft is otherwise unrecoverable (history thinking is never
 /// replayed to the provider).
 const THINKING_DRAFT_TAIL_CHARS: usize = 2000;
+
+/// After a TodoWrite, re-recite the full current task list at the conversation
+/// tail. TodoWrite's tool result carries only a summary line ("2/5 completed");
+/// the full list lives in the tool_use arguments and drifts out of recent
+/// attention as the loop grows. Manus-style recitation (todo.md step-by-step
+/// updates) pushes the global plan back into the model's recent attention span
+/// without touching the cached prefix. Skip recaps shorter than this to avoid
+/// noise; skip when nothing changed since the last recap.
+const TODO_RECAP_MIN_ITEMS: usize = 2;
 
 /// Extract the trailing `THINKING_DRAFT_TAIL_CHARS` chars of the last Thinking
 /// block (the truncated draft). Returns "" when no Thinking block is present.
@@ -5823,5 +5852,74 @@ mod tests {
         };
         assert!(text.contains("recovery_notice"));
         assert!(text.contains("the patch is ready"));
+    }
+
+    #[test]
+    fn todo_recap_counts_items_and_survives_projection() {
+        use nonoclaw_tools::builtin::todo::render;
+        use nonoclaw_tools::{TaskStore, TodoItem, TodoStatus};
+
+        // Full list: render yields one "[x]/[>]/[ ]" line per item.
+        let store = TaskStore::new();
+        store.replace_todos(
+            "scope",
+            vec![
+                TodoItem {
+                    content: "fix the lock".into(),
+                    status: TodoStatus::Completed,
+                    active_form: None,
+                },
+                TodoItem {
+                    content: "write tests".into(),
+                    status: TodoStatus::InProgress,
+                    active_form: None,
+                },
+                TodoItem {
+                    content: "ship it".into(),
+                    status: TodoStatus::Pending,
+                    active_form: None,
+                },
+            ],
+        );
+        let rendered = render(&store, "scope");
+        let nonempty = rendered
+            .lines()
+            .filter(|l| l.trim_start().starts_with("["))
+            .count();
+        assert_eq!(nonempty, 3);
+        assert!(nonempty >= TODO_RECAP_MIN_ITEMS);
+
+        // Single-item list → below the recap threshold (no recap noise).
+        store.replace_todos(
+            "scope",
+            vec![TodoItem {
+                content: "only task".into(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            }],
+        );
+        let rendered = render(&store, "scope");
+        let nonempty = rendered
+            .lines()
+            .filter(|l| l.trim_start().starts_with("["))
+            .count();
+        assert_eq!(nonempty, 1);
+        assert!(nonempty < TODO_RECAP_MIN_ITEMS);
+
+        // The recap user message survives history projection verbatim
+        // (append-only tail note, same projection as <git_status>).
+        let recap = Message::user(MessageContent::from_text(format!(
+            "<todo_recap>\n{}\n</todo_recap>",
+            "Task list:\n  [>] 1. write tests".trim_end()
+        )));
+        let projected = strip_unsupported_blocks(&[recap], true);
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(projected[0].content, MessageContent::Text(_)));
+        let text = match &projected[0].content {
+            MessageContent::Text(t) => t,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("<todo_recap>"));
+        assert!(text.contains("write tests"));
     }
 }
