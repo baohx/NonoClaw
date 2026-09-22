@@ -1833,8 +1833,13 @@ impl QueryEngine {
         // per-turn output budget in the thinking channel before any text or
         // tool_use. Recover by nudging it to act on its draft, with thinking
         // disabled for the recovery turn (see the truncation branch below).
-        let mut thinking_truncation_recoveries: u32 = 0;
+        let mut output_truncation_recoveries: u32 = 0;
         let mut suppress_thinking_next_turn = false;
+        // Set by the graceful stream-truncation path when it fabricates a
+        // MaxTokens stop reason for a turn that actually died mid-stream.
+        // Read by the truncation-recovery gate below. Initialized (false) at
+        // the top of each turn, before the request is sent.
+        let mut max_tokens_stop_was_fabricated;
 
         // Skill triggers: check user input against trigger patterns and
         // activate matching conditional skills before the first turn.
@@ -2524,6 +2529,10 @@ impl QueryEngine {
                 messages: request_message_components,
             });
 
+            // Reset the per-turn truncation signal before each request; the
+            // graceful stream-truncation path sets it for the CURRENT turn
+            // only, and the recovery gate below reads it post-turn.
+            max_tokens_stop_was_fabricated = false;
             let params = RequestParams {
                 model: self.options.model.clone(),
                 max_tokens: self.options.max_tokens,
@@ -2624,6 +2633,13 @@ impl QueryEngine {
                         let mut turn = failure.partial;
                         turn.content.push(ContentBlock::text(notice));
                         turn.stop_reason = turn.stop_reason.or(Some(StopReason::MaxTokens));
+                        // Root-cause signal for the truncation-recovery gate
+                        // below: this turn ended truncated, and the MaxTokens
+                        // stop reason was fabricated by us, not reported by
+                        // the provider. Gates on the FACT of truncation, not
+                        // on which content-block shape it happened to leave
+                        // behind (cf. run d18ef20e / c04ed0fb, shape B).
+                        max_tokens_stop_was_fabricated = true;
                         turn
                     } else {
                         let e = failure.into_core();
@@ -2763,6 +2779,60 @@ impl QueryEngine {
                 };
             }
 
+            // Shape B truncation: the stream died mid-response while a tool
+            // call was under construction. The graceful path above adopted
+            // the partial blocks (incl. a possibly half-built tool_use) and
+            // fabricated MaxTokens — the symptom-shaped gates below miss it
+            // (`tool_uses.is_empty()` is false here), and it used to fall
+            // through to "stopped without a complete final answer" with no
+            // recovery (run d18ef20e). Recovery cannot execute a truncated
+            // call: substitute a synthetic erroring tool_result so the pair
+            // stays structurally valid for the provider, then nudge the
+            // model to re-emit the call with complete arguments.
+            if max_tokens_stop_was_fabricated && !tool_uses.is_empty() {
+                let affected = tool_uses.len();
+                if output_truncation_recoveries < MAX_OUTPUT_TRUNCATION_RECOVERIES {
+                    output_truncation_recoveries += 1;
+                    let mut blocks: Vec<ContentBlock> = tool_uses
+                        .iter()
+                        .map(|(id, name, _)| ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: ToolResultContent::Text(format!(
+                                "error: the stream was interrupted while this {} call was being transmitted; the arguments never fully arrived. Re-issue the call.",
+                                name
+                            )),
+                            is_error: Some(true),
+                            cache_control: None,
+                        })
+                        .collect();
+                    blocks.push(ContentBlock::text(
+                        "<recovery_notice>\nYour previous turn was cut off mid-stream while a tool call was being transmitted; the call never fully arrived and has been answered with an error result instead of executing. Do NOT treat it as done. Re-issue the tool call now with complete arguments, or if the surrounding work is already finished, state the final answer. Keep this turn's output short.\n</recovery_notice>",
+                    ));
+                    let recovery_msg = Message::user(MessageContent::from_blocks(blocks));
+                    self.messages.push(recovery_msg.clone());
+                    self.persist(recovery_msg).await;
+                    on_event(&RunEvent::RecoveryApplied {
+                        category: "stream_truncation_tool_call".into(),
+                        detail: format!(
+                            "synthetic error tool_results injected for {} truncated call(s); recovery nudge {}/{}",
+                            affected,
+                            output_truncation_recoveries, MAX_OUTPUT_TRUNCATION_RECOVERIES
+                        ),
+                        items_affected: affected,
+                    });
+                    continue;
+                }
+                on_event(&RunEvent::RecoveryApplied {
+                    category: "stream_truncation_tool_call".into(),
+                    detail: "stream interrupted mid tool-call; recovery budget exhausted; partial call preserved as-is".into(),
+                    items_affected: affected,
+                });
+                final_text = assistant_text;
+                break RunFinishReason::Completed {
+                    detail: "model stop reason: max_tokens (stream interrupted mid tool-call; recovery budget exhausted)".into(),
+                };
+            }
+
             if tool_uses.is_empty() && stop_is_final {
                 if self.options.finalize_on_max_turns && assistant_text.trim().is_empty() {
                     return Err(nonoclaw_core::Error::Other(
@@ -2774,6 +2844,15 @@ impl QueryEngine {
                 // the per-turn output budget was consumed before the model
                 // produced any usable output. Surface it as a warning instead
                 // of letting the run pass as a silent "done".
+                //
+                // The recovery gate below fires on the root-cause FACT of
+                // truncation (fabricated MaxTokens from the graceful stream
+                // path, or a provider-reported MaxTokens), never on the
+                // content-block shape alone. The shape only picks the
+                // recovery parameters: thinking-only turns get a draft tail,
+                // partial tool_use turns get a placeholder tool_result so the
+                // truncated call is structurally paired. See
+                // `recovery-entry-predicate-root-cause-not-symptom-shape`.
                 let thinking_truncated = turn.stop_reason == Some(StopReason::MaxTokens)
                     && matches!(
                         turn.content.last(),
@@ -2786,8 +2865,8 @@ impl QueryEngine {
                     // nudging the model to act on its draft. History thinking
                     // blocks are stripped from later requests, so the draft
                     // only survives via a bounded tail embedded in the nudge.
-                    if thinking_truncation_recoveries < MAX_THINKING_TRUNCATION_RECOVERIES {
-                        thinking_truncation_recoveries += 1;
+                    if output_truncation_recoveries < MAX_OUTPUT_TRUNCATION_RECOVERIES {
+                        output_truncation_recoveries += 1;
                         suppress_thinking_next_turn = true;
                         let draft_tail = thinking_draft_tail(&turn.content);
                         let body = format!(
@@ -2801,7 +2880,7 @@ impl QueryEngine {
                             category: "max_tokens_thinking_truncation".into(),
                             detail: format!(
                                 "recovery nudge {}/{} injected; thinking disabled for the next turn",
-                                thinking_truncation_recoveries, MAX_THINKING_TRUNCATION_RECOVERIES
+                                output_truncation_recoveries, MAX_OUTPUT_TRUNCATION_RECOVERIES
                             ),
                             items_affected: 0,
                         });
@@ -2810,6 +2889,35 @@ impl QueryEngine {
                     on_event(&RunEvent::RecoveryApplied {
                         category: "max_tokens_thinking_truncation".into(),
                         detail: "per-turn output token cap hit while the model was still thinking; no text or tool call was produced for this turn (recovery budget exhausted)".into(),
+                        items_affected: 0,
+                    });
+                } else if max_tokens_stop_was_fabricated {
+                    // Shape C: the stream died mid-text (no tool call under
+                    // construction, last block is the truncation notice text).
+                    // Previously fell through to a bare "done" whose only
+                    // complete sentence was the notice itself (run c04ed0fb).
+                    // The partial text stays in the transcript; nudge the
+                    // model to continue from where it broke off.
+                    if output_truncation_recoveries < MAX_OUTPUT_TRUNCATION_RECOVERIES {
+                        output_truncation_recoveries += 1;
+                        let recovery_msg = Message::user(MessageContent::from_text(
+                            "<recovery_notice>\nYour previous turn was cut off mid-stream while writing your answer; the text that reached the transcript is incomplete. Continue from where it broke off and deliver the complete answer now. Do not repeat what you already wrote.\n</recovery_notice>",
+                        ));
+                        self.messages.push(recovery_msg.clone());
+                        self.persist(recovery_msg).await;
+                        on_event(&RunEvent::RecoveryApplied {
+                            category: "stream_truncation_text".into(),
+                            detail: format!(
+                                "recovery nudge {}/{} injected",
+                                output_truncation_recoveries, MAX_OUTPUT_TRUNCATION_RECOVERIES
+                            ),
+                            items_affected: 0,
+                        });
+                        continue;
+                    }
+                    on_event(&RunEvent::RecoveryApplied {
+                        category: "stream_truncation_text".into(),
+                        detail: "stream interrupted mid-text; recovery budget exhausted".into(),
                         items_affected: 0,
                     });
                 }
@@ -3438,9 +3546,10 @@ const DEFAULT_SUBAGENT_MAX_TURNS: u32 = 24;
 const HARD_MAX_SUBAGENT_TURNS: u32 = 200;
 const SUBAGENT_MAX_TURNS_ENV: &str = "NONOCLAW_SUBAGENT_MAX_TURNS";
 
-/// Max mid-thinking truncation recoveries per run before falling back to the
-/// terminal warning + completion (see the `thinking_truncated` branch).
-const MAX_THINKING_TRUNCATION_RECOVERIES: u32 = 2;
+/// Max stream/output truncation recoveries per run (mid-thinking, mid
+/// tool-call, mid-text) before falling back to the terminal warning +
+/// completion.
+const MAX_OUTPUT_TRUNCATION_RECOVERIES: u32 = 2;
 /// Bounded tail of the truncated thinking draft embedded in the recovery
 /// nudge — the draft is otherwise unrecoverable (history thinking is never
 /// replayed to the provider).
@@ -5093,6 +5202,158 @@ mod tests {
             ..EngineOptions::default()
         };
         QueryEngine::new(client, Arc::new(registry), todos, options)
+    }
+
+    /// Fixture serving one truncated-tool-call connection then one clean
+    /// answer connection. Connection 1 streams text + a tool_use block whose
+    /// `input_json_delta` is cut mid-argument, then closes WITHOUT
+    /// `message_stop` while claiming a larger content-length — reqwest sees
+    /// "error decoding response body" and the engine takes the graceful
+    /// truncation path with a partial tool_use in hand.
+    async fn spawn_truncated_tool_call_fixture(
+        final_answer: &'static str,
+    ) -> (
+        Arc<Client>,
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let task = tokio::spawn(async move {
+            for response_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "provider fixture request ended before headers");
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "provider fixture request body was truncated");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body =
+                    String::from_utf8(request[header_end..header_end + content_length].to_vec())
+                        .unwrap();
+                request_tx.send(body).await.unwrap();
+
+                if response_index == 0 {
+                    // Truncated mid tool_use: the input_json_delta is an
+                    // incomplete JSON object and message_stop never arrives.
+                    // content-length deliberately exceeds the written bytes so
+                    // the client errors out mid-decode.
+                    let sse = "event: message_start\ndata: {\"message\":{\"id\":\"msg_cut\",\"model\":\"fixture-model\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n\
+                     event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                     event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me search for the answer.\"}}\n\n\
+                     event: content_block_stop\ndata: {\"index\":0}\n\n\
+                     event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_trunc_1\",\"name\":\"Grep\"}}\n\n\
+                     event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"incomplete\"}}\n\n"
+                        .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        sse.len() + 64,
+                        sse
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    let answer_json = serde_json::to_string(final_answer).unwrap();
+                    let sse = format!(
+                        "event: message_start\ndata: {{\"message\":{{\"id\":\"msg_final\",\"model\":\"fixture-model\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":0}}}}}}\n\n\
+                         event: content_block_start\ndata: {{\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                         event: content_block_delta\ndata: {{\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{answer_json}}}}}\n\n\
+                         event: content_block_stop\ndata: {{\"index\":0}}\n\n\
+                         event: message_delta\ndata: {{\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":4}}}}\n\n\
+                         event: message_stop\ndata: {{}}\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let client =
+            Client::new(Some("fixture-key".into()), None, format!("http://{addr}")).unwrap();
+        (Arc::new(client), request_rx, task)
+    }
+
+    #[tokio::test]
+    async fn stream_truncation_mid_tool_use_recovers_with_synthetic_result() {
+        let (client, mut requests, fixture_task) =
+            spawn_truncated_tool_call_fixture("recovered final answer").await;
+        // Recovery needs a second provider turn after the nudge.
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let mut engine = QueryEngine::new(
+            client,
+            Arc::new(registry),
+            todos,
+            EngineOptions {
+                model: "fixture-requested-model".into(),
+                max_turns: 3,
+                auto_compact: false,
+                ..EngineOptions::default()
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut events = Vec::new();
+        let result = engine
+            .run(
+                MessageContent::from_text("搜索并返回完整结果"),
+                &cwd,
+                |event| events.push(event.clone()),
+            )
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+
+        // The run completes normally instead of dying with
+        // "stopped without a complete final answer".
+        assert_eq!(result.text, "recovered final answer");
+        // Recovery fired with the stream-truncation tool-call category.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::RecoveryApplied { category, .. }
+                    if category == "stream_truncation_tool_call"
+            )),
+            "expected a stream_truncation_tool_call RecoveryApplied event"
+        );
+
+        let _first_request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+        // The recovery request must not carry an unpaired tool_use: the
+        // truncated call is answered by a synthetic erroring tool_result.
+        let second_request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+        let messages = second_request["messages"].to_string();
+        assert!(
+            messages.contains("tool_trunc_1"),
+            "recovery request must reference the truncated tool call id"
+        );
+        assert!(
+            messages.contains("Re-issue the call"),
+            "recovery request must carry the synthetic error tool_result"
+        );
     }
 
     /// Full non-interactive engine success through a local Anthropic SSE
