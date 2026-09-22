@@ -1829,6 +1829,12 @@ impl QueryEngine {
         // not a completed answer.
         let mut final_text = String::new();
         let mut last_stop: Option<StopReason> = None;
+        // Mid-thinking max_tokens recovery: the model burned its entire
+        // per-turn output budget in the thinking channel before any text or
+        // tool_use. Recover by nudging it to act on its draft, with thinking
+        // disabled for the recovery turn (see the truncation branch below).
+        let mut thinking_truncation_recoveries: u32 = 0;
+        let mut suppress_thinking_next_turn = false;
 
         // Skill triggers: check user input against trigger patterns and
         // activate matching conditional skills before the first turn.
@@ -2525,7 +2531,11 @@ impl QueryEngine {
                 messages: request_messages,
                 tools: request_tools,
                 tool_choice: None,
-                thinking: self.options.thinking.clone(),
+                thinking: if suppress_thinking_next_turn {
+                    None
+                } else {
+                    self.options.thinking.clone()
+                },
                 temperature: None,
                 betas: Vec::new(),
                 extra_body: None,
@@ -2701,6 +2711,7 @@ impl QueryEngine {
                 max_budget_usd: self.options.max_budget_usd,
             });
             last_stop = turn.stop_reason.clone();
+            suppress_thinking_next_turn = false;
 
             // Collect assistant text for display + the transcript message.
             let assistant_text: String = turn
@@ -2769,9 +2780,36 @@ impl QueryEngine {
                         Some(ContentBlock::Thinking { .. })
                     );
                 if thinking_truncated {
+                    // Detection alone left the run dead (2026-08-29 sessions:
+                    // drafts fully formed in thinking, zero text/tool_use,
+                    // run terminated with a 0.4-reward warning). Recover by
+                    // nudging the model to act on its draft. History thinking
+                    // blocks are stripped from later requests, so the draft
+                    // only survives via a bounded tail embedded in the nudge.
+                    if thinking_truncation_recoveries < MAX_THINKING_TRUNCATION_RECOVERIES {
+                        thinking_truncation_recoveries += 1;
+                        suppress_thinking_next_turn = true;
+                        let draft_tail = thinking_draft_tail(&turn.content);
+                        let body = format!(
+                            "<recovery_notice>\nYour previous turn was cut off by the per-turn output limit while still thinking: no text or tool call reached the transcript, and prior thinking is not replayed to you on later turns. A tail of your unfinished draft follows.\nDo NOT restart the analysis and do NOT draft further in the thinking channel — thinking is disabled for this turn. Act now on what you already worked out: emit the pending Edit/Write/tool calls, or if the work is done, the final answer text. Keep this turn's output short.\n<unfinished_draft_tail>\n{}\n</unfinished_draft_tail>\n</recovery_notice>",
+                            draft_tail
+                        );
+                        let recovery_msg = Message::user(MessageContent::from_text(body));
+                        self.messages.push(recovery_msg.clone());
+                        self.persist(recovery_msg).await;
+                        on_event(&RunEvent::RecoveryApplied {
+                            category: "max_tokens_thinking_truncation".into(),
+                            detail: format!(
+                                "recovery nudge {}/{} injected; thinking disabled for the next turn",
+                                thinking_truncation_recoveries, MAX_THINKING_TRUNCATION_RECOVERIES
+                            ),
+                            items_affected: 0,
+                        });
+                        continue;
+                    }
                     on_event(&RunEvent::RecoveryApplied {
                         category: "max_tokens_thinking_truncation".into(),
-                        detail: "per-turn output token cap hit while the model was still thinking; no text or tool call was produced for this turn".into(),
+                        detail: "per-turn output token cap hit while the model was still thinking; no text or tool call was produced for this turn (recovery budget exhausted)".into(),
                         items_affected: 0,
                     });
                 }
@@ -3379,6 +3417,32 @@ fn preview(s: &str) -> String {
 const DEFAULT_SUBAGENT_MAX_TURNS: u32 = 24;
 const HARD_MAX_SUBAGENT_TURNS: u32 = 200;
 const SUBAGENT_MAX_TURNS_ENV: &str = "NONOCLAW_SUBAGENT_MAX_TURNS";
+
+/// Max mid-thinking truncation recoveries per run before falling back to the
+/// terminal warning + completion (see the `thinking_truncated` branch).
+const MAX_THINKING_TRUNCATION_RECOVERIES: u32 = 2;
+/// Bounded tail of the truncated thinking draft embedded in the recovery
+/// nudge — the draft is otherwise unrecoverable (history thinking is never
+/// replayed to the provider).
+const THINKING_DRAFT_TAIL_CHARS: usize = 2000;
+
+/// Extract the trailing `THINKING_DRAFT_TAIL_CHARS` chars of the last Thinking
+/// block (the truncated draft). Returns "" when no Thinking block is present.
+fn thinking_draft_tail(content: &[ContentBlock]) -> String {
+    match content.last() {
+        Some(ContentBlock::Thinking { thinking, .. }) => {
+            let chars: Vec<char> = thinking.chars().collect();
+            if chars.len() > THINKING_DRAFT_TAIL_CHARS {
+                chars[chars.len() - THINKING_DRAFT_TAIL_CHARS..]
+                    .iter()
+                    .collect()
+            } else {
+                thinking.clone()
+            }
+        }
+        _ => String::new(),
+    }
+}
 
 fn parse_subagent_max_turns(raw: Option<&str>) -> u32 {
     raw.and_then(|value| value.parse::<u32>().ok())
@@ -5706,5 +5770,58 @@ mod tests {
             }
         }
         panic!("expected the last message to carry a breakpoint");
+    }
+
+    #[test]
+    fn thinking_draft_tail_bounds_and_preserves_suffix() {
+        // Over the cap → exact char suffix (UTF-8 safe, char-boundary cut).
+        let long: String = "字abc".repeat(1000); // 4000 chars, multi-byte
+        let content = vec![ContentBlock::Thinking {
+            thinking: long.clone(),
+            signature: None,
+        }];
+        let tail = thinking_draft_tail(&content);
+        assert_eq!(tail.chars().count(), THINKING_DRAFT_TAIL_CHARS);
+        assert!(long.ends_with(&tail));
+
+        // Under the cap → returned verbatim.
+        let short = "draft: apply the Edit now".to_string();
+        let content = vec![ContentBlock::Thinking {
+            thinking: short.clone(),
+            signature: None,
+        }];
+        assert_eq!(thinking_draft_tail(&content), short);
+
+        // No thinking block → empty.
+        assert_eq!(
+            thinking_draft_tail(&[ContentBlock::text("no thinking")]),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn recovery_nudge_survives_history_projection() {
+        // The truncated turn is thinking-only; after `strip_unsupported_blocks`
+        // it degrades to a placeholder text. The injected recovery user message
+        // must survive as a real user turn with the draft tail intact, forming
+        // a valid assistant→user alternation for the next request.
+        let truncated =
+            Message::assistant(MessageContent::from_blocks(vec![ContentBlock::Thinking {
+                thinking: "d0".repeat(10),
+                signature: None,
+            }]));
+        let nudge = Message::user(MessageContent::from_text(
+            "<recovery_notice>\nact now on your draft\n<unfinished_draft_tail>\nthe patch is ready\n</unfinished_draft_tail>\n</recovery_notice>",
+        ));
+        let projected = strip_unsupported_blocks(&[truncated, nudge], true);
+        assert_eq!(projected.len(), 2, "both messages must survive projection");
+        assert_eq!(projected[0].role, Role::Assistant);
+        assert!(matches!(projected[1].content, MessageContent::Text(_)));
+        let text = match &projected[1].content {
+            MessageContent::Text(t) => t,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("recovery_notice"));
+        assert!(text.contains("the patch is ready"));
     }
 }
