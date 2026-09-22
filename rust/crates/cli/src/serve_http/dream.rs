@@ -319,9 +319,8 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 {brief}\
 1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。用 Bash `ls -t` 看最近改动的文件。\n\
 2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，做对比反思：检索同类任务的成功轨迹，高分 vs 低分逐段对照，定位第一个分歧点——是哪个编排决策（任务拆解方式、子代理/工具选择、步骤顺序）不同导致结果分岔。\n\
-3. 【知识萃取】只把【可复用、非显而易见】的知识提炼为结构化事实：类型选 preference/convention/decision/architecture/bug。写法遵循 .nonoclaw/memory/facts 的 YAML frontmatter 格式，importance 1-5。\n\
-4. 【记忆索引】用 Write 工具把每条事实写入 .nonoclaw/memory/facts/<slug>.md（注意：必须带 .nonoclaw/ 前缀，写到顶层 memory/ 的文件引擎不会加载）。bead 写入 .nonoclaw/memory/beads/<uuid>.md。\n\
-5. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\n\
+3. 【知识萃取·即写】只把【可复用、非显而易见】的知识提炼为结构化事实，且【每萃取一条立即用 Write 落盘一条，再分析下一条】——dream 随时可能被轮次截断，『全部析完再统一写』的批处理模式下一次截断就归零。每条事实：类型选 preference/convention/decision/architecture/bug，写法遵循 .nonoclaw/memory/facts 的 YAML frontmatter 格式，importance 1-5，用 Write 写入 .nonoclaw/memory/facts/<slug>.md（必须带 .nonoclaw/ 前缀，写到顶层 memory/ 的文件引擎不会加载）。supersede 旧事实、关闭 stale bead 这类纯记忆写操作也在分析到位的当场用 Edit 完成，绝不推迟或留委托。\n\
+4. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\n\
 纪律：\\
 - 不要重复已有事实：先 Grep .nonoclaw/memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
 - 通用性门槛：每条事实写之前自检——换个任务/换个项目这条还成立吗？只写通用原则，不写任务特定 trick（如「X 文件要改 Y 行」）。不成立的信息留在总结输出里，不写入 facts。\n\
@@ -1560,9 +1559,11 @@ mod tests {
     #[test]
     fn dream_prompt_embeds_reward_brief_and_keeps_phases() {
         let plain = dream_prompt();
-        for phase in ["碎片收集", "关联分析", "知识萃取", "记忆索引"] {
+        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"] {
             assert!(plain.contains(phase), "missing phase {phase}");
         }
+        // Inline-write discipline: no separate deferred-persistence phase.
+        assert!(plain.contains("立即用 Write 落盘"));
         // The brief (with its 【Reward 简报】 header) only appears when provided;
         // the plain prompt mentions "Reward 简报" only in phase-1 guidance,
         // never as an actual injected section.
@@ -1653,13 +1654,24 @@ mod tests {
     #[test]
     fn dream_prompt_has_four_phases() {
         let p = dream_prompt();
-        for phase in ["碎片收集", "关联分析", "知识萃取", "记忆索引"] {
+        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"] {
             assert!(p.contains(phase), "missing phase {phase}");
         }
-        // Phase 5: actionable improvement suggestions must land as beads so
-        // they surface in the next session's context automatically.
-        assert!(p.contains("改进建议落盘"), "missing phase 5");
-        assert!(p.contains("memory/beads/"), "phase 5 must target beads dir");
+        // Inline-write discipline (bead dream-waterfall): extraction and
+        // persistence are ONE phase — no "analyze everything, then write"
+        // batching that a mid-run truncation wipes to zero.
+        assert!(
+            p.contains("立即用 Write 落盘"),
+            "extraction must write inline, not batch"
+        );
+        assert!(
+            p.contains("绝不推迟或留委托"),
+            "in-scope memory writes must happen in the same dream"
+        );
+        assert!(
+            p.contains("memory/beads/"),
+            "phase 4 must target beads dir"
+        );
         // Facts/beads paths must carry the `.nonoclaw/` prefix — bare
         // `memory/facts/` wording caused agents to write to the repo top level,
         // where the engine never loads them (silent strays).
