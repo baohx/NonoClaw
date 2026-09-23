@@ -169,6 +169,17 @@ pub struct RunTerminal {
     pub result: Option<FinalResult>,
 }
 
+impl RunTerminal {
+    /// Cumulative token usage for the run (zero for cancelled/error runs
+    /// which carry no `FinalResult`). Backs `write_run_outcome` cache stats.
+    pub fn usage(&self) -> nonoclaw_core::usage::Usage {
+        self.result
+            .as_ref()
+            .map(|value| value.usage)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone)]
 pub struct RunController {
     context: RunContext,

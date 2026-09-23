@@ -512,7 +512,14 @@ async fn run_handler_inner(
                 nonoclaw_engine::jev_reward::run_reward_with_jev(status, &detail, turns, &signals)
                     .await;
             if let Err(e) = session_for_run
-                .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+                .write_run_outcome(
+                    &terminal.run_id,
+                    status,
+                    reward,
+                    turns,
+                    &detail,
+                    &terminal.usage(),
+                )
                 .await
             {
                 tracing::warn!(error = %e, "failed to persist run outcome");

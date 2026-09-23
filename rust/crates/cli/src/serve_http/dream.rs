@@ -367,6 +367,10 @@ struct OutcomeSummary {
     /// Unix secs when the outcome was appended (0 for legacy entries written
     /// before the field existed — treated as "older than any dream").
     ts: u64,
+    /// Cumulative input tokens for the run (0 for legacy/no-result runs).
+    input_tokens: u64,
+    /// Cumulative prompt-cache READ hits.
+    cache_read_tokens: u64,
 }
 
 /// Truncate a run-outcome `detail` for the dream brief, but never cut the
@@ -444,6 +448,14 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
                     value.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
                 ),
                 ts: value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+                input_tokens: value
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_read_tokens: value
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             });
         }
     }
@@ -670,6 +682,49 @@ fn reward_brief_with_ledger(
         );
     } else {
         brief.push_str("全部成功。萃取最近成功轨迹的工具使用与编排模式（怎么做对的）。\n");
+    }
+    // Cache-hit triage (Manus treats KV-cache hit rate as the #1 metric):
+    // surface runs whose prompt-cache read rate is low. Runs without usage
+    // data (legacy JSONL, cancelled/error with no result) are skipped —
+    // a missing numerator/denominator is not a low hit rate.
+    let mut input_total: u64 = 0;
+    let mut cache_read_total: u64 = 0;
+    let mut low_hit_runs: Vec<String> = Vec::new();
+    for outcome in outcomes.iter() {
+        if outcome.input_tokens == 0 {
+            continue;
+        }
+        input_total += outcome.input_tokens;
+        cache_read_total += outcome.cache_read_tokens;
+        if (outcome.cache_read_tokens as f64) < 0.6 * outcome.input_tokens as f64 {
+            low_hit_runs.push(format!(
+                "session {} run {}（{}/{}，{:.0}%）",
+                &outcome.session_id.chars().take(8).collect::<String>(),
+                &outcome.run_id.chars().take(8).collect::<String>(),
+                outcome.cache_read_tokens,
+                outcome.input_tokens,
+                100.0 * outcome.cache_read_tokens as f64 / outcome.input_tokens as f64,
+            ));
+        }
+    }
+    if input_total > 0 {
+        let overall = 100.0 * cache_read_total as f64 / input_total as f64;
+        brief.push_str(&format!(
+            "\n【Cache 简报】窗口内整体 prompt-cache 读命中率 {overall:.0}%。"
+        ));
+        if low_hit_runs.is_empty() {
+            brief.push_str("无低命中 run。\n");
+        } else {
+            brief.push_str(&format!(
+                "低于 60% 的 run（可能成因：tools 变动 / Block2 漂移 / 跨 run 冷启动）：\n{}\n",
+                low_hit_runs
+                    .iter()
+                    .take(5)
+                    .map(|line| format!("- {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
     }
     // Cap the brief so it cannot grow unboundedly with session count.
     (
@@ -1273,6 +1328,60 @@ mod tests {
     }
 
     #[test]
+    fn reward_brief_cache_triage_lists_low_hit_runs_and_skips_legacy() {
+        let dir = std::env::temp_dir().join("dream_cache_brief_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // One low-hit run (30%), one healthy run (90%), one legacy run
+        // (no cache fields — must not be counted in either direction).
+        std::fs::write(
+            dir.join("lowhit00000000-aaaa.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"l\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\",\"input_tokens\":10000,\"cache_read_tokens\":3000}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("healthy0000000-bbbb.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"h\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r2\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\",\"input_tokens\":10000,\"cache_read_tokens\":9000}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("legacy00000000-cccc.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"g\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r3\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
+        // Overall = (3000+9000)/(10000+10000) = 60%.
+        assert!(
+            brief.contains("Cache 简报"),
+            "cache section present: {brief}"
+        );
+        assert!(
+            brief.contains("60%"),
+            "overall hit rate aggregated: {brief}"
+        );
+        assert!(brief.contains("lowhit00"), "low-hit run listed: {brief}");
+        assert!(
+            !brief.contains("healthy000"),
+            "healthy run not flagged: {brief}"
+        );
+        assert!(
+            !brief.contains("legacy0000"),
+            "legacy run without cache fields skipped: {brief}"
+        );
+    }
+
+    #[test]
     fn reward_brief_aggregates_and_targets_worst() {
         let dir = std::env::temp_dir().join("dream_reward_brief_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1500,6 +1609,8 @@ mod tests {
             turns: 5,
             detail: "d".into(),
             ts: 0,
+            input_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 
@@ -1697,6 +1808,8 @@ mod tests {
                 turns: 2,
                 detail: String::new(),
                 ts: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
             },
             OutcomeSummary {
                 session_id: "b".into(),
@@ -1706,6 +1819,8 @@ mod tests {
                 turns: 2,
                 detail: String::new(),
                 ts: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
             },
         ];
         assert!(!has_headroom(&clean), "saturated window skips dreaming");
@@ -1718,6 +1833,8 @@ mod tests {
                 turns: 2,
                 detail: String::new(),
                 ts: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
             },
             OutcomeSummary {
                 session_id: "c".into(),
@@ -1727,6 +1844,8 @@ mod tests {
                 turns: 3,
                 detail: String::new(),
                 ts: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
             },
         ];
         assert!(has_headroom(&dirty), "one non-done outcome is headroom");

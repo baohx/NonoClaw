@@ -574,7 +574,14 @@ async fn main() -> Result<()> {
         )
         .await;
         if let Err(e) = outcome_session
-            .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+            .write_run_outcome(
+                &terminal.run_id,
+                status,
+                reward,
+                turns,
+                &detail,
+                &terminal.usage(),
+            )
             .await
         {
             tracing::warn!(error = %e, "failed to persist run outcome");

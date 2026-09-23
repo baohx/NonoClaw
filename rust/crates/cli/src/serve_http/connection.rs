@@ -2375,7 +2375,14 @@ async fn handle_ws(
                         )
                         .await;
                         if let Err(e) = session_for_wire
-                            .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
+                            .write_run_outcome(
+                                &terminal.run_id,
+                                status,
+                                reward,
+                                turns,
+                                &detail,
+                                &terminal.usage(),
+                            )
                             .await
                         {
                             tracing::warn!(error = %e, "failed to persist run outcome");

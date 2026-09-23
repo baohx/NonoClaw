@@ -81,6 +81,19 @@ pub enum SessionEntry {
         /// already-analyzed session. `default` keeps old JSONL parseable.
         #[serde(default)]
         ts: u64,
+        /// Cumulative input tokens for the run (from `FinalResult.usage`).
+        /// `default` keeps old JSONL parseable; 0 for cancelled/error runs
+        /// which have no result payload.
+        #[serde(default)]
+        input_tokens: u64,
+        /// Cumulative prompt-cache READ hits (Anthropic `cache_read_input_tokens`
+        /// / DeepSeek `prompt_cache_hit_tokens`). Raw counts are stored so any
+        /// downstream ratio survives schema evolution.
+        #[serde(default)]
+        cache_read_tokens: u64,
+        /// Cumulative prompt-cache WRITES (`cache_creation_input_tokens`).
+        #[serde(default)]
+        cache_creation_tokens: u64,
     },
     /// Running total of real API token usage (accumulated across all
     /// completed runs). Used to restore the frontend right-rail in/out
@@ -301,6 +314,7 @@ impl Session {
         reward: f64,
         turns: u32,
         detail: &str,
+        usage: &nonoclaw_core::usage::Usage,
     ) -> SessionResult<u64> {
         self.append_metadata(SessionEntry::RunOutcome {
             run_id: run_id.to_string(),
@@ -312,6 +326,9 @@ impl Session {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            input_tokens: usage.input_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_creation_tokens: usage.cache_creation_input_tokens,
         })
         .await
     }
@@ -1437,16 +1454,59 @@ mod tests {
             .await
             .unwrap();
 
-        s.write_run_outcome("run-1", "done", 1.0, 4, "all good")
+        let usage = nonoclaw_core::usage::Usage {
+            input_tokens: 10_000,
+            cache_read_input_tokens: 9_000,
+            ..Default::default()
+        };
+        s.write_run_outcome("run-1", "done", 1.0, 4, "all good", &usage)
             .await
             .unwrap();
-        s.write_run_outcome("run-2", "error", -1.0, 0, "provider 500")
-            .await
-            .unwrap();
+        s.write_run_outcome(
+            "run-2",
+            "error",
+            -1.0,
+            0,
+            "provider 500",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         let infos = service.list_sessions(&cwd).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].run_outcomes, 2, "both outcome labels counted");
+
+        // Cache stats round-trip through the JSONL.
+        let raw = std::fs::read_to_string(s.path()).unwrap();
+        let outcome_line = raw
+            .lines()
+            .find(|l| l.contains("\"run-1\""))
+            .expect("run-1 outcome line");
+        assert!(
+            outcome_line.contains("\"input_tokens\":10000"),
+            "input tokens persisted: {outcome_line}"
+        );
+        assert!(
+            outcome_line.contains("\"cache_read_tokens\":9000"),
+            "cache read tokens persisted: {outcome_line}"
+        );
+        // Old shape (no cache fields) still deserializes.
+        let legacy = serde_json::from_str::<SessionEntry>(
+            "{\"kind\":\"run_outcome\",\"run_id\":\"old\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\"}",
+        )
+        .expect("legacy run_outcome parses");
+        match legacy {
+            SessionEntry::RunOutcome {
+                input_tokens,
+                cache_read_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, 0);
+                assert_eq!(cache_read_tokens, 0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
 
         // Reward heuristic anchors.
         assert_eq!(run_reward("done", "completed"), 1.0);
