@@ -994,6 +994,7 @@ mod tests {
     fn configured_path_expansion_resolves_nonoclaw_home() {
         // Portable packages reference bundled runtimes via ${NONOCLAW_HOME}\..
         // so settings.json survives moving the package between drives.
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("NONOCLAW_HOME", "/x/NonoClawPortable/.nonoclaw-home");
         assert_eq!(
             expand_configured_path(

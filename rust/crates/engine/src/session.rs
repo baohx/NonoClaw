@@ -1296,6 +1296,7 @@ mod tests {
     /// heuristic (done=1, exhaustion penalties, cancelled=-0.3, error=-1).
     #[tokio::test]
     async fn list_sessions_cache_updates_on_append() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "cached-session", "model-x").unwrap();
@@ -1331,6 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn trace_batch_roundtrips_through_disk() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "trace-session", "model-x").unwrap();
@@ -1389,6 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_outcome_persists_and_scores() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "rl-session", "model-x").unwrap();
@@ -1452,6 +1455,16 @@ mod tests {
 
     #[tokio::test]
     async fn most_recent_session_skips_dream_tagged_sessions() {
+        // Session paths resolve through `NONOCLAW_HOME`/`HOME` read *at call
+        // time*. Other engine tests (settings/skills/toolchain) briefly flip
+        // those vars; without the shared env lock a flip can land between
+        // `create` and `most_recent_session` here, sending storage to a
+        // different root and failing the assertion. Pinning the var also
+        // keeps stray sessions out of the real `~/.nonoclaw`.
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = tempdir();
+        let saved_home = std::env::var_os("NONOCLAW_HOME");
+        std::env::set_var("NONOCLAW_HOME", &home);
         let cwd = tempdir();
         let service = SessionService::new();
 
@@ -1511,6 +1524,12 @@ mod tests {
             service.most_recent_session(&only_dream_cwd).unwrap(),
             None
         );
+
+        // Restore the environment before releasing the lock.
+        match saved_home {
+            Some(v) => std::env::set_var("NONOCLAW_HOME", v),
+            None => std::env::remove_var("NONOCLAW_HOME"),
+        }
     }
 
     #[tokio::test]
