@@ -673,6 +673,12 @@ fn run_reward_base(status: &str, finish_detail: &str) -> f64 {
         // generic branches because the engine's detail text also mentions
         // the output budget.
         0.4
+    } else if d.contains("mid tool-call") {
+        // Recovery-budget-exhausted mid tool-call truncation (shape B): the
+        // tool never executed, no answer exists. Zero usable output, same
+        // weight as mid-thinking. Checked before "budget" because the
+        // exhausted detail also contains that word.
+        0.4
     } else if d.contains("max turns") || d.contains("max_turns") {
         0.4
     } else if d.contains("budget") {
@@ -1410,6 +1416,11 @@ mod tests {
             run_reward("done", "model stop reason: max_tokens (truncated mid-thinking; per-turn output budget exhausted before any answer)"),
             0.6,
             "mid-thinking truncation penalized like max-turns exhaustion"
+        );
+        assert_eq!(
+            run_reward("done", "model stop reason: max_tokens (stream interrupted mid tool-call; recovery budget exhausted)"),
+            0.6,
+            "exhausted mid tool-call truncation: zero usable output, penalized like mid-thinking"
         );
         assert_eq!(
             run_reward("done", "model stop reason: max_tokens"),
