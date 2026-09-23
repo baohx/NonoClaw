@@ -75,7 +75,10 @@ pub fn apply(
         writable.push(workspace_root.to_path_buf());
         writable.extend(extra_writable.iter().cloned());
         ruleset = ruleset
-            .add_rules(path_beneath_rules(writable.iter().map(PathBuf::as_path), write_access))
+            .add_rules(path_beneath_rules(
+                writable.iter().map(PathBuf::as_path),
+                write_access,
+            ))
             .map_err(ruleset_io)?;
     }
 
@@ -120,10 +123,8 @@ mod tests {
             return;
         }
 
-        let target = std::env::temp_dir().join(format!(
-            "nonoclaw-landlock-probe-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let target =
+            std::env::temp_dir().join(format!("nonoclaw-landlock-probe-{}", uuid::Uuid::new_v4()));
         let workspace = std::env::temp_dir();
         // `touch <target>` requires MakeReg + WriteFile; a read-only sandbox
         // grants neither outside the workspace, so the child must fail.

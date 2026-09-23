@@ -156,7 +156,14 @@ fn write_plan_artifact(
         md.push_str("(none — all nodes completed)\n");
     } else {
         for id in open {
-            md.push_str(&format!("- {id} not completed{}\n", if aborted { " (aborted by human gate)" } else { "" }));
+            md.push_str(&format!(
+                "- {id} not completed{}\n",
+                if aborted {
+                    " (aborted by human gate)"
+                } else {
+                    ""
+                }
+            ));
         }
     }
     let _ = std::fs::write(dir.join(format!("{}-{ts}.md", def.name)), md);
@@ -202,7 +209,9 @@ pub async fn run_graph(
     // completed node become reachable; a completed router's chosen branch is
     // read back from the `_router:<id>` state key recorded at execution time.
     for id in &completed {
-        let Some(node) = def.nodes.get(id) else { continue };
+        let Some(node) = def.nodes.get(id) else {
+            continue;
+        };
         if node.kind == NodeKind::Router {
             if let Some(Value::String(branch)) = state.get(&format!("_router:{id}")) {
                 reachable.insert(branch.clone());
@@ -274,7 +283,8 @@ pub async fn run_graph(
             nodes_run.push(node_id.clone());
             done.insert(node_id.clone());
             completed.push(node_id.clone());
-            state.insert(node_id.clone(), Value::String(output.clone()));            save_checkpoint(
+            state.insert(node_id.clone(), Value::String(output.clone()));
+            save_checkpoint(
                 opts.cwd,
                 def,
                 &GraphCheckpoint {
@@ -371,7 +381,8 @@ pub async fn run_graph(
         nodes_run,
         nodes_completed: completed,
         resumed,
-        aborted,    })
+        aborted,
+    })
 }
 
 /// Run one node: agent (subagent), router (subagent picks a branch), or gate
@@ -419,9 +430,7 @@ async fn execute_node(
             };
             let answer = question
                 .ask(QuestionRequest {
-                    prompt: format!(
-                        "{prompt}\n\nProceed with the next step or abort the graph?",
-                    ),
+                    prompt: format!("{prompt}\n\nProceed with the next step or abort the graph?",),
                     options: vec!["Continue".into(), "Abort".into()],
                     context: Some(format!(
                         "Agent graph `{}` node `{node_id}` requires human approval.",
@@ -440,11 +449,7 @@ async fn execute_node(
                 Some(reply) if reply.trim().eq_ignore_ascii_case("abort") => {
                     Ok(("aborted by human approval".into(), vec![], true))
                 }
-                Some(reply) => Ok((
-                    format!("approved: {reply}"),
-                    node.next.ids(),
-                    false,
-                )),
+                Some(reply) => Ok((format!("approved: {reply}"), node.next.ids(), false)),
             }
         }
     }
@@ -521,14 +526,10 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
 
-
     /// Isolated scratch dir per test (checkpoint files collide in temp_dir
     /// when tests run in parallel with the same graph name).
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nc-graph-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nc-graph-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
@@ -572,7 +573,10 @@ nodes:
     #[test]
     fn normalize_branch_is_case_insensitive() {
         let branches = vec!["draft".to_string(), "rewrite".to_string()];
-        assert_eq!(normalize_branch("Rewrite.", &branches), Some("rewrite".into()));
+        assert_eq!(
+            normalize_branch("Rewrite.", &branches),
+            Some("rewrite".into())
+        );
         assert_eq!(normalize_branch("draft", &branches), Some("draft".into()));
         assert_eq!(normalize_branch("other", &branches), None);
         assert_eq!(normalize_branch("'draft'", &branches), Some("draft".into()));

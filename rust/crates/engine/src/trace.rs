@@ -56,9 +56,7 @@ impl TraceCollector {
     pub fn replay_snapshot(&self, root_run_id: &str) -> Vec<EventEnvelope> {
         self.snapshot()
             .into_iter()
-            .filter(|envelope| {
-                envelope.run_id == root_run_id && is_replay_event(&envelope.event)
-            })
+            .filter(|envelope| envelope.run_id == root_run_id && is_replay_event(&envelope.event))
             .collect()
     }
 }
@@ -155,7 +153,9 @@ mod tests {
             ));
         };
         // Content-heavy deltas must drop; window opens/closes must stay.
-        record(RunEvent::TextDelta { text: "answer".into() });
+        record(RunEvent::TextDelta {
+            text: "answer".into(),
+        });
         record(RunEvent::ThinkingDelta {
             text: "reasoning".into(),
             turn: 1,

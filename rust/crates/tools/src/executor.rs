@@ -1067,7 +1067,10 @@ mod tests {
 
         let reference = result.local_reference.expect("large result reference");
         assert!(result.content.contains("full result saved locally"));
-        assert!(result.content.contains("use Read with offset/limit"), "notice must guide the model to retrieve the spilled result with Read");
+        assert!(
+            result.content.contains("use Read with offset/limit"),
+            "notice must guide the model to retrieve the spilled result with Read"
+        );
         assert!(result.content.chars().count() <= 160);
         assert_eq!(
             tokio::fs::read_to_string(cwd.join(reference))

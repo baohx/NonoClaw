@@ -260,17 +260,13 @@ mod tests {
         // Structural errors are never rescued.
         assert!(rescue_candidate(&Error::Cancelled).is_none());
         assert!(rescue_candidate(&Error::Timeout).is_none());
-        assert!(
-            rescue_candidate(&Error::Auth("bad key (connection reset?)".into())).is_none()
-        );
+        assert!(rescue_candidate(&Error::Auth("bad key (connection reset?)".into())).is_none());
         assert!(rescue_candidate(&Error::PromptTooLong("too long".into())).is_none());
-        assert!(
-            rescue_candidate(&Error::Tool {
-                tool: "Edit".into(),
-                message: "stream broke".into()
-            })
-            .is_none()
-        );
+        assert!(rescue_candidate(&Error::Tool {
+            tool: "Edit".into(),
+            message: "stream broke".into()
+        })
+        .is_none());
         assert!(rescue_candidate(&Error::Config("bad upstream url".into())).is_none());
         // Other() with transient hint is the SSE/gateway escape hatch.
         assert!(rescue_candidate(&Error::Other("stream ended: eof".into())).is_some());

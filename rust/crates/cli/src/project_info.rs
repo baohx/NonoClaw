@@ -1022,14 +1022,9 @@ mod security_tests {
             ErrorKind::ArgumentConflict
         );
         assert_eq!(
-            crate::Cli::try_parse_from([
-                "nonoclaw",
-                "--serve-http",
-                "127.0.0.1:8765",
-                "--acp",
-            ])
-            .unwrap_err()
-            .kind(),
+            crate::Cli::try_parse_from(["nonoclaw", "--serve-http", "127.0.0.1:8765", "--acp",])
+                .unwrap_err()
+                .kind(),
             ErrorKind::ArgumentConflict
         );
         assert_eq!(

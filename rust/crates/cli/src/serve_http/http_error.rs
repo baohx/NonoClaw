@@ -102,11 +102,16 @@ mod tests {
         let app_error = model_client_error(&config, "glm-5.3", &error, "build_model_client");
         assert_eq!(app_error.code, ErrorCode::Configuration);
         assert!(
-            app_error.message.contains("not defined in settings profiles"),
+            app_error
+                .message
+                .contains("not defined in settings profiles"),
             "message should name the root cause: {}",
             app_error.message
         );
-        assert!(!app_error.message.contains("ANTHROPIC_API_KEY or ANTHROPIC"), "message must stay generic");
+        assert!(
+            !app_error.message.contains("ANTHROPIC_API_KEY or ANTHROPIC"),
+            "message must stay generic"
+        );
         assert_eq!(app_error.safe_details["model"], "glm-5.3");
         assert_eq!(app_error.safe_details["has_profile"], false);
         assert_eq!(app_error.safe_details["error_kind"], "auth");

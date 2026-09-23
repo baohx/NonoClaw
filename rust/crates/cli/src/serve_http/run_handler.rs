@@ -59,11 +59,7 @@ impl QuestionResolver for WsQuestionResolver {
                     request_id: request_id.clone(),
                     prompt: redact_text(&req.prompt),
                     context: req.context.as_deref().map(redact_text),
-                    options: req
-                        .options
-                        .iter()
-                        .map(|o| redact_text(o))
-                        .collect(),
+                    options: req.options.iter().map(|o| redact_text(o)).collect(),
                     urgency: match req.urgency {
                         QuestionUrgency::Low => "low".to_string(),
                         QuestionUrgency::Medium => "medium".to_string(),
@@ -239,7 +235,8 @@ fn push_attachment_text(
     text: &str,
     remaining: &mut usize,
     mark_truncated: bool,
-) {    if text.is_empty() || *remaining == 0 {
+) {
+    if text.is_empty() || *remaining == 0 {
         return;
     }
     const MARKER: &str = "\n[attachment content truncated]\n";

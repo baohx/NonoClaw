@@ -2,8 +2,8 @@
 //! `src/entrypoints/cli.tsx`. Runs headless (`--print`, piped input, or any
 //! positional prompt) or starts the web UI (`--serve-http`).
 
-mod attachments;
 mod acp;
+mod attachments;
 mod billing;
 mod project_info;
 mod remote;
@@ -109,7 +109,12 @@ struct Cli {
     prompt: Vec<String>,
 
     /// Compatibility marker for explicit headless mode; local prompt/stdin runs are already headless.
-    #[arg(short = 'p', long, default_value_t = false, help_heading = "Input & headless")]
+    #[arg(
+        short = 'p',
+        long,
+        default_value_t = false,
+        help_heading = "Input & headless"
+    )]
     print: bool,
 
     /// Tag the created session (e.g. `bench-smoke`, `eval`). Tagged sessions
@@ -132,11 +137,21 @@ struct Cli {
     permission_mode: PermissionModeArg,
 
     /// Comma-separated tool allowlist (e.g. "Read,Grep,Bash").
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Permissions")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Permissions"
+    )]
     allowed_tools: Vec<String>,
 
     /// Comma-separated tool denylist.
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Permissions")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Permissions"
+    )]
     disallowed_tools: Vec<String>,
 
     /// Maximum agent turns.
@@ -156,11 +171,7 @@ struct Cli {
     add_dir: Vec<PathBuf>,
 
     /// Skip all permission prompts (sets permission-mode = bypass-permissions).
-    #[arg(
-        long,
-        conflicts_with = "permission_mode",
-        help_heading = "Permissions"
-    )]
+    #[arg(long, conflicts_with = "permission_mode", help_heading = "Permissions")]
     dangerously_skip_permissions: bool,
 
     /// Output format.
@@ -281,7 +292,11 @@ struct Cli {
     mcp_serve_memory: bool,
 
     /// Install a plugin from SOURCE (local dir or git URL) into .nonoclaw/plugins.
-    #[arg(long, value_name = "SOURCE", help_heading = "Configuration & extensions")]
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        help_heading = "Configuration & extensions"
+    )]
     plugin_add: Option<String>,
 
     /// Verbose logging (RUST_LOG=debug also works).
@@ -355,9 +370,7 @@ async fn main() -> Result<()> {
     // spill retrieval) so an external harness can mount cross-session memory.
     if cli.mcp_serve_memory {
         let mut registry = nonoclaw_tools::ToolRegistry::new();
-        registry.register(std::sync::Arc::new(
-            nonoclaw_tools::builtin::MemoryTool,
-        ));
+        registry.register(std::sync::Arc::new(nonoclaw_tools::builtin::MemoryTool));
         registry.register(std::sync::Arc::new(nonoclaw_tools::builtin::ReadTool));
         let cwd = std::env::current_dir().context("no current directory")?;
         return Ok(nonoclaw_tools::mcp_server::serve_stdin(&registry, &cwd).await?);

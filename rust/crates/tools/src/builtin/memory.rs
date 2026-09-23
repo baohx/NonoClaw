@@ -117,7 +117,9 @@ fn session_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
     // Sessions live under the nonoclaw data dir, not the project; resolve the
     // per-project directory the same way `nonoclaw_engine::session` does.
     let Some(root) = nonoclaw_core::nonoclaw_data_dir() else {
-        return Ok(ToolResult::ok("No session transcripts found (no data dir)."));
+        return Ok(ToolResult::ok(
+            "No session transcripts found (no data dir).",
+        ));
     };
     let sanitized = cwd
         .to_string_lossy()
@@ -125,7 +127,9 @@ fn session_search(cwd: &Path, input: &Value) -> Result<ToolResult> {
         .replace('/', "-");
     let sessions_dir = root.join("projects").join(sanitized).join("sessions");
     if !sessions_dir.is_dir() {
-        return Ok(ToolResult::ok("No session transcripts found for this project."));
+        return Ok(ToolResult::ok(
+            "No session transcripts found for this project.",
+        ));
     }
     // Incremental build/refresh (cheap when fingerprints are unchanged), then search.
     let index = crate::session_index::build_index(cwd, &sessions_dir);

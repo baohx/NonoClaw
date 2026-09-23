@@ -1581,7 +1581,11 @@ mod tests {
             .iter()
             .find(|b| b.text.contains("<memory>"))
             .expect("memory block must exist");
-        assert!(mem_block.text.contains("<memory>\n"), "must open <memory>: got\n{}", mem_block.text);
+        assert!(
+            mem_block.text.contains("<memory>\n"),
+            "must open <memory>: got\n{}",
+            mem_block.text
+        );
         assert!(mem_block.text.contains("fact: user prefers Rust"));
         assert!(mem_block.text.contains("</memory>"), "must close </memory>");
         assert!(
@@ -1630,10 +1634,19 @@ mod tests {
         let new_memory = Some("bead: different content".to_string());
         let refreshed = refresh_context_block(&initial, &sys, &user, &new_memory, &None);
         // The cached memory block from initial must be preserved.
-        let mem_blocks: Vec<_> = refreshed.iter().filter(|b| b.text.contains("<memory>")).collect();
+        let mem_blocks: Vec<_> = refreshed
+            .iter()
+            .filter(|b| b.text.contains("<memory>"))
+            .collect();
         assert_eq!(mem_blocks.len(), 1, "exactly one memory block");
-        assert!(mem_blocks[0].text.contains("bead: work in progress"), "must preserve original memory");
-        assert!(!mem_blocks[0].text.contains("different content"), "must NOT pick up new memory on refresh");
+        assert!(
+            mem_blocks[0].text.contains("bead: work in progress"),
+            "must preserve original memory"
+        );
+        assert!(
+            !mem_blocks[0].text.contains("different content"),
+            "must NOT pick up new memory on refresh"
+        );
     }
 
     // ========================================================================

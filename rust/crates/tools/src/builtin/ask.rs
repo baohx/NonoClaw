@@ -64,9 +64,7 @@ impl Tool for AskUserQuestionTool {
         })?;
 
         // Parse structured Factor 7 fields.
-        let context = input["context"]
-            .as_str()
-            .map(|s| s.to_string());
+        let context = input["context"].as_str().map(|s| s.to_string());
 
         let urgency = input["urgency"]
             .as_str()
@@ -177,9 +175,7 @@ const URGENCY_CALIBRATION_BUDGET: std::time::Duration = std::time::Duration::fro
 /// Downgrade rule as a pure function: only High can move, only downward.
 fn apply_urgency_calibration(urgency: QuestionUrgency, p_urgent: Option<f64>) -> QuestionUrgency {
     match (urgency, p_urgent) {
-        (QuestionUrgency::High, Some(p)) if p < URGENCY_DEMOTE_THRESHOLD => {
-            QuestionUrgency::Medium
-        }
+        (QuestionUrgency::High, Some(p)) if p < URGENCY_DEMOTE_THRESHOLD => QuestionUrgency::Medium,
         (u, _) => u,
     }
 }
@@ -236,6 +232,9 @@ mod tests {
         assert_eq!(apply_urgency_calibration(Medium, Some(0.99)), Medium);
         assert_eq!(apply_urgency_calibration(Low, Some(0.99)), Low);
         // Default (unspecified → Medium) untouched.
-        assert_eq!(apply_urgency_calibration(QuestionUrgency::default(), None), Medium);
+        assert_eq!(
+            apply_urgency_calibration(QuestionUrgency::default(), None),
+            Medium
+        );
     }
 }

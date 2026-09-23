@@ -508,13 +508,9 @@ async fn run_handler_inner(
                 tools_ok: (packed >> 32) as u32,
                 tools_failed: packed as u32,
             };
-            let (reward, detail) = nonoclaw_engine::jev_reward::run_reward_with_jev(
-                status,
-                &detail,
-                turns,
-                &signals,
-            )
-            .await;
+            let (reward, detail) =
+                nonoclaw_engine::jev_reward::run_reward_with_jev(status, &detail, turns, &signals)
+                    .await;
             if let Err(e) = session_for_run
                 .write_run_outcome(&terminal.run_id, status, reward, turns, &detail)
                 .await

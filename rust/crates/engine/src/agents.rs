@@ -228,7 +228,11 @@ pub(crate) fn apply_subagent_profile(
     // Override takes complete precedence over append: the profile provides
     // a standalone instruction set, bypassing the default fixed prompt.
     options.append_system_prompt = Some(match profile {
-        Some(p) if p.system_prompt_override.as_deref().is_some_and(|s| !s.trim().is_empty()) => {
+        Some(p)
+            if p.system_prompt_override
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()) =>
+        {
             p.system_prompt_override.clone().unwrap()
         }
         _ => match profile.and_then(|p| p.system_prompt_append.as_deref()) {
@@ -687,7 +691,10 @@ Body text here."#;
         };
         let mut options = crate::EngineOptions::default();
         apply_subagent_profile(&mut options, Some(&profile), "Fixed.".into());
-        assert_eq!(options.append_system_prompt.as_deref(), Some("Override content."));
+        assert_eq!(
+            options.append_system_prompt.as_deref(),
+            Some("Override content.")
+        );
     }
 
     #[test]

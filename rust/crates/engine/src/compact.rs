@@ -40,7 +40,11 @@ const SUMMARY_USER_INSTRUCTION: &str = "Summarize the conversation above so work
 fn wire_chars(messages: &[Message]) -> usize {
     messages
         .iter()
-        .map(|m| serde_json::to_string(m).map(|s| s.chars().count()).unwrap_or(0))
+        .map(|m| {
+            serde_json::to_string(m)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
+        })
         .sum()
 }
 
@@ -58,7 +62,6 @@ fn can_reuse_prefix(
         None => false,
     }
 }
-
 
 /// Default cap on the summarizer's output. Overridable via the
 /// `compactMaxTokens` settings.json field.
@@ -169,8 +172,7 @@ pub async fn compact_messages(
         )));
         (tpl.system.clone(), msgs)
     } else {
-        let transcript =
-            bound_summary_transcript(&render_for_summary(to_compact), max_input_chars);
+        let transcript = bound_summary_transcript(&render_for_summary(to_compact), max_input_chars);
         let user_text = format!(
             "Summarize the following conversation so work can continue with only your summary plus \
              the most recent messages. Preserve concrete technical details.\n\n<conversation>\n\
@@ -353,10 +355,7 @@ pub fn micro_compact(messages: &[Message], frozen_from: usize) -> (Vec<Message>,
 ///
 /// `frozen_from` seals messages `[0, frozen_from)` from rewriting (cache
 /// prefix stability); see `micro_compact`.
-pub fn prune_tool_results(
-    messages: &[Message],
-    frozen_from: usize,
-) -> (Vec<Message>, usize) {
+pub fn prune_tool_results(messages: &[Message], frozen_from: usize) -> (Vec<Message>, usize) {
     let mut pruned_count = 0usize;
     let out: Vec<Message> = messages
         .iter()
@@ -670,7 +669,10 @@ mod tests {
     fn wire_chars_counts_serialized_messages() {
         let msgs = vec![user("hello world")];
         let n = wire_chars(&msgs);
-        assert!(n >= "hello world".len(), "wire chars must be at least the text length");
+        assert!(
+            n >= "hello world".len(),
+            "wire chars must be at least the text length"
+        );
         assert!(n > 0);
     }
 
@@ -679,9 +681,19 @@ mod tests {
         let msgs = vec![user("short")];
         let tpl = live_request("deepseek-chat");
         // Matching model + fits budget → reuse.
-        assert!(can_reuse_prefix(Some(&tpl), "deepseek-chat", &msgs, 1_000_000));
+        assert!(can_reuse_prefix(
+            Some(&tpl),
+            "deepseek-chat",
+            &msgs,
+            1_000_000
+        ));
         // Different model → no reuse (cache prefix not portable across models).
-        assert!(!can_reuse_prefix(Some(&tpl), "other-model", &msgs, 1_000_000));
+        assert!(!can_reuse_prefix(
+            Some(&tpl),
+            "other-model",
+            &msgs,
+            1_000_000
+        ));
         // Budget too small → no reuse (would truncate and break the prefix).
         assert!(!can_reuse_prefix(Some(&tpl), "deepseek-chat", &msgs, 1));
         // No prior request → no reuse.
@@ -800,7 +812,10 @@ mod tests {
         let msgs = many_messages(20, MICRO_THRESHOLD_CHARS + 1000);
         let frozen = 6;
         let (out, count) = micro_compact(&msgs, frozen);
-        assert_eq!(count, 6, "only the 6 eligible between seal and protection zone");
+        assert_eq!(
+            count, 6,
+            "only the 6 eligible between seal and protection zone"
+        );
         for (i, (a, b)) in out.iter().take(frozen).zip(msgs.iter()).enumerate() {
             assert_eq!(
                 serde_json::to_string(a).unwrap(),
@@ -827,10 +842,8 @@ mod tests {
     fn micro_compact_skips_prune_marked_results() {
         // A result already pruned by the 8K pruner must not be re-trimmed
         // (it carries PRUNE_MARKER and stays as-is).
-        let (pruned, _) = prune_tool_results(
-            &[big_tool_result("t0", PRUNE_THRESHOLD_CHARS + 10)],
-            0,
-        );
+        let (pruned, _) =
+            prune_tool_results(&[big_tool_result("t0", PRUNE_THRESHOLD_CHARS + 10)], 0);
         let msgs: Vec<Message> = pruned
             .into_iter()
             .chain(many_messages(10, MICRO_THRESHOLD_CHARS + 1000))
@@ -866,7 +879,10 @@ mod tests {
         assert_eq!(n2, 13, "aged results folded to stubs");
         let aged = serde_json::to_string(&second[0]).unwrap();
         assert!(aged.contains(AGING_MARKER_TEXT));
-        assert!(!aged.contains(MICRO_MARKER), "stub replaces micro-compact text");
+        assert!(
+            !aged.contains(MICRO_MARKER),
+            "stub replaces micro-compact text"
+        );
         // Third pass is fully idempotent.
         let (third, n3) = micro_compact(&second, 0);
         assert_eq!(n3, 0);

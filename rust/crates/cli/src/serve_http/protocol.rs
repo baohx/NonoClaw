@@ -8,9 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
 use nonoclaw_core::{
-    redact_text, redact_text_per_line, redact_value, AppError, ContentBlock, ErrorCode,
-    Message, MessageContent,
-    ToolResultContent,
+    redact_text, redact_text_per_line, redact_value, AppError, ContentBlock, ErrorCode, Message,
+    MessageContent, ToolResultContent,
 };
 use nonoclaw_engine::{
     EventEnvelope, RunEvent, RunTerminal, SequencedEngineEvent, Session, SessionSnapshot,
@@ -310,7 +309,8 @@ fn default_history_page_size() -> usize {
     100
 }
 
-pub(super) fn timestamp_ms() -> u64 {    SystemTime::now()
+pub(super) fn timestamp_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
@@ -331,7 +331,15 @@ pub(super) fn messages_loaded(
         ..
     } = snapshot;
     let (window, total) = tail_window(messages, HISTORY_TAIL_MESSAGES);
-    messages_loaded_windowed(session_id, window, total, revision, started, cumulative_usage, traces)
+    messages_loaded_windowed(
+        session_id,
+        window,
+        total,
+        revision,
+        started,
+        cumulative_usage,
+        traces,
+    )
 }
 
 /// Tail-windowed constructor used when restoring a session: send only the
@@ -392,7 +400,6 @@ pub(super) fn history_page(
     }
 }
 
-
 /// Default session-restore tail window.
 pub(super) const HISTORY_TAIL_MESSAGES: usize = 50;
 
@@ -437,18 +444,16 @@ pub(super) fn session_run_prompts(
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let started_ms = text
-        .lines()
-        .find_map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            if value.get("kind").and_then(|k| k.as_str()) != Some("session") {
-                return None;
-            }
-            value
-                .get("started")
-                .and_then(|s| s.as_str())
-                .and_then(parse_rfc3339_ms)
-        });
+    let started_ms = text.lines().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        if value.get("kind").and_then(|k| k.as_str()) != Some("session") {
+            return None;
+        }
+        value
+            .get("started")
+            .and_then(|s| s.as_str())
+            .and_then(parse_rfc3339_ms)
+    });
 
     let mut prompts = Vec::new();
     let mut message_index = 0usize;
@@ -518,7 +523,10 @@ fn extract_user_text(content: Option<&serde_json::Value>) -> String {
             .iter()
             .filter_map(|block| {
                 if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block.get("text").and_then(|t| t.as_str()).map(str::to_owned)
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned)
                 } else {
                     None
                 }
@@ -540,11 +548,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// Convert persisted model messages to the browser compatibility shape while
 /// removing data that the UI never needs: provider thinking/signatures,
 /// attachment bytes/extracted bodies, and unsafe tool payload fields.
-fn message_for_wire(
-    message: Message,
-    started_ms: Option<u64>,
-    index: usize,
-) -> serde_json::Value {
+fn message_for_wire(message: Message, started_ms: Option<u64>, index: usize) -> serde_json::Value {
     let attachments = attachment_filenames(&message.content);
     let mut wire = serde_json::json!({
         "role": message.role,
@@ -553,7 +557,9 @@ fn message_for_wire(
     });
     // Real wall-clock commit time (v0.23.2+) takes precedence; fall back to
     // the synthetic started+index estimate for legacy entries without `ts`.
-    let ts = message.ts.or_else(|| estimated_message_ms(started_ms, index));
+    let ts = message
+        .ts
+        .or_else(|| estimated_message_ms(started_ms, index));
     if let Some(ts) = ts {
         wire["ts"] = serde_json::Value::from(ts);
     }
@@ -661,7 +667,9 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
             "type": "text",
             "text": "[attachment image kept server-side]",
         })),
-        ContentBlock::ToolUse { id, name, input, .. } => Some(serde_json::json!({
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Some(serde_json::json!({
             "type": "tool_use",
             "id": id,
             "name": name,
@@ -763,7 +771,11 @@ mod tests {
     #[test]
     fn tail_window_keeps_last_n_and_reports_total() {
         let messages: Vec<Message> = (0..10)
-            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .map(|i| Message {
+                role: Role::User,
+                content: nonoclaw_core::MessageContent::Text(format!("m{i}")),
+                ts: None,
+            })
             .collect();
         let (window, total) = tail_window(messages, 3);
         assert_eq!(total, 10);
@@ -774,7 +786,11 @@ mod tests {
         }
         // Short sessions pass through untouched.
         let short: Vec<Message> = (0..2)
-            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .map(|i| Message {
+                role: Role::User,
+                content: nonoclaw_core::MessageContent::Text(format!("m{i}")),
+                ts: None,
+            })
             .collect();
         let (window, total) = tail_window(short, 3);
         assert_eq!(total, 2);
@@ -784,7 +800,11 @@ mod tests {
     #[test]
     fn history_page_reports_remaining_before_start() {
         let messages: Vec<Message> = (0..10)
-            .map(|i| Message { role: Role::User, content: nonoclaw_core::MessageContent::Text(format!("m{i}")), ts: None })
+            .map(|i| Message {
+                role: Role::User,
+                content: nonoclaw_core::MessageContent::Text(format!("m{i}")),
+                ts: None,
+            })
             .collect();
         // Page covering indexes 3..7 requested as "before 7, limit 4".
         let remaining = 7usize.saturating_sub(4).min(7);
@@ -883,7 +903,8 @@ mod tests {
             attachment_wire["content"],
             serde_json::json!([{ "type": "text", "text": "please summarize" }])
         );
-        let encoded = serde_json::json!([attachment_wire, message_for_wire(assistant, None, 1)]).to_string();
+        let encoded =
+            serde_json::json!([attachment_wire, message_for_wire(assistant, None, 1)]).to_string();
         for forbidden in [
             "private attachment body",
             "private-image-data",
@@ -913,7 +934,10 @@ mod tests {
         };
         // Real wall-clock ts wins over the started+index estimate.
         let wire = message_for_wire(
-            Message { ts: Some(1_700_000_123_456), ..msg.clone() },
+            Message {
+                ts: Some(1_700_000_123_456),
+                ..msg.clone()
+            },
             Some(1_700_000_000_000),
             5,
         );
@@ -1057,7 +1081,10 @@ mod tests {
             serde_json::to_value(snapshot).unwrap(),
             fixtures["snapshot"]
         );
-        assert_eq!(serde_json::to_value(history).unwrap(), fixtures["history_page"]);
+        assert_eq!(
+            serde_json::to_value(history).unwrap(),
+            fixtures["history_page"]
+        );
         assert_eq!(serde_json::to_value(done).unwrap(), fixtures["done"]);
         assert_eq!(serde_json::to_value(error).unwrap(), fixtures["error"]);
     }

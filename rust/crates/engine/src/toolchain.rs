@@ -253,7 +253,8 @@ async fn probe_one(
                 None => {
                     last_failure = Some(ProbeFailure {
                         code: "version_unrecognized",
-                        suggestion: "Use an executable whose --version output contains a numeric version.",
+                        suggestion:
+                            "Use an executable whose --version output contains a numeric version.",
                     });
                 }
             },
@@ -738,11 +739,7 @@ async fn probe_markitdown(
     }
 }
 
-async fn probe_markitdown_exec(
-    path: &str,
-    timeout: Duration,
-    limit: usize,
-) -> MarkItDownProbe {
+async fn probe_markitdown_exec(path: &str, timeout: Duration, limit: usize) -> MarkItDownProbe {
     match bounded_command(Path::new(path), &["--version"], timeout, limit).await {
         Ok(version) => MarkItDownProbe {
             status: "available".into(),
@@ -846,9 +843,13 @@ mod tests {
             std::env::temp_dir().join(format!("nonoclaw-toolchain-sc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).unwrap();
         std::fs::write(temp.join("node"), "x").unwrap();
-        std::fs::set_permissions(temp.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(temp.join("node"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let siblings = sibling_candidates("node.node", &temp.join("node"));
-        assert!(siblings.is_empty(), "node.exe absent, only sibling candidate");
+        assert!(
+            siblings.is_empty(),
+            "node.exe absent, only sibling candidate"
+        );
         std::fs::write(temp.join("node.exe"), "x").unwrap();
         let siblings = sibling_candidates("node.node", &temp.join("node"));
         assert_eq!(siblings, vec![temp.join("node.exe")]);
@@ -994,7 +995,9 @@ mod tests {
     fn configured_path_expansion_resolves_nonoclaw_home() {
         // Portable packages reference bundled runtimes via ${NONOCLAW_HOME}\..
         // so settings.json survives moving the package between drives.
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var("NONOCLAW_HOME", "/x/NonoClawPortable/.nonoclaw-home");
         assert_eq!(
             expand_configured_path(

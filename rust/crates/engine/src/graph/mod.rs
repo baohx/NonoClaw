@@ -180,9 +180,9 @@ impl GraphDefinition {
         if self.nodes.is_empty() {
             return Err(format!("graph `{}` declares no nodes", self.name));
         }
-        let start = self.start_node().ok_or_else(|| {
-            format!("graph `{}` has an invalid or missing start node", self.name)
-        })?;
+        let start = self
+            .start_node()
+            .ok_or_else(|| format!("graph `{}` has an invalid or missing start node", self.name))?;
         let mut pending: Vec<String> = vec![start.to_string()];
         // Walk successors to (a) resolve every reference and (b) detect
         // references that dangle outside the declared node set.
@@ -191,9 +191,10 @@ impl GraphDefinition {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let node = self.nodes.get(&id).ok_or_else(|| {
-                format!("graph `{}` references unknown node `{id}`", self.name)
-            })?;
+            let node = self
+                .nodes
+                .get(&id)
+                .ok_or_else(|| format!("graph `{}` references unknown node `{id}`", self.name))?;
             if node.kind == NodeKind::Router {
                 if node.next != Next::None {
                     return Err(format!(
@@ -244,9 +245,7 @@ pub fn load_graph_checked(cwd: &Path, name: &str) -> Result<GraphDefinition> {
                 path.display()
             ))
         } else {
-            Error::Config(format!(
-                "failed to read agent graph `{name}`: {error}"
-            ))
+            Error::Config(format!("failed to read agent graph `{name}`: {error}"))
         }
     })?;
     parse_graph(&raw, &path)
@@ -433,7 +432,10 @@ body text
         assert_eq!(def.name, "demo");
         assert_eq!(def.body, "body text");
         assert_eq!(def.nodes.len(), 6);
-        assert_eq!(def.nodes["a"].next, Next::Many(vec!["b".into(), "c".into()]));
+        assert_eq!(
+            def.nodes["a"].next,
+            Next::Many(vec!["b".into(), "c".into()])
+        );
         assert_eq!(def.nodes["d"].kind, NodeKind::Router);
         assert_eq!(
             def.nodes["d"].branches,
@@ -487,10 +489,7 @@ body text
 
     #[test]
     fn load_graph_checked_reads_real_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "nc-graph-load-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nc-graph-load-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let graphs = dir.join(".nonoclaw/graphs");
         std::fs::create_dir_all(&graphs).unwrap();
@@ -514,7 +513,10 @@ body text
         // JSON object passthrough.
         assert_eq!(parse_args("{\"topic\":\"AI\"}"), json!({"topic": "AI"}));
         // key=value pairs.
-        assert_eq!(parse_args("topic=AI depth=2"), json!({"topic": "AI", "depth": "2"}));
+        assert_eq!(
+            parse_args("topic=AI depth=2"),
+            json!({"topic": "AI", "depth": "2"})
+        );
         // Bare token becomes `input`.
         assert_eq!(parse_args("hello"), json!({"input": "hello"}));
         // Empty → null.

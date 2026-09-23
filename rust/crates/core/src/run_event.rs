@@ -438,7 +438,10 @@ const SAFE_TOKEN_SUFFIX_FIELDS: &[&str] = &["charspertoken", "pertoken"];
 
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_'], "");
-    if SAFE_TOKEN_SUFFIX_FIELDS.iter().any(|safe| key.ends_with(safe)) {
+    if SAFE_TOKEN_SUFFIX_FIELDS
+        .iter()
+        .any(|safe| key.ends_with(safe))
+    {
         return false;
     }
     [

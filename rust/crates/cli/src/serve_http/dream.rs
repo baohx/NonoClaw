@@ -1559,7 +1559,8 @@ mod tests {
     #[test]
     fn dream_prompt_embeds_reward_brief_and_keeps_phases() {
         let plain = dream_prompt();
-        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"] {
+        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"]
+        {
             assert!(plain.contains(phase), "missing phase {phase}");
         }
         // Inline-write discipline: no separate deferred-persistence phase.
@@ -1654,7 +1655,8 @@ mod tests {
     #[test]
     fn dream_prompt_has_four_phases() {
         let p = dream_prompt();
-        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"] {
+        for phase in ["碎片收集", "关联分析", "知识萃取·即写", "改进建议落盘"]
+        {
             assert!(p.contains(phase), "missing phase {phase}");
         }
         // Inline-write discipline (bead dream-waterfall): extraction and
@@ -1668,10 +1670,7 @@ mod tests {
             p.contains("绝不推迟或留委托"),
             "in-scope memory writes must happen in the same dream"
         );
-        assert!(
-            p.contains("memory/beads/"),
-            "phase 4 must target beads dir"
-        );
+        assert!(p.contains("memory/beads/"), "phase 4 must target beads dir");
         // Facts/beads paths must carry the `.nonoclaw/` prefix — bare
         // `memory/facts/` wording caused agents to write to the repo top level,
         // where the engine never loads them (silent strays).

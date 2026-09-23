@@ -133,7 +133,10 @@ impl Tool for ReadTool {
             // Truncate pathologically long lines (credential/minified dumps).
             let shown = if line.chars().count() > MAX_LINE_CHARS {
                 let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
-                format!("{cut}…[{} chars truncated]", line.chars().count() - MAX_LINE_CHARS)
+                format!(
+                    "{cut}…[{} chars truncated]",
+                    line.chars().count() - MAX_LINE_CHARS
+                )
             } else {
                 (*line).to_string()
             };
@@ -219,11 +222,7 @@ mod tests {
             background_registry: None,
         };
         let res = tool
-            .call(
-                json!({"file_path": ".env"}),
-                &ctx,
-                CancellationToken::new(),
-            )
+            .call(json!({"file_path": ".env"}), &ctx, CancellationToken::new())
             .await
             .unwrap();
         assert!(res.data.contains("refusing to read"), "got: {}", res.data);
@@ -264,7 +263,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(res.data.contains("[500 chars truncated]"), "got: {}", &res.data[..200]);
+        assert!(
+            res.data.contains("[500 chars truncated]"),
+            "got: {}",
+            &res.data[..200]
+        );
         assert!(res.data.len() < MAX_LINE_CHARS + 200);
     }
 

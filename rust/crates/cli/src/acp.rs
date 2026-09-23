@@ -68,11 +68,7 @@ pub async fn serve_stdin(
     serve_io(state, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-async fn serve_io<R, W>(
-    state: Arc<AcpState>,
-    reader: R,
-    writer: W,
-) -> nonoclaw_core::Result<()>
+async fn serve_io<R, W>(state: Arc<AcpState>, reader: R, writer: W) -> nonoclaw_core::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -196,10 +192,7 @@ fn prompt_text(params: &Value) -> String {
         .unwrap_or_default()
 }
 
-async fn new_session(
-    state: &AcpState,
-    params: &Value,
-) -> std::result::Result<Value, Value> {
+async fn new_session(state: &AcpState, params: &Value) -> std::result::Result<Value, Value> {
     let cwd = params
         .get("cwd")
         .and_then(|c| c.as_str())
@@ -218,10 +211,7 @@ async fn new_session(
 /// ACP `session/load`: resume a previously persisted session (the client —
 /// e.g. Zed — keeps the thread→sessionId mapping and calls this when
 /// reopening a thread). Mirrors `new_session`'s shape on success.
-async fn load_session(
-    state: &AcpState,
-    params: &Value,
-) -> std::result::Result<Value, Value> {
+async fn load_session(state: &AcpState, params: &Value) -> std::result::Result<Value, Value> {
     let Some(session_id) = params.get("sessionId").and_then(|s| s.as_str()) else {
         return Err(json!({"code": -32602, "message": "missing sessionId"}));
     };
@@ -266,15 +256,14 @@ async fn cancel_session(state: &AcpState, params: &Value) {
 }
 
 /// Run one prompt turn, streaming `session/update` notifications to `writer`.
-async fn prompt<W>(
-    state: &AcpState,
-    writer: &Arc<Mutex<W>>,
-    params: &Value,
-) -> Value
+async fn prompt<W>(state: &AcpState, writer: &Arc<Mutex<W>>, params: &Value) -> Value
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let Some(session_id) = params.get("sessionId").and_then(|s| s.as_str()).map(str::to_string)
+    let Some(session_id) = params
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
     else {
         return json!({"code": -32602, "message": "missing sessionId"});
     };
@@ -423,8 +412,7 @@ mod tests {
     #[test]
     fn acp_update_maps_model_facing_events() {
         assert_eq!(
-            acp_update(&RunEvent::TextDelta { text: "hi".into() })
-                .unwrap()["sessionUpdate"],
+            acp_update(&RunEvent::TextDelta { text: "hi".into() }).unwrap()["sessionUpdate"],
             "agent_message_chunk"
         );
         let tool = acp_update(&RunEvent::ToolUseStart {
@@ -487,10 +475,13 @@ mod tests {
 
         for expected_id in [1u64, 2u64] {
             let mut buf = String::new();
-            tokio::time::timeout(std::time::Duration::from_secs(10), test_r.read_line(&mut buf))
-                .await
-                .expect("serve_io stopped answering after the first request")
-                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                test_r.read_line(&mut buf),
+            )
+            .await
+            .expect("serve_io stopped answering after the first request")
+            .unwrap();
             let parsed: Value = serde_json::from_str(&buf).unwrap();
             assert_eq!(parsed["id"], expected_id, "unexpected response: {buf}");
         }
@@ -541,12 +532,9 @@ mod tests {
         assert_eq!(err["code"], -32000);
 
         // Path traversal → rejected before touching the filesystem.
-        let err = load_session(
-            &state,
-            &json!({"sessionId": "../../etc/passwd"}),
-        )
-        .await
-        .unwrap_err();
+        let err = load_session(&state, &json!({"sessionId": "../../etc/passwd"}))
+            .await
+            .unwrap_err();
         assert_eq!(err["code"], -32602);
 
         // Valid id → resumed and registered.

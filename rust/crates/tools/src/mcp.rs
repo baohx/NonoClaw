@@ -186,7 +186,8 @@ impl McpClient {
     }
 
     /// Invoke a tool; returns (text, is_error).
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool)> {        let result = self
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool)> {
+        let result = self
             .request("tools/call", json!({"name": name, "arguments": arguments}))
             .await?;
         let is_error = result

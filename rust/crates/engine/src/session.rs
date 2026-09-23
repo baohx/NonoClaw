@@ -183,7 +183,11 @@ enum SessionCommand {
     Clear(Reply<u64>),
     AppendMetadata(SessionEntry, Reply<u64>),
     Snapshot(Reply<SessionSnapshot>),
-    HistoryPage { before: usize, limit: usize, reply: Reply<SessionHistoryPage> },
+    HistoryPage {
+        before: usize,
+        limit: usize,
+        reply: Reply<SessionHistoryPage>,
+    },
 }
 
 /// One `load_older` page: messages strictly before `before`, ascending,
@@ -223,9 +227,17 @@ impl Session {
 
     /// Read one page of older messages (strictly before `before`, ascending)
     /// without materializing a full snapshot. Used by UI history paging.
-    pub async fn history_page(&self, before: usize, limit: usize) -> SessionResult<SessionHistoryPage> {
-        self.request(|reply| SessionCommand::HistoryPage { before, limit, reply })
-            .await
+    pub async fn history_page(
+        &self,
+        before: usize,
+        limit: usize,
+    ) -> SessionResult<SessionHistoryPage> {
+        self.request(|reply| SessionCommand::HistoryPage {
+            before,
+            limit,
+            reply,
+        })
+        .await
     }
 
     pub async fn append(&self, message: Message) -> SessionResult<u64> {
@@ -389,7 +401,9 @@ impl<T: Default> std::fmt::Debug for CacheCell<T> {
 
 impl<T: Default> Default for CacheCell<T> {
     fn default() -> Self {
-        Self { value: OnceLock::new() }
+        Self {
+            value: OnceLock::new(),
+        }
     }
 }
 
@@ -586,7 +600,14 @@ impl SessionService {
                 mtime,
                 run_outcomes,
             };
-            cache.insert(id, CachedSessionInfo { len, mtime_ms, info: info.clone() });
+            cache.insert(
+                id,
+                CachedSessionInfo {
+                    len,
+                    mtime_ms,
+                    info: info.clone(),
+                },
+            );
             out.push(info);
         }
         cache.retain(|id, _| seen.contains(id));
@@ -601,10 +622,12 @@ impl SessionService {
         Ok(self
             .list_sessions(cwd)?
             .into_iter()
-            .find(|info| !matches!(
-                info.tag.as_deref(),
-                Some(DREAM_SESSION_TAG) | Some(BENCH_SMOKE_SESSION_TAG)
-            ))
+            .find(|info| {
+                !matches!(
+                    info.tag.as_deref(),
+                    Some(DREAM_SESSION_TAG) | Some(BENCH_SMOKE_SESSION_TAG)
+                )
+            })
             .map(|info| info.id))
     }
 }
@@ -720,7 +743,11 @@ fn verification_evidence(detail: &str) -> bool {
     if let Some(idx) = d.find(" passed") {
         // Look back for a digit prefix: "12 passed", "3 passed".
         let prefix = &d[..idx];
-        if prefix.chars().rev().find(|c| !c.is_whitespace()).is_some_and(|c| c.is_ascii_digit())
+        if prefix
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| c.is_ascii_digit())
             && !prefix.ends_with('0')
         {
             return true;
@@ -1077,7 +1104,11 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
             SessionCommand::Snapshot(reply) => {
                 let _ = reply.send(Ok(state.snapshot()));
             }
-            SessionCommand::HistoryPage { before, limit, reply } => {
+            SessionCommand::HistoryPage {
+                before,
+                limit,
+                reply,
+            } => {
                 // Pure read over the in-memory message list: messages
                 // strictly before index `before`, ascending, capped at
                 // `limit`. Cloning the page keeps the writer's state intact.
@@ -1255,7 +1286,8 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
-fn sanitize_cwd(cwd: &Path) -> String {    cwd.to_string_lossy()
+fn sanitize_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
         .trim_start_matches(['/', '\\'])
         .replace(['/', '\\', ':'], "-")
 }
@@ -1296,7 +1328,9 @@ mod tests {
     /// heuristic (done=1, exhaustion penalties, cancelled=-0.3, error=-1).
     #[tokio::test]
     async fn list_sessions_cache_updates_on_append() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "cached-session", "model-x").unwrap();
@@ -1332,7 +1366,9 @@ mod tests {
 
     #[tokio::test]
     async fn trace_batch_roundtrips_through_disk() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "trace-session", "model-x").unwrap();
@@ -1352,9 +1388,7 @@ mod tests {
             )
         };
         let events = vec![envelope(1, 1_000), envelope(2, 2_500)];
-        s.write_trace("run-1", events)
-            .await
-            .unwrap();
+        s.write_trace("run-1", events).await.unwrap();
 
         // Freshly read snapshot exposes the trace batch.
         let snapshot = s.snapshot().await.unwrap();
@@ -1365,7 +1399,9 @@ mod tests {
         // And it survives a full reopen from disk (JSONL parse).
         let path = s.path().to_path_buf();
         drop(s);
-        let reopened = service.open_path(path, "trace-session", &cwd, "model-x").unwrap();
+        let reopened = service
+            .open_path(path, "trace-session", &cwd, "model-x")
+            .unwrap();
         let reopened_snapshot = reopened.snapshot().await.unwrap();
         assert_eq!(
             reopened_snapshot.traces.len(),
@@ -1391,7 +1427,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_outcome_persists_and_scores() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let cwd = tempdir();
         let service = SessionService::new();
         let s = service.create(&cwd, "rl-session", "model-x").unwrap();
@@ -1434,21 +1472,48 @@ mod tests {
         assert_eq!(run_reward("error", "boom"), -1.0);
 
         // Label-free adjustments (only apply to done runs).
-        let ok = RewardSignals { tools_ok: 10, tools_failed: 0 };
-        let mixed = RewardSignals { tools_ok: 5, tools_failed: 3 };
-        let hostile = RewardSignals { tools_ok: 2, tools_failed: 5 };
+        let ok = RewardSignals {
+            tools_ok: 10,
+            tools_failed: 0,
+        };
+        let mixed = RewardSignals {
+            tools_ok: 5,
+            tools_failed: 3,
+        };
+        let hostile = RewardSignals {
+            tools_ok: 2,
+            tools_failed: 5,
+        };
         // Verification evidence bonus, capped at 1.0.
         assert_eq!(
-            run_reward_labeled("done", "test result: ok. 12 passed", &RewardSignals::default()),
+            run_reward_labeled(
+                "done",
+                "test result: ok. 12 passed",
+                &RewardSignals::default()
+            ),
             1.0
         );
-        assert_eq!(run_reward_labeled("done", "3 passed", &RewardSignals::default()), 1.0);
-        assert_eq!(run_reward_labeled("done", "0 tests passed", &RewardSignals::default()), 1.0, "empty suite is not evidence");
-        assert_eq!(run_reward_labeled("done", "completed", &RewardSignals::default()), 1.0);
+        assert_eq!(
+            run_reward_labeled("done", "3 passed", &RewardSignals::default()),
+            1.0
+        );
+        assert_eq!(
+            run_reward_labeled("done", "0 tests passed", &RewardSignals::default()),
+            1.0,
+            "empty suite is not evidence"
+        );
+        assert_eq!(
+            run_reward_labeled("done", "completed", &RewardSignals::default()),
+            1.0
+        );
         // High tool error rate penalizes even a clean finish.
         assert!((run_reward_labeled("done", "completed", &hostile) - 0.7).abs() < 1e-9);
         assert!((run_reward_labeled("done", "completed", &mixed) - 0.85).abs() < 1e-9);
-        assert_eq!(run_reward_labeled("done", "completed", &ok), 1.0, "few tools → no rate judgment");
+        assert_eq!(
+            run_reward_labeled("done", "completed", &ok),
+            1.0,
+            "few tools → no rate judgment"
+        );
         // Non-done runs keep the base label untouched.
         assert_eq!(run_reward_labeled("error", "boom", &hostile), -1.0);
     }
@@ -1461,7 +1526,9 @@ mod tests {
         // `create` and `most_recent_session` here, sending storage to a
         // different root and failing the assertion. Pinning the var also
         // keeps stray sessions out of the real `~/.nonoclaw`.
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let home = tempdir();
         let saved_home = std::env::var_os("NONOCLAW_HOME");
         std::env::set_var("NONOCLAW_HOME", &home);
@@ -1479,10 +1546,7 @@ mod tests {
             .append(Message::user(MessageContent::from_text("consolidating")))
             .await
             .unwrap();
-        dream
-            .write_tag(DREAM_SESSION_TAG)
-            .await
-            .unwrap();
+        dream.write_tag(DREAM_SESSION_TAG).await.unwrap();
 
         let picked = service.most_recent_session(&cwd).unwrap();
         assert_eq!(
@@ -1500,10 +1564,7 @@ mod tests {
             .append(Message::user(MessageContent::from_text("task")))
             .await
             .unwrap();
-        smoke
-            .write_tag(BENCH_SMOKE_SESSION_TAG)
-            .await
-            .unwrap();
+        smoke.write_tag(BENCH_SMOKE_SESSION_TAG).await.unwrap();
         assert_eq!(
             service.most_recent_session(&cwd).unwrap().as_deref(),
             Some("work-session"),
@@ -1520,10 +1581,7 @@ mod tests {
             .await
             .unwrap();
         only.write_tag(DREAM_SESSION_TAG).await.unwrap();
-        assert_eq!(
-            service.most_recent_session(&only_dream_cwd).unwrap(),
-            None
-        );
+        assert_eq!(service.most_recent_session(&only_dream_cwd).unwrap(), None);
 
         // Restore the environment before releasing the lock.
         match saved_home {

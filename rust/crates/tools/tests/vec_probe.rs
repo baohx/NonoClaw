@@ -5,7 +5,7 @@
 //! trigram overlap clears 0.1 comfortably. If these measurements drift, the
 //! floor constant in `memory.rs` needs revisiting.
 
-use nonoclaw_tools::memory::{VECTOR_NOISE_FLOOR, cosine_similarity, embed};
+use nonoclaw_tools::memory::{cosine_similarity, embed, VECTOR_NOISE_FLOOR};
 
 fn cosine(a: &str, b: &str) -> f64 {
     cosine_similarity(&embed(a), &embed(b))
@@ -13,7 +13,10 @@ fn cosine(a: &str, b: &str) -> f64 {
 
 #[test]
 fn unrelated_texts_stay_below_floor() {
-    let unrelated = cosine("pip", "rust-edition use 2024 edition Use Rust edition 2024 for new projects. rust");
+    let unrelated = cosine(
+        "pip",
+        "rust-edition use 2024 edition Use Rust edition 2024 for new projects. rust",
+    );
     assert!(
         unrelated < VECTOR_NOISE_FLOOR,
         "unrelated cosine {unrelated} must stay below floor {VECTOR_NOISE_FLOOR}"

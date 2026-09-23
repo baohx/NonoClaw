@@ -112,13 +112,11 @@ mod tests {
     fn cache_read_accepts_deepseek_prompt_cache_hit_alias() {
         // DeepSeek's Anthropic-compatible endpoint may pass through its native
         // field name instead of translating to Anthropic's cache_read_input_tokens.
-        let part: UsagePart =
-            serde_json::from_str(r#"{"prompt_cache_hit_tokens": 60}"#).unwrap();
+        let part: UsagePart = serde_json::from_str(r#"{"prompt_cache_hit_tokens": 60}"#).unwrap();
         assert_eq!(part.cache_read_input_tokens, Some(60));
 
         // The canonical Anthropic name still works.
-        let part2: UsagePart =
-            serde_json::from_str(r#"{"cache_read_input_tokens": 42}"#).unwrap();
+        let part2: UsagePart = serde_json::from_str(r#"{"cache_read_input_tokens": 42}"#).unwrap();
         assert_eq!(part2.cache_read_input_tokens, Some(42));
     }
 }

@@ -66,9 +66,7 @@ pub struct ModelProviderMapping {
 
 /// Query balances for all configured providers concurrently.
 /// Silent on failure — problems are surfaced via `ok: false` in the result.
-pub async fn query_balances(
-    entries: &[(String, ProviderBillingEntry)],
-) -> Vec<ProviderBalance> {
+pub async fn query_balances(entries: &[(String, ProviderBillingEntry)]) -> Vec<ProviderBalance> {
     let client = reqwest::Client::new();
     let mut futures = Vec::new();
 
@@ -290,9 +288,7 @@ fn parse_glm_coding(body: &serde_json::Value) -> Result<ProviderBalance, String>
                 Some("TIME_LIMIT") => "MCP",
                 other => other.unwrap_or("?"),
             };
-            limit
-                .percentage
-                .map(|p| format!("{kind} {p:.0}%"))
+            limit.percentage.map(|p| format!("{kind} {p:.0}%"))
         })
         .collect();
     if parts.is_empty() {
@@ -333,7 +329,11 @@ fn parse_jiekou(body: &serde_json::Value) -> Result<ProviderBalance, String> {
     let mut bills: Vec<JieKouBill> = body
         .get("bills")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|b| serde_json::from_value(b.clone()).ok()).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| serde_json::from_value(b.clone()).ok())
+                .collect()
+        })
         .unwrap_or_default();
 
     if bills.is_empty() {
@@ -380,10 +380,7 @@ fn find_generic_balance(body: &serde_json::Value) -> Result<ProviderBalance, Str
             error: None,
         });
     }
-    if let Some(balance) = body
-        .pointer("/data/total_balance")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(balance) = body.pointer("/data/total_balance").and_then(|v| v.as_str()) {
         return Ok(ProviderBalance {
             provider: "unknown".into(),
             summary: balance.to_string(),
@@ -427,11 +424,17 @@ mod tests {
             Some("deepseek".into())
         );
         assert_eq!(
-            model_provider(&profile("glm-4.5-coding", "https://open.bigmodel.cn/api/paas/v4")),
+            model_provider(&profile(
+                "glm-4.5-coding",
+                "https://open.bigmodel.cn/api/paas/v4"
+            )),
             Some("glm-coding".into())
         );
         assert_eq!(
-            model_provider(&profile("glm-4-plus", "https://open.bigmodel.cn/api/paas/v4")),
+            model_provider(&profile(
+                "glm-4-plus",
+                "https://open.bigmodel.cn/api/paas/v4"
+            )),
             Some("glm-api".into())
         );
         assert_eq!(
@@ -439,11 +442,17 @@ mod tests {
             Some("jiekou".into())
         );
         assert_eq!(
-            model_provider(&profile("claude-sonnet-4-5", "https://api.highwayapi.ai/anthropic")),
+            model_provider(&profile(
+                "claude-sonnet-4-5",
+                "https://api.highwayapi.ai/anthropic"
+            )),
             Some("jiekou".into())
         );
         assert_eq!(
-            model_provider(&profile("claude-sonnet-4-5", "https://api.anthropic.com/v1")),
+            model_provider(&profile(
+                "claude-sonnet-4-5",
+                "https://api.anthropic.com/v1"
+            )),
             None
         );
     }
@@ -465,8 +474,12 @@ mod tests {
         let map = model_provider_map(&models);
         // deepseek + kimi resolved; anthropic has no match → excluded
         assert_eq!(map.len(), 2);
-        assert!(map.iter().any(|m| m.model == "deepseek-chat" && m.provider == "deepseek"));
-        assert!(map.iter().any(|m| m.model == "kimi-k2" && m.provider == "kimi"));
+        assert!(map
+            .iter()
+            .any(|m| m.model == "deepseek-chat" && m.provider == "deepseek"));
+        assert!(map
+            .iter()
+            .any(|m| m.model == "kimi-k2" && m.provider == "kimi"));
         assert!(!map.iter().any(|m| m.model == "claude-sonnet-4-5"));
     }
 
@@ -537,8 +550,16 @@ mod tests {
         });
         let balance = parse_provider_balance("jiekou", &body);
         assert!(balance.ok);
-        assert!(balance.summary.contains("本月 $17.55"), "expected 本月 $17.55, got: {}", balance.summary);
-        assert!(balance.summary.contains("累计 $21.53"), "expected 累计 $21.53, got: {}", balance.summary);
+        assert!(
+            balance.summary.contains("本月 $17.55"),
+            "expected 本月 $17.55, got: {}",
+            balance.summary
+        );
+        assert!(
+            balance.summary.contains("累计 $21.53"),
+            "expected 累计 $21.53, got: {}",
+            balance.summary
+        );
     }
 
     #[test]
@@ -593,9 +614,15 @@ mod live_tests {
         assert!(!entries.is_empty(), "no providerBilling configured");
         let balances = query_balances(&entries).await;
         for b in &balances {
-            eprintln!("[{:?}] ok={} summary={:?} error={:?}", b.provider, b.ok, b.summary, b.error);
+            eprintln!(
+                "[{:?}] ok={} summary={:?} error={:?}",
+                b.provider, b.ok, b.summary, b.error
+            );
         }
         // At least one provider must succeed against the real endpoints.
-        assert!(balances.iter().any(|b| b.ok), "all provider queries failed: {balances:#?}");
+        assert!(
+            balances.iter().any(|b| b.ok),
+            "all provider queries failed: {balances:#?}"
+        );
     }
 }

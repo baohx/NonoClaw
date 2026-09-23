@@ -40,7 +40,8 @@ async fn capture_one_request(response: &'static str) -> (String, tokio::task::Jo
             .lines()
             .find_map(|l| {
                 let (k, v) = l.split_once(':')?;
-                k.trim().eq_ignore_ascii_case("content-length")
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
                     .then(|| v.trim().parse().ok())?
             })
             .unwrap_or(0);
@@ -177,7 +178,10 @@ fn collect_keys(value: &serde_json::Value, keys: &mut Vec<String>) {
                 if !keys.iter().any(|e| e == k) {
                     keys.push(k.clone());
                 }
-                if !matches!(k.as_str(), "input" | "input_schema" | "parameters" | "arguments") {
+                if !matches!(
+                    k.as_str(),
+                    "input" | "input_schema" | "parameters" | "arguments"
+                ) {
                     collect_keys(v, keys);
                 }
             }
@@ -198,27 +202,61 @@ const FORBIDDEN: &[&str] = &["ts"];
 /// legitimately emit. Extend this list ONLY for provider protocol fields.
 const ANTHROPIC_ALLOWED: &[&str] = &[
     // request envelope
-    "model", "max_tokens", "stream", "messages", "system", "tools", "tool_choice",
+    "model",
+    "max_tokens",
+    "stream",
+    "messages",
+    "system",
+    "tools",
+    "tool_choice",
     // message envelope
-    "role", "content",
+    "role",
+    "content",
     // content blocks
-    "type", "text", "thinking", "signature", "id", "name", "input", "tool_use_id",
-    "is_error", "cache_control", "source", "media_type", "data",
+    "type",
+    "text",
+    "thinking",
+    "signature",
+    "id",
+    "name",
+    "input",
+    "tool_use_id",
+    "is_error",
+    "cache_control",
+    "source",
+    "media_type",
+    "data",
     // tools / tool_choice / system block internals
-    "description", "input_schema",
+    "description",
+    "input_schema",
 ];
 
 /// OpenAI Chat Completions whitelist for `serialize_body_openai`.
 const OPENAI_ALLOWED: &[&str] = &[
     // request envelope
-    "model", "max_tokens", "stream", "messages", "tools", "tool_choice", "temperature",
-    "stream_options", "include_usage",
+    "model",
+    "max_tokens",
+    "stream",
+    "messages",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "stream_options",
+    "include_usage",
     // message envelope
-    "role", "content", "tool_calls", "tool_call_id", "name",
+    "role",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+    "name",
     // tool_calls internals
-    "id", "type", "function", "arguments",
+    "id",
+    "type",
+    "function",
+    "arguments",
     // tools internals
-    "description", "parameters",
+    "description",
+    "parameters",
 ];
 
 #[tokio::test]
@@ -226,9 +264,7 @@ async fn anthropic_payload_contains_only_protocol_fields() {
     let (base_url, server) = capture_one_request(ANTHROPIC_SSE).await;
     let client = Client::new(Some("fixture-key".into()), None, base_url).unwrap();
     let params = request_params();
-    let _ = client
-        .run_turn(&params, |_event| {})
-        .await;
+    let _ = client.run_turn(&params, |_event| {}).await;
     let body = server.await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
@@ -263,9 +299,7 @@ async fn openai_payload_contains_only_protocol_fields() {
         .unwrap()
         .with_format(ApiFormat::OpenAI);
     let params = request_params();
-    let _ = client
-        .run_turn(&params, |_event| {})
-        .await;
+    let _ = client.run_turn(&params, |_event| {}).await;
     let body = server.await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 

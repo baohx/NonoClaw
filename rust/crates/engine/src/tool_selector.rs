@@ -75,7 +75,8 @@ fn query_tokens(query: &str) -> Vec<String> {
 fn score_entry(tokens: &[String], entry: &ToolSearchEntry) -> i32 {
     let name = entry.name.to_lowercase();
     let description = entry.description.to_lowercase();
-    let hint = entry.search_hint.to_lowercase();    let mut score = 0;
+    let hint = entry.search_hint.to_lowercase();
+    let mut score = 0;
     for token in tokens {
         if name == *token {
             score += 100;
@@ -182,7 +183,11 @@ fn entry_list_hash(entries: &[ToolSearchEntry]) -> u64 {
     for e in mcp {
         e.name.hash(&mut hasher);
         e.search_hint.hash(&mut hasher);
-        e.description.chars().take(200).collect::<String>().hash(&mut hasher);
+        e.description
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -350,8 +355,6 @@ mod tests {
         assert!(visible.contains("mcp__db__query"));
     }
 
-
-
     #[test]
     fn mcp_contract_groups_by_server_and_lists_tools() {
         let entries = vec![
@@ -376,8 +379,14 @@ mod tests {
         let entries = vec![entry("mcp__db__query", "query", "db")];
         assert!(refresh_mcp_contract(&dir, &entries), "first call writes");
         assert!(!refresh_mcp_contract(&dir, &entries), "same hash is no-op");
-        let changed = vec![entry("mcp__db__query", "query v2", "db"), entry("mcp__db__exec", "exec", "db")];
-        assert!(refresh_mcp_contract(&dir, &changed), "content change rewrites");
+        let changed = vec![
+            entry("mcp__db__query", "query v2", "db"),
+            entry("mcp__db__exec", "exec", "db"),
+        ];
+        assert!(
+            refresh_mcp_contract(&dir, &changed),
+            "content change rewrites"
+        );
         assert!(dir.join(".nonoclaw/mcp-contract.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }

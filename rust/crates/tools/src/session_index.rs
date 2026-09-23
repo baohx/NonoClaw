@@ -76,8 +76,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(TABLE[(n >> 18) as usize & 63] as char);
         out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -196,12 +204,10 @@ pub fn parse_session_chunks(path: &Path, session_id: &str) -> Vec<SessionChunk> 
                                     // Thinking text can be huge; keep the first slice only.
                                     if let Some(t) = block.get("thinking").and_then(|t| t.as_str())
                                     {
-                                        let head: String =
-                                            t.chars().take(400).collect();
+                                        let head: String = t.chars().take(400).collect();
                                         if !head.trim().is_empty() {
                                             push_chunk(
-                                                &mut out,
-                                                session_id, index, "thinking", &head,
+                                                &mut out, session_id, index, "thinking", &head,
                                             );
                                         }
                                     }
@@ -260,7 +266,9 @@ pub fn build_index(cwd: &Path, sessions_dir: &Path) -> SessionIndex {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Some(stamp) = stamp_of(&path) else { continue };
+            let Some(stamp) = stamp_of(&path) else {
+                continue;
+            };
             current.insert(stem.to_string(), stamp.clone());
             let unchanged = index
                 .stamps
@@ -304,11 +312,9 @@ pub fn build_index(cwd: &Path, sessions_dir: &Path) -> SessionIndex {
     }
     index.stamps = current;
     index.dim = VECTOR_DIM;
-    if let Err(e) = std::fs::create_dir_all(
-        session_index_path(cwd)
-            .parent()
-            .unwrap_or(Path::new(".")),
-    ) {
+    if let Err(e) =
+        std::fs::create_dir_all(session_index_path(cwd).parent().unwrap_or(Path::new(".")))
+    {
         tracing::warn!(error = %e, "cannot create memory dir for session index");
         return index;
     }
@@ -346,7 +352,11 @@ pub fn search(index: &SessionIndex, query: &str, limit: usize) -> Vec<SessionHit
         })
         .filter(|hit| hit.score > VECTOR_NOISE_FLOOR)
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     scored
 }
@@ -363,8 +373,14 @@ mod tests {
     #[test]
     fn base64_roundtrip() {
         for len in [0usize, 1, 2, 3, 64, 255, 256] {
-            let data: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37).wrapping_add(len as u8)).collect();
-            assert_eq!(base64_decode(&base64_encode(&data)).unwrap(), data, "len={len}");
+            let data: Vec<u8> = (0..len as u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(len as u8))
+                .collect();
+            assert_eq!(
+                base64_decode(&base64_encode(&data)).unwrap(),
+                data,
+                "len={len}"
+            );
         }
     }
 

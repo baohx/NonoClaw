@@ -10,8 +10,8 @@
 //! content-type-aware chars/token heuristic (prose ~4, code ~3) with ~10-15%
 //! error instead of the naive ~25%.
 
-use tiktoken::CoreBpe;
 use nonoclaw_core::{ContentBlock, Message, MessageContent};
+use tiktoken::CoreBpe;
 
 /// Default chars-per-token for plain English prose. Code and JSON have
 /// denser tokenization (~3 chars/token) due to symbols and short identifiers.
@@ -86,7 +86,29 @@ fn blended_chars_per_token(s: &str) -> f64 {
     }
     let code_indicators = s
         .chars()
-        .filter(|c| matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | ';' | '=' | '<' | '>' | '|' | '&' | '\\' | '/' | '*' | '#' | '$' | '@' | '`'))
+        .filter(|c| {
+            matches!(
+                c,
+                '{' | '}'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | ';'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '&'
+                    | '\\'
+                    | '/'
+                    | '*'
+                    | '#'
+                    | '$'
+                    | '@'
+                    | '`'
+            )
+        })
         .count();
     let ratio = code_indicators as f64 / s.chars().count() as f64;
     // Interpolate between prose (4) and code (3) based on symbol density.
@@ -110,7 +132,8 @@ pub fn estimate_message_tokens_for_model(model: Option<&str>, m: &Message) -> us
                     ContentBlock::Text { text, .. } => count_text_tokens(model, text),
                     ContentBlock::Thinking { thinking, .. } => count_text_tokens(model, thinking),
                     ContentBlock::ToolUse { name, input, .. } => {
-                        count_text_tokens(model, name) + count_text_tokens(model, &input.to_string())
+                        count_text_tokens(model, name)
+                            + count_text_tokens(model, &input.to_string())
                     }
                     ContentBlock::ToolResult { content, .. } => match content {
                         nonoclaw_core::ToolResultContent::Text(s) => count_text_tokens(model, s),
@@ -187,8 +210,12 @@ mod tests {
     #[test]
     fn code_content_estimates_higher_than_prose() {
         // Same length, but code has more symbols → more tokens.
-        let prose = Message::user(MessageContent::from_text("This is a sentence with words and more words here."));
-        let code = Message::user(MessageContent::from_text("{(\"key\": value); [arr] = func(a, b, c); return x;}"));
+        let prose = Message::user(MessageContent::from_text(
+            "This is a sentence with words and more words here.",
+        ));
+        let code = Message::user(MessageContent::from_text(
+            "{(\"key\": value); [arr] = func(a, b, c); return x;}",
+        ));
         let prose_tokens = estimate_message_tokens(&prose);
         let code_tokens = estimate_message_tokens(&code);
         assert!(

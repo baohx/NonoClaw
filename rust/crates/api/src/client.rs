@@ -310,9 +310,8 @@ fn endpoint_url(base_url: &str, endpoint: &str) -> String {
 /// Loopback stays allowed so local Ollama/vLLM endpoints (`http://localhost:*`)
 /// keep working.
 fn validate_base_url(base_url: &str) -> Result<()> {
-    let url = reqwest::Url::parse(base_url.trim()).map_err(|e| {
-        Error::Config(format!("invalid provider base_url `{base_url}`: {e}"))
-    })?;
+    let url = reqwest::Url::parse(base_url.trim())
+        .map_err(|e| Error::Config(format!("invalid provider base_url `{base_url}`: {e}")))?;
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -414,11 +413,12 @@ impl Client {
         // Messages endpoint (`/v1/messages`) rejects image content blocks.
         // So disable images only when this is a deepseek endpoint routed over
         // the Anthropic wire format; keep them for openai/responses/gemini.
-        let deepseek_anthropic_only = (deepseek_model || deepseek_endpoint)
-            && matches!(self.format, ApiFormat::Anthropic);
+        let deepseek_anthropic_only =
+            (deepseek_model || deepseek_endpoint) && matches!(self.format, ApiFormat::Anthropic);
         if deepseek_anthropic_only {
             capabilities.images = CapabilityStatus::Unsupported {
-                reason: "DeepSeek Anthropic-compatible endpoint does not accept image content blocks",
+                reason:
+                    "DeepSeek Anthropic-compatible endpoint does not accept image content blocks",
             };
         }
         capabilities
@@ -581,15 +581,14 @@ impl Client {
             ),
             ApiFormat::Gemini => {
                 let base = self.base_url.trim().trim_end_matches('/');
-                let url = if base.contains("streamGenerateContent")
-                    || base.contains("generateContent")
-                {
-                    base.to_string()
-                } else if base.ends_with("/v1") || base.contains("/v1/") {
-                    format!("{}/models/{}:generateContent", base, model)
-                } else {
-                    format!("{}/v1/models/{}:generateContent", base, model)
-                };
+                let url =
+                    if base.contains("streamGenerateContent") || base.contains("generateContent") {
+                        base.to_string()
+                    } else if base.ends_with("/v1") || base.contains("/v1/") {
+                        format!("{}/models/{}:generateContent", base, model)
+                    } else {
+                        format!("{}/v1/models/{}:generateContent", base, model)
+                    };
                 (
                     url,
                     serde_json::to_string(&serde_json::json!({
@@ -601,7 +600,10 @@ impl Client {
         };
         // Reuse the canonical header set (auth per format) via build_request's
         // rules: keep this probe aligned with real request authentication.
-        let mut req = self.http.post(url).header("content-type", "application/json");
+        let mut req = self
+            .http
+            .post(url)
+            .header("content-type", "application/json");
         match self.format {
             ApiFormat::Anthropic => {
                 req = req.header("anthropic-version", ANTHROPIC_VERSION);
@@ -908,7 +910,12 @@ impl BlockBuilder {
                         ))
                     })?
                 };
-                Ok(ContentBlock::ToolUse { id, name, input, cache_control: None })
+                Ok(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    cache_control: None,
+                })
             }
             BlockBuilder::Thinking {
                 thinking,
@@ -1166,20 +1173,22 @@ fn enforce_cache_breakpoint_cap(body: &mut serde_json::Value) {
         arrays
             .into_iter()
             .flatten()
-            .flat_map(|items| items.iter().map(|item| {
-                let own = item.get("cache_control").is_some() as usize;
-                let blocks = item
-                    .get("content")
-                    .and_then(|content| content.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|block| block.get("cache_control").is_some())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                own + blocks
-            }))
+            .flat_map(|items| {
+                items.iter().map(|item| {
+                    let own = item.get("cache_control").is_some() as usize;
+                    let blocks = item
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter(|block| block.get("cache_control").is_some())
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    own + blocks
+                })
+            })
             .sum()
     };
     let total = count_breakpoints(body);
@@ -1309,7 +1318,9 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
                                 "image_url":{"url": format!("data:{};base64,{}", source.media_type, source.data)}
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(serde_json::json!({
                                 "id": id, "type": "function",
                                 "function": {"name": name, "arguments": serde_json::to_string(input).unwrap_or_default()}
@@ -1533,9 +1544,8 @@ impl OpenAiState {
                 // A truncated stream can leave partial JSON arguments. Degrade
                 // to a `_partial_json` passthrough (matching `partial()`)
                 // instead of failing the whole turn.
-                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
-                    serde_json::json!({"_partial_json": tool.arguments})
-                })
+                serde_json::from_str(&tool.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"_partial_json": tool.arguments}))
             };
             content.push(ContentBlock::ToolUse {
                 id: tool.id,
@@ -1655,7 +1665,9 @@ fn handle_openai_chunk(
             // of the prompt is what entered the cache this turn, which maps
             // to Anthropic's cache_creation semantics for the UI bars.
             cache_creation_input_tokens: Some(
-                usage.prompt_tokens.saturating_sub(usage.cache_read_tokens()),
+                usage
+                    .prompt_tokens
+                    .saturating_sub(usage.cache_read_tokens()),
             ),
             cache_read_input_tokens: Some(usage.cache_read_tokens()),
         };
@@ -1700,7 +1712,10 @@ fn handle_openai_chunk(
         // Zen's ox-alpha/x-preview-f) emit `delta.reasoning_content` before the
         // visible `content`. Surface it as ThinkingDelta so the UI shows the
         // thought process and the turn doesn't look stalled.
-        if let Some(thinking) = delta.get("reasoning_content").and_then(|value| value.as_str()) {
+        if let Some(thinking) = delta
+            .get("reasoning_content")
+            .and_then(|value| value.as_str())
+        {
             if !thinking.is_empty() {
                 state.thinking_active = true;
                 on_event(&StreamEvent::ThinkingDelta {
@@ -1819,7 +1834,12 @@ fn serialize_body_responses(params: &RequestParams) -> Result<String> {
                                 "image_url": format!("data:{};base64,{}", source.media_type, source.data),
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input: tool_input, .. } => {
+                        ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input: tool_input,
+                            ..
+                        } => {
                             let call_args = tool_input.to_string();
                             input.push(serde_json::json!({
                                 "type": "function_call",
@@ -1898,7 +1918,9 @@ fn serialize_body_responses(params: &RequestParams) -> Result<String> {
         body["tool_choice"] = match params.tool_choice.as_ref() {
             None | Some(ToolChoice::Auto) => serde_json::json!("auto"),
             Some(ToolChoice::Any) => serde_json::json!("required"),
-            Some(ToolChoice::Tool { name }) => serde_json::json!({"type": "function", "name": name}),
+            Some(ToolChoice::Tool { name }) => {
+                serde_json::json!({"type": "function", "name": name})
+            }
             Some(ToolChoice::None) => serde_json::json!("none"),
         };
     }
@@ -1906,7 +1928,11 @@ fn serialize_body_responses(params: &RequestParams) -> Result<String> {
         // Map thinking config onto the Responses `reasoning.effort` dial.
         let effort = match thinking {
             ThinkingConfig::Enabled { budget_tokens } => {
-                if *budget_tokens >= 8000 { "high" } else { "medium" }
+                if *budget_tokens >= 8000 {
+                    "high"
+                } else {
+                    "medium"
+                }
             }
             ThinkingConfig::Adaptive { .. } => "medium",
         };
@@ -1987,9 +2013,8 @@ impl ResponsesState {
                 // A truncated stream can leave partial JSON arguments. Degrade
                 // to a `_partial_json` passthrough (matching `partial()`)
                 // instead of failing the whole turn.
-                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
-                    serde_json::json!({"_partial_json": tool.arguments})
-                })
+                serde_json::from_str(&tool.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"_partial_json": tool.arguments}))
             };
             content.push(ContentBlock::ToolUse {
                 id: tool.id,
@@ -2049,8 +2074,10 @@ fn handle_responses_chunk(
         "response.output_item.added" => {
             let item = &value["item"];
             if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                let index = value.get("output_index").and_then(|v| v.as_u64()).unwrap_or_default()
-                    as usize;
+                let index = value
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default() as usize;
                 let tool = state.tools.entry(index).or_default();
                 if let Some(id) = item.get("call_id").and_then(|v| v.as_str()) {
                     tool.id.push_str(id);
@@ -2069,8 +2096,10 @@ fn handle_responses_chunk(
             }
         }
         "response.function_call_arguments.delta" => {
-            let index = value.get("output_index").and_then(|v| v.as_u64()).unwrap_or_default()
-                as usize;
+            let index = value
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as usize;
             if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
                 let tool = state.tools.entry(index).or_default();
                 tool.arguments.push_str(delta);
@@ -2112,7 +2141,9 @@ fn handle_responses_chunk(
                 .or_else(|| response.get("status"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("completed");
-            let stop_reason = if event_type == "response.completed" && state.tools.values().any(|t| !t.id.is_empty()) {
+            let stop_reason = if event_type == "response.completed"
+                && state.tools.values().any(|t| !t.id.is_empty())
+            {
                 StopReason::ToolUse
             } else {
                 responses_stop_reason(reason)
@@ -2226,7 +2257,11 @@ fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
         std::collections::HashMap::new();
 
     for message in &params.messages {
-        let role = if message.role == nonoclaw_core::Role::Assistant { "model" } else { "user" };
+        let role = if message.role == nonoclaw_core::Role::Assistant {
+            "model"
+        } else {
+            "user"
+        };
         match &message.content {
             MessageContent::Text(text) => {
                 contents.push(serde_json::json!({"role": role, "parts": [{"text": text}]}));
@@ -2246,7 +2281,9 @@ fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
                                 }
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             call_names.insert(id.clone(), name.clone());
                             parts.push(serde_json::json!({
                                 "functionCall": {"name": name, "args": input}
@@ -2273,7 +2310,11 @@ fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
                                 }
                             };
                             let name = call_names.get(tool_use_id).cloned().unwrap_or_else(|| {
-                                tool_use_id.split('_').next().unwrap_or(tool_use_id).to_string()
+                                tool_use_id
+                                    .split('_')
+                                    .next()
+                                    .unwrap_or(tool_use_id)
+                                    .to_string()
                             });
                             parts.push(serde_json::json!({
                                 "functionResponse": {"name": name, "response": response}
@@ -2328,8 +2369,7 @@ fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
         body["generationConfig"]["temperature"] = serde_json::json!(t);
     }
     if let Some(thinking) = &params.thinking {
-        body["generationConfig"]["thinkingConfig"] =
-            serde_json::json!({"includeThoughts": true});
+        body["generationConfig"]["thinkingConfig"] = serde_json::json!({"includeThoughts": true});
         if let ThinkingConfig::Enabled { budget_tokens } = thinking {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"] =
                 serde_json::json!(budget_tokens);
@@ -2407,9 +2447,8 @@ impl GeminiState {
             let input = if tool.arguments.is_empty() {
                 serde_json::json!({})
             } else {
-                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| {
-                    serde_json::json!({"_gemini_raw": tool.arguments})
-                })
+                serde_json::from_str(&tool.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"_gemini_raw": tool.arguments}))
             };
             content.push(ContentBlock::ToolUse {
                 id: tool.id,
@@ -2487,7 +2526,9 @@ fn handle_gemini_chunk(
             });
         }
         let parts = &candidate["content"]["parts"];
-        let Some(parts) = parts.as_array() else { continue };
+        let Some(parts) = parts.as_array() else {
+            continue;
+        };
         for part in parts {
             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
@@ -2504,10 +2545,16 @@ fn handle_gemini_chunk(
                 }
             }
             if let Some(call) = part.get("functionCall") {
-                let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let name = call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 let id = format!("call_{}_{}", uuid_timestamp(), state.tool_call_counter);
                 state.tool_call_counter += 1;
-                let args = call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let args = call
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 let index = state.tools.len();
                 let tool = state.tools.entry(index).or_default();
                 tool.id = id.clone();
@@ -2569,7 +2616,10 @@ async fn fold_gemini_stream(
                     .pointer("/message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Gemini API error");
-                let status = error.get("status").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+                let status = error
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN");
                 return Err(state.failure(ProviderError::invalid_response(format!(
                     "{status}: {message}"
                 ))));
@@ -2657,8 +2707,7 @@ impl RawApiLogger {
                 "raw API logging enabled — full unredacted request/response payloads are being written to .nonoclaw/logs/api/"
             );
         });
-        let cwd =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let dir = cwd.join(".nonoclaw/logs/api");
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
@@ -2670,8 +2719,7 @@ impl RawApiLogger {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3201,7 +3249,9 @@ mod tests {
     fn probe_snippet_extracts_provider_message_and_flags_html() {
         // Nested provider error (zen/Anthropic shape).
         assert_eq!(
-            probe_snippet(r#"{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}"#),
+            probe_snippet(
+                r#"{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}"#
+            ),
             "Missing API key."
         );
         // OpenAI shape.
@@ -3210,7 +3260,10 @@ mod tests {
             "Model not supported"
         );
         // Top-level message.
-        assert_eq!(probe_snippet(r#"{"message":"insufficient balance"}"#), "insufficient balance");
+        assert_eq!(
+            probe_snippet(r#"{"message":"insufficient balance"}"#),
+            "insufficient balance"
+        );
         // HTML 404 pages collapse to a path hint, never raw markup.
         assert!(probe_snippet("<!DOCTYPE html><html>404</html>").contains("wrong endpoint path"));
         // Empty success body.
@@ -3233,7 +3286,8 @@ mod tests {
                 content: nonoclaw_core::MessageContent::Blocks(vec![
                     ContentBlock::text("describe"),
                     ContentBlock::Image {
-                        source: nonoclaw_core::ImageSource {                            kind: "base64".into(),
+                        source: nonoclaw_core::ImageSource {
+                            kind: "base64".into(),
                             media_type: "image/png".into(),
                             data: "aGk=".into(),
                         },
@@ -3283,7 +3337,9 @@ mod tests {
             _ => panic!("expected text"),
         }
         match &output.content[1] {
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "Read");
                 assert_eq!(input["path"], "/a");
@@ -3317,7 +3373,11 @@ mod tests {
                 Message {
                     role: nonoclaw_core::Role::User,
                     content: nonoclaw_core::MessageContent::Blocks(vec![
-                        ContentBlock::tool_result("call_9".to_string(), "file body".to_string(), false),
+                        ContentBlock::tool_result(
+                            "call_9".to_string(),
+                            "file body".to_string(),
+                            false,
+                        ),
                         ContentBlock::Image {
                             source: nonoclaw_core::ImageSource {
                                 kind: "base64".into(),
@@ -3341,13 +3401,19 @@ mod tests {
         let body = serialize_body_gemini(&params).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["contents"][0]["role"], "model");
-        assert_eq!(parsed["contents"][0]["parts"][0]["functionCall"]["name"], "Read");
+        assert_eq!(
+            parsed["contents"][0]["parts"][0]["functionCall"]["name"],
+            "Read"
+        );
         // functionResponse must resolve name via the preceding call_id map.
         assert_eq!(
             parsed["contents"][1]["parts"][0]["functionResponse"]["name"],
             "Read"
         );
-        assert_eq!(parsed["contents"][1]["parts"][1]["inline_data"]["mime_type"], "image/jpeg");
+        assert_eq!(
+            parsed["contents"][1]["parts"][1]["inline_data"]["mime_type"],
+            "image/jpeg"
+        );
 
         // Stream folding: text + functionCall + finishReason.
         let mut state = GeminiState::default();
@@ -3394,7 +3460,12 @@ mod tests {
         assert!(msg.contains("refusing plaintext HTTP"), "{msg}");
 
         let err = validate_base_url("ftp://example.com").unwrap_err();
-        assert!(err.to_string().contains("unsupported provider base_url scheme"), "{}", err);
+        assert!(
+            err.to_string()
+                .contains("unsupported provider base_url scheme"),
+            "{}",
+            err
+        );
     }
 
     #[test]
@@ -3537,7 +3608,9 @@ mod tests {
             _ => panic!("expected text block"),
         }
         match &content[1] {
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "Read");
                 assert_eq!(input["file_path"], "/a");
@@ -3615,12 +3688,28 @@ mod tests {
         // rolling message breakpoint = 5 > the provider cap of 4. The cap
         // enforcer must keep the deepest (rolling) markers and drop the
         // oldest system marker.
-        let cc = || Some(CacheControl { kind: nonoclaw_core::CacheControlKind::Ephemeral });
+        let cc = || {
+            Some(CacheControl {
+                kind: nonoclaw_core::CacheControlKind::Ephemeral,
+            })
+        };
         let mut params = fixture_params();
         params.system = vec![
-            SystemBlock { kind: "text".into(), text: "identity".into(), cache_control: cc() },
-            SystemBlock { kind: "text".into(), text: "project".into(), cache_control: cc() },
-            SystemBlock { kind: "text".into(), text: "memory".into(), cache_control: cc() },
+            SystemBlock {
+                kind: "text".into(),
+                text: "identity".into(),
+                cache_control: cc(),
+            },
+            SystemBlock {
+                kind: "text".into(),
+                text: "project".into(),
+                cache_control: cc(),
+            },
+            SystemBlock {
+                kind: "text".into(),
+                text: "memory".into(),
+                cache_control: cc(),
+            },
         ];
         params.tools[0].cache_control = cc();
         params.messages = vec![Message {
@@ -3633,7 +3722,10 @@ mod tests {
         }];
         let body: serde_json::Value =
             serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
-        let count = serde_json::to_string(&body).unwrap().matches("cache_control").count();
+        let count = serde_json::to_string(&body)
+            .unwrap()
+            .matches("cache_control")
+            .count();
         assert_eq!(count, 4, "exactly the cap of 4 breakpoints must survive");
         // The rolling message breakpoint survives...
         assert!(!body["messages"][0]["content"][0]["cache_control"].is_null());
@@ -3842,7 +3934,9 @@ mod tests {
         };
         let anthropic = usage_json_with_base(
             &glm_turn,
-            glm_turn.input_tokens + glm_turn.cache_read_input_tokens + glm_turn.cache_creation_input_tokens,
+            glm_turn.input_tokens
+                + glm_turn.cache_read_input_tokens
+                + glm_turn.cache_creation_input_tokens,
         );
         let expected = 9_216_f64 / (116_380 + 9_216) as f64 * 100.0;
         assert_eq!(anthropic["cache_hit_rate_pct"].as_f64().unwrap(), expected);
@@ -3858,7 +3952,9 @@ mod tests {
         };
         let rate = usage_json_with_base(
             &high_hit,
-            high_hit.input_tokens + high_hit.cache_read_input_tokens + high_hit.cache_creation_input_tokens,
+            high_hit.input_tokens
+                + high_hit.cache_read_input_tokens
+                + high_hit.cache_creation_input_tokens,
         )["cache_hit_rate_pct"]
             .as_f64()
             .unwrap();
@@ -3904,7 +4000,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
         let encoded = body.to_string();
-        assert!(!encoded.contains("\"ts\""), "session ts leaked into anthropic payload: {encoded}");
+        assert!(
+            !encoded.contains("\"ts\""),
+            "session ts leaked into anthropic payload: {encoded}"
+        );
         assert!(body["messages"][0]["content"].is_string());
     }
 
@@ -3916,13 +4015,16 @@ mod tests {
         // caching needs no markers — so the serializer must not leak the
         // Anthropic field into the OpenAI payload.
         let mut params = fixture_params();
-        let cc = Some(CacheControl { kind: nonoclaw_core::CacheControlKind::Ephemeral });
+        let cc = Some(CacheControl {
+            kind: nonoclaw_core::CacheControlKind::Ephemeral,
+        });
         params.messages = vec![Message {
             role: nonoclaw_core::Role::Assistant,
             content: nonoclaw_core::MessageContent::Blocks(vec![ContentBlock::ToolUse {
                 id: "tu_x".into(),
                 name: "Read".into(),
-                input: serde_json::json!({}),                cache_control: cc,
+                input: serde_json::json!({}),
+                cache_control: cc,
             }]),
             ts: None,
         }];
@@ -4264,9 +4366,7 @@ mod security_tests {
                 text: "system prompt body".into(),
                 cache_control: None,
             }],
-            messages: vec![Message::user(MessageContent::from_text(
-                "raw user prompt",
-            ))],
+            messages: vec![Message::user(MessageContent::from_text("raw user prompt"))],
             tools: vec![],
             tool_choice: None,
             thinking: None,
@@ -4328,8 +4428,7 @@ mod security_tests {
             .collect();
         assert_eq!(names.len(), 3, "request + resp + summary: {names:?}");
         let request_file = names.iter().find(|n| n.ends_with(".request.json")).unwrap();
-        let request_text =
-            std::fs::read_to_string(log_dir.join(request_file)).unwrap();
+        let request_text = std::fs::read_to_string(log_dir.join(request_file)).unwrap();
         // Full-fidelity diagnostics: prompt content IS present (that is the point).
         assert!(request_text.contains("raw user prompt"));
         assert!(request_text.contains("fixture-model"));
@@ -4403,7 +4502,10 @@ mod security_tests {
         let body_bytes = req.body().and_then(|b| b.as_bytes()).unwrap_or_default();
         let body = String::from_utf8_lossy(body_bytes);
         assert!(!body.contains(secret), "api key leaked into body: {body}");
-        assert!(!body.contains("x-api-key"), "header name leaked into body: {body}");
+        assert!(
+            !body.contains("x-api-key"),
+            "header name leaked into body: {body}"
+        );
 
         if let Some(v) = had_raw {
             std::env::set_var("NONOCLAW_RAW_API_LOG", v);

@@ -305,11 +305,10 @@ pub fn load_memory_prompt_with_partitions(
 
     let mut buf = String::new();
     let beads = nonoclaw_tools::memory::load_beads(cwd);
-    let active: Vec<&nonoclaw_tools::memory::Bead> =
-        nonoclaw_tools::memory::active_beads(&beads)
-            .into_iter()
-            .take(5)
-            .collect();
+    let active: Vec<&nonoclaw_tools::memory::Bead> = nonoclaw_tools::memory::active_beads(&beads)
+        .into_iter()
+        .take(5)
+        .collect();
     let facts = nonoclaw_tools::memory::load_facts(cwd);
     let mut top_facts: Vec<&nonoclaw_tools::memory::Fact> = facts.iter().collect();
     top_facts.sort_by(|left, right| {
@@ -460,10 +459,8 @@ mod tests {
 
     #[test]
     fn ancestor_nonoclaw_md_loaded_from_parent_dirs() {
-        let root = std::env::temp_dir().join(format!(
-            "nonoclaw-ancestor-ctx-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("nonoclaw-ancestor-ctx-{}", uuid::Uuid::new_v4()));
         let outer = root.join("outer");
         let inner = outer.join("inner");
         std::fs::create_dir_all(inner.join(".nonoclaw")).unwrap();
@@ -493,7 +490,10 @@ mod tests {
         // Inner (more specific) comes first in the budget race.
         let inner_pos = ctx.nonoclaw_md.find("INNER-CONVENTION");
         let outer_pos = ctx.nonoclaw_md.find("OUTER-CONVENTION");
-        assert!(inner_pos < outer_pos, "nearest ancestor loaded last-wins order");
+        assert!(
+            inner_pos < outer_pos,
+            "nearest ancestor loaded last-wins order"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -577,10 +577,8 @@ mod tests {
     #[test]
     fn legacy_memory_limit_preserves_behaviour() {
         // The single-limit wrapper still caps total size at `max_chars`.
-        let root = std::env::temp_dir().join(format!(
-            "nonoclaw-memory-legacy-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("nonoclaw-memory-legacy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".nonoclaw/memory")).unwrap();
         let fact_b = nonoclaw_tools::memory::Fact {
             name: "fact-b".into(),

@@ -297,18 +297,36 @@ mod tests {
 
     #[test]
     fn sudo_gets_noninteractive_flag() {
-        assert_eq!(ensure_sudo_noninteractive("sudo apt install"), "sudo -n apt install");
-        assert_eq!(ensure_sudo_noninteractive("sudo systemctl restart nginx"), "sudo -n systemctl restart nginx");
-        assert_eq!(ensure_sudo_noninteractive("  sudo make install"), "  sudo -n make install");
+        assert_eq!(
+            ensure_sudo_noninteractive("sudo apt install"),
+            "sudo -n apt install"
+        );
+        assert_eq!(
+            ensure_sudo_noninteractive("sudo systemctl restart nginx"),
+            "sudo -n systemctl restart nginx"
+        );
+        assert_eq!(
+            ensure_sudo_noninteractive("  sudo make install"),
+            "  sudo -n make install"
+        );
         // Plain sudo with no args
         assert_eq!(ensure_sudo_noninteractive("sudo"), "sudo -n");
         // Already has -n — no change
-        assert_eq!(ensure_sudo_noninteractive("sudo -n apt install"), "sudo -n apt install");
-        assert_eq!(ensure_sudo_noninteractive("sudo -E -n apt install"), "sudo -E -n apt install");
+        assert_eq!(
+            ensure_sudo_noninteractive("sudo -n apt install"),
+            "sudo -n apt install"
+        );
+        assert_eq!(
+            ensure_sudo_noninteractive("sudo -E -n apt install"),
+            "sudo -E -n apt install"
+        );
         // Non-sudo commands pass through
         assert_eq!(ensure_sudo_noninteractive("ls -la"), "ls -la");
         assert_eq!(ensure_sudo_noninteractive("apt install"), "apt install");
         // sudo in a pipe is NOT modified (not a leading sudo)
-        assert_eq!(ensure_sudo_noninteractive("echo foo | sudo tee /x"), "echo foo | sudo tee /x");
+        assert_eq!(
+            ensure_sudo_noninteractive("echo foo | sudo tee /x"),
+            "echo foo | sudo tee /x"
+        );
     }
 }

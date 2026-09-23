@@ -64,8 +64,8 @@ pub fn redact_credentials_opt(text: &str) -> Option<String> {
     }
 
     // 4. `Bearer <token>` (whole match replaced).
-    let bearer_re =
-        regex::Regex::new(r"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{12,}").expect("bearer regex is static");
+    let bearer_re = regex::Regex::new(r"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{12,}")
+        .expect("bearer regex is static");
     if bearer_re.is_match(&working) {
         working = bearer_re.replace_all(&working, REDACTED).into_owned();
         changed = true;
@@ -83,7 +83,11 @@ pub fn redact_credentials_opt(text: &str) -> Option<String> {
         changed = true;
     }
 
-    if changed { Some(working) } else { None }
+    if changed {
+        Some(working)
+    } else {
+        None
+    }
 }
 
 /// Redact credential-shaped material from `text` (always allocates).
@@ -120,7 +124,10 @@ mod tests {
         assert!(out.contains("PORT=8080"));
         assert!(out.contains("PASSWORD=[REDACTED]"));
         assert!(out.contains("TOKEN=[REDACTED]"));
-        assert!(out.contains("NORMAL_KEY=keepme"), "non-secret keys untouched");
+        assert!(
+            out.contains("NORMAL_KEY=keepme"),
+            "non-secret keys untouched"
+        );
         assert!(!out.contains("hunter2"));
         assert!(!out.contains("abc123tokenvalue"));
     }
@@ -132,9 +139,15 @@ mod tests {
         // PASSWORD survived while API_KEY was caught by the token rule).
         let text = "     1\t# sample config\n     2\tSERVER=prod01\n     3\tPASSWORD=superSecretValue123\n     4\tAPI_KEY=sk-ant-api03-abcdEFGH1234xyz\n     5\tEND=tail\n";
         let out = redact_credentials(text);
-        assert!(!out.contains("superSecretValue123"), "PASSWORD value leaked: {out}");
+        assert!(
+            !out.contains("superSecretValue123"),
+            "PASSWORD value leaked: {out}"
+        );
         assert!(!out.contains("sk-ant-api03"), "API key leaked: {out}");
-        assert!(out.contains("PASSWORD=[REDACTED]"), "PASSWORD line redacted: {out}");
+        assert!(
+            out.contains("PASSWORD=[REDACTED]"),
+            "PASSWORD line redacted: {out}"
+        );
         assert!(out.contains("SERVER=prod01"), "benign lines survive: {out}");
         assert!(out.contains("END=tail"), "benign lines survive: {out}");
     }
@@ -174,7 +187,10 @@ mod tests {
         let text = "Authorization: Bearer abcDEF1234567890xyz\nBearer short";
         let out = redact_credentials(text);
         assert!(out.contains("[REDACTED]"));
-        assert!(out.contains("Bearer short"), "short token (prose) untouched");
+        assert!(
+            out.contains("Bearer short"),
+            "short token (prose) untouched"
+        );
     }
 
     #[test]

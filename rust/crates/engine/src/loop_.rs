@@ -30,8 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::SubagentLifecycle;
 use crate::compact::{compact_messages, KEEP_RECENT_TURNS};
 use crate::context::{
-    get_system_context_with_limit, get_user_context_with_limit,
-    load_memory_prompt_with_partitions,
+    get_system_context_with_limit, get_user_context_with_limit, load_memory_prompt_with_partitions,
 };
 use crate::run::{RunContext, RunController, RunLimits, RunTerminalStatus};
 use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
@@ -251,7 +250,9 @@ fn bounded_history_block(block: &ContentBlock, max_chars: usize) -> Option<Conte
                 source: source.clone(),
             })
         }
-        ContentBlock::ToolUse { id, name, input, .. } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             let mut bounded = ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
@@ -532,20 +533,18 @@ fn redact_tool_result_credentials(messages: &[Message]) -> Vec<Message> {
                                 None => block.clone(),
                             }
                         }
-                        ToolResultContent::Blocks(inner) => {
-                            match redact_inner_text_blocks(inner) {
-                                Some(inner2) => {
-                                    changed = true;
-                                    ContentBlock::ToolResult {
-                                        tool_use_id: tool_use_id.clone(),
-                                        content: ToolResultContent::Blocks(inner2),
-                                        is_error: *is_error,
-                                        cache_control: cache_control.clone(),
-                                    }
+                        ToolResultContent::Blocks(inner) => match redact_inner_text_blocks(inner) {
+                            Some(inner2) => {
+                                changed = true;
+                                ContentBlock::ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    content: ToolResultContent::Blocks(inner2),
+                                    is_error: *is_error,
+                                    cache_control: cache_control.clone(),
                                 }
-                                None => block.clone(),
                             }
-                        }
+                            None => block.clone(),
+                        },
                     },
                     _ => block.clone(),
                 })
@@ -569,24 +568,28 @@ fn redact_inner_text_blocks(inner: &[ContentBlock]) -> Option<Vec<ContentBlock>>
     let out: Vec<ContentBlock> = inner
         .iter()
         .map(|b| match b {
-            ContentBlock::Text { text, cache_control } => {
-                match nonoclaw_core::redaction::redact_credentials_opt(text) {
-                    Some(clean) => {
-                        changed = true;
-                        ContentBlock::Text {
-                            text: clean,
-                            cache_control: cache_control.clone(),
-                        }
+            ContentBlock::Text {
+                text,
+                cache_control,
+            } => match nonoclaw_core::redaction::redact_credentials_opt(text) {
+                Some(clean) => {
+                    changed = true;
+                    ContentBlock::Text {
+                        text: clean,
+                        cache_control: cache_control.clone(),
                     }
-                    None => b.clone(),
                 }
-            }
+                None => b.clone(),
+            },
             _ => b.clone(),
         })
         .collect();
-    if changed { Some(out) } else { None }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
 }
-
 
 /// Mark prefix breakpoints for Anthropic prompt caching.
 ///
@@ -1380,10 +1383,7 @@ impl QueryEngine {
     /// contexts share the collector, but `replay_snapshot` retains the same
     /// scoped wrapper events the live browser received and excludes raw child
     /// envelopes, so reload is behaviorally equivalent to live rendering.
-    pub(crate) async fn persist_run_trace_to(
-        session: Option<&Session>,
-        context: &RunContext,
-    ) {
+    pub(crate) async fn persist_run_trace_to(session: Option<&Session>, context: &RunContext) {
         let Some(session) = session else {
             return;
         };
@@ -1552,10 +1552,12 @@ impl QueryEngine {
         // would otherwise never be trimmed, and the rewrite happens at the
         // run boundary so the in-run prefix bytes stay stable.
         {
-            let (microd, micro_count) =
-                crate::compact::micro_compact(&self.messages, 0);
+            let (microd, micro_count) = crate::compact::micro_compact(&self.messages, 0);
             if micro_count > 0 {
-                if self.persist_compaction(microd.clone(), self.session_revision).await {
+                if self
+                    .persist_compaction(microd.clone(), self.session_revision)
+                    .await
+                {
                     self.messages = microd;
                 }
             }
@@ -1665,11 +1667,8 @@ impl QueryEngine {
         if context.parent_run_id.is_none() {
             crate::tool_selector::refresh_mcp_contract(cwd, &self.registry.search_entries());
         }
-        let priority = tool_payload_priority(
-            &self.options.core_tools,
-            &activated_order,
-            &extras_order,
-        );
+        let priority =
+            tool_payload_priority(&self.options.core_tools, &activated_order, &extras_order);
         let tool_schema_max_chars =
             crate::budget::ContextBudget::chars(context_budget.tool_schema_tokens, chars_per_token);
         let (mut tool_defs, tool_prompts) = build_tool_payload(
@@ -1986,11 +1985,8 @@ impl QueryEngine {
                 } else {
                     Some(self.options.allowed_tools.as_slice())
                 };
-                let priority = tool_payload_priority(
-                    &self.options.core_tools,
-                    &next_activated,
-                    &extras_order,
-                );
+                let priority =
+                    tool_payload_priority(&self.options.core_tools, &next_activated, &extras_order);
                 let (next_defs, next_prompts) = build_tool_payload(
                     &self.registry,
                     &visible_tools,
@@ -2232,7 +2228,8 @@ impl QueryEngine {
                 // under their thresholds, skip the summarizer call entirely.
                 let mut pruned_results = 0usize;
                 if should_prefire || should_compact {
-                    let (pruned, pruned_count) = crate::compact::prune_tool_results(&self.messages, self.cache.frozen_idx);
+                    let (pruned, pruned_count) =
+                        crate::compact::prune_tool_results(&self.messages, self.cache.frozen_idx);
                     if pruned_count > 0 {
                         let est_after = estimate_total_for_model(
                             Some(&self.options.model),
@@ -2612,8 +2609,7 @@ impl QueryEngine {
                         // the "max length" wording; transient stream failures
                         // (connection reset, decode errors) must not be
                         // reported as output-limit errors.
-                        let is_length_limit =
-                            error_indicates_length_limit(&failure.error.message);
+                        let is_length_limit = error_indicates_length_limit(&failure.error.message);
                         let notice = truncation_notice(is_length_limit);
                         on_event(&RunEvent::TextDelta {
                             text: notice.to_string(),
@@ -2751,9 +2747,9 @@ impl QueryEngine {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, name, input, .. } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some((id.clone(), name.clone(), input.clone())),
                     _ => None,
                 })
                 .collect();
@@ -2854,10 +2850,7 @@ impl QueryEngine {
                 // truncated call is structurally paired. See
                 // `recovery-entry-predicate-root-cause-not-symptom-shape`.
                 let thinking_truncated = turn.stop_reason == Some(StopReason::MaxTokens)
-                    && matches!(
-                        turn.content.last(),
-                        Some(ContentBlock::Thinking { .. })
-                    );
+                    && matches!(turn.content.last(), Some(ContentBlock::Thinking { .. }));
                 if thinking_truncated {
                     // Detection alone left the run dead (2026-08-29 sessions:
                     // drafts fully formed in thinking, zero text/tool_use,
@@ -2926,8 +2919,7 @@ impl QueryEngine {
                     detail: if thinking_truncated {
                         "model stop reason: max_tokens (truncated mid-thinking; per-turn output budget exhausted before any answer)".into()
                     } else {
-                        turn
-                            .stop_reason
+                        turn.stop_reason
                             .as_ref()
                             .map(|reason| format!("model stop reason: {}", reason.as_str()))
                             .unwrap_or_else(|| "model returned no further tool calls".into())
@@ -3223,8 +3215,7 @@ impl QueryEngine {
             // cacheable prefix; the superseded snapshot earlier in history
             // gets reclaimed by micro-compact (2K threshold).
             if ran_mutating_tool {
-                let fresh =
-                    get_system_context_with_limit(cwd, prompt_limits.git_chars).await;
+                let fresh = get_system_context_with_limit(cwd, prompt_limits.git_chars).await;
                 let body = format!(
                     "<git_status turn=\"{turns_made}\">\n{}\n</git_status>",
                     fresh.git_summary.trim()
@@ -3463,7 +3454,10 @@ fn forward_stream_event(
             // The thinking block closed (not the whole message). This is the
             // precise end of reasoning; MessageStop still emits a fallback
             // `active: false` for providers that skip block-level events.
-            on_event(&RunEvent::ThinkingState { active: false, turn });
+            on_event(&RunEvent::ThinkingState {
+                active: false,
+                turn,
+            });
         }
         StreamEvent::MessageDelta { usage, .. } => {
             let mut total = total_before_turn;
@@ -4393,7 +4387,10 @@ mod tests {
         let serialized = serde_json::to_string(&prepared).unwrap();
         assert!(!serialized.contains("hunter2"), "kv secret leaked");
         assert!(!serialized.contains("MIIEow"), "private key body leaked");
-        assert!(!serialized.contains("RSA PRIVATE KEY-----"), "pem headers leaked");
+        assert!(
+            !serialized.contains("RSA PRIVATE KEY-----"),
+            "pem headers leaked"
+        );
         assert!(serialized.contains("[REDACTED PRIVATE KEY]"));
         assert!(serialized.contains("PASSWORD=[REDACTED]"));
         // Benign content in the same result survives.
@@ -4715,8 +4712,7 @@ mod tests {
             &[text1.clone(), text2.clone()],
             &activated,
         );
-        let union12: std::collections::HashSet<_> =
-            single1.0.union(&single2.0).cloned().collect();
+        let union12: std::collections::HashSet<_> = single1.0.union(&single2.0).cloned().collect();
         assert_eq!(both.0, union12);
         assert_eq!(
             &both.1[..single1.1.len()],
@@ -4738,7 +4734,11 @@ mod tests {
         );
         assert_eq!(
             p,
-            vec!["ToolSearch".to_string(), "Agent".to_string(), single1.1[0].clone()]
+            vec![
+                "ToolSearch".to_string(),
+                "Agent".to_string(),
+                single1.1[0].clone()
+            ]
         );
     }
 
@@ -4762,8 +4762,7 @@ mod tests {
         assert!(nonoclaw_tools::builtin::tool_search::activate_tool(
             &scope, "Agent"
         ));
-        let activated_order =
-            nonoclaw_tools::builtin::tool_search::activated_tools_ordered(&scope);
+        let activated_order = nonoclaw_tools::builtin::tool_search::activated_tools_ordered(&scope);
         let activated: std::collections::HashSet<String> =
             activated_order.iter().cloned().collect();
         let visible = selected_tool_names(&registry, &options, "hello", &activated);
@@ -5746,14 +5745,17 @@ mod tests {
     async fn micro_compact_rewrites_are_persisted_to_session() {
         let (client, _requests, fixture_task) =
             spawn_provider_fixture(vec!["fixture answer"]).await;
-        let cwd = std::env::temp_dir().join(format!(
-            "nonoclaw-micro-persist-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let cwd =
+            std::env::temp_dir().join(format!("nonoclaw-micro-persist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).unwrap();
         let session_file = cwd.join("micro-persist.jsonl");
         let session = crate::session::SessionService::new()
-            .open_path(session_file, "micro-persist-id", &cwd, "fixture-requested-model")
+            .open_path(
+                session_file,
+                "micro-persist-id",
+                &cwd,
+                "fixture-requested-model",
+            )
             .unwrap();
         // Seed a session whose old tail already holds a large tool result
         // (>2048 chars, more than MICRO_PROTECT_RECENT messages from the end).
@@ -5777,11 +5779,7 @@ mod tests {
             .unwrap();
         session
             .append(Message::user(MessageContent::from_blocks(vec![
-                ContentBlock::tool_result(
-                    "micro-t1".into(),
-                    large_result,
-                    false,
-                ),
+                ContentBlock::tool_result("micro-t1".into(), large_result, false),
             ])))
             .await
             .unwrap();
@@ -5802,8 +5800,14 @@ mod tests {
             auto_compact: true,
             ..EngineOptions::default()
         };
-        let mut engine =
-            QueryEngine::with_session(client, Arc::new(registry), todos, options, session, snapshot);
+        let mut engine = QueryEngine::with_session(
+            client,
+            Arc::new(registry),
+            todos,
+            options,
+            session,
+            snapshot,
+        );
         engine
             .run(MessageContent::from_text("new question"), &cwd, |_event| {})
             .await
@@ -5922,10 +5926,10 @@ mod tests {
         assert!(!error_indicates_length_limit(
             "error decoding response body"
         ));
+        assert!(!error_indicates_length_limit("connection reset by peer"));
         assert!(!error_indicates_length_limit(
-            "connection reset by peer"
+            "stream closed before completion"
         ));
-        assert!(!error_indicates_length_limit("stream closed before completion"));
         let network_notice = truncation_notice(false);
         assert!(network_notice.contains("流式响应中断"));
         assert!(
@@ -5976,7 +5980,11 @@ mod tests {
             let role = if i % 2 == 0 { "user" } else { "assistant" };
             let text = format!("message {i} from {role}");
             messages.push(Message {
-                role: if i % 2 == 0 { Role::User } else { Role::Assistant },
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
                 content: MessageContent::from_text(text),
                 ts: None,
             });
@@ -5991,7 +5999,10 @@ mod tests {
             }
             false
         };
-        assert!(check_idx(19), "rolling breakpoint must be on the last message");
+        assert!(
+            check_idx(19),
+            "rolling breakpoint must be on the last message"
+        );
         // No other message may carry a breakpoint (4-breakpoint provider cap;
         // system+tools already spend the rest).
         for idx in 0..19 {
@@ -6005,7 +6016,11 @@ mod tests {
         // 20 messages, this run started at index 10 → sealed history [0,10).
         let mut messages = Vec::new();
         for i in 0..20 {
-            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
             messages.push(Message {
                 role,
                 content: MessageContent::from_text(format!("m{i}")),
@@ -6021,8 +6036,14 @@ mod tests {
             }
             false
         };
-        assert!(check_idx(9), "frozen boundary message (frozen_idx-1) carries the sealed breakpoint");
-        assert!(check_idx(19), "rolling breakpoint stays on the last message");
+        assert!(
+            check_idx(9),
+            "frozen boundary message (frozen_idx-1) carries the sealed breakpoint"
+        );
+        assert!(
+            check_idx(19),
+            "rolling breakpoint stays on the last message"
+        );
         for idx in 0..19 {
             if idx != 9 {
                 assert!(!check_idx(idx), "idx {idx} should not carry a breakpoint");
@@ -6079,7 +6100,10 @@ mod tests {
                 assert_eq!(blocks.len(), 1, "no synthetic blocks: {blocks:?}");
                 match blocks.last() {
                     Some(ContentBlock::ToolResult { cache_control, .. }) => {
-                        assert!(cache_control.is_some(), "tool_result carries the breakpoint");
+                        assert!(
+                            cache_control.is_some(),
+                            "tool_result carries the breakpoint"
+                        );
                     }
                     other => panic!("expected tool_result, got {other:?}"),
                 }
@@ -6102,7 +6126,10 @@ mod tests {
             MessageContent::Blocks(blocks) => {
                 assert!(matches!(
                     blocks.last(),
-                    Some(ContentBlock::ToolUse { cache_control: Some(_), .. })
+                    Some(ContentBlock::ToolUse {
+                        cache_control: Some(_),
+                        ..
+                    })
                 ));
             }
             other => panic!("expected blocks, got {other:?}"),
@@ -6118,7 +6145,10 @@ mod tests {
         let result = apply_cache_breakpoints(messages, 0);
         if let MessageContent::Blocks(blocks) = &result[0].content {
             if let Some(ContentBlock::Text { cache_control, .. }) = blocks.last() {
-                assert!(cache_control.is_some(), "single message must carry the rolling breakpoint");
+                assert!(
+                    cache_control.is_some(),
+                    "single message must carry the rolling breakpoint"
+                );
                 return;
             }
         }
