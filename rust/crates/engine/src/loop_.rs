@@ -388,7 +388,12 @@ fn bounded_history_sequence(messages: &[Message], max_chars: usize) -> Vec<Messa
 }
 
 fn history_window(messages: &[Message], max_chars: usize) -> Vec<Message> {
-    if payload_history_chars(messages) <= max_chars {
+    // Prefix-cumulative suffix sums: suffix[i] = chars over messages [i, len).
+    let mut suffix = vec![0usize; messages.len() + 1];
+    for i in (0..messages.len()).rev() {
+        suffix[i] = suffix[i + 1] + payload_message_chars(&messages[i]);
+    }
+    if suffix[0] <= max_chars {
         return messages.to_vec();
     }
     if messages.is_empty() || max_chars == 0 {
@@ -408,14 +413,14 @@ fn history_window(messages: &[Message], max_chars: usize) -> Vec<Message> {
 
     let start = (0..messages.len())
         .filter(|index| is_plain_history_user(&messages[*index]))
-        .find(|index| payload_history_chars(&messages[*index..]) <= tail_budget)
+        .find(|index| suffix[*index] <= tail_budget)
         .or_else(|| {
             (0..messages.len())
                 .rev()
                 .find(|index| is_plain_history_user(&messages[*index]))
         })
         .unwrap_or(messages.len() - 1);
-    let tail = if payload_history_chars(&messages[start..]) <= tail_budget {
+    let tail = if suffix[start] <= tail_budget {
         messages[start..].to_vec()
     } else {
         bounded_history_sequence(&messages[start..], tail_budget)
@@ -1223,6 +1228,65 @@ struct EngineCache {
     /// Keyed by tool-specific resource identifier (e.g. "Read:/path/to/file").
     /// LRU-bounded by [`TOOL_RESULT_CACHE_MAX`].
     tool_result_cache: std::collections::HashMap<String, ToolResultCacheEntry>,
+    /// Per-message cumulative payload char counts (`payload_message_chars`)
+    /// in lockstep with `QueryEngine::messages`: `history_chars[i]` sums
+    /// messages `[0, i)`, so suffix sums and totals are O(1). Appends go
+    /// through `push_history_chars`; every rewrite/replace/clear site
+    /// (compaction, micro-compact, prune, restore) calls
+    /// `invalidate_message_char_cache` and the arrays rebuild lazily.
+    history_chars: Vec<usize>,
+}
+
+impl EngineCache {
+    /// Rebuild the cumulative char cache from scratch (O(n) in messages).
+    fn rebuild_history_chars(&mut self, messages: &[Message]) {
+        self.history_chars.clear();
+        self.history_chars.reserve(messages.len() + 1);
+        let mut total = 0usize;
+        self.history_chars.push(0);
+        for message in messages {
+            total += payload_message_chars(message);
+            self.history_chars.push(total);
+        }
+    }
+
+    /// Total payload chars over all messages; O(1) after the first call
+    /// following an append/rewrite.
+    fn history_chars_through(&mut self, messages: &[Message]) -> usize {
+        self.rebuild_if_stale(messages);
+        self.history_chars[messages.len()]
+    }
+
+    /// Record one appended message incrementally (O(1), no rescan). Only
+    /// valid when the cache trails the log by exactly one message; any other
+    /// state (already fresh, same-length rewrite, big jump) rebuilds instead,
+    /// so a missed `invalidate_message_char_cache` self-heals on the next
+    /// push rather than silently returning stale sums.
+    fn push_history_chars(&mut self, messages: &[Message]) {
+        if self.history_chars.len() != messages.len() {
+            self.rebuild_history_chars(messages);
+            return;
+        }
+        let Some(last) = messages.last() else {
+            return;
+        };
+        let prev = *self.history_chars.last().unwrap_or(&0);
+        self.history_chars.push(prev + payload_message_chars(last));
+    }
+
+    /// Invalidate after any non-append mutation (rewrite/replace/clear).
+    fn invalidate_message_char_cache(&mut self) {
+        self.history_chars.clear();
+    }
+
+    /// A valid cache always holds exactly `len + 1` entries for the current
+    /// message count (prefix-cumulative over an append-only log). Any other
+    /// length means a rewrite/truncation happened — rebuild lazily.
+    fn rebuild_if_stale(&mut self, messages: &[Message]) {
+        if self.history_chars.len() != messages.len() + 1 {
+            self.rebuild_history_chars(messages);
+        }
+    }
 }
 
 /// Maximum number of entries in the tool-result dedup cache. Each entry
@@ -1271,6 +1335,7 @@ impl Default for EngineCache {
             cached_git_context: None,
             tool_result_cache: std::collections::HashMap::new(),
             last_request: None,
+            history_chars: Vec::new(),
         }
     }
 }
@@ -1559,12 +1624,14 @@ impl QueryEngine {
                     .await
                 {
                     self.messages = microd;
+                    self.cache.invalidate_message_char_cache();
                 }
             }
         }
         self.cache.frozen_idx = self.messages.len();
         let user_msg = Message::user(user_content.clone());
         self.messages.push(user_msg.clone());
+        self.cache.push_history_chars(&self.messages);
         self.persist(user_msg).await;
 
         // Apply every budget before constructing the provider payload. Cache
@@ -1624,6 +1691,7 @@ impl QueryEngine {
                 system_ctx.git_summary.trim()
             )));
             self.messages.push(git_msg.clone());
+            self.cache.push_history_chars(&self.messages);
             self.persist(git_msg).await;
         }
         let user_ctx = get_user_context_with_limit(
@@ -2088,6 +2156,7 @@ impl QueryEngine {
                             let tokens_after =
                                 ratio_tokens(tokens_at_spawn, chars_at_spawn, chars_after);
                             self.messages = compacted;
+                            self.cache.invalidate_message_char_cache();
                             self.cache.frozen_idx = 0;
                             on_event(&EngineEvent::Compacted {
                                 removed,
@@ -2186,6 +2255,7 @@ impl QueryEngine {
                         self.persist_compaction(microd.clone(), micro_revision)
                             .await;
                         self.messages = microd;
+                        self.cache.invalidate_message_char_cache();
                         self.cache.last_input_tokens = 0;
                         on_event(&EngineEvent::Compacted {
                             removed: 0,
@@ -2210,7 +2280,9 @@ impl QueryEngine {
                         self.options.chars_per_token,
                     )
                 };
-                let history_est = payload_history_chars(&self.messages)
+                let history_est = self
+                    .cache
+                    .history_chars_through(&self.messages)
                     .div_ceil(chars_per_token)
                     .saturating_add(self.messages.len().saturating_mul(4));
                 let (mut should_prefire, mut should_compact) = compaction_decision(
@@ -2248,6 +2320,7 @@ impl QueryEngine {
                             context_budget.history_tokens,
                         );
                         self.messages = pruned;
+                        self.cache.invalidate_message_char_cache();
                         // Messages changed: the provider-reported token cache no
                         // longer reflects this transcript, so clear it.
                         self.cache.last_input_tokens = 0;
@@ -2391,6 +2464,7 @@ impl QueryEngine {
                             .await
                     {
                         self.messages = compacted;
+                        self.cache.invalidate_message_char_cache();
                         self.cache.frozen_idx = 0;
                         on_event(&EngineEvent::Compacted {
                             removed,
@@ -2741,6 +2815,7 @@ impl QueryEngine {
             }
             let asst_msg = Message::assistant(MessageContent::from_blocks(turn.content.clone()));
             self.messages.push(asst_msg.clone());
+            self.cache.push_history_chars(&self.messages);
             self.persist(asst_msg).await;
 
             let tool_uses: Vec<(String, String, Value)> = turn
@@ -2806,6 +2881,7 @@ impl QueryEngine {
                     ));
                     let recovery_msg = Message::user(MessageContent::from_blocks(blocks));
                     self.messages.push(recovery_msg.clone());
+                    self.cache.push_history_chars(&self.messages);
                     self.persist(recovery_msg).await;
                     on_event(&RunEvent::RecoveryApplied {
                         category: "stream_truncation_tool_call".into(),
@@ -2868,6 +2944,7 @@ impl QueryEngine {
                         );
                         let recovery_msg = Message::user(MessageContent::from_text(body));
                         self.messages.push(recovery_msg.clone());
+                        self.cache.push_history_chars(&self.messages);
                         self.persist(recovery_msg).await;
                         on_event(&RunEvent::RecoveryApplied {
                             category: "max_tokens_thinking_truncation".into(),
@@ -2897,6 +2974,7 @@ impl QueryEngine {
                             "<recovery_notice>\nYour previous turn was cut off mid-stream while writing your answer; the text that reached the transcript is incomplete. Continue from where it broke off and deliver the complete answer now. Do not repeat what you already wrote.\n</recovery_notice>",
                         ));
                         self.messages.push(recovery_msg.clone());
+                        self.cache.push_history_chars(&self.messages);
                         self.persist(recovery_msg).await;
                         on_event(&RunEvent::RecoveryApplied {
                             category: "stream_truncation_text".into(),
@@ -3207,6 +3285,7 @@ impl QueryEngine {
                 .collect();
             let tr_msg = Message::user(MessageContent::from_blocks(blocks));
             self.messages.push(tr_msg.clone());
+            self.cache.push_history_chars(&self.messages);
             self.persist(tr_msg).await;
 
             // 2026-09-18 cache-fix: after a mutating tool, append a fresh git
@@ -3223,6 +3302,7 @@ impl QueryEngine {
                 if !fresh.git_summary.trim().is_empty() {
                     let git_msg = Message::user(MessageContent::from_text(body));
                     self.messages.push(git_msg.clone());
+                    self.cache.push_history_chars(&self.messages);
                     self.persist(git_msg).await;
                 }
             }
@@ -3242,6 +3322,7 @@ impl QueryEngine {
                     let body = format!("<todo_recap>\n{}\n</todo_recap>", rendered.trim_end());
                     let recap_msg = Message::user(MessageContent::from_text(body));
                     self.messages.push(recap_msg.clone());
+                    self.cache.push_history_chars(&self.messages);
                     self.persist(recap_msg).await;
                 }
             }
@@ -3326,6 +3407,7 @@ impl QueryEngine {
                 .map_err(|error| nonoclaw_core::Error::Other(error.to_string()))?;
         }
         self.messages.clear();
+        self.cache.invalidate_message_char_cache();
         Ok(())
     }
 
@@ -3384,6 +3466,7 @@ impl QueryEngine {
                 .await
         {
             self.messages = compacted;
+            self.cache.invalidate_message_char_cache();
             self.cache.frozen_idx = 0;
             let removed = before - kept;
             runtime
@@ -4446,6 +4529,60 @@ mod tests {
         let expected = payload_history_chars(&projected);
         assert_eq!(measured_chars, expected);
         assert!(expected >= 200 + "inspect".chars().count());
+    }
+
+    #[test]
+    fn history_char_cache_tracks_append_and_invalidation() {
+        // The cache must agree with a full rescan across every mutation shape
+        // the loop performs: append, rewrite (compaction), clear, restore.
+        let mut cache = EngineCache::default();
+        let mut messages: Vec<Message> = Vec::new();
+
+        let expect_agreement = |cache: &mut EngineCache, messages: &[Message]| {
+            assert_eq!(
+                cache.history_chars_through(messages),
+                payload_history_chars(messages),
+                "total diverged at len {}",
+                messages.len()
+            );
+            // Suffix sums: prefix[len] is the total; every intermediate
+            // value must be a valid partial sum (monotone non-decreasing).
+            cache.rebuild_if_stale(messages);
+            for window in cache.history_chars.windows(2) {
+                assert!(window[0] <= window[1]);
+            }
+        };
+
+        // Appends (the common path) stay incremental.
+        for turn in 0..20 {
+            messages.push(Message::user(MessageContent::from_text(format!(
+                "turn {turn} with some payload"
+            ))));
+            cache.push_history_chars(&messages);
+            expect_agreement(&mut cache, &messages);
+        }
+
+        // Simulated compaction rewrite: replace history with a summary.
+        messages = vec![Message::user(MessageContent::from_text(
+            "<conversation_history_summary>condensed</conversation_history_summary>",
+        ))];
+        cache.invalidate_message_char_cache();
+        expect_agreement(&mut cache, &messages);
+
+        // Continue appending after the rewrite.
+        messages.push(Message::assistant(MessageContent::from_text("resumed")));
+        cache.push_history_chars(&messages);
+        expect_agreement(&mut cache, &messages);
+
+        // Truncation-style rewrite (fewer messages than the cache covers).
+        messages.truncate(1);
+        cache.invalidate_message_char_cache();
+        expect_agreement(&mut cache, &messages);
+
+        // Clear (session restore path).
+        messages.clear();
+        cache.invalidate_message_char_cache();
+        expect_agreement(&mut cache, &messages);
     }
 
     #[test]
