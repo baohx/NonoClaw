@@ -773,6 +773,34 @@ fn verification_evidence(detail: &str) -> bool {
     false
 }
 
+/// Coarse failure category for a run outcome, mirroring the exhaustion
+/// buckets `run_reward_base` already scores. Used by the dream brief to
+/// aggregate reward by failure mode and spot category drift.
+pub fn failure_category(status: &str, finish_detail: &str) -> &'static str {
+    if status == "error" {
+        return "error";
+    }
+    let d = finish_detail.to_lowercase();
+    let category = if d.contains("mid-thinking") {
+        "truncation_mid_thinking"
+    } else if d.contains("mid tool-call") {
+        "truncation_mid_toolcall"
+    } else if d.contains("max turns") || d.contains("max_turns") {
+        "max_turns"
+    } else if d.contains("budget") {
+        "budget_exhausted"
+    } else if d.contains("max_tokens") {
+        "truncation_max_tokens"
+    } else if d.contains("context limit") || d.contains("context_limit") {
+        "context_limit"
+    } else if status == "cancelled" {
+        "cancelled"
+    } else {
+        "completed"
+    };
+    category
+}
+
 struct SessionState {
     revision: u64,
     header: SessionEntry,
@@ -1510,6 +1538,20 @@ mod tests {
 
         // Reward heuristic anchors.
         assert_eq!(run_reward("done", "completed"), 1.0);
+        assert_eq!(failure_category("done", "completed"), "completed");
+        assert_eq!(failure_category("done", "max turns reached"), "max_turns");
+        assert_eq!(
+            failure_category(
+                "done",
+                "stream interrupted mid tool-call; recovery budget exhausted"
+            ),
+            "truncation_mid_toolcall"
+        );
+        assert_eq!(
+            failure_category("cancelled", "user requested cancellation"),
+            "cancelled"
+        );
+        assert_eq!(failure_category("error", "provider 500"), "error");
         assert_eq!(run_reward("done", "max turns reached"), 0.6);
         assert_eq!(run_reward("done", "budget exceeded"), 0.7);
         assert_eq!(run_reward("done", "context limit"), 0.8);

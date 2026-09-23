@@ -320,7 +320,8 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。用 Bash `ls -t` 看最近改动的文件。\n\
 2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，做对比反思：检索同类任务的成功轨迹，高分 vs 低分逐段对照，定位第一个分歧点——是哪个编排决策（任务拆解方式、子代理/工具选择、步骤顺序）不同导致结果分岔。\n\
 3. 【知识萃取·即写】只把【可复用、非显而易见】的知识提炼为结构化事实，且【每萃取一条立即用 Write 落盘一条，再分析下一条】——dream 随时可能被轮次截断，『全部析完再统一写』的批处理模式下一次截断就归零。每条事实：类型选 preference/convention/decision/architecture/bug，写法遵循 .nonoclaw/memory/facts 的 YAML frontmatter 格式，importance 1-5，用 Write 写入 .nonoclaw/memory/facts/<slug>.md（必须带 .nonoclaw/ 前缀，写到顶层 memory/ 的文件引擎不会加载）。supersede 旧事实、关闭 stale bead 这类纯记忆写操作也在分析到位的当场用 Edit 完成，绝不推迟或留委托。\n\
-4. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\n\
+4. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\
+   特别地：若简报的【失败类别分布】里某一类别连续两个窗口出现且量级不降（如 truncation_mid_toolcall 反复出现），把它视为系统性问题——为此类别写一条专项 bead（含该类别近几个窗口的计数趋势），并考虑提案参数修正（max_turns、compact 阈值、观测 cap 等调整建议写在 bead 里，人批准后才改）。\n\n\
 纪律：\\
 - 不要重复已有事实：先 Grep .nonoclaw/memory/facts/ 确认；如有近似事实，用 supersedes 取代而不是新增。\n\
 - 通用性门槛：每条事实写之前自检——换个任务/换个项目这条还成立吗？只写通用原则，不写任务特定 trick（如「X 文件要改 Y 行」）。不成立的信息留在总结输出里，不写入 facts。\n\
@@ -654,11 +655,39 @@ fn reward_brief_with_ledger(
     let done = all.iter().filter(|o| o.status == "done").count();
     let cancelled = all.iter().filter(|o| o.status == "cancelled").count();
     let error = all.iter().filter(|o| o.status == "error").count();
+    // Failure-mode distribution (bead reward-feedback-loop-closure, layer 1):
+    // aggregate by category so drift (e.g. truncation suddenly doubling) is
+    // visible in every dream, not only when a human reviews raw JSONL.
+    let mut categories: std::collections::BTreeMap<&str, usize> = Default::default();
+    for o in outcomes.iter() {
+        if o.turns == 0 && o.status != "done" {
+            continue; // known noise: 0-turn cancelled/error runs
+        }
+        *categories
+            .entry(nonoclaw_engine::session::failure_category(
+                &o.status, &o.detail,
+            ))
+            .or_default() += 1;
+    }
+    let non_completed: usize = categories
+        .iter()
+        .filter(|(k, _)| **k != "completed")
+        .map(|(_, v)| *v)
+        .sum();
     let sessions = aggregate_sessions(&outcomes);
     let mut brief = format!(
         "【Reward 简报】上次 dream 以来 run 结局：done × {done}，cancelled × {cancelled}，error × {error}（{} 个 session）。\n",
         sessions.len()
     );
+    if non_completed > 0 {
+        let dist = categories
+            .iter()
+            .filter(|(k, _)| **k != "completed")
+            .map(|(k, v)| format!("{k} × {v}"))
+            .collect::<Vec<_>>()
+            .join("，");
+        brief.push_str(&format!("失败类别分布：{dist}。\n"));
+    }
     let failed: Vec<&SessionStats> = sessions.iter().filter(|s| s.mean < 1.0).collect();
     if !failed.is_empty() {
         let priorities: Vec<f64> = sessions.iter().map(|s| s.priority).collect();
@@ -1325,6 +1354,46 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reward_brief_failure_distribution_buckets_and_skips_zero_turn_noise() {
+        let dir = std::env::temp_dir().join("dream_failure_dist_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("dist111111111-aaaa.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"d1\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"done\",\"reward\":0.6,\"turns\":8,\"detail\":\"max turns reached\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r2\",\"status\":\"done\",\"reward\":0.6,\"turns\":9,\"detail\":\"stream interrupted mid tool-call; recovery budget exhausted\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r3\",\"status\":\"cancelled\",\"reward\":-0.3,\"turns\":0,\"detail\":\"user requested cancellation\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
+        assert!(
+            brief.contains("失败类别分布"),
+            "distribution section present: {brief}"
+        );
+        assert!(
+            brief.contains("max_turns × 1"),
+            "max_turns bucketed: {brief}"
+        );
+        assert!(
+            brief.contains("truncation_mid_toolcall × 1"),
+            "mid tool-call bucketed: {brief}"
+        );
+        let dist_line = brief
+            .lines()
+            .find(|l| l.starts_with("失败类别分布"))
+            .expect("distribution line exists");
+        assert!(
+            !dist_line.contains("cancelled"),
+            "zero-turn cancel noise excluded from distribution: {brief}"
+        );
     }
 
     #[test]
