@@ -490,12 +490,34 @@ fn prepare_messages_for_request(
     let compatible = strip_unsupported_blocks(messages, supports_images);
     let sanitized = redact_tool_result_credentials(&compatible);
     let attachment_bounded = limit_attachment_images(&sanitized, attachment_max_chars);
-    let fits = payload_history_chars(&attachment_bounded) <= history_max_chars;
-    let windowed = history_window(&attachment_bounded, history_max_chars);
+    // Canonicalize Text to a single text block BEFORE any caching decisions:
+    // the rolling breakpoint converts the LAST message to Blocks form when it
+    // marks it, so a message stored as plain Text would flip serialization
+    // shape between turns ("content":"..." vs "content":[{"text":...}]) and
+    // invalidate the very prefix the breakpoint wrote. Normalizing here makes
+    // every message serialize the same bytes in every turn, marked or not.
+    let canonical = normalize_text_blocks(attachment_bounded);
+    let fits = payload_history_chars(&canonical) <= history_max_chars;
+    let windowed = history_window(&canonical, history_max_chars);
     // The frozen breakpoint only stays valid when the window kept the
     // sealed prefix verbatim (no summary substitution / no head truncation).
     let effective_frozen = if fits { frozen_idx } else { 0 };
     apply_cache_breakpoints(windowed, effective_frozen)
+}
+
+/// Convert every `MessageContent::Text` into an equivalent single-text-block
+/// `Blocks` form so all messages serialize identically whether or not the
+/// rolling cache marker was ever attached to them.
+fn normalize_text_blocks(messages: Vec<Message>) -> Vec<Message> {
+    messages
+        .into_iter()
+        .map(|mut message| {
+            if let MessageContent::Text(text) = message.content {
+                message.content = MessageContent::Blocks(vec![ContentBlock::text(text)]);
+            }
+            message
+        })
+        .collect()
 }
 
 /// Content-layer credential gate: scrub credential-shaped material out of
