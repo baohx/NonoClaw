@@ -107,6 +107,14 @@ async fn query_one(
         return fail("API key not configured".into());
     }
 
+    // Ark Agent Plan has no API-Key-queryable balance endpoint (the plan
+    // usage APIs need Access Key HMAC signing). A minimal Messages call is
+    // the cheapest liveness probe: 200 = plan active, 401/403 = key/plan
+    // problem, 429 = rate limited (also proves the key is valid).
+    if provider == "ark-agentplan" {
+        return query_ark_agentplan(client, api_key).await;
+    }
+
     let (header_name, header_value) = auth_header(provider, api_key);
     // JieKou's bill endpoint requires query params. We query the lifetime
     // `summary` bill list (one entry per month) and aggregate on the fly.
@@ -179,6 +187,73 @@ fn parse_provider_balance(provider: &str, body: &serde_json::Value) -> ProviderB
 }
 
 // ── Provider-specific parsers ───────────────────────────────────────────────
+
+/// Ark Agent Plan liveness probe. The Messages endpoint answers with the
+/// model the plan auto-routed to; usage/quota endpoints require Access Key
+/// HMAC signing which a plan API key cannot do, so "plan is active" is the
+/// most honest summary available.
+async fn query_ark_agentplan(client: &reqwest::Client, api_key: &str) -> ProviderBalance {
+    let response = match client
+        .post("https://ark.cn-beijing.volces.com/api/plan/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(12))
+        .body(
+            serde_json::json!({
+                "model": "ark-code-latest",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ark_fail(format!("request failed: {e}")),
+    };
+    let status = response.status();
+    if status.as_u16() == 429 {
+        // Rate limited — the key is valid and the plan is active.
+        return ark_ok("活跃（限流中）".into());
+    }
+    if !status.is_success() {
+        return ark_fail(format!("HTTP {status}"));
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => return ark_fail(format!("parse error: {e}")),
+    };
+    ark_ok(ark_liveness_summary(&body))
+}
+
+fn ark_fail(error: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "ark-agentplan".into(),
+        summary: String::new(),
+        ok: false,
+        error: Some(error),
+    }
+}
+
+fn ark_ok(summary: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "ark-agentplan".into(),
+        summary,
+        ok: true,
+        error: None,
+    }
+}
+
+/// Build the Insight summary from an Anthropic Messages 200 body.
+fn ark_liveness_summary(body: &serde_json::Value) -> String {
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown");
+    format!("Agent Plan 活跃 · {model}")
+}
 
 /// Kimi: https://platform.kimi.com/docs/api/balance
 /// Response: `{"data": {"available_balance": 2.61, "voucher_balance": 0, "cash_balance": 2.61}}`
@@ -594,6 +669,36 @@ mod tests {
         let balance = parse_provider_balance("custom", &body);
         assert!(balance.ok);
         assert_eq!(balance.summary, "99.90");
+    }
+
+    #[test]
+    fn ark_liveness_summary_reads_model_from_200_body() {
+        let body = serde_json::json!({
+            "id": "msg_x", "model": "auto",
+            "content": [{"type": "thinking"}, {"type": "text", "text": "."}]
+        });
+        let balance = ark_liveness_summary(&body);
+        assert_eq!(balance, "Agent Plan 活跃 · auto");
+    }
+
+    #[test]
+    fn ark_liveness_summary_defaults_when_model_missing() {
+        let body = serde_json::json!({"content": []});
+        let balance = ark_liveness_summary(&body);
+        assert_eq!(balance, "Agent Plan 活跃 · unknown");
+    }
+
+    #[test]
+    fn ark_helpers_build_provider_balance() {
+        let ok = ark_ok("活跃（限流中）".into());
+        assert!(ok.ok);
+        assert_eq!(ok.provider, "ark-agentplan");
+        assert_eq!(ok.summary, "活跃（限流中）");
+
+        let fail = ark_fail("HTTP 401".into());
+        assert!(!fail.ok);
+        assert!(fail.summary.is_empty());
+        assert_eq!(fail.error.as_deref(), Some("HTTP 401"));
     }
 }
 
