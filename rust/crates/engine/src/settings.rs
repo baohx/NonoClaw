@@ -165,6 +165,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Document/OCR model name or inline configuration.",
     },
     ConfigFieldReference {
+        name: "videoModels",
+        description: "Task-based video generation models (e.g. Seedance): [{ name, label, baseUrl, apiKey, default, capabilities }].",
+    },
+    ConfigFieldReference {
         name: "attachmentConverter",
         description: "Document conversion strategy for file uploads: \"auto\", \"markitdown\", or \"legacy\".",
     },
@@ -280,6 +284,10 @@ pub struct SettingsFile {
     pub chars_per_token: usize,
     #[serde(rename = "docModel", default)]
     pub doc_model: Option<DocModelSetting>,
+    /// Task-based video generation models (e.g. Seedance). Consumed by the
+    /// video module, not the chat registry.
+    #[serde(rename = "videoModels", default)]
+    pub video_models: Option<Vec<VideoModelProfile>>,
     /// Document conversion strategy for file uploads.
     /// - `"auto"` (default): probe for MarkItDown CLI → use if available,
     ///   fall back to legacy `docModel` OCR otherwise.
@@ -538,6 +546,7 @@ impl Default for SettingsFile {
             proxy: None,
             chars_per_token: default_chars_per_token(),
             doc_model: None,
+            video_models: None,
             attachment_converter: None,
             executables: None,
             provider_billing: None,
@@ -551,6 +560,45 @@ impl Default for SettingsFile {
 pub enum DocModelSetting {
     Full(DocModelConfig),
     Name(String),
+}
+
+/// Configuration for task-based video generation models (e.g. Doubao
+/// Seedance). These are asynchronous content-generation APIs, not chat
+/// models, so they live outside `models[]` and are consumed by the video
+/// service rather than the chat registry.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VideoModelProfile {
+    /// Generation model ID sent to the provider (must be the versioned full
+    /// name, e.g. `doubao-seedance-2-0-mini-260615`).
+    pub name: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    /// API key (or `$ENV_VAR` reference).
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    /// Mark this profile as the default for the video module.
+    #[serde(default)]
+    pub default: bool,
+    /// Human-facing capability hints for the wizard UI (JSON kept loose on
+    /// purpose: capabilities evolve faster than this struct).
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+}
+
+impl fmt::Debug for VideoModelProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VideoModelProfile")
+            .field("name", &self.name)
+            .field("label", &self.label)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("default", &self.default)
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3433,6 +3481,58 @@ mod tests {
             diagnostics.is_empty(),
             "known fields must not warn: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn video_models_field_is_known_and_parses() {
+        // Regression guard: `videoModels` (SettingsFile field) must stay in
+        // CONFIG_REFERENCE, otherwise every settings.json using the video
+        // module trips a spurious unknown_field warning at startup.
+        let names = config_reference()
+            .iter()
+            .map(|field| field.name)
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("videoModels"));
+
+        let mut diagnostics = Vec::new();
+        diagnose_unknown_fields(
+            &serde_json::json!({
+                "videoModels": [
+                    {
+                        "name": "doubao-seedance-2-0-mini-260615",
+                        "baseUrl": "https://ark.cn-beijing.volces.com",
+                        "apiKey": "$ARK_PAY_KEY",
+                        "default": true
+                    }
+                ]
+            }),
+            &source("video"),
+            &mut diagnostics,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "videoModels must not warn: {diagnostics:?}"
+        );
+
+        let parsed: SettingsFile = serde_json::from_value(serde_json::json!({
+            "videoModels": [
+                {
+                    "name": "doubao-seedance-2-5-260628",
+                    "label": "Seedance 2.5",
+                    "baseUrl": "https://ark.cn-beijing.volces.com",
+                    "apiKey": "$ARK_PAY_KEY",
+                    "default": true,
+                    "capabilities": {"resolutions": ["480p", "720p", "1080p"]}
+                }
+            ]
+        }))
+        .expect("videoModels must parse");
+        let profiles = parsed.video_models.expect("videoModels present");
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].default);
+        assert_eq!(profiles[0].label.as_deref(), Some("Seedance 2.5"));
+        assert!(format!("{:?}", profiles[0]).contains("[REDACTED]"));
+        assert!(!format!("{:?}", profiles[0]).contains("$ARK_PAY_KEY"));
     }
 
     #[test]

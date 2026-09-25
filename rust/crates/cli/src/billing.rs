@@ -121,6 +121,14 @@ async fn query_one(
         return query_kiro_gateway(client, url, api_key).await;
     }
 
+    // Ark pay-as-you-go key: no API-Key-queryable balance either (wallet
+    // endpoints need Access Key HMAC signing). The free /models listing is
+    // the cheapest liveness probe: 200 = key active, and the model count is
+    // a useful "what this key can reach" summary.
+    if provider == "ark-pay" {
+        return query_ark_pay(client, url, api_key).await;
+    }
+
     let (header_name, header_value) = auth_header(provider, api_key);
     // JieKou's bill endpoint requires query params. We query the lifetime
     // `summary` bill list (one entry per month) and aggregate on the fly.
@@ -307,6 +315,58 @@ async fn query_kiro_gateway(client: &reqwest::Client, url: &str, api_key: &str) 
 fn kiro_fail(error: String) -> ProviderBalance {
     ProviderBalance {
         provider: "kiro".into(),
+        summary: String::new(),
+        ok: false,
+        error: Some(error),
+    }
+}
+
+/// Liveness probe for the Ark pay-as-you-go key via the free model listing
+/// (`GET {balanceUrl}` with Bearer auth, e.g. `/api/v3/models`). The listing
+/// endpoint is free, answers fast, and doubles as a "models reachable"
+/// summary. 429 also proves the key is valid (rate limited, not rejected).
+async fn query_ark_pay(client: &reqwest::Client, url: &str, api_key: &str) -> ProviderBalance {
+    let response = match client
+        .get(url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ark_pay_fail(format!("request failed: {e}")),
+    };
+    let status = response.status();
+    if status.as_u16() == 429 {
+        return ark_pay_ok("活跃（限流中）".into());
+    }
+    if !status.is_success() {
+        return ark_pay_fail(format!("HTTP {status}"));
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => return ark_pay_fail(format!("parse error: {e}")),
+    };
+    let count = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    ark_pay_ok(format!("按量计费活跃 · 可用 {count} 模型"))
+}
+
+fn ark_pay_ok(summary: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "ark-pay".into(),
+        summary,
+        ok: true,
+        error: None,
+    }
+}
+
+fn ark_pay_fail(error: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "ark-pay".into(),
         summary: String::new(),
         ok: false,
         error: Some(error),
@@ -779,6 +839,19 @@ mod tests {
         assert!(!fail.ok);
         assert!(fail.summary.is_empty());
         assert_eq!(fail.error.as_deref(), Some("HTTP 502"));
+    }
+
+    #[test]
+    fn ark_pay_helpers_build_provider_balance() {
+        let ok = ark_pay_ok("按量计费活跃 · 可用 135 模型".into());
+        assert!(ok.ok);
+        assert_eq!(ok.provider, "ark-pay");
+        assert_eq!(ok.summary, "按量计费活跃 · 可用 135 模型");
+
+        let fail = ark_pay_fail("HTTP 401".into());
+        assert!(!fail.ok);
+        assert!(fail.summary.is_empty());
+        assert_eq!(fail.error.as_deref(), Some("HTTP 401"));
     }
 }
 
