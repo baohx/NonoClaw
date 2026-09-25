@@ -74,3 +74,4 @@ bench/
 
 # Research materials (local survey papers/notes, not source code)
 research/
+*.pdf
