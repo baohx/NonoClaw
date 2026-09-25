@@ -14,6 +14,7 @@ use std::time::Duration;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,6 +22,9 @@ use std::sync::Mutex;
 
 use super::connection::AppState;
 use super::http_error::json_response;
+use super::project_context::ProjectContext;
+use nonoclaw_api::{Client, ClientPurpose, RequestParams, SystemBlock};
+use nonoclaw_core::{ContentBlock, ImageSource, Message, MessageContent};
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TASK_IMAGES: usize = 30;
@@ -870,6 +874,180 @@ pub(super) async fn file_handler(
         bytes,
     )
         .into_response()
+}
+
+/// Seedance prompt-engineering spec injected into every enhance/vision call.
+const ENHANCE_SYSTEM: &str = "You are a Seedance (字节跳动视频生成模型) prompt engineer. \
+Rewrite the user's draft into ONE Chinese video-generation prompt, 80-150 字, following this structure: \
+主体(外观/服装细节) → 动作/运动 → 镜头语言(推拉摇移/景别) → 光线 → 氛围与风格. \
+No preamble, no explanations, no markdown — output the rewritten prompt only.";
+
+#[derive(Deserialize)]
+pub(super) struct EnhanceParams {
+    /// Draft prompt to rewrite (`action: "enhance"`) — required for enhance.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// `enhance` (default) or `describe` (read reference images, produce
+    /// insertable character/scene description fragments).
+    #[serde(default)]
+    action: Option<String>,
+    /// Reference images as base64 data-URLs (used by both actions).
+    #[serde(default)]
+    images: Vec<String>,
+    /// Optional chat model override for the enhancer (defaults to the
+    /// active conversation model).
+    #[serde(rename = "enhanceModel", default)]
+    model: Option<String>,
+}
+
+/// Pick the chat client for enhance/describe. An explicit `enhanceModel`
+/// request parameter wins; otherwise the active conversation model.
+fn enhance_client(
+    project: &ProjectContext,
+    requested_model: Option<&str>,
+) -> Result<Arc<Client>, String> {
+    project
+        .config()
+        .client_for(ClientPurpose::Conversation, requested_model)
+        .map_err(|error| format!("no chat client available: {error}"))
+}
+
+/// POST /api/video/enhance — prompt enhancement / reference-image reading
+/// via a vision chat model (Seedance prompt spec injected; PRD §3 Step 3).
+/// Goes through the engine's `Client` so every configured wire format
+/// (Anthropic / OpenAI / Responses / Gemini) and auth scheme just works.
+pub(super) async fn enhance_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    Json(body): Json<EnhanceParams>,
+) -> Response {
+    if !state.authorized(params.get("token").map(String::as_str)) {
+        return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
+    }
+    let action = body.action.as_deref().unwrap_or("enhance");
+    if action != "enhance" && action != "describe" {
+        return video_error(
+            StatusCode::BAD_REQUEST,
+            "action must be enhance or describe",
+        );
+    }
+    let describe = action == "describe";
+    if describe && body.images.is_empty() {
+        return video_error(StatusCode::BAD_REQUEST, "describe requires images");
+    }
+    if !describe && body.prompt.as_deref().unwrap_or_default().trim().is_empty() {
+        return video_error(
+            StatusCode::BAD_REQUEST,
+            "enhance requires a non-empty prompt",
+        );
+    }
+    if body.images.len() > MAX_TASK_IMAGES {
+        return video_error(StatusCode::BAD_REQUEST, "too many images");
+    }
+
+    let project = state.project();
+    let model_name = project
+        .config()
+        .model_for(ClientPurpose::Conversation, body.model.as_deref());
+    let client = match enhance_client(&project, Some(&model_name)) {
+        Ok(client) => client,
+        Err(message) => return video_error(StatusCode::NOT_FOUND, &message),
+    };
+
+    let system_text = if describe {
+        "You are analyzing reference images for a video-generation workflow. \
+Output 2-4 short Chinese description fragments (角色外观/场景/氛围), one per line, \
+each ≤40 字, ready to paste into a video prompt. No preamble, no numbering."
+    } else {
+        ENHANCE_SYSTEM
+    };
+    let mut user_text = if describe {
+        "描述这些参考图中的可用素材：".to_string()
+    } else {
+        format!(
+            "请增强这段视频提示词：{}",
+            body.prompt.as_deref().unwrap_or_default()
+        )
+    };
+    if !body.images.is_empty() && !describe {
+        user_text.push_str("\n（参考图附后，可结合画面内容改写）");
+    }
+
+    // One user turn: text + optional base64 images.
+    let mut content = vec![ContentBlock::Text {
+        text: user_text,
+        cache_control: None,
+    }];
+    for data_url in &body.images {
+        let Some((media_type, data)) = split_data_url(data_url) else {
+            return video_error(
+                StatusCode::BAD_REQUEST,
+                "images must be data:...;base64,... URLs",
+            );
+        };
+        content.push(ContentBlock::Image {
+            source: ImageSource {
+                kind: "base64".into(),
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            },
+        });
+    }
+
+    let params = RequestParams {
+        model: model_name.clone(),
+        max_tokens: 1024,
+        system: vec![SystemBlock {
+            kind: "text".into(),
+            text: system_text.to_string(),
+            cache_control: None,
+        }],
+        messages: vec![Message::user(MessageContent::from_blocks(content))],
+        tools: vec![],
+        tool_choice: None,
+        thinking: None,
+        temperature: Some(0.4),
+        betas: vec![],
+        extra_body: None,
+        trace_label: Some("video-enhance".into()),
+        session_id: None,
+    };
+    let output = match client.run_turn(&params, |_| {}).await {
+        Ok(output) => output,
+        Err(error) => {
+            return video_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("enhance request failed: {error}"),
+            )
+        }
+    };
+    // Fold text blocks out of the turn output.
+    let result: String = output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string();
+    if result.is_empty() {
+        return video_error(StatusCode::BAD_GATEWAY, "enhance model returned no text");
+    }
+    json_response(
+        StatusCode::OK,
+        &json!({ "result": result, "model": output.model, "action": action }),
+    )
+}
+
+/// Split `data:<mime>;base64,<payload>` into its parts (Anthropic wire needs
+/// them separate). Returns `None` for non-data URLs.
+fn split_data_url(data_url: &str) -> Option<(&str, &str)> {
+    let rest = data_url.strip_prefix("data:")?;
+    let (mime, payload) = rest.split_once(";base64,")?;
+    Some((mime, payload))
 }
 
 #[cfg(test)]

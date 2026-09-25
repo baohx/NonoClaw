@@ -721,6 +721,11 @@ pub async fn serve(
             axum::routing::get(super::video_service::models_handler),
         )
         .route(
+            "/api/video/enhance",
+            axum::routing::post(super::video_service::enhance_handler)
+                .layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
+        )
+        .route(
             "/api/video/tasks",
             axum::routing::post(super::video_service::create_handler)
                 .layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
@@ -3735,6 +3740,7 @@ mod characterization_tests {
             public_url: None,
             provider_balances: vec![],
             model_providers: vec![],
+            video_tasks_in_flight: 0,
         };
         let system_probe = project_info.system.clone();
         let messages = vec![

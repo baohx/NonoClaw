@@ -56,6 +56,10 @@ pub struct ProjectInfo {
     pub provider_balances: Vec<nonoclaw_engine::ProviderBalance>,
     /// Model name → billing provider key (only models with configured billing).
     pub model_providers: Vec<crate::billing::ModelProviderMapping>,
+    /// Video (Seedance) tasks currently queued/running/downloading — Insight
+    /// rail badge. 0 hides the badge.
+    #[serde(default)]
+    pub video_tasks_in_flight: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -387,7 +391,26 @@ pub async fn gather(
         public_url,
         provider_balances,
         model_providers,
+        video_tasks_in_flight: video_tasks_in_flight(cwd),
     }
+}
+
+/// Count ledger video tasks not yet terminal (queued/running/downloading).
+/// The ledger is the wizard's and the VideoGenerate tool's shared source of
+/// truth; a missing/empty ledger simply means zero.
+fn video_tasks_in_flight(cwd: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(cwd.join(".nonoclaw/video/tasks.jsonl")) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|task| {
+            matches!(
+                task.get("status").and_then(|status| status.as_str()),
+                Some("queued" | "running" | "downloading")
+            )
+        })
+        .count() as u64
 }
 
 fn cli_reference() -> Vec<ReferenceItem> {

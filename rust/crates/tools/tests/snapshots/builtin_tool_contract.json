@@ -278,6 +278,44 @@
   {
     "input_schema": {
       "properties": {
+        "duration": {
+          "description": "Clip length in seconds (model-dependent, e.g. 5 or 10).",
+          "type": "integer"
+        },
+        "images": {
+          "description": "Optional reference/first-frame images as data:...;base64,... URLs (local files must be base64-encoded first).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "Video model profile name from videoModels settings. Defaults to the profile marked default.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Video generation prompt. Seedance convention: 主体 → 动作 → 镜头语言 → 景别 → 光线 → 风格.",
+          "type": "string"
+        },
+        "ratio": {
+          "description": "Aspect ratio, e.g. 16:9 / 9:16 / adaptive.",
+          "type": "string"
+        },
+        "resolution": {
+          "description": "e.g. 720p / 1080p (model-dependent).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "name": "VideoGenerate"
+  },
+  {
+    "input_schema": {
+      "properties": {
         "action": {
           "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
           "enum": [
