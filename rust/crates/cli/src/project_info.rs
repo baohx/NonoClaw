@@ -413,6 +413,32 @@ fn video_tasks_in_flight(cwd: &Path) -> u64 {
         .count() as u64
 }
 
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    #[test]
+    fn video_tasks_in_flight_counts_only_active_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nonoclaw/video")).unwrap();
+        // Missing ledger → 0.
+        assert_eq!(video_tasks_in_flight(dir.path()), 0);
+        std::fs::write(
+            dir.path().join(".nonoclaw/video/tasks.jsonl"),
+            concat!(
+                "{\"id\":\"vid-1\",\"status\":\"queued\"}\n",
+                "{\"id\":\"vid-2\",\"status\":\"running\"}\n",
+                "{\"id\":\"vid-3\",\"status\":\"succeeded\"}\n",
+                "{\"id\":\"vid-4\",\"status\":\"failed\"}\n",
+                "{\"id\":\"vid-5\",\"status\":\"downloading\"}\n",
+                "not-json\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(video_tasks_in_flight(dir.path()), 3);
+    }
+}
+
 fn cli_reference() -> Vec<ReferenceItem> {
     let mut reference = crate::Cli::command()
         .get_arguments()
