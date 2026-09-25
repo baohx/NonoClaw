@@ -393,8 +393,12 @@ pub(super) async fn create_handler(
     // and persists the mp4. Later list/get reads poll status on demand too.
     let dispatcher_state = state.clone();
     let dispatch_task = task.clone();
+    let task_id = task.id.clone();
     tokio::spawn(async move {
-        run_task(dispatcher_state, dispatch_task).await;
+        run_task(dispatcher_state.clone(), dispatch_task).await;
+        // Whatever the terminal state (succeeded/failed/expired), the id must
+        // leave the queue or list_handler relabels it `queued+N` forever.
+        dispatcher_state.video_queue.dequeue(&task_id);
     });
 
     json_response(StatusCode::CREATED, &json!({ "task": sanitize(&task) }))
@@ -666,8 +670,12 @@ pub(super) async fn list_handler(
     let cwd = state.project().cwd().to_path_buf();
     let mut tasks = read_ledger(&cwd);
     for task in &mut tasks {
-        if let Some(position) = state.video_queue.queue_position(&task.id) {
-            task.status = format!("queued+{position}");
+        // Only genuinely-not-yet-submitted tasks get a queue position; a
+        // stale queue entry must never relabel a terminal task.
+        if task.status == "queued" {
+            if let Some(position) = state.video_queue.queue_position(&task.id) {
+                task.status = format!("queued+{position}");
+            }
         }
     }
     json_response(
@@ -1053,6 +1061,56 @@ fn split_data_url(data_url: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_position_does_not_override_terminal_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let mut task = VideoTask {
+            id: "vid-1".into(),
+            remote_id: Some("cgt-x".into()),
+            model: "m".into(),
+            mode: "t2v".into(),
+            prompt: "p".into(),
+            images: vec![],
+            duration: 5,
+            resolution: "720p".into(),
+            ratio: "16:9".into(),
+            draft: false,
+            status: "queued".into(),
+            error: None,
+            file: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        append_ledger(cwd, &task).expect("append queued");
+        task.status = "succeeded".into();
+        task.file = Some("vid-1.mp4".into());
+        append_ledger(cwd, &task).expect("append succeeded");
+        // Bug regression: a stale queue entry must NOT relabel a terminal
+        // task as queued+N in listings.
+        let queue = VideoStore::new();
+        queue.enqueue("vid-1");
+        let mut tasks = read_ledger(cwd);
+        for task in &mut tasks {
+            if let Some(position) = queue.queue_position(&task.id) {
+                if task.status == "queued" {
+                    task.status = format!("queued+{position}");
+                }
+            }
+        }
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "succeeded");
+        // Sanity: a genuinely queued task still gets its position.
+        let mut fresh = task.clone();
+        fresh.id = "vid-2".into();
+        fresh.status = "queued".into();
+        fresh.remote_id = None;
+        queue.enqueue("vid-2");
+        let position = queue.queue_position("vid-2").expect("position");
+        assert_eq!(position, 1);
+        let _ = fresh;
+    }
 
     #[test]
     fn ledger_roundtrip_latest_wins() {
