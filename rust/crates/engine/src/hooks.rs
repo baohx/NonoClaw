@@ -609,16 +609,23 @@ async fn execute_command(
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| HookRunError::Failed("spawn"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&payload)
-            .await
-            .map_err(|_| HookRunError::Failed("stdin"))?;
-    }
+    let mut stdin = child.stdin.take();
+    // Feed stdin concurrently with waiting: a hook command that ignores
+    // stdin (e.g. `sh -c 'printf …'`) may exit before we write, and a
+    // sequential write_all would then hit EPIPE and fail the whole hook
+    // even though the hook succeeded. The exit status — not the stdin
+    // write — is the hook's verdict, so EPIPE here is ignored.
+    let stdin_task = tokio::spawn(async move {
+        if let Some(mut stdin) = stdin.as_mut() {
+            let _ = stdin.write_all(&payload).await;
+            let _ = stdin.shutdown().await;
+        }
+    });
     let output = child
         .wait_with_output()
         .await
         .map_err(|_| HookRunError::Failed("wait"))?;
+    let _ = stdin_task.await;
     if !output.status.success() {
         return Ok(HookDecision::Deny {
             reason: format!("{hook_type} command hook denied the operation"),
@@ -931,10 +938,15 @@ mod tests {
                 ],
                 prompt: None,
                 http: None,
-                // Generous budget: the real subprocess spawn (sh -c printf) is
-                // fast, but under parallel test load a 1s window gets squeezed
-                // and the timeout path (failure_policy: Deny) fires spuriously.
-                timeout_secs: Some(10),
+                // Generous wall-clock budget: `tokio::time::timeout` covers
+                // fork/exec queueing too, and under parallel test load (load
+                // 15 on 8 cores observed) a 10s window let the Deny-on-timeout
+                // path fire spuriously (~1/3 of runs). The timeout path itself
+                // is covered deterministically by
+                // `timeout_and_cancellation_fail_closed_without_leaking_output`
+                // (sleep 5 vs 1s budget), so this test only needs the
+                // happy-path budget to be starvation-proof.
+                timeout_secs: Some(60),
                 failure_policy: HookFailurePolicy::Deny,
             },
         )];
