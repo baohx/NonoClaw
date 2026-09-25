@@ -110,8 +110,10 @@ export default function VideoStudio({ onClose }: Props) {
   const model = models.find((m) => m.name === modelName) ?? null;
   const capabilities = model?.capabilities;
 
-  // Model list load.
-  useEffect(() => {
+  // Model list load. Re-fetch on focus: the dialog mounts once and would
+  // otherwise cache an empty list (e.g. serve restarted with new config).
+  const loadModels = useCallback(() => {
+    setModelsError(null);
     fetch(api("/api/video/models"))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((data: { models: VideoModel[] }) => {
@@ -126,6 +128,12 @@ export default function VideoStudio({ onClose }: Props) {
       })
       .catch((e: Error) => setModelsError(e.message));
   }, []);
+
+  useEffect(() => {
+    loadModels();
+    window.addEventListener("focus", loadModels);
+    return () => window.removeEventListener("focus", loadModels);
+  }, [loadModels]);
 
   // Task list poll: 5s while any in-flight, paused when tab hidden.
   const refreshTasks = useCallback(() => {
@@ -244,6 +252,14 @@ export default function VideoStudio({ onClose }: Props) {
             <div style={{ marginTop: 8, fontSize: 11, color: "var(--faint)" }}>
               在 settings.json 的 videoModels[] 中配置（apiKey 支持 $ENV 引用），重启 serve 后生效
             </div>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              style={{ marginTop: 10 }}
+              onClick={loadModels}
+            >
+              重试
+            </button>
           </div>
         )}
         {modelsLoaded && models.length > 0 && (
