@@ -246,7 +246,7 @@ export default function VideoStudio({ onClose }: Props) {
           </div>
         ) : !modelsLoaded ? (
           <div style={{ padding: "16px 0", color: "var(--muted)" }}>加载模型中…</div>
-        ) : (
+        ) : models.length === 0 ? (
           <div style={{ padding: "16px 0", color: "var(--danger, #e5484d)" }}>
             未配置任何视频模型。
             <div style={{ marginTop: 8, fontSize: 11, color: "var(--faint)" }}>
@@ -261,7 +261,7 @@ export default function VideoStudio({ onClose }: Props) {
               重试
             </button>
           </div>
-        )}
+        ) : null}
         {modelsLoaded && models.length > 0 && (
           <>
             {/* Step indicator */}
