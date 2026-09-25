@@ -612,7 +612,9 @@ fn build_content(task: &VideoTask) -> serde_json::Value {
         }
         _ => {
             for image in &task.images {
-                parts.push(json!({ "type": "image_url", "image_url": { "url": image } }));
+                // Ark rejects image parts without a role in reference/i2v
+                // mode ("role must be specified for image contents").
+                parts.push(json!({ "type": "image_url", "role": "reference_image", "image_url": { "url": image } }));
             }
         }
     }
@@ -1207,7 +1209,11 @@ mod tests {
 
         task.mode = "reference".into();
         let content = build_content(&task);
-        assert_eq!(content.as_array().unwrap().len(), 3);
+        let parts = content.as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        // Ark requires every image part in reference mode to carry a role.
+        assert_eq!(parts[1]["role"], "reference_image");
+        assert_eq!(parts[2]["role"], "reference_image");
     }
 
     #[test]
