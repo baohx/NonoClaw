@@ -71,3 +71,6 @@ memory/
 
 # Benchmark artifacts (terminal-bench) — adapter code stays, outputs excluded
 bench/
+
+# Research materials (local survey papers/notes, not source code)
+research/
