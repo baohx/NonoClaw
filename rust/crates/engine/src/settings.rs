@@ -1953,6 +1953,9 @@ fn merge_settings_value(
     if present("docModel", overlay.doc_model.is_some()) {
         base.doc_model.clone_from(&overlay.doc_model);
     }
+    if present("videoModels", overlay.video_models.is_some()) {
+        base.video_models.clone_from(&overlay.video_models);
+    }
     if let Some(executables) = &overlay.executables {
         base.executables = Some(match &base.executables {
             Some(existing) => {
@@ -4080,6 +4083,34 @@ mod tests {
             );
             assert_eq!(first.settings.max_turns, (count > 0).then_some(count));
         }
+    }
+
+    #[test]
+    fn video_models_survive_layer_merging() {
+        // Regression: videoModels was missing a branch in merge_settings_value,
+        // so user-layer profiles were silently dropped when project layers
+        // were merged on top (empty /api/video/models despite valid config).
+        let user = layer(
+            "user.json",
+            serde_json::json!({
+                "videoModels": [{
+                    "name": "doubao-seedance-2-0-mini-260615",
+                    "baseUrl": "https://ark.cn-beijing.volces.com",
+                    "apiKey": "$ARK_PAY_KEY",
+                    "default": true
+                }]
+            }),
+        );
+        let project = layer("project.json", serde_json::json!({ "maxTurns": 64 }));
+        let resolved = resolve_layers(
+            &[user, project],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+        let profiles = resolved.video_models();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "doubao-seedance-2-0-mini-260615");
+        assert_eq!(profiles[0].base_url, "https://ark.cn-beijing.volces.com");
     }
 
     #[test]

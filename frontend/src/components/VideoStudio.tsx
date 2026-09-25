@@ -92,6 +92,7 @@ type Step = 1 | 2 | 3 | 4;
 export default function VideoStudio({ onClose }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [models, setModels] = useState<VideoModel[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [mode, setMode] = useState<string>("t2v");
   const [images, setImages] = useState<{ name: string; url: string }[]>([]);
@@ -115,6 +116,7 @@ export default function VideoStudio({ onClose }: Props) {
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((data: { models: VideoModel[] }) => {
         setModels(data.models ?? []);
+        setModelsLoaded(true);
         const preferred = data.models?.find((m) => m.default) ?? data.models?.[0];
         if (preferred) {
           setModelName(preferred.name);
@@ -234,9 +236,17 @@ export default function VideoStudio({ onClose }: Props) {
               在 settings.json 的 videoModels[] 中配置（apiKey 支持 $ENV 引用）
             </div>
           </div>
-        ) : models.length === 0 ? (
+        ) : !modelsLoaded ? (
           <div style={{ padding: "16px 0", color: "var(--muted)" }}>加载模型中…</div>
         ) : (
+          <div style={{ padding: "16px 0", color: "var(--danger, #e5484d)" }}>
+            未配置任何视频模型。
+            <div style={{ marginTop: 8, fontSize: 11, color: "var(--faint)" }}>
+              在 settings.json 的 videoModels[] 中配置（apiKey 支持 $ENV 引用），重启 serve 后生效
+            </div>
+          </div>
+        )}
+        {modelsLoaded && models.length > 0 && (
           <>
             {/* Step indicator */}
             <div style={{ display: "flex", gap: 8, margin: "14px 0 16px", fontSize: 11 }}>
