@@ -137,6 +137,8 @@ export default function InsightRail({ info, onOpen, onRefresh, onTrajectoryOpen,
 
         <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} send={send} />
 
+        <VideoTasksBadge />
+
         <Section
           id="cache"
           label="Cache"
@@ -575,6 +577,26 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
         <b>only PreToolUse</b> can block — non-zero exit denies the call.
       </div>
     </>
+  );
+}
+
+// ── Video tasks badge ───────────────────────────────────────────────────────
+
+/** "视频任务 N 个进行中" — hidden when 0; click opens the Video Studio. */
+function VideoTasksBadge() {
+  const inFlight = useStore((s) => s.projectInfo?.video_tasks_in_flight ?? 0);
+  if (inFlight === 0) return null;
+  return (
+    <div
+      className="insight-row"
+      style={{ cursor: "pointer", padding: "6px 10px", borderRadius: 8, background: "var(--bg-soft, #1c1c1e)", display: "flex", alignItems: "center", gap: 8 }}
+      onClick={() => useStore.getState().setShowVideoStudio(true)}
+      title="点击打开视频工作台"
+    >
+      <span>🎬</span>
+      <span className="insight-row__name">视频任务</span>
+      <span className="tag">{inFlight} 个进行中</span>
+    </div>
   );
 }
 

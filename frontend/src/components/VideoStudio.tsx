@@ -95,7 +95,9 @@ export default function VideoStudio({ onClose }: Props) {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [mode, setMode] = useState<string>("t2v");
-  const [images, setImages] = useState<{ name: string; url: string }[]>([]);
+  const [images, setImages] = useState<{ name: string; url: string; dataUrl: string }[]>([]);
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceNote, setEnhanceNote] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string>("");
   const [duration, setDuration] = useState(5);
   const [resolution, setResolution] = useState("720p");
@@ -170,11 +172,80 @@ export default function VideoStudio({ onClose }: Props) {
   const addImages = (files: FileList | null) => {
     if (!files) return;
     const next = [...images];
+    const pending: Promise<void>[] = [];
     for (const file of Array.from(files)) {
       if (next.length >= maxImages) break;
-      next.push({ name: file.name, url: URL.createObjectURL(file) });
+      const index = next.length;
+      next.push({ name: file.name, url: URL.createObjectURL(file), dataUrl: "" });
+      pending.push(
+        new Promise<void>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            next[index] = { ...next[index], dataUrl: String(reader.result ?? "") };
+            resolve();
+          };
+          reader.onerror = () => resolve();
+          reader.readAsDataURL(file);
+        }),
+      );
     }
     setImages(next);
+    if (pending.length) void Promise.all(pending);
+  };
+
+  // POST /api/video/enhance — ✨ rewrite the draft into Seedance convention
+  // (never auto-submits; result replaces the textarea only after user click).
+  const enhancePrompt = async () => {
+    if (!prompt.trim() || enhancing) return;
+    setEnhancing(true);
+    setEnhanceNote(null);
+    try {
+      const resp = await fetch(api("/api/video/enhance"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "enhance",
+          prompt,
+          images: images.map((image) => image.dataUrl).filter(Boolean),
+        }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error ?? `HTTP ${resp.status}`);
+      setPrompt(String(body.result ?? ""));
+      setEnhanceNote(`已按 Seedance 规范改写（模型 ${body.model ?? "?"}）`);
+    } catch (e) {
+      setEnhanceNote(`增强失败：${(e as Error).message}`);
+    } finally {
+      setEnhancing(false);
+    }
+  };
+
+  // POST /api/video/enhance?action=describe — 📷 let a vision model read the
+  // uploaded reference images and append insertable material fragments.
+  const describeImages = async () => {
+    if (enhancing) return;
+    const dataUrls = images.map((image) => image.dataUrl).filter(Boolean);
+    if (!dataUrls.length) {
+      setEnhanceNote("请先上传参考图（等待缩略图生成后再试）");
+      return;
+    }
+    setEnhancing(true);
+    setEnhanceNote(null);
+    try {
+      const resp = await fetch(api("/api/video/enhance"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "describe", images: dataUrls }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error ?? `HTTP ${resp.status}`);
+      setPrompt((prev) => (prev.trim() ? `${prev.trim()}\n${body.result}` : String(body.result)));
+      setEnhanceNote("已插入参考图素材描述");
+    } catch (e) {
+      setEnhanceNote(`读图失败：${(e as Error).message}`);
+    } finally {
+      setEnhancing(false);
+    }
   };
 
   // `图N` reference validation against the uploaded count.
@@ -411,6 +482,29 @@ export default function VideoStudio({ onClose }: Props) {
                   rows={7}
                   style={{ width: "100%", fontSize: 13, fontFamily: "var(--font-mono)", resize: "vertical" }}
                 />
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+                  <button
+                    type="button"
+                    onClick={() => void enhancePrompt()}
+                    disabled={enhancing || !prompt.trim()}
+                    style={{ fontSize: 12, padding: "3px 10px" }}
+                    title="用视觉对话模型按 Seedance 规范改写提示词"
+                  >
+                    {enhancing ? "处理中…" : "✨ 增强"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void describeImages()}
+                    disabled={enhancing || !images.length}
+                    style={{ fontSize: 12, padding: "3px 10px" }}
+                    title="让视觉模型描述参考图素材并插入提示词"
+                  >
+                    📷 读图取材
+                  </button>
+                  {enhanceNote && (
+                    <span style={{ fontSize: 11, color: "var(--faint)", flex: 1 }}>{enhanceNote}</span>
+                  )}
+                </div>
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 11 }}>
                   <span style={{ color: promptRefWarning ? "var(--danger, #e5484d)" : "var(--faint)" }}>
                     {promptRefWarning ?? `${prompt.length} 字`}

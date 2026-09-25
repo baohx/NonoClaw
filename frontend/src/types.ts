@@ -511,6 +511,8 @@ export interface ProjectInfo {
   provider_balances: ProviderBalance[];
   /** Model name → billing provider key (only models with configured billing). */
   model_providers: ModelProviderMapping[];
+  /** Video (Seedance) tasks currently queued/running/downloading. */
+  video_tasks_in_flight: number;
 }
 
 export interface ProviderBalance {
