@@ -115,6 +115,12 @@ async fn query_one(
         return query_ark_agentplan(client, api_key).await;
     }
 
+    // Kiro gateway (local subscription proxy) likewise has no balance API.
+    // Probe the gateway's /v1/messages liveness via the default alias.
+    if provider == "kiro" {
+        return query_kiro_gateway(client, url, api_key).await;
+    }
+
     let (header_name, header_value) = auth_header(provider, api_key);
     // JieKou's bill endpoint requires query params. We query the lifetime
     // `summary` bill list (one entry per month) and aggregate on the fly.
@@ -253,6 +259,67 @@ fn ark_liveness_summary(body: &serde_json::Value) -> String {
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
     format!("Agent Plan 活跃 · {model}")
+}
+
+/// Liveness probe for the local Kiro gateway (subscription proxy, no balance
+/// API). Mirrors the ark-agentplan approach: minimal Messages call, 200 =
+/// gateway + auth OK. Uses the `auto-kiro` alias (defaults to the tier's
+/// default model) so the probe tracks the gateway's default routing.
+async fn query_kiro_gateway(client: &reqwest::Client, url: &str, api_key: &str) -> ProviderBalance {
+    let response = match client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(12))
+        .body(
+            serde_json::json!({
+                "model": "auto-kiro",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return kiro_fail(format!("request failed: {e}")),
+    };
+    let status = response.status();
+    if status.as_u16() == 429 {
+        return kiro_ok("活跃（限流中）".into());
+    }
+    if !status.is_success() {
+        return kiro_fail(format!("HTTP {status}"));
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => return kiro_fail(format!("parse error: {e}")),
+    };
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown");
+    kiro_ok(format!("Kiro 网关活跃 · {model}"))
+}
+
+fn kiro_fail(error: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "kiro".into(),
+        summary: String::new(),
+        ok: false,
+        error: Some(error),
+    }
+}
+
+fn kiro_ok(summary: String) -> ProviderBalance {
+    ProviderBalance {
+        provider: "kiro".into(),
+        summary,
+        ok: true,
+        error: None,
+    }
 }
 
 /// Kimi: https://platform.kimi.com/docs/api/balance
@@ -699,6 +766,19 @@ mod tests {
         assert!(!fail.ok);
         assert!(fail.summary.is_empty());
         assert_eq!(fail.error.as_deref(), Some("HTTP 401"));
+    }
+
+    #[test]
+    fn kiro_helpers_build_provider_balance() {
+        let ok = kiro_ok("Kiro 网关活跃 · gpt-5.6-sol".into());
+        assert!(ok.ok);
+        assert_eq!(ok.provider, "kiro");
+        assert_eq!(ok.summary, "Kiro 网关活跃 · gpt-5.6-sol");
+
+        let fail = kiro_fail("HTTP 502".into());
+        assert!(!fail.ok);
+        assert!(fail.summary.is_empty());
+        assert_eq!(fail.error.as_deref(), Some("HTTP 502"));
     }
 }
 
