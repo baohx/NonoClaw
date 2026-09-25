@@ -95,7 +95,7 @@ export default function VideoStudio({ onClose }: Props) {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [mode, setMode] = useState<string>("t2v");
-  const [images, setImages] = useState<{ name: string; url: string; dataUrl: string }[]>([]);
+  const [images, setImages] = useState<{ name: string; url: string; dataUrl: string; file: File }[]>([]);
   const [enhancing, setEnhancing] = useState(false);
   const [enhanceNote, setEnhanceNote] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string>("");
@@ -176,7 +176,7 @@ export default function VideoStudio({ onClose }: Props) {
     for (const file of Array.from(files)) {
       if (next.length >= maxImages) break;
       const index = next.length;
-      next.push({ name: file.name, url: URL.createObjectURL(file), dataUrl: "" });
+      next.push({ name: file.name, url: URL.createObjectURL(file), dataUrl: "", file });
       pending.push(
         new Promise<void>((resolve) => {
           const reader = new FileReader();
@@ -270,8 +270,7 @@ export default function VideoStudio({ onClose }: Props) {
         JSON.stringify({ model: modelName, mode, prompt, duration, resolution, ratio, draft }),
       );
       for (const image of images) {
-        const blob = await fetch(image.url).then((r) => r.blob());
-        form.append("image", blob, image.name);
+        form.append("image", image.file, image.name);
       }
       const resp = await fetch(api("/api/video/tasks"), { method: "POST", body: form });
       if (!resp.ok) {

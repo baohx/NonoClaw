@@ -82,7 +82,11 @@ pub(super) async fn serve_manifest() -> impl IntoResponse {
 }
 
 pub(super) async fn serve_sw() -> impl IntoResponse {
-    let body = r#"const C="nc-v3";self.addEventListener("install",e=>{e.waitUntil(self.skipWaiting())});self.addEventListener("activate",e=>{e.waitUntil((async()=>{await self.clients.claim();const keys=await caches.keys();for(const k of keys){if(k!==C)await caches.delete(k)}})())});self.addEventListener("fetch",e=>{const u=new URL(e.request.url);if(u.pathname.startsWith("/assets/")){e.respondWith(caches.open(C).then(c=>c.match(e.request).then(r=>r||fetch(e.request).then(res=>{c.put(e.request,res.clone());return res}))))}else if(u.pathname==="/ws"){return}else{e.respondWith(fetch(e.request))}});"#;
+    let body = r#"const C="nc-v3";self.addEventListener("install",e=>{e.waitUntil(self.skipWaiting())});self.addEventListener("activate",e=>{e.waitUntil((async()=>{await self.clients.claim();const keys=await caches.keys();for(const k of keys){if(k!==C)await caches.delete(k)}})())});self.addEventListener("fetch",e=>{const u=new URL(e.request.url);if(u.pathname.startsWith("/assets/")){e.respondWith(caches.open(C).then(c=>c.match(e.request).then(r=>r||fetch(e.request).then(res=>{c.put(e.request,res.clone());return res}))))}});
+// Only /assets/ is intercepted (its sole responsibility: hashed-bundle
+// caching). Everything else — especially API POSTs with large multipart
+// bodies — must bypass respondWith: routing a request body through the SW
+// process is a known Chromium failure source (TypeError: Failed to fetch)."#;
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/javascript")
