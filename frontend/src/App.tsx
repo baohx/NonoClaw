@@ -18,6 +18,7 @@ import SessionPicker from "./components/SessionPicker";
 import SessionRail from "./components/SessionRail";
 import StatusBar from "./components/StatusBar";
 import TrajectoryGovernance from "./components/TrajectoryGovernance";
+import VideoStudio from "./components/VideoStudio";
 
 const WS_PROTO = window.location.protocol === "https:" ? "wss" : "ws";
 const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
@@ -36,6 +37,8 @@ export default function App() {
   const setShowApiLog = useStore((s) => s.setShowApiLog);
   const showGovernance = useStore((s) => s.showGovernance);
   const setShowGovernance = useStore((s) => s.setShowGovernance);
+  const showVideoStudio = useStore((s) => s.showVideoStudio);
+  const setShowVideoStudio = useStore((s) => s.setShowVideoStudio);
   const historyOlderRemaining = useStore((s) => s.historyOlderRemaining);
   const historyLoading = useStore((s) => s.historyLoading);
   const requestOlderHistory = useStore((s) => s.requestOlderHistory);
@@ -431,6 +434,7 @@ export default function App() {
           onToggleInsight={toggleInsight}
           onToggleApiLog={() => setShowApiLog(true)}
           onToggleGovernance={() => setShowGovernance(true)}
+          onOpenVideoStudio={() => setShowVideoStudio(true)}
           onShowQr={() => setShowQr(true)}
         />
         <div className={bodyClass}>
@@ -545,6 +549,7 @@ export default function App() {
       {showQr && <QrDialog onClose={() => setShowQr(false)} />}
       {showApiLog && <ApiLogDrawer onClose={() => setShowApiLog(false)} />}
       {showGovernance && <TrajectoryGovernance onClose={() => setShowGovernance(false)} />}
+      {showVideoStudio && <VideoStudio onClose={() => setShowVideoStudio(false)} />}
     </>
   );
 }

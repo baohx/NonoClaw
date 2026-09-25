@@ -1257,6 +1257,28 @@ impl ResolvedConfig {
             .map(|value| self.resolve_reference(value))
     }
 
+    /// Resolved video generation model profiles (task-based APIs, not chat).
+    /// API keys have `$ENV` references expanded; empty result = module off.
+    pub fn video_models(&self) -> Vec<VideoModelProfile> {
+        self.settings
+            .video_models
+            .as_ref()
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .map(|profile| VideoModelProfile {
+                        name: profile.name.clone(),
+                        label: profile.label.clone(),
+                        base_url: self.resolve_reference(&profile.base_url),
+                        api_key: self.resolve_reference(&profile.api_key),
+                        default: profile.default,
+                        capabilities: profile.capabilities.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Resolved Jev settings when the integration is effectively enabled
     /// (key present and not explicitly disabled). Returns a ready-to-use
     /// `(base_url, api_key, model)` triple.

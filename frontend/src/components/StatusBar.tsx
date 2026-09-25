@@ -15,6 +15,7 @@ interface Props {
   onToggleLeftRail: () => void;
   onToggleInsight: () => void;
   onToggleApiLog: () => void;
+  onOpenVideoStudio: () => void;
   onToggleGovernance: () => void;
 }
 
@@ -31,6 +32,7 @@ export default function StatusBar({
   onToggleLeftRail,
   onToggleInsight,
   onToggleApiLog,
+  onOpenVideoStudio,
   onToggleGovernance,
   onShowQr,
 }: Props) {
@@ -174,6 +176,14 @@ export default function StatusBar({
           aria-label="Toggle API log viewer"
         >
           &#x1f4dd;
+        </button>
+        <button
+          className="iconbtn"
+          onClick={onOpenVideoStudio}
+          title="Video generation studio (Seedance)"
+          aria-label="Open video studio"
+        >
+          &#x1f3ac;
         </button>
         <button
           className="iconbtn"

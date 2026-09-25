@@ -125,6 +125,8 @@ pub(super) struct AppState {
     pub(super) markitdown_path: Arc<Mutex<Option<String>>>,
     /// Last observed client activity (AutoDream idle detection).
     pub(super) last_activity: Arc<Mutex<std::time::SystemTime>>,
+    /// Video generation local queue + Ark RPM window.
+    pub(super) video_queue: Arc<super::video_service::VideoStore>,
 }
 
 impl AppState {
@@ -397,6 +399,7 @@ pub(super) fn upload_exploration_state(
         )),
         markitdown_path: Arc::new(Mutex::new(None)),
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
+        video_queue: Arc::new(super::video_service::VideoStore::new()),
     })
 }
 
@@ -639,6 +642,7 @@ pub async fn serve(
         )),
         markitdown_path: Arc::new(Mutex::new(None)),
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
+        video_queue: Arc::new(super::video_service::VideoStore::new()),
     });
 
     // Load persisted pending permissions (survives server restarts).
@@ -711,6 +715,31 @@ pub async fn serve(
         .route(
             "/api/stt",
             axum::routing::post(super::speech_service::stt_handler),
+        )
+        .route(
+            "/api/video/models",
+            axum::routing::get(super::video_service::models_handler),
+        )
+        .route(
+            "/api/video/tasks",
+            axum::routing::post(super::video_service::create_handler)
+                .layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
+        )
+        .route(
+            "/api/video/tasks",
+            axum::routing::get(super::video_service::list_handler),
+        )
+        .route(
+            "/api/video/tasks/:task_id",
+            axum::routing::get(super::video_service::get_handler),
+        )
+        .route(
+            "/api/video/tasks/:task_id",
+            axum::routing::delete(super::video_service::delete_handler),
+        )
+        .route(
+            "/api/video/tasks/:task_id/file",
+            axum::routing::get(super::video_service::file_handler),
         )
         .route(
             "/api/sessions/:session_id/permissions",

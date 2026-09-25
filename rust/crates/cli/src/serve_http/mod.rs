@@ -20,5 +20,6 @@ mod session_hub;
 mod speech_service;
 mod static_service;
 mod upload_service;
+mod video_service;
 
 pub use connection::serve;

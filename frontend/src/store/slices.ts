@@ -285,6 +285,9 @@ export interface UiSlice {
   showApiLog: boolean;
   /** Whether the trajectory governance tab is open. */
   showGovernance: boolean;
+  /** Whether the video generation studio dialog is open. */
+  showVideoStudio: boolean;
+  setShowVideoStudio: (show: boolean) => void;
   setXrayBudget: (event: import("../types").EngineEvent | null) => void;
   setLeftRailCollapsed: (collapsed: boolean) => void;
   setInsightCollapsed: (collapsed: boolean) => void;
@@ -839,10 +842,12 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   toolsHidden: false,
   showApiLog: false,
   showGovernance: false,
+  showVideoStudio: false,
   setXrayBudget: (event) => set({ xrayBudget: event }),
   setToolsHidden: (toolsHidden) => set({ toolsHidden }),
   setShowApiLog: (showApiLog) => set({ showApiLog }),
   setShowGovernance: (showGovernance) => set({ showGovernance }),
+  setShowVideoStudio: (showVideoStudio) => set({ showVideoStudio }),
   setLeftRailCollapsed: (leftRailCollapsed) => set({ leftRailCollapsed }),
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),
