@@ -89,6 +89,32 @@ fn load_profiles(cwd: &Path) -> Result<Vec<ProfileEntry>> {
     })
 }
 
+/// Translate a raw Ark error body into actionable guidance for the operator.
+/// Returns the raw text unchanged when the code is not recognised — the raw
+/// body carries the request id, which is what support asks for.
+pub fn describe_ark_error(raw: &str) -> String {
+    let hints: [(&str, &str); 3] = [
+        (
+            "InputImageSensitiveContentDetected.PrivacyInformation",
+            "输入图含真人脸，被方舟内容审核拦截。可改用：同账号 30 天内的 Seedream/Seedance 原始产物（勿剪辑/压缩/转发），或虚拟人像库素材（asset://ID，需先在方舟控制台创建）",
+        ),
+        (
+            "ModelNotOpen",
+            "模型未开通或余额不足：需账户余额 >200 元，或购买对应资源包",
+        ),
+        (
+            "role must be specified",
+            "图片参数缺 role（旧版本缺陷，升级后重试即可）",
+        ),
+    ];
+    for (needle, hint) in hints {
+        if raw.contains(needle) {
+            return format!("{hint}；原始报错：{raw}");
+        }
+    }
+    raw.to_string()
+}
+
 /// Mirror of the engine's `nonoclaw_config_dir` (XDG-aware home config dir).
 fn nonoclaw_home_config_dir() -> Option<PathBuf> {
     #[cfg(windows)]
@@ -228,6 +254,16 @@ fn split_data_url(data_url: &str) -> Option<(&str, &str)> {
     Some((mime, payload))
 }
 
+/// Ark accepts data-URLs, public URLs and virtual-person assets. The
+/// `asset://` form is the documented workaround for the real-person-face
+/// moderation rejection, so it must not be filtered out here.
+fn is_supported_image_url(url: &str) -> bool {
+    split_data_url(url).is_some()
+        || url.starts_with("asset://")
+        || url.starts_with("https://")
+        || url.starts_with("http://")
+}
+
 /// Build the Ark content-generation payload (single-image i2v or plain t2v).
 fn build_payload(model: &str, prompt: &str, images: &[String]) -> Value {
     let text = prompt.to_string();
@@ -236,14 +272,21 @@ fn build_payload(model: &str, prompt: &str, images: &[String]) -> Value {
     let image_urls: Vec<&str> = images
         .iter()
         .map(String::as_str)
-        .filter(|url| split_data_url(url).is_some())
+        .filter(|url| is_supported_image_url(url))
         .collect();
     if image_urls.is_empty() {
         json!({ "model": model, "content": [{ "type": "text", "text": text }] })
     } else {
         let mut content = vec![json!({ "type": "text", "text": text })];
         for url in image_urls {
-            content.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+            // Ark rejects image parts without a role: "role must be specified
+            // for image contents". reference_image is the multi-reference /
+            // i2v role; first/last_frame cannot be mixed with it.
+            content.push(json!({
+                "type": "image_url",
+                "role": "reference_image",
+                "image_url": { "url": url }
+            }));
         }
         json!({ "model": model, "content": content })
     }
@@ -446,7 +489,10 @@ impl VideoGenerateTool {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(format!("ark create failed: HTTP {status}: {body}"));
+            return Err(format!(
+                "ark create failed: HTTP {status}: {}",
+                describe_ark_error(&body)
+            ));
         }
         let remote_id = serde_json::from_str::<Value>(&body)
             .ok()
@@ -560,6 +606,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ark_errors_get_actionable_hints() {
+        // Real-person face rejection → the documented workarounds.
+        let face = r#"{"error":{"code":"InputImageSensitiveContentDetected.PrivacyInformation","message":"may contain real person"}}"#;
+        let described = describe_ark_error(face);
+        assert!(described.contains("真人脸"));
+        assert!(described.contains("asset://"));
+        // Unknown codes pass through verbatim so the request id survives.
+        let unknown = r#"{"error":{"code":"Whatever","message":"Request id: abc"}}"#;
+        assert_eq!(describe_ark_error(unknown), unknown);
+    }
+
+    #[test]
     fn next_local_id_is_monotonic_and_prefixed() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
@@ -593,6 +651,36 @@ mod tests {
         assert_eq!(
             content[1].pointer("/image_url/url").and_then(Value::as_str),
             Some(data_url)
+        );
+        // Ark rejects image parts without a role.
+        assert_eq!(
+            content[1].get("role").and_then(Value::as_str),
+            Some("reference_image")
+        );
+    }
+
+    #[test]
+    fn payload_keeps_asset_and_public_urls() {
+        // `asset://` (virtual-person library) is the documented workaround for
+        // the real-person-face moderation rejection — it must reach Ark.
+        let payload = build_payload(
+            "m",
+            "p",
+            &[
+                "asset://voice-123".to_string(),
+                "https://example.com/a.png".to_string(),
+                "not-a-url".to_string(),
+            ],
+        );
+        let content = payload.get("content").unwrap().as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(
+            content[1].pointer("/image_url/url").and_then(Value::as_str),
+            Some("asset://voice-123")
+        );
+        assert_eq!(
+            content[2].pointer("/image_url/url").and_then(Value::as_str),
+            Some("https://example.com/a.png")
         );
     }
 

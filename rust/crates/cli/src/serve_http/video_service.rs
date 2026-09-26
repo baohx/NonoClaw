@@ -505,7 +505,10 @@ async fn run_task(state: Arc<AppState>, mut task: VideoTask) {
             fail_task(
                 &cwd,
                 &mut task,
-                &format!("ark create failed: HTTP {status}: {text}"),
+                &format!(
+                    "ark create failed: HTTP {status}: {}",
+                    nonoclaw_tools::builtin::video_generate::describe_ark_error(&text)
+                ),
             );
             return;
         }
