@@ -865,6 +865,7 @@ impl AnthropicState {
         let content = self
             .blocks
             .into_values()
+            .filter(|block| !matches!(block, BlockBuilder::Text(text) if text.is_empty()))
             .map(BlockBuilder::finalize)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| StreamFailure {
@@ -1240,8 +1241,24 @@ fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     // would 400 on strict schemas and shift prompt-cache bytes every turn.
     if let serde_json::Value::Array(ref mut arr) = messages_value {
         for message in arr.iter_mut() {
-            if let serde_json::Value::Object(ref mut map) = message {
-                map.remove("ts");
+            let serde_json::Value::Object(ref mut map) = message else {
+                continue;
+            };
+            map.remove("ts");
+            // Empty text blocks 400 on strict Anthropic-compatible endpoints
+            // ("text content is empty"). They originate from tool-call-only
+            // assistant turns (OpenAI shape) or SSE streams whose
+            // content_block_start never received a text_delta. Drop them so
+            // sessions recorded before the stream fix replay cleanly.
+            if let Some(serde_json::Value::Array(ref mut blocks)) = map.get_mut("content") {
+                blocks.retain(|block| {
+                    !(block.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("x")
+                            .is_empty())
+                });
             }
         }
     }
@@ -4005,6 +4022,126 @@ mod tests {
             "session ts leaked into anthropic payload: {encoded}"
         );
         assert!(body["messages"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn anthropic_serializer_strips_empty_text_blocks() {
+        // Session 1d2a7671 regression: an assistant turn recorded with an
+        // empty text block (SSE content_block_start that never received a
+        // text_delta) 400s on strict Anthropic-compatible endpoints with
+        // "text content is empty". The serializer must drop such blocks so
+        // pre-fix sessions replay cleanly.
+        let mut params = fixture_params();
+        params.messages = vec![
+            Message {
+                role: nonoclaw_core::Role::User,
+                content: nonoclaw_core::MessageContent::Text("hi".into()),
+                ts: None,
+            },
+            Message {
+                role: nonoclaw_core::Role::Assistant,
+                content: nonoclaw_core::MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "before".into(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: String::new(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: "after".into(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                        cache_control: None,
+                    },
+                ]),
+                ts: None,
+            },
+        ];
+        let body: serde_json::Value =
+            serde_json::from_str(&serialize_body_anthropic(&params).unwrap()).unwrap();
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["before", "after"], "empty text block leaked");
+        // Non-text blocks must survive the filter.
+        assert!(blocks.iter().any(|b| b["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn anthropic_stream_drops_unfilled_empty_text_block() {
+        // content_block_start for a text block that never receives a
+        // text_delta must not emit an empty Text block into the message
+        // content (the upstream source of the poisoned transcripts).
+        let frames: Vec<SseFrame> = vec![
+            SseFrame {
+                event: "content_block_start".into(),
+                data: r#"{"index":0,"content_block":{"type":"text","text":""}}"#.into(),
+            },
+            SseFrame {
+                event: "content_block_stop".into(),
+                data: r#"{"index":0}"#.into(),
+            },
+            SseFrame {
+                event: "content_block_start".into(),
+                data: r#"{"index":1,"content_block":{"type":"text","text":""}}"#.into(),
+            },
+            SseFrame {
+                event: "content_block_delta".into(),
+                data: r#"{"index":1,"delta":{"type":"text_delta","text":"real"}}"#.into(),
+            },
+            SseFrame {
+                event: "content_block_stop".into(),
+                data: r#"{"index":1}"#.into(),
+            },
+        ];
+
+        let mut message_id = String::new();
+        let mut model = String::new();
+        let mut usage = Usage::default();
+        let mut stop_reason: Option<StopReason> = None;
+        let mut blocks: BTreeMap<usize, BlockBuilder> = BTreeMap::new();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let mut cb = |e: &StreamEvent| events.push(e.clone());
+
+        for f in &frames {
+            handle_frame(
+                f,
+                &mut message_id,
+                &mut model,
+                &mut usage,
+                &mut stop_reason,
+                &mut blocks,
+                &mut cb,
+            )
+            .unwrap();
+        }
+
+        let state = AnthropicState {
+            message_id,
+            model,
+            usage,
+            stop_reason,
+            blocks,
+        };
+        let outcome = state.finish().expect("stream should finish cleanly");
+        let texts: Vec<&str> = outcome
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["real"], "empty text block leaked into content");
     }
 
     #[test]
