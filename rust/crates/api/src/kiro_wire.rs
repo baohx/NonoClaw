@@ -115,13 +115,10 @@ pub fn serialize_body_kiro(params: &RequestParams) -> Result<String, serde_json:
         Some(model_name_to_kiro(&params.model))
     };
 
-    let mut user_input_msg = serde_json::json!({
+    let user_input_msg = serde_json::json!({
         "content": current_content,
         "origin": "AI_EDITOR"
     });
-    if let Some(mid) = model_id {
-        user_input_msg["modelId"] = serde_json::Value::String(mid);
-    }
 
     let mut conversation_state = serde_json::json!({
         "currentMessage": { "userInputMessage": user_input_msg },
@@ -131,7 +128,11 @@ pub fn serialize_body_kiro(params: &RequestParams) -> Result<String, serde_json:
         conversation_state["history"] = serde_json::Value::Array(history);
     }
 
-    let body = serde_json::json!({ "conversationState": conversation_state });
+    let mut body = serde_json::json!({ "conversationState": conversation_state });
+    // modelId goes at the top level, NOT inside userInputMessage.
+    if let Some(mid) = model_id {
+        body["modelId"] = serde_json::Value::String(mid);
+    }
     serde_json::to_string(&body)
 }
 
@@ -485,10 +486,8 @@ mod tests {
         };
         let body = serialize_body_kiro(&params).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-            "claude-sonnet-4"
-        );
+        // modelId goes at the top level, NOT inside userInputMessage.
+        assert_eq!(parsed["modelId"], "claude-sonnet-4");
     }
 
     #[test]
