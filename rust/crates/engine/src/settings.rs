@@ -188,6 +188,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         name: "proxy",
         description: "Outbound proxy URL (e.g. \"http://127.0.0.1:20171\") exported as HTTP(S)_PROXY/ALL_PROXY for all HTTP clients. Loopback bypasses via NO_PROXY.",
     },
+    ConfigFieldReference {
+        name: "jev",
+        description: "Jev (TypeSafe AI System One) decision-model integration: { apiKey, enabled, baseUrl, model }. Off unless a key is present and enabled.",
+    },
 ];
 
 pub fn config_reference() -> &'static [ConfigFieldReference] {
@@ -2702,6 +2706,48 @@ fn validate_executable_settings(
     }
 }
 
+/// Extract environment variable names referenced by a settings string.
+///
+/// Mirrors the runtime expansion rules: a leading `$VAR` is a whole-value
+/// reference (`${VAR}` with nothing else, or `$VAR` alone), while `${VAR}`
+/// may be embedded anywhere (e.g. `"${HOME}/.nonoclaw/..."`) exactly like
+/// `nonoclaw_tools::mcp::expand_placeholders`.
+fn environment_reference_names(raw: &str) -> Vec<(String, bool)> {
+    let mut names = Vec::new();
+    let rest = raw;
+    // Whole-value reference: `$VAR` or `${VAR}` spanning the entire string.
+    if let Some(after) = rest.strip_prefix('$') {
+        let whole = if let Some(inner) = after.strip_prefix('{') {
+            inner.strip_suffix('}')
+        } else {
+            // `$VAR` alone (no trailing content): treat as whole reference.
+            (!rest.contains('/')).then_some(after)
+        };
+        if let Some(variable) = whole {
+            if !variable.is_empty() {
+                names.push((variable.to_string(), true));
+                return names;
+            }
+        }
+    }
+    // Embedded `${VAR}` references.
+    let mut search_from = 0;
+    while let Some(start) = rest[search_from..].find("${") {
+        let start = start + search_from;
+        if let Some(end_rel) = rest[start + 2..].find('}') {
+            let end = start + 2 + end_rel;
+            let variable = &rest[start + 2..end];
+            if !variable.is_empty() {
+                names.push((variable.to_string(), false));
+            }
+            search_from = end + 1;
+        } else {
+            break;
+        }
+    }
+    names
+}
+
 fn diagnose_missing_env_reference(
     raw: &str,
     field: &str,
@@ -2709,13 +2755,13 @@ fn diagnose_missing_env_reference(
     environment: &ConfigEnvironment,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
-    if let Some(variable) = raw.strip_prefix('$') {
-        if environment.get(variable).is_none() {
+    for (variable, _whole) in environment_reference_names(raw) {
+        if environment.get(&variable).is_none() {
             diagnostics.push(ConfigDiagnostic::error(
                 "environment_reference_missing",
                 format!("{field} references unset environment variable `${variable}`"),
                 Some(field.into()),
-                source,
+                source.clone(),
                 format!("Set {variable} in the process environment or settings env map."),
             ));
         }
@@ -2728,8 +2774,11 @@ fn record_environment_reference_sources(
     sources: &mut BTreeMap<String, Vec<ConfigSource>>,
 ) {
     let record = |raw: &str, field: String, sources: &mut BTreeMap<String, Vec<ConfigSource>>| {
-        if let Some(variable) = raw.strip_prefix('$') {
-            if environment.get(variable).is_some() {
+        // Only a whole-value reference makes the field env-sourced; embedded
+        // `${VAR}` inside a larger string (e.g. an MCP command path) keeps the
+        // field attributed to its settings file.
+        if let Some((variable, true)) = environment_reference_names(raw).into_iter().next() {
+            if environment.get(&variable).is_some() {
                 set_scalar_source(
                     sources,
                     &field,
@@ -3480,6 +3529,51 @@ mod tests {
     }
 
     #[test]
+    fn environment_reference_parsing_handles_embedded_placeholders() {
+        // Regression: `diagnose_missing_env_reference` treated the whole
+        // string after `$` as a variable name, so MCP commands like
+        // `${HOME}/.nvm/.../node` warned about a bogus variable
+        // `${HOME}/.nvm/.../node` even though HOME is set.
+        let environment = ConfigEnvironment::capture();
+        let mut diagnostics = Vec::new();
+        diagnose_missing_env_reference(
+            "${HOME}/.nvm/versions/node/v24.21.0/bin/node",
+            "mcpServers.context7.command",
+            None,
+            &environment,
+            &mut diagnostics,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "embedded ${{HOME}} must resolve via the process env: {diagnostics:?}"
+        );
+
+        diagnose_missing_env_reference(
+            "${NO_SUCH_VAR_FOR_TEST}/bin/tool",
+            "mcpServers.x.command",
+            None,
+            &environment,
+            &mut diagnostics,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].field.as_deref(),
+            Some("mcpServers.x.command")
+        );
+
+        // Whole-value references keep their original semantics.
+        let mut diagnostics = Vec::new();
+        diagnose_missing_env_reference(
+            "$UNSET_WHOLE_VALUE",
+            "models.gpt.apiKey",
+            None,
+            &environment,
+            &mut diagnostics,
+        );
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
     fn proxy_and_dream_fields_are_known_config_fields() {
         // Regression: `proxy` (SettingsFile field) and the dream scheduler
         // toggles were missing from CONFIG_REFERENCE, so every real user
@@ -3491,13 +3585,15 @@ mod tests {
         assert!(names.contains("proxy"));
         assert!(names.contains("dreamEnabled"));
         assert!(names.contains("dreamIdleMinutes"));
+        assert!(names.contains("jev"));
 
         let mut diagnostics = Vec::new();
         diagnose_unknown_fields(
             &serde_json::json!({
                 "proxy": "http://127.0.0.1:20171",
                 "dreamEnabled": true,
-                "dreamIdleMinutes": 15
+                "dreamIdleMinutes": 15,
+                "jev": {"apiKey": "$JEV_API_KEY", "enabled": true}
             }),
             &source("proxy"),
             &mut diagnostics,
