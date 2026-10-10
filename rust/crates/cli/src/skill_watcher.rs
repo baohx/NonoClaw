@@ -307,11 +307,13 @@ pub fn spawn_project_skill_watcher(projects: ProjectContextStore) -> tokio::task
 
 /// Static watcher retained for non-Web CLI/ACP sessions, whose project cannot
 /// change after startup.
-pub fn spawn_skill_watcher(
-    skills_manager: Arc<RwLock<SkillsManager>>,
-    cwd: PathBuf,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+pub fn spawn_skill_watcher(skills_manager: Arc<RwLock<SkillsManager>>, cwd: PathBuf) -> std::thread::JoinHandle<()> {
+    // Detached OS thread, not `tokio::task::spawn_blocking`: the watcher loop
+    // only exits when its channel is disconnected, which never happens for a
+    // static watcher. A spawn_blocking task that never returns blocks the
+    // runtime's BlockingPool::shutdown, hanging every headless run after the
+    // model response is printed. A detached thread dies with the process.
+    std::thread::spawn(move || {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<WatchEvent>();
         let mut watcher = None;
         let debounce = Duration::from_millis(500);
