@@ -9,7 +9,7 @@ pub mod mcp_server;
 pub mod memory;
 pub mod permissions;
 pub mod registry;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod sandbox;
 pub mod sensitive;
 pub mod session_index;

@@ -119,23 +119,54 @@ impl Tool for BashTool {
         #[cfg(windows)]
         let (shell, arg) = ("cmd", "/C");
         #[cfg(not(windows))]
-        let (shell, arg) = ("bash", "-c");
+        let (shell, arg, skip_profile) = resolve_unix_shell();
 
-        let mut cmd = Command::new(shell);
-        // Do not load login/profile scripts: a nominally read-only command
-        // must not trigger arbitrary profile side effects. PATH and other
-        // required environment are inherited from the NonoClaw process.
-        #[cfg(not(windows))]
-        {
-            cmd.arg("--noprofile").arg("--norc");
-        }
-        cmd.arg(arg).arg(command);
+        // macOS Seatbelt wraps the whole child argv in `sandbox-exec -f …`
+        // (no pre_exec-installable API exists); Linux Landlock is applied on
+        // the Command below. Keep the wrapper argv for post-spawn cleanup.
+        #[cfg(target_os = "macos")]
+        let seatbelt = seatbelt_argv(ctx.options.permission_mode, ctx.cwd, shell, arg, &command);
+        #[cfg(target_os = "macos")]
+        let mut cmd = match seatbelt.as_deref() {
+            Some(wrapper) => {
+                // wrapper[0] is "sandbox-exec" itself; Command::new already
+                // sets the program, so only pass the trailing args.
+                let mut cmd = Command::new("sandbox-exec");
+                cmd.args(&wrapper[1..]);
+                cmd
+            }
+            None => {
+                let mut cmd = Command::new(shell);
+                if skip_profile {
+                    cmd.arg("--noprofile").arg("--norc");
+                }
+                cmd.arg(arg).arg(command);
+                cmd
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = {
+            let mut cmd = Command::new(shell);
+            // Do not load login/profile scripts: a nominally read-only command
+            // must not trigger arbitrary profile side effects. PATH and other
+            // required environment are inherited from the NonoClaw process.
+            #[cfg(not(windows))]
+            {
+                if skip_profile {
+                    cmd.arg("--noprofile").arg("--norc");
+                }
+            }
+            cmd.arg(arg).arg(command);
+            cmd
+        };
         // Close stdin so interactive commands (sudo, ssh, passwd, etc.)
         // fail-fast with EOF instead of hanging until the timeout. The agent
         // should use non-interactive flags (-n, --yes, --non-interactive) or
         // inline input via heredoc/piping instead.
         cmd.stdin(std::process::Stdio::null());
-        // OS-level sandbox backstop for sandboxed permission modes (Linux only).
+        // OS-level sandbox backstop for sandboxed permission modes (Linux:
+        // Landlock pre_exec ruleset; macOS is handled by the argv wrapper).
+        #[cfg(not(target_os = "macos"))]
         apply_sandbox(&mut cmd, ctx.options.permission_mode, ctx.cwd);
 
         let mut child = cmd
@@ -148,6 +179,11 @@ impl Tool for BashTool {
                 tool: "Bash".into(),
                 message: format!("failed to spawn shell: {e}"),
             })?;
+        // The Seatbelt profile file can be removed once the child is running.
+        #[cfg(target_os = "macos")]
+        if let Some(wrapper) = seatbelt.as_deref() {
+            crate::sandbox::cleanup(wrapper);
+        }
 
         let mut stdout = child.stdout.take().expect("stdout piped");
         let mut stderr = child.stderr.take().expect("stderr piped");
@@ -223,9 +259,45 @@ fn ensure_sudo_noninteractive(cmd: &str) -> String {
     format!("{indent}sudo -n{after_sudo}")
 }
 
+#[cfg(not(windows))]
+/// Pick the Unix shell for the Bash tool. Prefers `bash` (POSIX-compatible
+/// Bourne shell is the tool contract); falls back to `sh` on minimal distros
+/// (Alpine/BusyBox) where bash is not installed. Returns
+/// `(program, arg, is_bash)` — profile-skipping flags only apply to bash.
+fn resolve_unix_shell() -> (&'static str, &'static str, bool) {
+    use std::sync::OnceLock;
+    // (bash, sh) probe results, cached for the process lifetime since PATH
+    // rarely changes mid-run.
+    static FOUND: OnceLock<(bool, bool)> = OnceLock::new();
+    let (has_bash, has_sh) = *FOUND.get_or_init(|| (find_on_path("bash"), find_on_path("sh")));
+    if has_bash {
+        ("bash", "-c", true)
+    } else if has_sh {
+        ("sh", "-c", false)
+    } else {
+        // Neither found on PATH — let Command::new surface the spawn error
+        // ("program not found") rather than guessing a path here.
+        ("bash", "-c", true)
+    }
+}
+
+#[cfg(not(windows))]
+/// Cheap existence probe that avoids the `which` crate: iterate PATH and
+/// check for an executable file.
+fn find_on_path(program: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(program);
+        std::fs::metadata(&candidate)
+            .map(|m| m.is_file() && m.mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
 /// Install a Linux Landlock ruleset in the Bash child when the run is in a
-/// sandboxed permission mode. No-op on non-Linux platforms or when the kernel
-/// lacks Landlock (falls back to approval-only gating).
+/// sandboxed permission mode. No-op when the kernel lacks Landlock (falls
+/// back to approval-only gating).
 #[cfg(target_os = "linux")]
 fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
     use crate::sandbox::{self, SandboxMode};
@@ -246,7 +318,39 @@ fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+/// macOS Seatbelt: there is no pre_exec-installable ruleset API, so instead
+/// of configuring `cmd` we rewrite the child argv to
+/// `sandbox-exec -f <profile> -- bash -c <command>`. Returns the wrapper
+/// argv (for profile cleanup after the child exits) or None when Seatbelt
+/// is unavailable (falls back to approval-only gating).
+fn seatbelt_argv(
+    mode: PermissionMode,
+    cwd: &Path,
+    shell: &str,
+    arg: &str,
+    command: &str,
+) -> Option<Vec<String>> {
+    use crate::sandbox::{self, SandboxMode};
+    let sandbox_mode = match mode {
+        PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
+        PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        _ => None,
+    }?;
+    if !sandbox::probe() {
+        return None;
+    }
+    sandbox::wrap_argv(
+        sandbox_mode,
+        cwd,
+        &[],
+        shell,
+        &[arg.to_string(), command.to_string()],
+    )
+    .ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn apply_sandbox(_cmd: &mut Command, _mode: PermissionMode, _cwd: &Path) {}
 
 /// Fail-closed classifier for the handful of commands that may bypass a

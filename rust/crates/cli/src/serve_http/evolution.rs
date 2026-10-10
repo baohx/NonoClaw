@@ -49,7 +49,7 @@ pub enum CommitOutcome {
     },
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported_backend() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -165,7 +165,7 @@ pub fn default_gate(latest_status: &str, latest_reward: f64) -> Result<(), Strin
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure {
     use std::ffi::CString;
     use std::fs::{File, Permissions};
@@ -313,7 +313,7 @@ mod secure {
                         | libc::O_EXCL
                         | libc::O_CLOEXEC
                         | libc::O_NOFOLLOW,
-                    libc::S_IRUSR | libc::S_IWUSR,
+                    libc::S_IRUSR as libc::c_uint | libc::S_IWUSR as libc::c_uint,
                 )
             };
             if descriptor < 0 {
@@ -327,6 +327,7 @@ mod secure {
             let source = Self::c_name(source)?;
             let destination = Self::c_name(destination)?;
             // SAFETY: both names and the directory descriptor are valid.
+            #[cfg(target_os = "linux")]
             let result = unsafe {
                 libc::renameat2(
                     self.file.as_raw_fd(),
@@ -334,6 +335,19 @@ mod secure {
                     self.file.as_raw_fd(),
                     destination.as_ptr(),
                     libc::RENAME_NOREPLACE,
+                )
+            };
+            // SAFETY: renameatx_np mirrors renameat2 semantics on macOS:
+            // RENAME_EXCL fails with EEXIST when the destination exists,
+            // matching Linux RENAME_NOREPLACE (verified on macOS 12).
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::renameatx_np(
+                    self.file.as_raw_fd(),
+                    source.as_ptr(),
+                    self.file.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::RENAME_EXCL,
                 )
             };
             if result == 0 {
@@ -400,7 +414,8 @@ mod secure {
             let left = Self::c_name(left)?;
             let right = Self::c_name(right)?;
             // SAFETY: both names and the directory descriptor are valid;
-            // RENAME_EXCHANGE swaps the two entries atomically.
+            // the entries swap atomically.
+            #[cfg(target_os = "linux")]
             let result = unsafe {
                 libc::renameat2(
                     self.file.as_raw_fd(),
@@ -408,6 +423,18 @@ mod secure {
                     self.file.as_raw_fd(),
                     right.as_ptr(),
                     libc::RENAME_EXCHANGE,
+                )
+            };
+            // SAFETY: RENAME_SWAP is the macOS counterpart of
+            // RENAME_EXCHANGE (verified on macOS 12).
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::renameatx_np(
+                    self.file.as_raw_fd(),
+                    left.as_ptr(),
+                    self.file.as_raw_fd(),
+                    right.as_ptr(),
+                    libc::RENAME_SWAP,
                 )
             };
             if result == 0 {
@@ -449,10 +476,54 @@ mod secure {
         }
 
         fn entry_names(&self) -> io::Result<Vec<OsString>> {
-            let path = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
-            std::fs::read_dir(path)?
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect()
+            #[cfg(target_os = "linux")]
+            {
+                let path = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+                std::fs::read_dir(path)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // /dev/fd/N cannot open a directory fd on macOS; enumerate
+                // through a duplicated descriptor owned by fdopendir.
+                use std::ffi::CStr;
+                use std::os::unix::ffi::OsStringExt;
+                // SAFETY: dup creates an owned copy; fdopendir takes sole
+                // ownership of the duplicated descriptor.
+                let dup = unsafe { libc::dup(self.file.as_raw_fd()) };
+                if dup < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: `dup` is a valid descriptor that fdopendir consumes.
+                let dir = unsafe { libc::fdopendir(dup) };
+                if dir.is_null() {
+                    let error = io::Error::last_os_error();
+                    // SAFETY: fdopendir failed, so the duplicate is still ours.
+                    unsafe { libc::close(dup) };
+                    return Err(error);
+                }
+                let mut names = Vec::new();
+                loop {
+                    // SAFETY: `dir` is a live DIR* from fdopendir; readdir
+                    // returns a borrowed entry valid until the next call.
+                    let entry = unsafe { libc::readdir(dir) };
+                    if entry.is_null() {
+                        break;
+                    }
+                    // SAFETY: the dirent is populated by readdir above.
+                    let name = unsafe { (*entry).d_name };
+                    // SAFETY: readdir NUL-terminates d_name.
+                    let bytes = unsafe { CStr::from_ptr(name.as_ptr()) }.to_bytes();
+                    if bytes == b"." || bytes == b".." {
+                        continue;
+                    }
+                    names.push(OsString::from_vec(bytes.to_vec()));
+                }
+                // SAFETY: `dir` is a live DIR* whose iteration finished.
+                unsafe { libc::closedir(dir) };
+                Ok(names)
+            }
         }
 
         fn sync(&self) -> io::Result<()> {
@@ -1375,17 +1446,17 @@ mod secure {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn resource_identity(project_nonoclaw: &Path, live: &Path) -> io::Result<String> {
     secure::resource_identity(project_nonoclaw, live)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn resource_identity(_project_nonoclaw: &Path, _live: &Path) -> io::Result<String> {
     Err(unsupported_backend())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn stage_shadow(
     project_nonoclaw: &Path,
     live: &Path,
@@ -1394,12 +1465,12 @@ pub(super) fn stage_shadow(
     secure::stage_shadow(project_nonoclaw, live, content)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn stage_shadow(_project_nonoclaw: &Path, _live: &Path, _content: &str) -> io::Result<PathBuf> {
     Err(unsupported_backend())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn commit_gated(
     live: &Path,
     project_nonoclaw: &Path,
@@ -1408,7 +1479,7 @@ pub(super) fn commit_gated(
     secure::commit_gated(live, project_nonoclaw, gate)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn commit_gated(
     _live: &Path,
     _project_nonoclaw: &Path,
@@ -1417,17 +1488,17 @@ pub fn commit_gated(
     Err(unsupported_backend())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn restore(project_nonoclaw: &Path, live: &Path) -> io::Result<bool> {
     secure::restore(project_nonoclaw, live)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn restore(_project_nonoclaw: &Path, _live: &Path) -> io::Result<bool> {
     Err(unsupported_backend())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 

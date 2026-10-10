@@ -89,8 +89,18 @@ pub struct ContentQuery {
 struct OpenLogDirectory {
     display_path: PathBuf,
     access_path: PathBuf,
-    #[cfg(target_os = "linux")]
+    /// On Linux, `access_path` is the `/proc/self/fd/N` alias for `handle`
+    /// and is kept only for the fail-closed readability probe at open time.
+    /// On macOS there is no fd alias path, so listing is enumerated through
+    /// `fdopendir` into `entry_names` at open time instead. Either way the
+    /// retained descriptor anchors every per-file open via `openat`.
+    #[cfg(unix)]
     handle: std::fs::File,
+    /// Restricted listing snapshot taken at open time (see
+    /// `cap_entry_names`): Linux reads it through the `/proc/self/fd/N`
+    /// alias, macOS through fdopendir on a duplicate of `handle`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    entry_names: Vec<std::ffi::OsString>,
 }
 
 /// Parse the exact filename contract emitted by `RawApiLogger`.
@@ -144,7 +154,7 @@ async fn open_log_directory(project_root: PathBuf) -> io::Result<OpenLogDirector
         .map_err(|error| io::Error::other(format!("raw-log directory task failed: {error}")))?
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_log_directory_sync(project_root: &FsPath) -> io::Result<OpenLogDirectory> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -210,18 +220,94 @@ fn open_log_directory_sync(project_root: &FsPath) -> io::Result<OpenLogDirectory
     for component in LOG_DIR_COMPONENTS {
         handle = open_directory_at(&handle, component)?;
     }
-    let access_path = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
-    // Fail closed on Linux environments without procfs rather than falling
-    // back to a replaceable pathname after opening the trusted descriptor.
-    std::fs::read_dir(&access_path)?;
-    Ok(OpenLogDirectory {
-        display_path: canonical_root.join(".nonoclaw/logs/api"),
-        access_path,
-        handle,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let access_path = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        // Fail closed on Linux environments without procfs rather than
+        // falling back to a replaceable pathname after opening the trusted
+        // descriptor. Collecting the listing here doubles as the readability
+        // probe the streaming scan used to perform.
+        let mut entry_names = std::fs::read_dir(&access_path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        cap_entry_names(&mut entry_names);
+        Ok(OpenLogDirectory {
+            display_path: canonical_root.join(".nonoclaw/logs/api"),
+            access_path,
+            entry_names,
+            handle,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // /dev/fd/N cannot reopen a directory descriptor on macOS, so the
+        // listing snapshot is taken here through fdopendir on a duplicate of
+        // the trusted descriptor; per-file reads stay anchored via openat on
+        // `handle`, so the confinement guarantees are unchanged.
+        let mut entry_names = snapshot_entry_names(handle.as_raw_fd())?;
+        cap_entry_names(&mut entry_names);
+        let display_path = canonical_root.join(".nonoclaw/logs/api");
+        Ok(OpenLogDirectory {
+            access_path: display_path.clone(),
+            display_path,
+            entry_names,
+            handle,
+        })
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Keep one entry past the cap so the listing loop observes the overflow and
+/// reports `truncated` exactly like the previous streaming scan did.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cap_entry_names(entry_names: &mut Vec<std::ffi::OsString>) {
+    if entry_names.len() > MAX_SCANNED_ENTRIES {
+        entry_names.truncate(MAX_SCANNED_ENTRIES + 1);
+    }
+}
+
+/// Enumerate directory entries through a duplicate of `fd`. fdopendir takes
+/// sole ownership of the descriptor it is given, so the original stays valid
+/// for later openat calls.
+#[cfg(target_os = "macos")]
+fn snapshot_entry_names(fd: std::os::fd::RawFd) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::ffi::{CStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+
+    // SAFETY: dup creates an owned copy that fdopendir may consume.
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `duplicate` is a valid descriptor owned by this call.
+    let dir = unsafe { libc::fdopendir(duplicate) };
+    if dir.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so the duplicate is still ours to close.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `dir` is a live DIR* from fdopendir; readdir returns a
+        // borrowed entry valid until the next call.
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: the dirent was populated by readdir above and readdir
+        // NUL-terminates d_name.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(OsString::from_vec(bytes.to_vec()));
+    }
+    // SAFETY: `dir` is a live DIR* whose iteration finished.
+    unsafe { libc::closedir(dir) };
+    Ok(names)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_log_directory_sync(_project_root: &FsPath) -> io::Result<OpenLogDirectory> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -233,7 +319,7 @@ async fn open_log_file(
     directory: &OpenLogDirectory,
     file_name: &str,
 ) -> io::Result<tokio::fs::File> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -273,7 +359,7 @@ async fn open_log_file(
         return Ok(tokio::fs::File::from_std(file));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (directory, file_name);
         Err(io::Error::new(
@@ -324,36 +410,14 @@ pub async fn list_raw_logs(
     let mut entries = Vec::with_capacity(limit);
     let mut truncated = false;
     let mut scanned = 0usize;
-    let mut reader = match tokio::fs::read_dir(&directory.access_path).await {
-        Ok(reader) => reader,
-        Err(error) => {
-            tracing::warn!(kind = ?error.kind(), "raw API log directory cannot be read");
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raw API log directory is unavailable",
-            );
-        }
-    };
-
-    loop {
-        let entry = match reader.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(error) => {
-                tracing::warn!(kind = ?error.kind(), "raw API log directory iteration failed");
-                return err_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "raw API log directory is unavailable",
-                );
-            }
-        };
+    for file_name in &directory.entry_names {
         scanned += 1;
         if scanned > MAX_SCANNED_ENTRIES {
             truncated = true;
             break;
         }
 
-        let Ok(file_name) = entry.file_name().into_string() else {
+        let Ok(file_name) = file_name.clone().into_string() else {
             continue;
         };
         let Some((ts_ms, trace, kind)) = parse_log_file_name(&file_name) else {
