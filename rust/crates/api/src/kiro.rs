@@ -67,8 +67,11 @@ impl KiroTokenManager {
     /// Create a manager that reads from the default `~/.aws/sso/cache/`
     /// location.
     pub fn new() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let cache_path = PathBuf::from(home).join(KIRO_AUTH_CACHE);
+        // Platform-aware home resolution (falls back to USERPROFILE on
+        // Windows); without HOME (launchd/systemd services) prefer the
+        // NonoClaw data dir's idea of home over an arbitrary ".".
+        let home = nonoclaw_core::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cache_path = home.join(KIRO_AUTH_CACHE);
         Self {
             cache_path,
             http: reqwest::Client::new(),
