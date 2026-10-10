@@ -29,16 +29,20 @@
 //!
 //! ## Limitations (vs. native Anthropic Messages)
 //!
-//! * No tool calling — the Kiro backend does not expose tool_use blocks.
 //! * No streaming — the non-streaming path returns the full response in
 //!   one JSON body.  We simulate streaming by emitting a single
 //!   `TextDelta` after the request completes.
 //! * No prompt caching, thinking, or image blocks in history.
 //! * System prompts are prepended to the first user message.
+//! * Tool calling is supported: definitions ride on the current message as
+//!   `userInputMessageContext.tools`, prior calls/results replay through
+//!   `assistantResponseMessage.toolUses` and
+//!   `userInputMessageContext.toolResults`, and response `toolUseEvent`
+//!   frames are folded into `ContentBlock::ToolUse` blocks.
 
-use nonoclaw_core::{ContentBlock, Message, MessageContent, Role};
+use nonoclaw_core::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 
-use crate::client::{RequestParams, StreamEvent, SystemBlock};
+use crate::client::{RequestParams, StreamEvent, SystemBlock, ToolSchema};
 
 /// Kiro API endpoint.
 pub const KIRO_API_URL: &str =
@@ -58,40 +62,69 @@ pub fn serialize_body_kiro(params: &RequestParams) -> Result<String, serde_json:
     }
 
     // Separate the last user message (becomes `currentMessage`) from the
-    // preceding history.
+    // preceding history.  Tool results accumulate in `pending_tool_results`
+    // and are flushed as dedicated history entries only when a later
+    // message arrives — the final pending set rides on `currentMessage`.
     let mut history: Vec<serde_json::Value> = Vec::new();
     let mut current_content = String::new();
+    let mut pending_tool_results: Vec<serde_json::Value> = Vec::new();
 
     for msg in &params.messages {
         match msg.role {
             Role::User => {
-                let text = extract_text(&msg.content);
-                if !text.is_empty() {
-                    if current_content.is_empty() && history.is_empty() {
-                        // First user message — may become currentMessage.
-                        current_content = text;
-                    } else {
-                        // Push previous current into history.
-                        if !current_content.is_empty() {
-                            history.push(serde_json::json!({
-                                "userInputMessage": { "content": std::mem::take(&mut current_content) }
-                            }));
-                        }
-                        current_content = text;
+                let text = extract_user_text(&msg.content);
+                // Tool results ride on user messages as a context list.
+                for block in iter_blocks(&msg.content) {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } = block
+                    {
+                        pending_tool_results.push(serde_json::json!({
+                            "toolUseId": tool_use_id,
+                            "content": [{ "text": tool_result_text(content) }],
+                            "status": if is_error.unwrap_or(false) { "error" } else { "success" },
+                        }));
                     }
+                }
+                if !text.is_empty() {
+                    // A new real user turn: flush any accumulated state into
+                    // history, then this text becomes the current message.
+                    flush_pending(history.as_mut(), &mut current_content, &mut pending_tool_results);
+                    current_content = text;
                 }
             }
             Role::Assistant => {
-                // Flush pending user message into history first.
-                if !current_content.is_empty() {
-                    history.push(serde_json::json!({
-                        "userInputMessage": { "content": std::mem::take(&mut current_content) }
-                    }));
-                }
+                // Assistant turns always flush pending user state first.
+                flush_pending(history.as_mut(), &mut current_content, &mut pending_tool_results);
                 let text = extract_text(&msg.content);
-                if !text.is_empty() {
+                let tool_uses: Vec<serde_json::Value> = iter_blocks(&msg.content)
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, name, input, .. } => Some(
+                            serde_json::json!({
+                                "toolUseId": id,
+                                "name": name,
+                                // Wire-verified: input must be a JSON object.
+                                // Stringified JSON is rejected with HTTP 500.
+                                "input": input,
+                            }),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() || !tool_uses.is_empty() {
+                    let mut asm = serde_json::Map::new();
+                    // Wire-verified: assistantResponseMessage must always carry a
+                    // `content` field, even when the turn is tool-uses-only —
+                    // omitting it is rejected with 400 REQUEST_BODY_INVALID.
+                    asm.insert("content".into(), serde_json::Value::String(text));
+                    if !tool_uses.is_empty() {
+                        asm.insert("toolUses".into(), serde_json::Value::Array(tool_uses));
+                    }
                     history.push(serde_json::json!({
-                        "assistantResponseMessage": { "content": text }
+                        "assistantResponseMessage": asm
                     }));
                 }
             }
@@ -115,10 +148,32 @@ pub fn serialize_body_kiro(params: &RequestParams) -> Result<String, serde_json:
         Some(model_name_to_kiro(&params.model))
     };
 
-    let user_input_msg = serde_json::json!({
+    let mut user_input_msg = serde_json::json!({
         "content": current_content,
         "origin": "AI_EDITOR"
     });
+    // Tools (definitions) and pending tool results ride on the current
+    // message inside `userInputMessageContext`.
+    if !params.tools.is_empty() || !pending_tool_results.is_empty() {
+        let mut ctx = serde_json::Map::new();
+        if !params.tools.is_empty() {
+            ctx.insert(
+                "tools".into(),
+                serde_json::Value::Array(
+                    params.tools.iter().map(tool_schema_to_kiro).collect(),
+                ),
+            );
+        }
+        if !pending_tool_results.is_empty() {
+            ctx.insert(
+                "toolResults".into(),
+                serde_json::Value::Array(pending_tool_results),
+            );
+        }
+        let _ = user_input_msg
+            .as_object_mut()
+            .map(|m| m.insert("userInputMessageContext".into(), serde_json::Value::Object(ctx)));
+    }
 
     let mut conversation_state = serde_json::json!({
         "currentMessage": { "userInputMessage": user_input_msg },
@@ -156,6 +211,104 @@ fn model_name_to_kiro(name: &str) -> String {
         parts[..parts.len() - 1].join("-")
     } else {
         name.to_string()
+    }
+}
+
+/// Convert an Anthropic `ToolSchema` into Kiro's `toolSpecification` shape:
+/// `{ toolSpecification: { name, description, inputSchema: { json } } }`.
+fn tool_schema_to_kiro(tool: &ToolSchema) -> serde_json::Value {
+    let description = if tool.description.trim().is_empty() {
+        tool.name.trim().to_string()
+    } else {
+        tool.description.clone()
+    };
+    // Kiro chokes on empty/absent schemas — normalise to an empty object schema.
+    let schema = if tool.input_schema.is_null() {
+        serde_json::json!({ "type": "object", "properties": {} })
+    } else {
+        tool.input_schema.clone()
+    };
+    serde_json::json!({
+        "toolSpecification": {
+            "name": tool.name,
+            "description": description,
+            "inputSchema": { "json": schema },
+        }
+    })
+}
+
+/// Iterate over the content blocks of a message (empty when the content is
+/// plain text).
+fn iter_blocks(content: &MessageContent) -> std::slice::Iter<'_, ContentBlock> {
+    static EMPTY: std::sync::OnceLock<Vec<ContentBlock>> = std::sync::OnceLock::new();
+    match content {
+        MessageContent::Text(_) => EMPTY.get_or_init(Vec::new).iter(),
+        MessageContent::Blocks(blocks) => blocks.iter(),
+    }
+}
+
+/// Push any accumulated (pending) user text and tool results into the
+/// conversation history.  Called when a later turn arrives; whatever
+/// remains pending at the end of the loop rides on `currentMessage`.
+fn flush_pending(
+    history: &mut Vec<serde_json::Value>,
+    current_content: &mut String,
+    pending_tool_results: &mut Vec<serde_json::Value>,
+) {
+    if !current_content.is_empty() {
+        history.push(serde_json::json!({
+            "userInputMessage": { "content": std::mem::take(current_content) }
+        }));
+    }
+    if !pending_tool_results.is_empty() {
+        history.push(serde_json::json!({
+            "userInputMessage": {
+                "content": "",
+                "origin": "AI_EDITOR",
+                "userInputMessageContext": {
+                    "toolResults": std::mem::take(pending_tool_results)
+                }
+            }
+        }));
+    }
+}
+
+/// Extract only the user-authored text of a message — tool results are
+/// excluded because they are replayed through `userInputMessageContext`.
+fn extract_user_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::Blocks(blocks) => {
+            let mut out = String::new();
+            for block in blocks {
+                if let ContentBlock::Text { text, .. } = block {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Flatten a tool result's content into the single text string Kiro expects.
+fn tool_result_text(content: &ToolResultContent) -> String {
+    match content {
+        ToolResultContent::Text(t) => t.clone(),
+        ToolResultContent::Blocks(blocks) => {
+            let mut out = String::new();
+            for b in blocks {
+                if let ContentBlock::Text { text, .. } = b {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            out
+        }
     }
 }
 
@@ -323,6 +476,69 @@ pub fn extract_context_usage_from_frames(frames: &[KiroEventFrame]) -> Option<f6
         }
     }
     None
+}
+
+/// A tool call reconstructed from response `toolUseEvent` frames.
+///
+/// Kiro streams each tool call as a sequence of frames sharing a
+/// `toolUseId`: `name` on the first frame, `input` string deltas
+/// throughout, and `stop: true` on the closing frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroToolUse {
+    pub tool_use_id: String,
+    pub name: String,
+    /// Parsed input object (empty object when the accumulated JSON is empty).
+    pub input: serde_json::Value,
+}
+
+/// Extract tool calls from a list of event-stream frames.
+///
+/// Frames are grouped by `toolUseId` preserving first-seen order; `input`
+/// fragments are concatenated then parsed as JSON.
+pub fn extract_tool_uses_from_frames(frames: &[KiroEventFrame]) -> Vec<KiroToolUse> {
+    let mut order: Vec<String> = Vec::new();
+    let mut acc: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new(); // id → (name, input buffer)
+
+    for frame in frames {
+        if frame.event_type != "toolUseEvent" {
+            continue;
+        }
+        let id = frame
+            .payload
+            .get("toolUseId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let entry = acc.entry(id.clone()).or_insert_with(|| {
+            order.push(id);
+            (String::new(), String::new())
+        });
+        if let Some(name) = frame.payload.get("name").and_then(|v| v.as_str()) {
+            if entry.0.is_empty() {
+                entry.0 = name.to_string();
+            }
+        }
+        if let Some(chunk) = frame.payload.get("input").and_then(|v| v.as_str()) {
+            entry.1.push_str(chunk);
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|id| {
+            let (name, input_str) = acc.remove(&id).unwrap_or_default();
+            let input = if input_str.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&input_str).unwrap_or_else(|_| serde_json::json!({}))
+            };
+            KiroToolUse { tool_use_id: id, name, input }
+        })
+        .collect()
 }
 
 // ── Response parsing ─────────────────────────────────────────────────────────
@@ -760,5 +976,184 @@ mod tests {
         let ctx = extract_context_usage_from_frames(&frames);
         assert!(ctx.is_some());
         assert!((ctx.unwrap() - 0.5884000062942505).abs() < 1e-15);
+    }
+
+    fn base_params(messages: Vec<Message>) -> RequestParams {
+        RequestParams {
+            model: "auto-kiro".into(),
+            messages,
+            system: vec![],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: 4096,
+            thinking: None,
+            temperature: None,
+            betas: vec![],
+            extra_body: None,
+            session_id: None,
+            trace_label: None,
+        }
+    }
+
+    #[test]
+    fn serialize_tools_and_tool_history() {
+        // Conversation: user asks → assistant calls a tool → user returns
+        // the result → user asks follow-up (current message).
+        let assistant = Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text { text: "Let me check.".into(), cache_control: None },
+                ContentBlock::ToolUse {
+                    id: "tu_1".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "Beijing"}),
+                    cache_control: None,
+                },
+            ]),
+            ts: None,
+        };
+        let user_result = Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: nonoclaw_core::ToolResultContent::Text("22C sunny".into()),
+                is_error: Some(false),
+                cache_control: None,
+            }]),
+            ts: None,
+        };
+        let params = RequestParams {
+            tools: vec![ToolSchema {
+                name: "get_weather".into(),
+                description: "Get current weather".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }),
+                cache_control: None,
+            }],
+            ..base_params(vec![text_msg(Role::User, "weather in Beijing?"), assistant, user_result, text_msg(Role::User, "thanks")])
+        };
+
+        let body = serialize_body_kiro(&params).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let conv = &parsed["conversationState"];
+
+        // Tool definition rides on currentMessage.userInputMessageContext.tools
+        let ctx = &conv["currentMessage"]["userInputMessage"]["userInputMessageContext"];
+        let tools = ctx["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["toolSpecification"]["name"], "get_weather");
+        assert_eq!(
+            tools[0]["toolSpecification"]["inputSchema"]["json"]["type"],
+            "object"
+        );
+
+        // History: user question, assistant text+toolUses, toolResults entry,
+        // (follow-up became currentMessage).
+        let history = conv["history"].as_array().unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0]["userInputMessage"]["content"], "weather in Beijing?");
+        let asm = &history[1]["assistantResponseMessage"];
+        assert_eq!(asm["content"], "Let me check.");
+        let tu = &asm["toolUses"][0];
+        assert_eq!(tu["toolUseId"], "tu_1");
+        assert_eq!(tu["name"], "get_weather");
+        // Wire-verified: input must be a JSON object, not a stringified one.
+        assert_eq!(tu["input"], serde_json::json!({"city": "Beijing"}));
+        let tr_entry = &history[2]["userInputMessage"]["userInputMessageContext"]["toolResults"];
+        assert_eq!(tr_entry[0]["toolUseId"], "tu_1");
+        assert_eq!(tr_entry[0]["content"][0]["text"], "22C sunny");
+        assert_eq!(tr_entry[0]["status"], "success");
+    }
+
+    #[test]
+    fn serialize_tool_only_assistant_keeps_content_field() {
+        // Wire-verified (2026-10-10): assistantResponseMessage carrying only
+        // toolUses and no `content` field is rejected by the Kiro backend with
+        // 400 REQUEST_BODY_INVALID. `content: ""` must always be present.
+        let assistant = Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "tu_9".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "/tmp/x"}),
+                cache_control: None,
+            }]),
+            ts: None,
+        };
+        let followup = Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_9".into(),
+                content: nonoclaw_core::ToolResultContent::Text("data".into()),
+                is_error: None,
+                cache_control: None,
+            }]),
+            ts: None,
+        };
+        let params = base_params(vec![assistant, followup]);
+        let body = serialize_body_kiro(&params).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let asm = &parsed["conversationState"]["history"][0]["assistantResponseMessage"];
+        assert!(asm.get("content").is_some());
+        assert_eq!(asm["content"], "");
+        assert_eq!(asm["toolUses"][0]["toolUseId"], "tu_9");
+    }
+
+    #[test]
+    fn serialize_error_tool_result_status() {
+        let user_result = Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_e".into(),
+                content: nonoclaw_core::ToolResultContent::Text("boom".into()),
+                is_error: Some(true),
+                cache_control: None,
+            }]),
+            ts: None,
+        };
+        let params = base_params(vec![user_result]);
+        let body = serialize_body_kiro(&params).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // No prior user text → the tool-result entry is the current message's
+        // context (only tool content in conversation).
+        let tr = &parsed["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["toolResults"];
+        assert_eq!(tr[0]["status"], "error");
+    }
+
+    #[test]
+    fn extract_tool_uses_accumulates_input_fragments() {
+        let mk = |payload: serde_json::Value| KiroEventFrame {
+            event_type: "toolUseEvent".into(),
+            payload,
+        };
+        let frames = vec![
+            mk(serde_json::json!({"toolUseId": "a", "name": "read_file", "input": "{\"pa"})),
+            mk(serde_json::json!({"toolUseId": "a", "input": "th\":\"/tmp\"}"})),
+            mk(serde_json::json!({"toolUseId": "a", "stop": true})),
+            mk(serde_json::json!({"toolUseId": "b", "name": "bash", "input": "{\"cmd\":\"ls\"}"})),
+            mk(serde_json::json!({"toolUseId": "b", "stop": true})),
+        ];
+        let uses = extract_tool_uses_from_frames(&frames);
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0].tool_use_id, "a");
+        assert_eq!(uses[0].name, "read_file");
+        assert_eq!(uses[0].input, serde_json::json!({"path": "/tmp"}));
+        assert_eq!(uses[1].name, "bash");
+        assert_eq!(uses[1].input, serde_json::json!({"cmd": "ls"}));
+    }
+
+    #[test]
+    fn extract_tool_uses_ignores_malformed_json() {
+        let frames = vec![KiroEventFrame {
+            event_type: "toolUseEvent".into(),
+            payload: serde_json::json!({"toolUseId": "x", "name": "t", "input": "not-json{"}),
+        }];
+        let uses = extract_tool_uses_from_frames(&frames);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].input, serde_json::json!({}));
     }
 }

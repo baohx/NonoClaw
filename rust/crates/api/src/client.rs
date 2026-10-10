@@ -2729,8 +2729,9 @@ async fn fold_kiro_non_stream(
     // Parse AWS event-stream frames.
     let frames = crate::kiro_wire::parse_aws_event_stream(&body_bytes);
     let text = crate::kiro_wire::extract_text_from_frames(&frames);
+    let tool_uses = crate::kiro_wire::extract_tool_uses_from_frames(&frames);
 
-    if text.is_empty() {
+    if text.is_empty() && tool_uses.is_empty() {
         return Err(StreamFailure::before_stream(
             ProviderError::invalid_response("kiro: empty response content".to_string()),
         ));
@@ -2750,22 +2751,46 @@ async fn fold_kiro_non_stream(
             cache_read_input_tokens: None,
         },
     });
-    on_event(&StreamEvent::TextDelta {
-        text: text.clone(),
-    });
+    if !text.is_empty() {
+        on_event(&StreamEvent::TextDelta {
+            text: text.clone(),
+        });
+    }
+    let mut content: Vec<ContentBlock> = Vec::new();
+    if !text.is_empty() {
+        content.push(ContentBlock::Text {
+            text,
+            cache_control: None,
+        });
+    }
+    let mut stop_reason = nonoclaw_core::StopReason::EndTurn;
+    for (index, tu) in tool_uses.iter().enumerate() {
+        on_event(&StreamEvent::ToolUseStart {
+            index,
+            id: tu.tool_use_id.clone(),
+            name: tu.name.clone(),
+        });
+        let input_json = tu.input.to_string();
+        on_event(&StreamEvent::ToolUseInputDelta {
+            index,
+            partial_json: input_json.clone(),
+        });
+        on_event(&StreamEvent::BlockStop { index });
+        content.push(ContentBlock::ToolUse {
+            id: tu.tool_use_id.clone(),
+            name: tu.name.clone(),
+            input: tu.input.clone(),
+            cache_control: None,
+        });
+        stop_reason = nonoclaw_core::StopReason::ToolUse;
+    }
     on_event(&StreamEvent::MessageStop);
-
-    // Build TurnOutput directly.
-    let content_block = ContentBlock::Text {
-        text,
-        cache_control: None,
-    };
 
     Ok(TurnOutput {
         message_id,
         model: model_used,
-        content: vec![content_block],
-        stop_reason: Some(nonoclaw_core::StopReason::EndTurn),
+        content,
+        stop_reason: Some(stop_reason),
         usage: Usage::default(),
     })
 }
