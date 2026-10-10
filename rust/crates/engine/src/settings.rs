@@ -3369,6 +3369,24 @@ pub fn apply_proxy_env(settings: &SettingsFile) {
     }
 }
 
+/// Export the `settings.env` block into the process environment as a
+/// fallback for values not already present. Configuration resolution
+/// itself stays side-effect free (captured in [`ResolvedConfig`]) — this
+/// explicit export step makes file-defined secrets visible to consumers
+/// that read plain process env (WebSearch's SERPER/BRAVE keys, Bash tool
+/// subprocesses, MCP servers launched without an explicit `env` block).
+/// Process-provided variables always win over the settings file.
+pub fn apply_settings_env(settings: &SettingsFile) {
+    let Some(environment) = &settings.env else {
+        return;
+    };
+    for (key, value) in environment {
+        if !value.is_empty() && std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 /// Legacy compatibility only. Canonical callers use the captured environment
 /// in [`ResolvedConfig`] and never mutate process state while resolving config.
 #[deprecated(note = "use load_resolved_config; configuration resolution is side-effect free")]
@@ -4294,6 +4312,35 @@ mod tests {
             resolved.source_for("executables.node.node.version")[0],
             source("project.json")
         );
+    }
+
+    #[test]
+    fn apply_settings_env_exports_as_fallback() {
+        // Use unlikely-to-collide keys and restore whatever was there.
+        let key = "NONOCLAW_TEST_ENV_FALLBACK_KEY";
+        let saved = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+
+        // No env block → no-op.
+        apply_settings_env(&SettingsFile::default());
+        assert!(std::env::var_os(key).is_none());
+
+        // File value exported when unset; process value wins when set.
+        let settings = serde_json::from_str::<SettingsFile>(&format!(
+            r#"{{"env": {{"{key}": "from-file"}}}}"#
+        ))
+        .unwrap();
+        apply_settings_env(&settings);
+        assert_eq!(std::env::var(key).unwrap(), "from-file");
+
+        unsafe { std::env::set_var(key, "from-process") };
+        apply_settings_env(&settings);
+        assert_eq!(std::env::var(key).unwrap(), "from-process");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     #[test]

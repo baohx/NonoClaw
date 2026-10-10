@@ -397,6 +397,9 @@ async fn main() -> Result<()> {
     // Export proxy env vars before any reqwest client is built (reqwest
     // snapshots proxy config at client build time).
     nonoclaw_engine::apply_proxy_env(resolved.settings());
+    // Export file-defined env (API keys etc.) as a fallback so tools that
+    // read plain process env (WebSearch, Bash subprocesses) see them.
+    nonoclaw_engine::apply_settings_env(resolved.settings());
 
     // Initialize the Jev decision-model client for run-outcome reward
     // labels (process-wide; every write site degrades to heuristics when

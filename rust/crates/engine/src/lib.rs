@@ -44,7 +44,7 @@ pub use session::{
     SessionInfo, SessionResult, SessionService, SessionSnapshot,
 };
 pub use settings::{
-    apply_proxy_env, config_reference, load_resolved_config, ConfigDiagnostic,
+    apply_proxy_env, apply_settings_env, config_reference, load_resolved_config, ConfigDiagnostic,
     ConfigFieldReference, ConfigSource, ModelProfile, ProviderBalance, ProviderBilling,
     ProviderBillingEntry, ResolvedConfig, RunConfigOverrides, SettingsFile,
 };
