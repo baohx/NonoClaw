@@ -12,6 +12,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Technical Transparency & Breathing](#technical-transparency--breathing)
 - [Multi-Model & Multi-Provider](#multi-model--multi-provider)
 - [Cross-Session Memory (Mneme)](#cross-session-memory-mneme)
+- [Platform Differences](#platform-differences-linux-macos-windows)
 - [Permission Modes](#permission-modes)
 - [Web UI](#web-ui)
 - [Desktop app (Electron)](#desktop-app-electron-v023)
@@ -422,6 +423,19 @@ definition. This caches ~10K tokens across turns.
 | Knowledge doesn't compound | Each new source benefits from all prior knowledge |
 
 Inspired by [Andrej Karpathy's LLM Wiki pattern](https://github.com/karpathy/llm-wiki) (April 2026) and [WikiMind](https://github.com/HAL-9909/llm-wikimind).
+
+---
+
+## Platform Differences (Linux / macOS / Windows)
+
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| Bash tool shell | `bash` (falls back to `sh` when absent, e.g. Alpine) | `bash` (falls back to `sh`) | `cmd /C` |
+| Sandbox (`sandbox-workspace-write` / `sandbox-read-only`) | Landlock (kernel probe + graceful fallback to normal permission checks) | Seatbelt via `sandbox-exec` (degrades to normal permission checks when unavailable) | Not available; modes degrade to normal permission checks |
+| Raw API log viewing (`/api/logs/raw`) | Handle-relative dirfd backend (`/proc/self/fd`) | Handle-relative dirfd backend (`fdopendir` snapshot) | Unsupported |
+| Atomic log evolution (no-clobber / swap) | `renameat2` (`RENAME_NOREPLACE` / `RENAME_EXCHANGE`) | `renameatx_np` (`RENAME_EXCL` / `RENAME_SWAP`) | Unsupported |
+| Shell profile isolation | `--noprofile --norc` | `--noprofile --norc` | N/A (cmd) |
+| Installer | `install.sh` (XDG paths) | `install.sh` (XDG paths) | separate installer; behavior may differ |
 
 ---
 
@@ -1103,6 +1117,7 @@ NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI�
 - [多模型与多供应商](#multi-model--multi-provider)
 - [跨会话记忆 (Mneme)](#cross-session-memory-mneme)
 - [LLM Wiki](#llm-wiki-structured-knowledge-compilation)
+- [平台差异](#平台差异-linux-macos-windows)
 - [权限模式](#permission-modes)
 - [Web 界面](#web-ui)
 - [移动端与远程访问](#mobile--remote-access)
@@ -1461,6 +1476,19 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 | 知识不累积 | 每个新来源受益于所有先前知识 |
 
 灵感来源于 [Andrej Karpathy 的 LLM Wiki 模式](https://github.com/karpathy/llm-wiki)（2026 年 4 月）和 [WikiMind](https://github.com/HAL-9909/llm-wikimind)。
+
+---
+
+## 平台差异（Linux / macOS / Windows）
+
+| 能力 | Linux | macOS | Windows |
+|---|---|---|---|
+| Bash 工具 shell | `bash`（缺失时回退 `sh`，如 Alpine） | `bash`（回退 `sh`） | `cmd /C` |
+| 沙箱（`sandbox-workspace-write` / `sandbox-read-only`） | Landlock（内核探测 + 优雅回退到常规权限检查） | Seatbelt（`sandbox-exec`，不可用时回退到常规权限检查） | 不可用；模式回退到常规权限检查 |
+| 原始 API 日志查看（`/api/logs/raw`） | 句柄相对 dirfd 后端（`/proc/self/fd`） | 句柄相对 dirfd 后端（`fdopendir` 快照） | 不支持 |
+| 原子日志演化（no-clobber / swap） | `renameat2`（`RENAME_NOREPLACE` / `RENAME_EXCHANGE`） | `renameatx_np`（`RENAME_EXCL` / `RENAME_SWAP`） | 不支持 |
+| shell profile 隔离 | `--noprofile --norc` | `--noprofile --norc` | 不适用（cmd） |
+| 安装器 | `install.sh`（XDG 路径） | `install.sh`（XDG 路径） | 独立安装器；行为可能不同 |
 
 ---
 
