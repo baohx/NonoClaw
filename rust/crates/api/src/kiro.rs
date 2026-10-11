@@ -57,6 +57,17 @@ struct OidcErrorBody {
     description: Option<String>,
 }
 
+/// On-disk shape of the sibling client registration file that Kiro IDE
+/// writes into `~/.aws/sso/cache/` next to `kiro-auth-token.json`
+/// (a `<sha1-of-clientId>.json` holding `clientId` + `clientSecret`).
+#[derive(Debug, Deserialize)]
+struct KiroClientRegistration {
+    #[serde(rename = "clientId")]
+    client_id: String,
+    #[serde(rename = "clientSecret")]
+    client_secret: String,
+}
+
 /// In-memory token state with mutex-free refresh.
 pub struct KiroTokenManager {
     cache_path: PathBuf,
@@ -109,6 +120,43 @@ impl KiroTokenManager {
             .map_err(|e| KiroAuthError::CacheParse(format!("{}: {e}", self.cache_path.display())))
     }
 
+    /// Find and read the sibling OIDC client registration in the same
+    /// directory as the token cache.  The registration file is named
+    /// `<sha1(clientId)>.json` and contains `clientId` + `clientSecret`.
+    /// Matching by content (not filename) keeps this robust across Kiro
+    /// IDE versions that may rename registrations.
+    fn read_client_registration(&self) -> Result<KiroClientRegistration, KiroAuthError> {
+        let Some(dir) = self.cache_path.parent() else {
+            return Err(KiroAuthError::RegistrationMissing(
+                self.cache_path.display().to_string(),
+            ));
+        };
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            KiroAuthError::RegistrationMissing(format!("{e}: {}", dir.display()))
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if path == self.cache_path {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(reg) = serde_json::from_str::<KiroClientRegistration>(&raw) {
+                // Only accept a parse that has non-empty credential fields;
+                // token caches deserialize partially into this shape via
+                // ignored fields, but lack the secret.
+                if !reg.client_id.is_empty() && !reg.client_secret.is_empty() {
+                    return Ok(reg);
+                }
+            }
+        }
+        Err(KiroAuthError::RegistrationMissing(dir.display().to_string()))
+    }
+
     fn is_expired(&self, cache: &KiroAuthCache) -> bool {
         // Treat tokens within 60 s of their stated expiry as expired to
         // avoid a race where the token lapses mid-request.
@@ -120,9 +168,16 @@ impl KiroTokenManager {
     }
 
     async fn refresh(&self, cache: KiroAuthCache) -> Result<String, KiroAuthError> {
+        // The OIDC refresh grant requires the client registration that Kiro
+        // IDE created alongside the token cache: a sibling JSON file in the
+        // same `~/.aws/sso/cache/` directory holding `clientId` +
+        // `clientSecret`.  (Sending a placeholder clientId yields
+        // `invalid_client: Invalid client provided`.)
+        let reg = self.read_client_registration()?;
         let body = serde_json::json!({
             "grantType": "refresh_token",
-            "clientId": "kiro",
+            "clientId": reg.client_id,
+            "clientSecret": reg.client_secret,
             "refreshToken": cache.refresh_token,
         });
 
@@ -210,6 +265,9 @@ pub enum KiroAuthError {
     #[error("cannot write kiro auth cache: {0}")]
     CacheWrite(String),
 
+    #[error("kiro OIDC client registration not found: {0}")]
+    RegistrationMissing(String),
+
     #[error("token refresh failed: {0}")]
     Refresh(String),
 
@@ -229,6 +287,9 @@ impl KiroAuthError {
             }
             KiroAuthError::CacheWrite(msg) => {
                 format!("Could not save refreshed Kiro tokens: {msg}")
+            }
+            KiroAuthError::RegistrationMissing(path) => {
+                format!("Kiro OIDC client registration not found in {path}. Open Kiro IDE once to log in.")
             }
             KiroAuthError::Refresh(msg) => {
                 format!("Failed to refresh Kiro access token: {msg}")
@@ -358,5 +419,54 @@ mod tests {
             region: None,
         };
         assert!(!mgr.is_expired(&cache2));
+    }
+
+    #[test]
+    fn client_registration_found_alongside_token_cache() {
+        // Regression: refresh() used to send a placeholder clientId ("kiro")
+        // and no clientSecret, which AWS OIDC rejects with `invalid_client`.
+        // The real credentials live in a sibling `<sha1(clientId)>.json`.
+        let dir = std::env::temp_dir().join(format!("kiro-reg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // token cache — also parses as a partial registration (no secret)
+        let token_cache = serde_json::json!({
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": "2020-01-01T00:00:00.000Z",
+        });
+        std::fs::write(dir.join("kiro-auth-token.json"), token_cache.to_string()).unwrap();
+
+        // client registration sibling
+        let reg = serde_json::json!({
+            "clientId": "real-client-id", "clientSecret": "real-secret",
+            "expiresAt": "2027-01-01T00:00:00.000Z",
+        });
+        std::fs::write(dir.join("e909a0580879b06ece1202964fbe9dda95ea4ce3.json"), reg.to_string())
+            .unwrap();
+
+        let mgr = KiroTokenManager::with_cache_path(dir.join("kiro-auth-token.json"));
+        let found = mgr.read_client_registration().unwrap();
+        assert_eq!(found.client_id, "real-client-id");
+        assert_eq!(found.client_secret, "real-secret");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn client_registration_missing_yields_actionable_error() {
+        let dir = std::env::temp_dir().join(format!("kiro-noreg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_cache = serde_json::json!({
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": "2020-01-01T00:00:00.000Z",
+        });
+        std::fs::write(dir.join("kiro-auth-token.json"), token_cache.to_string()).unwrap();
+
+        let mgr = KiroTokenManager::with_cache_path(dir.join("kiro-auth-token.json"));
+        let err = mgr.read_client_registration().unwrap_err();
+        assert!(matches!(err, KiroAuthError::RegistrationMissing(_)));
+        assert!(err.user_message().contains("Open Kiro IDE"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
