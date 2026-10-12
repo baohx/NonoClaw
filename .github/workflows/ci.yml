@@ -40,7 +40,15 @@ jobs:
       # pre-existing formatting drift (e.g. api/src/client.rs, kiro_wire.rs);
       # re-enabling it requires a formatting-only commit first.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets 2>&1 | tee /tmp/clippy.log | grep -E '^(error|warning: unused)' -A4 || true
+          # Surface errors as workflow annotations so they are readable via
+          # the public annotations API without log download rights.
+          grep -E '^error' /tmp/clippy.log | head -20 | while read -r _; do
+            echo "::error::$(grep -A2 "^$_" /tmp/clippy.log | tail -1)"
+          done
+          cargo clippy --workspace --all-targets
 
       - name: Build
         run: cargo build --workspace
