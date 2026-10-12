@@ -41,17 +41,23 @@ jobs:
       # re-enabling it requires a formatting-only commit first.
       - name: Clippy
         run: |
-          set -o pipefail
-          cargo clippy --workspace --all-targets 2>&1 | tee /tmp/clippy.log | grep -E '^(error|warning: unused)' -A4 || true
-          # Surface errors as workflow annotations so they are readable via
-          # the public annotations API without log download rights.
-          grep -E '^error' /tmp/clippy.log | head -20 | while read -r _; do
-            echo "::error::$(grep -A2 "^$_" /tmp/clippy.log | tail -1)"
-          done
-          cargo clippy --workspace --all-targets
+          set +e
+          cargo clippy --workspace --all-targets --color=never --message-format=short > /tmp/clippy.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            grep 'error' /tmp/clippy.log | head -10 | sed 's|^|::error::|' || true
+            exit "$status"
+          fi
 
       - name: Build
         run: cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace
+        run: |
+          set +e
+          cargo test --workspace --color=never > /tmp/test.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            grep -E 'FAILED|^failures:|^test .* FAILED' /tmp/test.log | head -10 | sed 's|^|::error::|' || true
+            exit "$status"
+          fi
