@@ -47,7 +47,9 @@ jobs:
           if [ "$status" -ne 0 ]; then
             # Rust compiler errors carry the word "error"; linker failures
             # ("cannot find -l...", "undefined reference", "collect2:") do not.
-            grep -E 'error(\[|:)|cannot find|undefined reference|collect2:|ld: ' /tmp/clippy.log | head -15 | sed 's|^|::error::|' || true
+            # Dump the non-progress lines (exclude the Downloaded/Compiling
+            # noise) so the real linker diagnostic reaches the annotations.
+            grep -vE 'Downloaded|Compiling|Checking' /tmp/clippy.log | grep -vE '^\s*$' | tail -40 | sed 's|^|::error::|' || true
             exit "$status"
           fi
 
