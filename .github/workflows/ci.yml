@@ -31,6 +31,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # rust/.cargo/config.toml pins -fuse-ld=mold for
+      # x86_64-unknown-linux-gnu (written by install.sh --mold); the
+      # GitHub-hosted Ubuntu runner does not ship mold by default.
+      - name: Install mold linker (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
