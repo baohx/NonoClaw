@@ -42,14 +42,12 @@ jobs:
       - name: Clippy
         run: |
           set +e
-          cargo clippy --workspace --all-targets --color=never --message-format=short > /tmp/clippy.log 2>&1
+          # Human format (not --message-format=short) so rustc's multi-line
+          # linker diagnostics ("= note: ...", "collect2: ...") are preserved.
+          cargo clippy --workspace --all-targets --color=never > /tmp/clippy.log 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
-            # Rust compiler errors carry the word "error"; linker failures
-            # ("cannot find -l...", "undefined reference", "collect2:") do not.
-            # Dump the non-progress lines (exclude the Downloaded/Compiling
-            # noise) so the real linker diagnostic reaches the annotations.
-            grep -vE 'Downloaded|Compiling|Checking' /tmp/clippy.log | grep -vE '^\s*$' | tail -40 | sed 's|^|::error::|' || true
+            grep -vE 'Downloaded|Compiling|Checking' /tmp/clippy.log | grep -vE '^\s*$' | tail -60 | sed 's|^|::error::|' || true
             exit "$status"
           fi
 
