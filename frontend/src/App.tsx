@@ -133,7 +133,11 @@ export default function App() {
   // subscription here keeps App.tsx out of the streaming hot path.
   useEffect(() => {
     let lastLen = 0;
-    return useStore.subscribe((state) => {
+    return useStore.subscribe((state, prev) => {
+      // An older history page just landed above the viewport: VirtualChat's
+      // anchor compensation owns the scroll position here — don't fight it
+      // by jumping to bottom.
+      if (prev.historyLoading && !state.historyLoading) return;
       const len = state.messages.length;
       const streaming = state.streamingIdx !== null;
       if (len !== lastLen) {

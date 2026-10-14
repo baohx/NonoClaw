@@ -863,8 +863,20 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
 export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
   type Block = { type?: string; text?: string; thinking?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean };
   const output: ChatMessage[] = [];
-  let counter = 1;
-  const nextId = () => `msg-${counter++}`;
+  // Stable ids derived from the source entry's absolute index: when an older
+  // page is prepended the full history is re-mapped, and rows keep their
+  // identity only if ids don't depend on position. Tool rows keep
+  // `tool-${callId}` and live messages keep `msg-${n}` — no collisions.
+  let idSuffix = 0;
+  let idSrcIndex = -1;
+  const nextId = () => {
+    if (idSrcIndex !== currentSrcIndex) {
+      idSrcIndex = currentSrcIndex;
+      idSuffix = 0;
+    }
+    idSuffix += 1;
+    return idSuffix === 1 ? `hist-${currentSrcIndex}` : `hist-${currentSrcIndex}-${idSuffix}`;
+  };
   const firstUseById = new Map<string, Block>();
   const lastResultById = new Map<string, Block>();
   const duplicateUses = new Set<string>();
@@ -888,6 +900,12 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
       }
     }
   }
+
+  // Engine-appended bookkeeping payloads (live git status, todo recap) are
+  // persisted as user messages for the model, not for humans. Skip them
+  // entirely so restored history shows only real conversation.
+  const isBookkeeping = (text: string): boolean =>
+    text.startsWith("<git_status") || text.startsWith("<todo_recap>");
 
   const emittedUses = new Set<string>();
   // Timestamp of the last source message — inherited by messages exploded
@@ -932,6 +950,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
       : [];
     const blocks: Block[] = Array.isArray(message.content) ? message.content as Block[] : [];
     if (typeof message.content === "string") {
+      if (message.role === "user" && isBookkeeping(message.content)) continue;
       if (message.role === "user" || message.role === "assistant") appendText(message.role, message.content, attachments);
       continue;
     }
@@ -944,6 +963,7 @@ export function engineMessagesToChat(messages: unknown[]): ChatMessage[] {
         continue;
       }
       if (block.type === "text") {
+        if (message.role === "user" && isBookkeeping(block.text ?? "")) continue;
         if (message.role === "user" || message.role === "assistant") {
           appendText(message.role, block.text ?? "", pendingAttachments);
           // Extended thinking precedes its visible text: attach to the entry

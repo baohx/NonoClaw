@@ -158,6 +158,33 @@ function chatPromptAndUsageChecks(): void {
   assert(restoredAttachments[2].attachments === undefined,
     "attachment history must not leak filenames into a later user turn");
 
+  const restoredBookkeeping = engineMessagesToChat([
+    { role: "user", content: "<git_status turn=\"3\">\nM src/a.ts\n</git_status>" },
+    { role: "assistant", content: "answer" },
+    { role: "user", content: [{ type: "text", text: "<todo_recap>\n[ ] one\n</todo_recap>" }] },
+    { role: "user", content: "real follow-up" },
+  ]);
+  assert(restoredBookkeeping.map((message) => message.role + ":" + message.content).join("|")
+    === "assistant:answer|user:real follow-up",
+    "restored history must drop engine bookkeeping (git_status/todo_recap) user messages");
+
+  // Stable history ids: `load_older` prepends re-map the FULL history, so row
+  // identity must derive from the absolute src_index, not position. Ids of
+  // surviving rows must be identical after a prepend.
+  const tailPage = [
+    { role: "user", content: "q2", src_index: 1 },
+    { role: "assistant", content: "a2", src_index: 2 },
+  ];
+  const olderPage = [
+    { role: "user", content: "q1", src_index: 0 },
+  ];
+  const tailMapped = engineMessagesToChat(tailPage);
+  const fullMapped = engineMessagesToChat([...olderPage, ...tailPage]);
+  assert(tailMapped.every((m, i) => m.id === fullMapped[i + olderPage.length].id),
+    "history ids must be stable across prepended older pages (derive from src_index)");
+  assert(!tailMapped.some((m) => /^msg-\d+$/.test(m.id)),
+    "history ids must not collide with live `msg-N` ids");
+
   let prompts = { resolvedPermissionIds: [] as string[], resolvedQuestionIds: [] as string[] };
   prompts = resolvePromptTransition(prompts, "permission", "permission-a");
   prompts = resolvePromptTransition(prompts, "permission", "permission-a");

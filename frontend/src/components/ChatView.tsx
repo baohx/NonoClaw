@@ -39,31 +39,17 @@ interface Props {
   send: (message: ClientMsg) => void;
 }
 
-/** "Load earlier messages" affordance for tail-windowed sessions. The bar
- * itself is the scroll anchor: after a page prepend, restoring its viewport
- * offset keeps the reader's position stable. */
+/** "Load earlier messages" affordance for tail-windowed sessions. Viewport
+ * stability after a page prepend is handled by VirtualChat's anchor
+ * compensation — the bar itself no longer participates. */
 const LoadOlderBar = memo(function LoadOlderBar({ send }: { send: (m: ClientMsg) => void }) {
   const remaining = useStore((s) => s.historyOlderRemaining);
   const loading = useStore((s) => s.historyLoading);
   const requestOlderHistory = useStore((s) => s.requestOlderHistory);
-  const anchorRef = useRef<HTMLDivElement | null>(null);
   if (remaining <= 0 && !loading) return null;
-  const onLoad = () => {
-    const el = anchorRef.current;
-    // Viewport offset of the anchor before the prepend. The chat scroller is
-    // the nearest scrollable ancestor of this bar — find it and restore the
-    // offset after the page lands so the reader's position stays put.
-    const scroller = el?.closest<HTMLElement>(".chat-scroll") ?? null;
-    const top = el && scroller ? el.getBoundingClientRect().top - scroller.getBoundingClientRect().top : 0;
-    requestOlderHistory(send);
-    requestAnimationFrame(() => {
-      if (!el || !scroller) return;
-      const delta = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - top;
-      if (delta > 0) scroller.scrollTop += delta;
-    });
-  };
+  const onLoad = () => requestOlderHistory(send);
   return (
-    <div ref={anchorRef} className="load-older-bar">
+    <div className="load-older-bar">
       <button className="load-older-btn" onClick={onLoad} disabled={loading}>
         {loading ? "加载中…" : `加载更早的消息（还有 ${remaining} 条）`}
       </button>
@@ -104,6 +90,7 @@ export default function ChatView({ toolsHidden, send }: Props) {
 
   // toolsHidden: group consecutive tool messages into a single placeholder.
   const rendered: React.ReactNode[] = [];
+  const renderedKeys: string[] = [];
   let toolGroupCount = 0;
   let toolGroupFirstId = "";
   let groupKeyIndex = 0;
@@ -120,6 +107,7 @@ export default function ChatView({ toolsHidden, send }: Props) {
           isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
         />
       );
+      renderedKeys.push(msg.id);
       continue;
     }
     // This is a tool message — count it in the current group.
@@ -143,12 +131,13 @@ export default function ChatView({ toolsHidden, send }: Props) {
         </span>
       </div>
     );
+    renderedKeys.push(`tool-group-${toolGroupFirstId}`);
   }
 
   return (
     <div>
       {messages.length === 0 && <WelcomeMessage />}
-      <VirtualChat rows={rendered.map((node, i) => ({ key: `h-${i}`, node }))} />
+      <VirtualChat rows={rendered.map((node, i) => ({ key: renderedKeys[i], node }))} />
     </div>
   );
 }

@@ -322,6 +322,7 @@ pub(super) fn messages_loaded(
     session_id: &str,
     snapshot: SessionSnapshot,
     cumulative_usage: serde_json::Value,
+    redact: bool,
 ) -> ServerMsg {
     let SessionSnapshot {
         messages,
@@ -339,12 +340,14 @@ pub(super) fn messages_loaded(
         started,
         cumulative_usage,
         traces,
+        redact,
     )
 }
 
 /// Tail-windowed constructor used when restoring a session: send only the
 /// most recent `HISTORY_TAIL_MESSAGES` messages; `total` tells the client how
 /// much older history exists behind `load_older` paging.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn messages_loaded_windowed(
     session_id: &str,
     messages: Vec<Message>,
@@ -353,6 +356,7 @@ pub(super) fn messages_loaded_windowed(
     started: Option<String>,
     cumulative_usage: serde_json::Value,
     traces: Vec<nonoclaw_engine::session::PersistedTraceWire>,
+    redact: bool,
 ) -> ServerMsg {
     let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
     let first_index = total.saturating_sub(messages.len());
@@ -364,7 +368,9 @@ pub(super) fn messages_loaded_windowed(
         messages: messages
             .into_iter()
             .enumerate()
-            .map(|(offset, message)| message_for_wire(message, started_ms, first_index + offset))
+            .map(|(offset, message)| {
+                message_for_wire(message, started_ms, first_index + offset, redact)
+            })
             .collect(),
         cumulative_usage,
         total,
@@ -381,6 +387,7 @@ pub(super) fn history_page(
     total: usize,
     revision: u64,
     started: Option<String>,
+    redact: bool,
 ) -> ServerMsg {
     let started_ms = started.as_deref().and_then(parse_rfc3339_ms);
     let before_index = before_index.min(total);
@@ -394,7 +401,9 @@ pub(super) fn history_page(
         messages: messages
             .into_iter()
             .enumerate()
-            .map(|(offset, message)| message_for_wire(message, started_ms, first_index + offset))
+            .map(|(offset, message)| {
+                message_for_wire(message, started_ms, first_index + offset, redact)
+            })
             .collect(),
         remaining,
     }
@@ -548,11 +557,16 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// Convert persisted model messages to the browser compatibility shape while
 /// removing data that the UI never needs: provider thinking/signatures,
 /// attachment bytes/extracted bodies, and unsafe tool payload fields.
-fn message_for_wire(message: Message, started_ms: Option<u64>, index: usize) -> serde_json::Value {
+fn message_for_wire(
+    message: Message,
+    started_ms: Option<u64>,
+    index: usize,
+    redact: bool,
+) -> serde_json::Value {
     let attachments = attachment_filenames(&message.content);
     let mut wire = serde_json::json!({
         "role": message.role,
-        "content": safe_message_content(message.content),
+        "content": safe_message_content(message.content, redact),
         "src_index": index,
     });
     // Real wall-clock commit time (v0.23.2+) takes precedence; fall back to
@@ -574,7 +588,7 @@ fn message_for_wire(message: Message, started_ms: Option<u64>, index: usize) -> 
     wire
 }
 
-fn safe_message_content(content: MessageContent) -> serde_json::Value {
+fn safe_message_content(content: MessageContent, redact: bool) -> serde_json::Value {
     match content {
         MessageContent::Text(text) => serde_json::Value::String(text),
         MessageContent::Blocks(blocks) => {
@@ -584,7 +598,12 @@ fn safe_message_content(content: MessageContent) -> serde_json::Value {
                     "text": prompt
                 }]);
             }
-            serde_json::Value::Array(blocks.into_iter().filter_map(safe_block).collect())
+            serde_json::Value::Array(
+                blocks
+                    .into_iter()
+                    .filter_map(|block| safe_block(block, redact))
+                    .collect(),
+            )
         }
     }
 }
@@ -657,7 +676,7 @@ fn attached_user_prompt(blocks: &[ContentBlock]) -> Option<String> {
     )
 }
 
-fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
+fn safe_block(block: ContentBlock, redact: bool) -> Option<serde_json::Value> {
     match block {
         ContentBlock::Text { text, .. } => Some(serde_json::json!({
             "type": "text",
@@ -673,7 +692,7 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
             "type": "tool_use",
             "id": id,
             "name": name,
-            "input": redact_value(input),
+            "input": if redact { redact_value(input) } else { input },
         })),
         ContentBlock::ToolResult {
             tool_use_id,
@@ -683,7 +702,7 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
         } => Some(serde_json::json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id,
-            "content": safe_tool_result_content(content),
+            "content": safe_tool_result_content(content, redact),
             "is_error": is_error,
         })),
         // Thinking text is surfaced (live runs already stream it via
@@ -694,16 +713,29 @@ fn safe_block(block: ContentBlock) -> Option<serde_json::Value> {
         // fully unreadable.
         ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({
             "type": "thinking",
-            "thinking": redact_text_per_line(&thinking),
+            "thinking": if redact {
+                redact_text_per_line(&thinking)
+            } else {
+                thinking
+            },
         })),
     }
 }
 
-fn safe_tool_result_content(content: ToolResultContent) -> serde_json::Value {
+fn safe_tool_result_content(content: ToolResultContent, redact: bool) -> serde_json::Value {
     match content {
-        ToolResultContent::Text(text) => serde_json::Value::String(redact_text(&text)),
+        ToolResultContent::Text(text) => serde_json::Value::String(if redact {
+            redact_text(&text)
+        } else {
+            text
+        }),
         ToolResultContent::Blocks(blocks) => {
-            serde_json::Value::Array(blocks.into_iter().filter_map(safe_block).collect())
+            serde_json::Value::Array(
+                blocks
+                    .into_iter()
+                    .filter_map(|block| safe_block(block, redact))
+                    .collect(),
+            )
         }
     }
 }
@@ -891,7 +923,7 @@ mod tests {
             ts: None,
         };
 
-        let attachment_wire = message_for_wire(attachment, None, 0);
+        let attachment_wire = message_for_wire(attachment, None, 0, true);
         assert_eq!(
             attachment_wire["attachments"],
             serde_json::json!([
@@ -904,7 +936,7 @@ mod tests {
             serde_json::json!([{ "type": "text", "text": "please summarize" }])
         );
         let encoded =
-            serde_json::json!([attachment_wire, message_for_wire(assistant, None, 1)]).to_string();
+            serde_json::json!([attachment_wire, message_for_wire(assistant, None, 1, true)]).to_string();
         for forbidden in [
             "private attachment body",
             "private-image-data",
@@ -926,6 +958,49 @@ mod tests {
     }
 
     #[test]
+    fn message_for_wire_bypass_keeps_raw_tool_input_and_thinking() {
+        // localHistoryRedaction=false keeps raw tool inputs/results and
+        // thinking; attachment stripping and signature dropping still apply.
+        let assistant = Message {
+            role: Role::Assistant,
+            content: MessageContent::from_blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "thinking at /Users/secret/path".into(),
+                    signature: Some("provider-signature".into()),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "Fixture".into(),
+                    input: serde_json::json!({
+                        "path": "src/main.rs",
+                        "api_key": "sk-proj-tool"
+                    }),
+                    cache_control: None,
+                },
+                ContentBlock::text("visible answer"),
+            ]),
+            ts: None,
+        };
+        let wire = message_for_wire(assistant, None, 0, false);
+        let encoded = wire.to_string();
+        assert!(encoded.contains("sk-proj-tool"), "raw tool input kept");
+        assert!(encoded.contains("/Users/secret/path"), "raw thinking kept");
+        assert!(
+            !encoded.contains("provider-signature"),
+            "signature still dropped"
+        );
+        // Tool results keep raw text too.
+        let user = Message::user(MessageContent::from_blocks(vec![
+            ContentBlock::tool_result("tool-1".into(), "/Users/secret/path/ok", false),
+        ]));
+        let wire = message_for_wire(user, None, 1, false);
+        assert!(
+            wire.to_string().contains("/Users/secret/path/ok"),
+            "raw tool result kept"
+        );
+    }
+
+    #[test]
     fn message_ts_prefers_real_over_synthetic() {
         let msg = Message {
             role: Role::User,
@@ -940,11 +1015,12 @@ mod tests {
             },
             Some(1_700_000_000_000),
             5,
+            true,
         );
         assert_eq!(wire["ts"], 1_700_000_123_456u64);
         // Legacy entries without ts fall back to the synthetic estimate.
         let legacy = Message { ts: None, ..msg };
-        let wire = message_for_wire(legacy, Some(1_700_000_000_000), 5);
+        let wire = message_for_wire(legacy, Some(1_700_000_000_000), 5, true);
         assert_eq!(wire["ts"], 1_700_000_005_000u64);
     }
 

@@ -314,7 +314,7 @@ impl SessionHub {
         }
     }
 
-    pub(super) async fn sync(&self, session_id: &str, exclude: &Tx) {
+    pub(super) async fn sync(&self, session_id: &str, exclude: &Tx, redact: bool) {
         let (handle, peers) = {
             let entries = self.entries.lock().await;
             let Some(entry) = entries.get(session_id) else {
@@ -337,6 +337,7 @@ impl SessionHub {
             session_id,
             snapshot,
             self.cumulative_usage_json(session_id).await,
+            redact,
         );
         let mut dead = Vec::new();
         for peer in peers {

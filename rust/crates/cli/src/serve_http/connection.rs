@@ -405,6 +405,16 @@ pub(super) fn upload_exploration_state(
 
 /// Resolve the initial permission mode from settings.json's `permissions.defaultMode`.
 /// Falls back to `PermissionMode::Default` when the field is absent or unrecognised.
+/// Whether restored session history sent to the local UI keeps its default
+/// redaction (paths, env, keys in tool inputs/results and thinking).
+/// `localHistoryRedaction: false` in settings.json opts out.
+fn history_redaction_enabled(config: &ResolvedConfig) -> bool {
+    config
+        .settings()
+        .local_history_redaction
+        .unwrap_or(true)
+}
+
 fn initial_permission_mode(config: &ResolvedConfig) -> nonoclaw_core::PermissionMode {
     config
         .settings()
@@ -1058,7 +1068,12 @@ async fn handle_ws(
             &state,
             &tx,
             project_generation,
-            messages_loaded(&sid, snapshot, cumulative_usage),
+            messages_loaded(
+                &sid,
+                snapshot,
+                cumulative_usage,
+                history_redaction_enabled(state.project().config()),
+            ),
         )
         .await
         {
@@ -1295,6 +1310,7 @@ async fn handle_ws(
                     &sid,
                     snapshot,
                     state.session_hub.cumulative_usage_json(&sid).await,
+                    history_redaction_enabled(state.project().config()),
                 );
                 let info = ServerMsg::Info {
                     model: state.active_model.lock().await.clone(),
@@ -1410,6 +1426,7 @@ async fn handle_ws(
                     &sid,
                     snapshot,
                     state.session_hub.cumulative_usage_json(&sid).await,
+                    history_redaction_enabled(state.project().config()),
                 );
                 let info = ServerMsg::Info {
                     model: state.active_model.lock().await.clone(),
@@ -1779,6 +1796,7 @@ async fn handle_ws(
                         total,
                         snapshot.revision,
                         snapshot.started,
+                        history_redaction_enabled(state.project().config()),
                     ),
                 )
                 .await
@@ -2526,7 +2544,7 @@ async fn handle_ws(
                             // Broadcast updated messages + project info to all
                             // other peers sharing this session.
                             if let Some(ref cid) = sync_sid {
-                                s.session_hub.sync(cid, &tx2).await;
+                                s.session_hub.sync(cid, &tx2, history_redaction_enabled(s.project().config())).await;
                                 // Also push ProjectInfo refresh.
                                 let pi = ServerMsg::ProjectInfo { info };
                                 let peers = s.session_hub.peers(cid).await;
@@ -2914,7 +2932,12 @@ async fn handle_ws(
                     &state,
                     &tx,
                     project_generation,
-                    messages_loaded(&sid, snapshot, cumulative_usage),
+                    messages_loaded(
+                        &sid,
+                        snapshot,
+                        cumulative_usage,
+                        history_redaction_enabled(state.project().config()),
+                    ),
                 )
                 .await
                 {
@@ -3144,13 +3167,18 @@ async fn handle_ws(
                     .session_hub
                     .cumulative_usage_json(canonical.id())
                     .await;
-                let ml = messages_loaded(canonical.id(), snapshot, cum_usage);
+                let ml = messages_loaded(
+                    canonical.id(),
+                    snapshot,
+                    cum_usage,
+                    history_redaction_enabled(state.project().config()),
+                );
                 send_msg(&tx, ml).await;
 
                 // Broadcast the clear before releasing exclusivity, so a new
                 // run cannot race an older MessagesLoaded snapshot to peers.
                 if let Some(ref cid) = shared_sid {
-                    state.session_hub.sync(cid, &tx).await;
+                    state.session_hub.sync(cid, &tx, history_redaction_enabled(state.project().config())).await;
                 }
                 clear_lease.finish().await;
             }
@@ -3362,7 +3390,7 @@ async fn handle_ws(
                         )
                         .await;
                         if let Some(ref id) = shared_sid {
-                            state.session_hub.sync(id, &tx).await;
+                            state.session_hub.sync(id, &tx, history_redaction_enabled(state.project().config())).await;
                         }
                     }
                     Ok(None) => {

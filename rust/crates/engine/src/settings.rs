@@ -192,6 +192,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         name: "jev",
         description: "Jev (TypeSafe AI System One) decision-model integration: { apiKey, enabled, baseUrl, model }. Off unless a key is present and enabled.",
     },
+    ConfigFieldReference {
+        name: "localHistoryRedaction",
+        description: "Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local UI. Default true.",
+    },
 ];
 
 pub fn config_reference() -> &'static [ConfigFieldReference] {
@@ -271,6 +275,11 @@ pub struct SettingsFile {
     /// Default 10.
     #[serde(rename = "dreamIdleMinutes", default)]
     pub dream_idle_minutes: Option<u64>,
+    /// Redact sensitive values (paths, env, keys) in tool inputs/results
+    /// and thinking when session history is restored to the local UI.
+    /// Default true.
+    #[serde(rename = "localHistoryRedaction", default)]
+    pub local_history_redaction: Option<bool>,
     #[serde(rename = "elevenlabsApiKey", default)]
     pub elevenlabs_api_key: Option<String>,
     /// Jev (TypeSafe AI System One) decision-model settings. Off unless a
@@ -545,6 +554,7 @@ impl Default for SettingsFile {
             compact_max_tokens: None,
             dream_enabled: None,
             dream_idle_minutes: None,
+            local_history_redaction: None,
             elevenlabs_api_key: None,
             jev: None,
             proxy: None,
@@ -1885,6 +1895,12 @@ fn merge_settings_value(
     }
     if present("proxy", overlay.proxy.is_some()) {
         base.proxy = overlay.proxy.clone();
+    }
+    if present(
+        "localHistoryRedaction",
+        overlay.local_history_redaction.is_some(),
+    ) {
+        base.local_history_redaction = overlay.local_history_redaction;
     }
     if present(
         "skillIndexMaxTokens",
@@ -3605,6 +3621,7 @@ mod tests {
         assert!(names.contains("dreamEnabled"));
         assert!(names.contains("dreamIdleMinutes"));
         assert!(names.contains("jev"));
+        assert!(names.contains("localHistoryRedaction"));
 
         let mut diagnostics = Vec::new();
         diagnose_unknown_fields(
@@ -3612,6 +3629,7 @@ mod tests {
                 "proxy": "http://127.0.0.1:20171",
                 "dreamEnabled": true,
                 "dreamIdleMinutes": 15,
+                "localHistoryRedaction": false,
                 "jev": {"apiKey": "$JEV_API_KEY", "enabled": true}
             }),
             &source("proxy"),

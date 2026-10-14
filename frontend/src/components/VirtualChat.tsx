@@ -15,7 +15,7 @@
  *   rather than being clipped by a stale cache entry.
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 /** Fallback height for rows never measured yet. */
 const UNMEASURED_HEIGHT = 160;
@@ -96,6 +96,33 @@ export default function VirtualChat({ rows }: Props) {
   const total = offsets[rows.length];
   const top = Math.max(0, scrollTop - UNMEASURED_HEIGHT * OVERSCAN);
   const bottom = scrollTop + viewport + UNMEASURED_HEIGHT * OVERSCAN;
+
+  // Viewport anchoring for prepended rows: an older page landing above the
+  // viewport (or a measurement replacing an estimate) shifts content under a
+  // fixed scrollTop. Track the first visible row (key + offset) from the
+  // previous commit and, synchronously before paint, add the delta to
+  // scrollTop so the reader's position stays put. Anchors that vanish
+  // (session switch) and deltas of 0 (appends below) are no-ops.
+  const anchorRef = useRef<{ key: string; offset: number } | null>(null);
+  const prevAnchorRef = useRef<{ key: string; offset: number } | null>(null);
+  let nextAnchor: { key: string; offset: number } | null = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (offsets[i + 1] >= scrollTop) {
+      nextAnchor = { key: rows[i].key, offset: offsets[i] };
+      break;
+    }
+  }
+  prevAnchorRef.current = anchorRef.current;
+  anchorRef.current = nextAnchor;
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    const anchor = prevAnchorRef.current;
+    if (!scroller || !anchor) return;
+    const idx = rows.findIndex((row) => row.key === anchor.key);
+    if (idx < 0) return;
+    const delta = offsets[idx] - anchor.offset;
+    if (delta !== 0) scroller.scrollTop += delta;
+  }, [rows, dirty]);
 
   // Binary search: first row whose bottom edge passes `top`.
   let start = 0;
