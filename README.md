@@ -869,7 +869,7 @@ Full example at `~/.nonoclaw/settings.json`:
 | `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `15`) |
 | `dreamEnabled` | Enable the AutoDream idle memory consolidation run (default `true`) |
 | `dreamIdleMinutes` | Idle minutes before a dream run may start (default `10`) |
-| `localHistoryRedaction` | Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local Web UI (default `true`) |
+| `localHistoryRedaction` | Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local Web UI and in live-streamed run events; trace export stays redacted regardless (default `true`) |
 | `thinking` | Provider thinking configuration: `true` or `{"type":"enabled","budget_tokens":16000}` |
 | `executables` | Explicit rust/node/python executable paths and versions (see below) |
 | `elevenlabsApiKey` | ElevenLabs speech-to-text API key |

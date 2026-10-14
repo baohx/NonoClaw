@@ -385,6 +385,14 @@ impl EventEnvelope<RunEvent> {
         self.session_revision = revision;
         self
     }
+
+    /// Replace the payload while preserving the envelope identity (event id,
+    /// run id, sequence, timestamp). Used to send an unredacted transport
+    /// copy alongside the redacted trace copy of the same event.
+    pub fn with_event(mut self, event: RunEvent) -> Self {
+        self.event = event;
+        self
+    }
 }
 
 pub fn timestamp_ms() -> u64 {
@@ -633,6 +641,42 @@ mod tests {
         assert!(!value["event_id"].as_str().unwrap().is_empty());
         let decoded: EventEnvelope = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.sequence, 42);
+    }
+
+    #[test]
+    fn with_event_swaps_payload_but_preserves_envelope_identity() {
+        let sensitive = RunEvent::ToolUseStart {
+            id: "tool-1".into(),
+            name: "Read".into(),
+            input: json!({"path": "/Users/baohx/secret/creds.txt", "api_key": "sk-ant-secret"}),
+        };
+        // The redacted envelope is what trace export consumes.
+        let envelope = EventEnvelope::at(
+            "run-1",
+            Some("parent-1".into()),
+            "session-1",
+            7,
+            42,
+            1_700_000_000_000,
+            sensitive.clone(),
+        );
+        let transport_copy = envelope.clone().with_event(sensitive);
+        assert_eq!(transport_copy.event_id, envelope.event_id);
+        assert_eq!(transport_copy.run_id, envelope.run_id);
+        assert_eq!(transport_copy.parent_run_id, envelope.parent_run_id);
+        assert_eq!(transport_copy.session_id, envelope.session_id);
+        assert_eq!(transport_copy.session_revision, envelope.session_revision);
+        assert_eq!(transport_copy.sequence, envelope.sequence);
+        assert_eq!(transport_copy.timestamp_ms, envelope.timestamp_ms);
+        // Payload is the raw one: original stays redacted for the trace.
+        let value = serde_json::to_value(&transport_copy).unwrap();
+        assert_eq!(value["event"]["input"]["api_key"], "sk-ant-secret");
+        assert_eq!(
+            value["event"]["input"]["path"],
+            "/Users/baohx/secret/creds.txt"
+        );
+        let trace_value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(trace_value["event"]["input"]["api_key"], "[REDACTED]");
     }
 
     #[test]

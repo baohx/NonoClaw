@@ -194,7 +194,7 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
     },
     ConfigFieldReference {
         name: "localHistoryRedaction",
-        description: "Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local UI. Default true.",
+        description: "Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local UI and in live-streamed run events; trace export stays redacted regardless. Default true.",
     },
 ];
 

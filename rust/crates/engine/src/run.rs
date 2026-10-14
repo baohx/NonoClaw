@@ -39,6 +39,9 @@ pub struct RunContext {
     pub limits: RunLimits,
     pub cancel: CancellationToken,
     pub trace: TraceCollector,
+    /// Whether live events streamed to the transport (WS consumers) are
+    /// redacted. Trace export stays redacted regardless of this flag.
+    pub redact_transport: bool,
     sequence: Arc<AtomicU64>,
     cancel_reason: Arc<Mutex<Option<String>>>,
 }
@@ -57,6 +60,13 @@ impl std::fmt::Debug for RunContext {
 }
 
 impl RunContext {
+    /// Builder counterpart to [`RunContext::redact_transport`] for call sites
+    /// that construct the context inline (`RunContext::new(..)` chains).
+    pub fn with_transport_redaction(mut self, redact: bool) -> Self {
+        self.redact_transport = redact;
+        self
+    }
+
     pub fn new(
         session_id: impl Into<String>,
         cwd: PathBuf,
@@ -90,6 +100,7 @@ impl RunContext {
             limits,
             cancel,
             trace: TraceCollector::default(),
+            redact_transport: true,
             sequence: Arc::new(AtomicU64::new(0)),
             cancel_reason: Arc::new(Mutex::new(None)),
         }
@@ -114,6 +125,7 @@ impl RunContext {
             Some(self.run_id.clone()),
         );
         child.trace = self.trace.clone();
+        child.redact_transport = self.redact_transport;
         child
     }
 
@@ -292,9 +304,16 @@ impl RunController {
             let started = Instant::now();
             let result = engine
                 .run_with_context(user_content, &engine_context, |event| {
+                    // Trace export always records the redacted copy; the
+                    // transport copy is raw when the caller opted out.
                     let envelope = engine_context.envelope(event.clone());
                     engine_context.trace.record(envelope.clone());
-                    let _ = event_tx.send(envelope);
+                    if !engine_context.redact_transport {
+                        let envelope = envelope.with_event(event.clone());
+                        let _ = event_tx.send(envelope);
+                    } else {
+                        let _ = event_tx.send(envelope);
+                    }
                 })
                 .await;
             if let Err(error) = &result {
@@ -333,9 +352,14 @@ impl RunController {
                     usage: Default::default(),
                 });
                 for event in terminal_events {
-                    let envelope = engine_context.envelope(event);
+                    let envelope = engine_context.envelope(event.clone());
                     engine_context.trace.record(envelope.clone());
-                    let _ = event_tx.send(envelope);
+                    if !engine_context.redact_transport {
+                        let envelope = envelope.with_event(event);
+                        let _ = event_tx.send(envelope);
+                    } else {
+                        let _ = event_tx.send(envelope);
+                    }
                 }
             }
             (engine, result)
@@ -521,6 +545,127 @@ mod tests {
         }
         values.sort_unstable();
         assert_eq!(values, (1..=64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn child_context_inherits_transport_redaction_flag() {
+        let parent = RunContext::new(
+            "session-parent",
+            PathBuf::from("/tmp"),
+            "model",
+            RunLimits::default(),
+        )
+        .with_transport_redaction(false);
+        assert!(!parent.redact_transport);
+        let child = parent.child(
+            "session-child",
+            PathBuf::from("/tmp"),
+            "model",
+            RunLimits::default(),
+        );
+        assert!(!child.redact_transport);
+    }
+
+    #[tokio::test]
+    async fn transport_opt_out_sends_raw_events_while_trace_stays_redacted() {
+        use std::sync::Arc;
+
+        let sse = concat!(
+            "event: message_start\ndata: {\"message\":{\"id\":\"msg_x\",\"model\":\"fixture-model\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"path is /Users/baohx/secret\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\ndata: {}\n\n"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 8192];
+            let mut request = Vec::new();
+            loop {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = Arc::new(
+            nonoclaw_api::Client::new(Some("fixture-key".into()), None, format!("http://{addr}"))
+                .unwrap(),
+        );
+        let (registry, todos) = nonoclaw_tools::register_all();
+        let options = crate::loop_::EngineOptions {
+            model: "fixture-model".into(),
+            max_turns: 1,
+            auto_compact: false,
+            ..Default::default()
+        };
+        let engine = QueryEngine::new(client, Arc::new(registry), todos, options);
+        let cwd = std::env::temp_dir().join(format!("nonoclaw-run-raw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let controller = RunController::new(
+            RunContext::new(
+                "session",
+                cwd.clone(),
+                "fixture-model",
+                RunLimits::default(),
+            )
+            .with_transport_redaction(false),
+        );
+        let transport = Arc::new(Mutex::new(Vec::<EventEnvelope>::new()));
+        let captured = Arc::clone(&transport);
+        let handle = controller.start(
+            engine,
+            MessageContent::from_text("say the secret path"),
+            move |event| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(event);
+                }
+            },
+        );
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+            .await
+            .expect("run must finish");
+        fixture.await.unwrap();
+
+        assert_eq!(completion.terminal.status, RunTerminalStatus::Done);
+        // Transport copy is raw: the model's text containing /Users/... flows
+        // through unredacted.
+        let transport_events = transport.lock().unwrap();
+        let raw_text = transport_events
+            .iter()
+            .filter_map(|event| match &event.event {
+                RunEvent::TextDelta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            raw_text.contains("/Users/baohx/secret"),
+            "transport copy must keep the raw path, got: {raw_text}"
+        );
+        // Trace copy is redacted even though transport opted out.
+        let trace = controller.context().trace.snapshot();
+        assert!(!trace.is_empty());
+        let serialized = serde_json::to_string(&trace).unwrap();
+        assert!(
+            !serialized.contains("/Users/baohx/secret"),
+            "trace export must stay redacted"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[tokio::test]

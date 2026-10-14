@@ -398,7 +398,13 @@ async fn run_handler_inner(
         session_snapshot,
     );
 
-    let controller = RunController::for_engine(&engine, project.cwd().to_path_buf());
+    let controller = RunController::new(
+        engine
+            .run_context(project.cwd().to_path_buf())
+            .with_transport_redaction(super::connection::history_redaction_enabled(
+                project.config(),
+            )),
+    );
     if run_lease.set_controller(controller.clone()).await.is_err() {
         run_lease.finish().await;
         return super::http_error::error_response(

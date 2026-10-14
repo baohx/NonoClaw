@@ -408,11 +408,8 @@ pub(super) fn upload_exploration_state(
 /// Whether restored session history sent to the local UI keeps its default
 /// redaction (paths, env, keys in tool inputs/results and thinking).
 /// `localHistoryRedaction: false` in settings.json opts out.
-fn history_redaction_enabled(config: &ResolvedConfig) -> bool {
-    config
-        .settings()
-        .local_history_redaction
-        .unwrap_or(true)
+pub(crate) fn history_redaction_enabled(config: &ResolvedConfig) -> bool {
+    config.settings().local_history_redaction.unwrap_or(true)
 }
 
 fn initial_permission_mode(config: &ResolvedConfig) -> nonoclaw_core::PermissionMode {
@@ -2088,12 +2085,15 @@ async fn handle_ws(
                             s.todos.clone(),
                             fork_opts,
                         );
-                        let controller = RunController::new(RunContext::new(
-                            session_for_run.id(),
-                            project.cwd().to_path_buf(),
-                            model_used.clone(),
-                            fork_limits,
-                        ));
+                        let controller = RunController::new(
+                            RunContext::new(
+                                session_for_run.id(),
+                                project.cwd().to_path_buf(),
+                                model_used.clone(),
+                                fork_limits,
+                            )
+                            .with_transport_redaction(history_redaction_enabled(project.config())),
+                        );
                         if run_lease.set_controller(controller.clone()).await.is_err() {
                             drop(project_transition);
                             if let Some(ready) = ready_tx.take() {
@@ -2329,8 +2329,11 @@ async fn handle_ws(
                         include_attachment_images,
                         attachment_max_chars,
                     );
-                    let controller =
-                        RunController::for_engine(&engine, project.cwd().to_path_buf());
+                    let controller = RunController::new(
+                        engine
+                            .run_context(project.cwd().to_path_buf())
+                            .with_transport_redaction(history_redaction_enabled(project.config())),
+                    );
                     if run_lease.set_controller(controller.clone()).await.is_err() {
                         drop(project_transition);
                         if let Some(ready) = ready_tx.take() {
