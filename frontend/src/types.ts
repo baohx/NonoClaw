@@ -236,6 +236,9 @@ export interface InfoMsg {
   /** Auth token for QR-code remote access. */
   auth_token?: string;
   available_models: ModelInfo[];
+  /** Mirrors the server's localHistoryRedaction setting; false disables the
+   * browser-side sanitizer along with the server-side history redaction. */
+  redact_history?: boolean;
 }
 
 export interface EventMsg extends RunWireMeta {

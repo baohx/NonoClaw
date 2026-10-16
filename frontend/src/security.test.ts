@@ -1,4 +1,5 @@
 import {
+  browserHistoryRedactionEnabled,
   clearMobileAccessToken,
   getBrowserAccessToken,
   getMobileAccessToken,
@@ -6,6 +7,7 @@ import {
   sanitizeBrowserValue,
   sanitizeMediaAttachment,
   sanitizeProjectInfo,
+  setBrowserHistoryRedaction,
   setMobileAccessToken,
 } from "./security.ts";
 
@@ -71,3 +73,22 @@ check(
 check(!setMobileAccessToken("Bearer unsafe token"), "unsafe mobile token format must be rejected");
 check(getMobileAccessToken() === "", "rejected credentials must clear the vault");
 clearMobileAccessToken();
+
+// localHistoryRedaction=false bypasses the browser sanitizer (server already
+// sent plaintext; the UI must not re-redact what the user opted to keep).
+check(browserHistoryRedactionEnabled() === true, "redaction must default to enabled");
+setBrowserHistoryRedaction(false);
+check(
+  sanitizeBrowserText("provider failed with Bearer token") === "provider failed with Bearer token",
+  "opted-out text must pass through untouched",
+);
+check(
+  JSON.stringify(sanitizeBrowserValue({ api_key: "sk-proj-plain", content: "body" }))
+    .includes("sk-proj-plain"),
+  "opted-out values must pass through untouched",
+);
+setBrowserHistoryRedaction(true);
+check(
+  sanitizeBrowserText("provider failed with Bearer token") === "[REDACTED]",
+  "re-enabling must restore redaction",
+);

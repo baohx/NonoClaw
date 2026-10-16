@@ -1558,7 +1558,7 @@ impl QueryEngine {
         // The controller path bypasses run() and records in its own wrapper —
         // double counting is impossible by construction.
         let on_event = |event: &EngineEvent| {
-            let envelope = context.envelope(event.clone());
+            let envelope = context.recorded_envelope(event.clone());
             context.trace.record(envelope);
             on_event(event);
         };
@@ -3048,7 +3048,15 @@ impl QueryEngine {
                 on_event(&EngineEvent::ToolUseStart {
                     id: id.clone(),
                     name: name.clone(),
-                    input: nonoclaw_core::redact_value(input.clone()),
+                    // Pre-enveloped redaction is redundant when the envelope
+                    // layer redacts (`redacted()` covers the whole event); it
+                    // must be gated on the same opt-out so plaintext survives
+                    // when local history redaction is disabled.
+                    input: if context.redact_transport {
+                        nonoclaw_core::redact_value(input.clone())
+                    } else {
+                        input.clone()
+                    },
                 });
                 on_event(&RunEvent::ToolQueued {
                     tool_use_id: id.clone(),

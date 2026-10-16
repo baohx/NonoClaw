@@ -262,6 +262,7 @@ fn make_permission_resolver(
     pending: Arc<PermissionMap>,
     meta: super::permission_api::PendingPermissionMeta,
     session_id: String,
+    redact_history: bool,
 ) -> nonoclaw_engine::PermissionResolver {
     Arc::new(move |request: PermissionRequest| {
         let tx = tx.clone();
@@ -269,6 +270,18 @@ fn make_permission_resolver(
         let meta = Arc::clone(&meta);
         let session_id = session_id.clone();
         Box::pin(async move {
+            // Permission prompts are local-only UI copies; redaction mirrors
+            // localHistoryRedaction (opt-out keeps the dialog fully plaintext).
+            let message = if redact_history {
+                redact_text(&request.message)
+            } else {
+                request.message.clone()
+            };
+            let input = if redact_history {
+                redact_value(request.input.clone())
+            } else {
+                request.input.clone()
+            };
             let (sender, receiver) = oneshot::channel();
             let request_id = Uuid::new_v4().to_string();
             let key = (session_id.clone(), request_id.clone());
@@ -279,8 +292,8 @@ fn make_permission_resolver(
                     session_id,
                     request_id: request_id.clone(),
                     tool_name: request.tool_name.clone(),
-                    message: redact_text(&request.message),
-                    input: redact_value(request.input.clone()),
+                    message: message.clone(),
+                    input: input.clone(),
                 },
             );
             send_msg(
@@ -288,8 +301,8 @@ fn make_permission_resolver(
                 ServerMsg::PermissionRequired {
                     request_id,
                     tool_name: request.tool_name,
-                    message: redact_text(&request.message),
-                    input: redact_value(request.input),
+                    message,
+                    input,
                 },
             )
             .await;
@@ -334,6 +347,7 @@ pub(super) fn build_options(
         pending_permissions,
         permission_meta,
         session_id,
+        super::connection::history_redaction_enabled(config),
     ));
     options.skills_manager = Some(skills_manager);
     options.background_registry = Some(background_registry);

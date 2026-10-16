@@ -1,13 +1,29 @@
 const SENSITIVE_BROWSER_KEY = /(^|[_-])(api[_-]?key|authorization|credential|password|secret|token|prompt|attachment[_-]?data|extracted[_-]?text|images?|content|body)($|[_-])/i;
 const SENSITIVE_BROWSER_TEXT = /(bearer\s+\S+|sk-(?:ant|proj)-\S+|api[_-]?key\s*[:=]|authorization\s*[:=]|password\s*[:=]|secret\s*[:=])/i;
 
+/** Mirrors the server's `localHistoryRedaction` setting, delivered on every
+ * Info frame. Defaults to true (redact) until the first Info arrives so a
+ * malicious/legacy server cannot disarm the browser backstop by omission. */
+let browserHistoryRedaction = true;
+
+export function setBrowserHistoryRedaction(enabled: boolean): void {
+  browserHistoryRedaction = enabled;
+}
+
+/** Whether history redaction is currently active; consulted by the subagent
+ * event filter so its sensitive-key drops follow the same setting. */
+export function browserHistoryRedactionEnabled(): boolean {
+  return browserHistoryRedaction;
+}
+
 export function sanitizeBrowserText(value: string): string {
-  return SENSITIVE_BROWSER_TEXT.test(value) ? "[REDACTED]" : value;
+  return browserHistoryRedaction && SENSITIVE_BROWSER_TEXT.test(value) ? "[REDACTED]" : value;
 }
 
 /** Defensive browser-store filter. Server-side filtering remains canonical,
  * but malformed/legacy frames cannot persist credentials or attachment data. */
 export function sanitizeBrowserValue(value: unknown, key = ""): unknown {
+  if (!browserHistoryRedaction) return value;
   if (SENSITIVE_BROWSER_KEY.test(key)) {
     if (key === "body") return "[skill content kept server-side]";
     if (key === "prompt_preview") return "[tool prompt hidden]";

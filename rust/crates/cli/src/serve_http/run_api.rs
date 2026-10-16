@@ -340,11 +340,24 @@ async fn run_handler_inner(
     let pending_perms = Arc::clone(&state.pending_permissions);
     let perm_meta = Arc::clone(&state.permission_meta);
     let permission_session_id = session_id.clone();
+    // Mirrors localHistoryRedaction: opt-out keeps REST permission records
+    // plaintext, matching the WS path (run_handler::make_permission_resolver).
+    let permission_redact = super::connection::history_redaction_enabled(project.config());
     options.permission_resolver = Some(Arc::new(move |request| {
         let pending_perms = Arc::clone(&pending_perms);
         let perm_meta = Arc::clone(&perm_meta);
         let session_id = permission_session_id.clone();
         Box::pin(async move {
+            let message = if permission_redact {
+                nonoclaw_core::redact_text(&request.message)
+            } else {
+                request.message.clone()
+            };
+            let input = if permission_redact {
+                nonoclaw_core::redact_value(request.input.clone())
+            } else {
+                request.input.clone()
+            };
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let request_id = uuid::Uuid::new_v4().to_string();
             let key = (session_id.clone(), request_id.clone());
@@ -355,8 +368,8 @@ async fn run_handler_inner(
                     session_id,
                     request_id,
                     tool_name: request.tool_name,
-                    message: nonoclaw_core::redact_text(&request.message),
-                    input: nonoclaw_core::redact_value(request.input),
+                    message,
+                    input,
                 },
             );
             receiver

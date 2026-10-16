@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { breathController } from "./breath";
-import { clearMobileAccessToken, getBrowserAccessToken, sanitizeBrowserText, setMobileAccessToken } from "./security";
+import { clearMobileAccessToken, getBrowserAccessToken, sanitizeBrowserText, setBrowserHistoryRedaction, setMobileAccessToken } from "./security";
 import { useStore } from "./store";
 import { acceptScopedEnvelope } from "./store/transitions";
 import { traceEntryFromEvent, traceTerminalEntry } from "./trace";
@@ -311,6 +311,7 @@ export function dispatchServerMessage(message: ServerMsg): void {
   const state = useStore.getState();
   switch (message.type) {
     case "info":
+      setBrowserHistoryRedaction(message.redact_history !== false);
       state.setInfo(
         message.model,
         message.session_id,

@@ -202,6 +202,11 @@ pub(super) enum ServerMsg {
         #[serde(skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
         available_models: Vec<ModelInfo>,
+        /// Whether the browser-side sanitizer should redact sensitive keys in
+        /// tool inputs/results. Mirrors the `localHistoryRedaction` setting so
+        /// the frontend layer can be bypassed when the user opted out.
+        #[serde(default)]
+        redact_history: bool,
     },
     SessionList {
         sessions: Vec<SessionInfoWire>,

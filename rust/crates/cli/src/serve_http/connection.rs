@@ -1086,6 +1086,7 @@ async fn handle_ws(
             ServerMsg::Info {
                 model: initial_model.clone(),
                 auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                redact_history: history_redaction_enabled(initial_project.config()),
                 available_models: initial_project
                     .config()
                     .all_models()
@@ -1312,6 +1313,7 @@ async fn handle_ws(
                 let info = ServerMsg::Info {
                     model: state.active_model.lock().await.clone(),
                     auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                    redact_history: history_redaction_enabled(project.config()),
                     available_models: project
                         .config()
                         .conversation_models()
@@ -1428,6 +1430,7 @@ async fn handle_ws(
                 let info = ServerMsg::Info {
                     model: state.active_model.lock().await.clone(),
                     auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                    redact_history: history_redaction_enabled(project.config()),
                     available_models: project
                         .config()
                         .all_models()
@@ -2705,6 +2708,7 @@ async fn handle_ws(
                     let info_message = ServerMsg::Info {
                         model: name.clone(),
                         auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                        redact_history: history_redaction_enabled(project.config()),
                         available_models: project
                             .config()
                             .all_models()
@@ -2956,6 +2960,7 @@ async fn handle_ws(
                     ServerMsg::Info {
                         model: selected_model.clone(),
                         auth_token: expose_remote_token.then(|| state.auth_token.clone()),
+                        redact_history: history_redaction_enabled(next.config()),
                         available_models: next
                             .config()
                             .all_models()
@@ -3820,6 +3825,7 @@ mod characterization_tests {
                 model: "m".into(),
                 session_id: "s".into(),
                 auth_token: Some("t".into()),
+                redact_history: true,
                 available_models: vec![],
             },
             ServerMsg::SessionList { sessions: vec![] },

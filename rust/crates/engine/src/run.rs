@@ -40,7 +40,8 @@ pub struct RunContext {
     pub cancel: CancellationToken,
     pub trace: TraceCollector,
     /// Whether live events streamed to the transport (WS consumers) are
-    /// redacted. Trace export stays redacted regardless of this flag.
+    /// redacted. When false (local history redaction opt-out), the trace
+    /// export also keeps the raw event — see `recorded_envelope`.
     pub redact_transport: bool,
     sequence: Arc<AtomicU64>,
     cancel_reason: Arc<Mutex<Option<String>>>,
@@ -144,6 +145,19 @@ impl RunContext {
         )
     }
 
+    /// Envelope copy for trace recording and transport. Redacted unless the
+    /// caller opted out of local history redaction (`redact_transport`),
+    /// in which case the raw event is kept for both sinks — the local
+    /// session jsonl replays what the user saw live.
+    pub fn recorded_envelope(&self, event: RunEvent) -> EventEnvelope {
+        let envelope = self.envelope(event.clone());
+        if self.redact_transport {
+            envelope
+        } else {
+            envelope.with_event(event)
+        }
+    }
+
     pub fn cancel(&self, reason: impl Into<String>) {
         let reason = reason.into();
         let mut current = self.cancel_reason.lock().unwrap();
@@ -238,13 +252,9 @@ impl RunController {
             .last()
             .is_some_and(|event| matches!(&event.event, RunEvent::RunFinished { .. }))
         {
-            self.context.trace.record(EventEnvelope::new(
-                self.context.run_id.clone(),
-                self.context.parent_run_id.clone(),
-                self.context.session_id.clone(),
-                0,
-                sequence,
-                RunEvent::RunFinished {
+            self.context
+                .trace
+                .record(self.context.recorded_envelope(RunEvent::RunFinished {
                     status: match status {
                         RunTerminalStatus::Done => TechnicalStatus::Succeeded,
                         RunTerminalStatus::Cancelled => TechnicalStatus::Cancelled,
@@ -304,16 +314,12 @@ impl RunController {
             let started = Instant::now();
             let result = engine
                 .run_with_context(user_content, &engine_context, |event| {
-                    // Trace export always records the redacted copy; the
-                    // transport copy is raw when the caller opted out.
-                    let envelope = engine_context.envelope(event.clone());
+                    // One envelope per event feeds both sinks: trace export and
+                    // the transport stream. It is redacted unless the caller
+                    // opted out of local history redaction.
+                    let envelope = engine_context.recorded_envelope(event.clone());
                     engine_context.trace.record(envelope.clone());
-                    if !engine_context.redact_transport {
-                        let envelope = envelope.with_event(event.clone());
-                        let _ = event_tx.send(envelope);
-                    } else {
-                        let _ = event_tx.send(envelope);
-                    }
+                    let _ = event_tx.send(envelope);
                 })
                 .await;
             if let Err(error) = &result {
@@ -352,14 +358,9 @@ impl RunController {
                     usage: Default::default(),
                 });
                 for event in terminal_events {
-                    let envelope = engine_context.envelope(event.clone());
+                    let envelope = engine_context.recorded_envelope(event);
                     engine_context.trace.record(envelope.clone());
-                    if !engine_context.redact_transport {
-                        let envelope = envelope.with_event(event);
-                        let _ = event_tx.send(envelope);
-                    } else {
-                        let _ = event_tx.send(envelope);
-                    }
+                    let _ = event_tx.send(envelope);
                 }
             }
             (engine, result)
@@ -567,7 +568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_opt_out_sends_raw_events_while_trace_stays_redacted() {
+    async fn transport_opt_out_sends_raw_events_and_trace_persists_plaintext() {
         use std::sync::Arc;
 
         let sse = concat!(
@@ -657,13 +658,15 @@ mod tests {
             raw_text.contains("/Users/baohx/secret"),
             "transport copy must keep the raw path, got: {raw_text}"
         );
-        // Trace copy is redacted even though transport opted out.
+        // Trace copy is raw too when the caller opted out: the local session
+        // jsonl replays what the user saw live (user-set localHistoryRedaction
+        // semantics, 2026-10-16).
         let trace = controller.context().trace.snapshot();
         assert!(!trace.is_empty());
         let serialized = serde_json::to_string(&trace).unwrap();
         assert!(
-            !serialized.contains("/Users/baohx/secret"),
-            "trace export must stay redacted"
+            serialized.contains("/Users/baohx/secret"),
+            "trace snapshot must keep the raw path when redaction is opted out"
         );
         std::fs::remove_dir_all(&cwd).ok();
     }

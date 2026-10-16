@@ -7,7 +7,7 @@ import type {
   SubagentRunStatus,
   SubagentTool,
 } from "../types";
-import { sanitizeBrowserText } from "../security";
+import { browserHistoryRedactionEnabled, sanitizeBrowserText } from "../security";
 
 /** Parent-envelope checks for scoped child events. This intentionally does not
  * advance root ordering: child_sequence owns child idempotency, while these
@@ -414,7 +414,7 @@ function safeChildId(value: unknown): string {
 const SENSITIVE_CHILD_KEY = /(^|[_-])(api[_-]?key|authorization|credential|password|secret|token|prompt|attachment[_-]?data|extracted[_-]?text|images?|content|body)($|[_-])/i;
 
 function safeChildValue(value: unknown, depth = 0, key = ""): unknown {
-  if (SENSITIVE_CHILD_KEY.test(key)) return undefined;
+  if (browserHistoryRedactionEnabled() && SENSITIVE_CHILD_KEY.test(key)) return undefined;
   if (depth > 4) return "[truncated]";
   if (typeof value === "string") return safeChildString(value);
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
