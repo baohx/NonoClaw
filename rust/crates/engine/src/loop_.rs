@@ -4479,6 +4479,10 @@ mod tests {
     }
 
     #[test]
+    // Ignored per fc125af: tool-result credential redaction to the provider
+    // is disabled at user request. Restore alongside the core-redaction
+    // #[ignore] drops when redaction is re-enabled.
+    #[ignore = "credential redaction disabled at user request (fc125af)"]
     fn tool_result_credentials_are_redacted_before_serialization() {
         // A tool result carrying `.env`-style secrets + a PEM private key must
         // be scrubbed before the messages are serialized into a provider body.
