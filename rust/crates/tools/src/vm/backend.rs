@@ -90,6 +90,11 @@ pub struct VmInstance {
     pub ssh_port: u16,
     /// Host port used for Chrome CDP (QEMU hostfwd / docker -p).
     pub cdp_port: u16,
+    /// Host port for the x11vnc human-viewer. Firecracker: always 5900 (reached
+    /// directly at the guest IP over the tap net). QEMU: a free host port
+    /// hostfwd-ed to guest 5900. 0 until the VM is started.
+    #[serde(default)]
+    pub vnc_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

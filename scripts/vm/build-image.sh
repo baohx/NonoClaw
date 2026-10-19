@@ -154,7 +154,7 @@ APTCONF
 apt-get -qq update >/dev/null
 # openssh + X deps for headless chromium; socat for the CDP relay below
 apt-get -qq install -y openssh-server chromium xvfb xdotool fonts-noto-cjk \
-    ca-certificates curl less procps iproute2 cloud-guest-utils socat >/dev/null
+    ca-certificates curl less procps iproute2 cloud-guest-utils socat x11vnc >/dev/null
 systemctl enable ssh
 systemctl enable systemd-networkd
 
@@ -187,8 +187,12 @@ Requires=xvfb.service
 
 [Service]
 Environment=DISPLAY=:99
-ExecStart=/usr/bin/chromium --headless=new --no-sandbox --disable-gpu \
-    --remote-debugging-port=9221 \
+# NOT --headless: chromium renders into the Xvfb :99 framebuffer so x11vnc can
+# mirror the SAME screen the agent drives via CDP. A human VNC viewer and the
+# agent thus share one browser window + profile (hand-off: log in by hand, let
+# the agent continue with the live session). CDP works identically headful.
+ExecStart=/usr/bin/chromium --no-sandbox --disable-gpu \
+    --remote-debugging-port=9221 --start-maximized \
     --user-data-dir=/root/.chromium-cdp --no-first-run --disable-dev-shm-usage
 Restart=always
 RestartSec=3
@@ -212,9 +216,34 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
+# Human take-over viewer: x11vnc mirrors the SAME Xvfb :99 screen the headful
+# chromium renders into, exposed on 0.0.0.0:5900. A human connects with any VNC
+# client to watch/drive the live browser (e.g. log in by hand), then hands the
+# session back to the agent — both share one browser window + profile.
+# -nopw: no VNC auth. The port is only reachable over the private VM network
+# (Firecracker: guest IP on the host tap; QEMU: 127.0.0.1 hostfwd), never the
+# public internet. -forever/-shared: survive client disconnects + allow the
+# agent's CDP and a human viewer to be attached at the same time.
+cat > /etc/systemd/system/x11vnc.service <<UNIT
+[Unit]
+Description=x11vnc (human viewer on :5900, mirrors Xvfb :99)
+After=xvfb.service
+Requires=xvfb.service
+
+[Service]
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -listen 0.0.0.0 -noxdamage -quiet
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 ln -sf /etc/systemd/system/xvfb.service /etc/systemd/system/multi-user.target.wants/xvfb.service
 ln -sf /etc/systemd/system/chromium-cdp.service /etc/systemd/system/multi-user.target.wants/chromium-cdp.service
 ln -sf /etc/systemd/system/cdp-relay.service /etc/systemd/system/multi-user.target.wants/cdp-relay.service
+ln -sf /etc/systemd/system/x11vnc.service /etc/systemd/system/multi-user.target.wants/x11vnc.service
 
 # Grow the filesystem on first boot (instance disks are truncated larger than
 # the base image). The root disk is a BARE ext4 (no partition table), so this

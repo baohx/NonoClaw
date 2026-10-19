@@ -68,8 +68,8 @@ QEMU (macOS included)."
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["list", "status", "create", "start", "stop", "destroy"],
-                    "description": "Lifecycle action."
+                    "enum": ["list", "status", "create", "start", "stop", "destroy", "viewer"],
+                    "description": "Lifecycle action. 'viewer' returns the VNC address for a human to watch/drive the live browser."
                 },
                 "name": {
                     "type": "string",
@@ -119,6 +119,30 @@ QEMU (macOS included)."
                 };
                 Ok(ToolResult::ok(serde_json::to_string_pretty(&inst).unwrap_or_default()))
             }
+            "viewer" => {
+                // Human take-over: report the VNC address to watch/drive the
+                // live browser (x11vnc mirrors the same Xvfb :99 screen the
+                // agent drives via CDP). Firecracker is reached directly at the
+                // guest IP; QEMU via the 127.0.0.1 hostfwd port.
+                let Some(inst) = load_instance(cwd, &name) else {
+                    return Ok(ToolResult::error(format!("no VM instance named '{name}'")));
+                };
+                if inst.state != VmState::Running {
+                    return Ok(ToolResult::error(format!(
+                        "'{name}' is not running (state={:?}); start it first",
+                        inst.state
+                    )));
+                }
+                let addr = match inst.backend {
+                    VmBackend::Firecracker => format!("{}:5900", guest_ip_for(inst.slot)),
+                    VmBackend::Qemu => format!("127.0.0.1:{}", inst.vnc_port),
+                };
+                Ok(ToolResult::ok(format!(
+                    "VNC viewer for '{name}': connect any VNC client to {addr}\n\
+                     (no password). You share the live browser window + profile \
+                     with the agent — log in by hand, then let the agent continue."
+                )))
+            }
             "create" => {
                 // reject if exists (idempotent success if already created)
                 if load_instance(cwd, &name).is_some() {
@@ -167,6 +191,7 @@ QEMU (macOS included)."
                     updated_at: now,
                     ssh_port: 0,
                     cdp_port: 0,
+                    vnc_port: 0,
                 };
                 save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
                 ssh::ensure_key(cwd, &name).map_err(|e| Error::Other(e))?;
@@ -184,6 +209,13 @@ QEMU (macOS included)."
                 inst.state = VmState::Starting;
                 inst.ssh_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
                 inst.cdp_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
+                // VNC human-viewer port. Firecracker reaches the guest directly
+                // at its IP, so the port is the in-guest 5900. QEMU needs a free
+                // host port to hostfwd to guest 5900 (set before start()).
+                inst.vnc_port = match inst.backend {
+                    VmBackend::Firecracker => 5900,
+                    VmBackend::Qemu => free_port().await.map_err(|e| Error::Other(e.to_string()))?,
+                };
                 save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
                 let sup = backend_for(&inst);
                 match sup.start(cwd, &inst).await {

@@ -46,6 +46,8 @@ impl VmSupervisor for QemuBackend {
         // User-mode net: guest 10.0.2.15, hostfwd to chosen free ports.
         let ssh_port = inst.ssh_port;
         let cdp_port = inst.cdp_port;
+        // VNC human-viewer: hostfwd a free host port to guest 5900 (x11vnc).
+        let vnc_port = if inst.vnc_port != 0 { inst.vnc_port } else { 5900 };
         let accel = accel_flag(); // ("-accel", "hvf")
         let mut accel_args: Vec<String> =
             accel.iter().map(|s| s.to_string()).collect();
@@ -64,7 +66,7 @@ impl VmSupervisor for QemuBackend {
             "-serial", format!("file:{}", dir.join("console.log").display()).as_str(),
             "-drive", &format!("file={},format=raw,if=virtio", rootfs.display()),
             "-netdev", &format!(
-                "user,id=n0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22,hostfwd=tcp:127.0.0.1:{cdp_port}-:9222"
+                "user,id=n0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22,hostfwd=tcp:127.0.0.1:{cdp_port}-:9222,hostfwd=tcp:127.0.0.1:{vnc_port}-:5900"
             ),
             "-device", "virtio-net-pci,netdev=n0",
         ]);

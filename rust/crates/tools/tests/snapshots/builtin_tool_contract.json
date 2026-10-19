@@ -325,14 +325,15 @@
           "type": "string"
         },
         "type": {
-          "description": "Lifecycle action.",
+          "description": "Lifecycle action. 'viewer' returns the VNC address for a human to watch/drive the live browser.",
           "enum": [
             "list",
             "status",
             "create",
             "start",
             "stop",
-            "destroy"
+            "destroy",
+            "viewer"
           ],
           "type": "string"
         }
