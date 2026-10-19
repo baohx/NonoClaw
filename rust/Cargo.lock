@@ -1663,6 +1663,7 @@ version = "0.23.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "glob",
  "landlock",
@@ -1677,6 +1678,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "uuid",

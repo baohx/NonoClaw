@@ -94,6 +94,10 @@ pub fn register_all() -> (ToolRegistry, Arc<TodoStore>) {
     reg.register(std::sync::Arc::new(WebFetchTool));
     reg.register(std::sync::Arc::new(WebSearchTool));
     reg.register(std::sync::Arc::new(video_generate::VideoGenerateTool));
+    reg.register(std::sync::Arc::new(crate::vm::VmTool));
+    reg.register(std::sync::Arc::new(crate::vm::VmExecTool));
+    reg.register(std::sync::Arc::new(crate::vm::VmFsTool));
+    reg.register(std::sync::Arc::new(crate::vm::VmBrowserTool));
     reg.register(std::sync::Arc::new(MemoryTool));
     reg.register(std::sync::Arc::new(LspTool::new()));
     reg.register(std::sync::Arc::new(AgentTool));

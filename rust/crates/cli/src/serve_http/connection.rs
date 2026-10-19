@@ -661,6 +661,18 @@ pub async fn serve(
     // Spawn one watcher that follows atomically published project contexts.
     crate::skill_watcher::spawn_project_skill_watcher(state.projects.clone());
 
+    // Prewarm the microVM so the first VM-bound tool call doesn't pay the
+    // cold-boot latency. No-op unless vm.defaultExecution is "vm" (the
+    // default); idempotent and non-fatal (a failed prewarm just means the
+    // first real call cold-boots). Runs detached so serve startup is not
+    // blocked by the ~7s boot.
+    {
+        let cwd = cwd.clone();
+        tokio::spawn(async move {
+            nonoclaw_tools::vm::prewarm_default(&cwd).await;
+        });
+    }
+
     // Build vector indexes in the background so the first Memory search of a
     // session is already warm: facts index + full-transcript session index.
     {
