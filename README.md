@@ -2,7 +2,7 @@
 
 A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent CLI). Full agentic loop, tool dispatch, permission system, session persistence, MCP client/server, a **Web UI** with PWA, an **Electron desktop app** (Linux / Windows), and mobile-to-desktop session sync. Actively developed with an enhanced system prompt, surgical-editing rules, and anti-overengineering patterns.
 
-> **Version**: v0.23.3 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, **high-fidelity DOCX/PDF export**, **AutoDream background memory consolidation**, and **adversarial verification agents**.
+> **Version**: v0.23.4 | **Goal**: a native CLI coding agent with Apple-style UI, voice input, ECharts/SVG/Mermaid rendering, cross-session memory, multimodal document understanding, **declarative agent graphs** (reusable DAG pipelines with router/gate/checkpoint), **progressive skill disclosure**, **session-pinned MCP tool selection**, **exact BPE tokenization**, **local vector search**, **cache hit-rate visualization**, **high-fidelity DOCX/PDF export**, **AutoDream background memory consolidation**, and **adversarial verification agents**.
 
 ---
 
@@ -1093,7 +1093,8 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 | `NONOCLAW_BIN_DIR` | `install.sh` executable destination (default `~/.local/bin`) |
 | `NONOCLAW_DATA_DIR` | `install.sh` Web asset root and runtime lookup root (`frontend/dist` is appended) |
 | `XDG_DATA_HOME` | Standard data root; used as `$XDG_DATA_HOME/nonoclaw` when `NONOCLAW_DATA_DIR` is unset |
-| `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch backends |
+| `SERPER_API_KEY` / `BRAVE_API_KEY` / `DEEPSEEK_API_KEY` | WebSearch backends (checked in that order) |
+| `WEBSEARCH_BACKEND` | Force a WebSearch backend (`serper` / `brave` / `deepseek`) when several keys are configured; errors instead of falling back if its key is missing |
 | `NONOCLAW_MAX_TOOL_CONCURRENCY` | Maximum parallel tool executions (default `10`; invalid values fall back) |
 | `NONOCLAW_SUBAGENT_MAX_TURNS` | Child-agent turn cap (default `24`, hard maximum `200`, never above the parent limit) |
 | `NONOCLAW_RAW_API_LOG` | Set to `1`, `true`, or `yes` to enable full unredacted request/raw-SSE logging (same channel as `--log-raw-api`) |
@@ -1108,7 +1109,7 @@ Compatibility remains part of the architecture: existing CLI flags, tool names/s
 
 NonoClaw 是 [Claude Code](https://claude.ai/code)（Anthropic 的智能体 CLI）的 **Rust 重写版本**。完整的智能体循环、工具调度、权限系统、会话持久化、MCP 客户端/服务端、带 PWA 的 **Web 界面**以及手机与桌面端会话同步。配备增强型系统提示词、手术级编辑规则和反过度工程模式。
 
-> **版本**: v0.23.3 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**、**高保真 DOCX/PDF 导出**、**AutoDream 后台记忆整理**和**对抗性验证 agent**。
+> **版本**: v0.23.4 | **目标**: 一个原生 CLI 编程智能体，具备 Apple 风格 UI、语音输入、ECharts/SVG/Mermaid 图表渲染、跨会话记忆、多模态文档理解、**声明式 agent graph**（可复用 DAG 管线，支持路由/看门/断点续跑）、**技能渐进式披露**、**MCP 会话级工具选择**、**精确 BPE 分词**、**本地向量搜索**、**缓存命中率可视化**、**高保真 DOCX/PDF 导出**、**AutoDream 后台记忆整理**和**对抗性验证 agent**。
 
 ---
 
@@ -1893,7 +1894,8 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "并行运行独立检查"
 | `NONOCLAW_BIN_DIR` | `install.sh` 可执行文件目标目录（默认 `~/.local/bin`） |
 | `NONOCLAW_DATA_DIR` | `install.sh` Web 资源根目录及运行时查找根目录（自动追加 `frontend/dist`） |
 | `XDG_DATA_HOME` | 标准数据根目录；未设置 `NONOCLAW_DATA_DIR` 时使用 `$XDG_DATA_HOME/nonoclaw` |
-| `SERPER_API_KEY` / `BRAVE_API_KEY` | WebSearch 后端 |
+| `SERPER_API_KEY` / `BRAVE_API_KEY` / `DEEPSEEK_API_KEY` | WebSearch 后端（按此顺序取第一个已配置的） |
+| `WEBSEARCH_BACKEND` | 多个 key 并存时强制指定 WebSearch 后端（`serper` / `brave` / `deepseek`）；对应 key 缺失时报错，不静默回退 |
 | `NONOCLAW_MAX_TOOL_CONCURRENCY` | 最大并行工具执行数（默认 `10`；非法值回退默认） |
 | `NONOCLAW_SUBAGENT_MAX_TURNS` | 子代理轮次上限（默认 `24`，硬上限 `200`，且不超过父运行限制） |
 | `NONOCLAW_RAW_API_LOG` | 设为 `1`、`true` 或 `yes`，开启完整未脱敏请求/raw-SSE 日志（等同 `--log-raw-api` 通道） |
