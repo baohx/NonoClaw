@@ -3389,7 +3389,7 @@ pub fn apply_proxy_env(settings: &SettingsFile) {
 /// fallback for values not already present. Configuration resolution
 /// itself stays side-effect free (captured in [`ResolvedConfig`]) — this
 /// explicit export step makes file-defined secrets visible to consumers
-/// that read plain process env (WebSearch's SERPER/BRAVE keys, Bash tool
+/// that read plain process env (WebSearch's SERPER/BRAVE/DEEPSEEK keys, Bash tool
 /// subprocesses, MCP servers launched without an explicit `env` block).
 /// Process-provided variables always win over the settings file.
 pub fn apply_settings_env(settings: &SettingsFile) {
