@@ -22,4 +22,4 @@ pub use backend::{
     guest_ip_for, instances_dir, load_vm_settings, scan_instances, vm_root, VmBackend, VmInstance,
     VmSettings, VmState,
 };
-pub use tools::{VmBrowserTool, VmExecTool, VmFsTool, VmTool};
+pub use tools::{prewarm_default, VmBrowserTool, VmExecTool, VmFsTool, VmTool};

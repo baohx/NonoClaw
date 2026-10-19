@@ -120,6 +120,11 @@ pub struct VmSettings {
     pub default_cpus: Option<u32>,
     /// Default disk size in MB for new instances (default 8192).
     pub default_disk_mb: Option<u32>,
+    /// Where tasks execute by default: "vm" (run in the microVM, the default)
+    /// or "host" (run directly on the host machine). Routing is advisory — it
+    /// is injected into the system prompt as policy, not hard-enforced; host
+    /// tools stay available and host write operations still require approval.
+    pub default_execution: Option<String>,
 }
 
 pub fn load_vm_settings() -> VmSettings {

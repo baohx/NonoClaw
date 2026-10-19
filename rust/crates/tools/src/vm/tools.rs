@@ -310,6 +310,44 @@ async fn start_instance(cwd: &Path, mut inst: VmInstance) -> Result<ToolResult> 
     }
 }
 
+/// Background session prewarm: if `vm.defaultExecution` is "vm" (the default),
+/// bring the default instance up ahead of first use so the first VM-bound tool
+/// call doesn't pay the cold-boot latency. No-op when the setting is "host".
+/// Idempotent and safe to call unconditionally at serve startup — a VM that is
+/// already running short-circuits immediately. Errors are logged, not fatal:
+/// a failed prewarm just means the first real call pays the cold boot.
+pub async fn prewarm_default(cwd: &Path) {
+    let settings = load_vm_settings();
+    let mode = settings.default_execution.as_deref().unwrap_or("vm");
+    if mode != "vm" {
+        return;
+    }
+    let name = "default";
+    let inst = match load_instance(cwd, name) {
+        Some(i) => i,
+        None => match create_instance(cwd, name, None) {
+            Ok(_) => match load_instance(cwd, name) {
+                Some(i) => i,
+                None => {
+                    tracing::warn!("vm prewarm: instance vanished after create");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "vm prewarm: create failed");
+                return;
+            }
+        },
+    };
+    if inst.state == VmState::Running {
+        return;
+    }
+    match start_instance(cwd, inst).await {
+        Ok(r) => tracing::info!(result = %r.data, "vm prewarm: default instance ready"),
+        Err(e) => tracing::warn!(error = %e, "vm prewarm: start failed"),
+    }
+}
+
 fn pick_backend(settings: &super::backend::VmSettings) -> VmBackend {
     match settings.backend.as_deref() {
         Some("qemu") => VmBackend::Qemu,
@@ -345,8 +383,9 @@ impl Tool for VmExecTool {
     }
     fn prompt_guidelines(&self) -> &[&str] {
         &[
-            "Start the VM (Vm start) before using it; commands fail fast if it is stopped.",
-            "The VM is disposable Linux — install packages freely with apt; they persist in the instance disk.",
+            "Prefer running tasks in the VM by default: use VmExec/VmFs/VmBrowser for building, running untrusted or network-facing code, browsing, and scratch work. Reach for the host Bash/Write/Edit tools only when the task is specifically about the host machine (host paths, host services, this repo's own files) or the user asks for the host.",
+            "Call `Vm ensure` once before VM work — it creates+starts the instance if needed and returns immediately if it is already running.",
+            "The VM is disposable Linux — install packages freely with apt; they persist in the instance disk. To move files between host and VM use VmFs put/get (the host working directory is NOT mounted; the VM works out of /root/work).",
         ]
     }
     async fn check_permissions(&self, _input: &Value, _ctx: &ToolCtx<'_>) -> PermissionDecision {
