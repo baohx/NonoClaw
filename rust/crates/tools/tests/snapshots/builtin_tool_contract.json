@@ -325,10 +325,11 @@
           "type": "string"
         },
         "type": {
-          "description": "Lifecycle action. 'viewer' returns the VNC address for a human to watch/drive the live browser.",
+          "description": "Lifecycle action. 'ensure' idempotently creates+starts the VM and returns once it's running (use this before any VM work). 'viewer' returns the VNC address for a human to watch/drive the live browser.",
           "enum": [
             "list",
             "status",
+            "ensure",
             "create",
             "start",
             "stop",

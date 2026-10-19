@@ -32,11 +32,12 @@ impl Tool for VmTool {
         "Vm"
     }
     fn prompt(&self) -> &str {
-        "Manage persistent Linux microVM instances. Actions: list, status, create, \
-start, stop, destroy. Input: {\"type\": <action>, \"name\": <instance>, \
-\"image\"?: string}. The default instance is named \"default\". The VM's disk \
-survives stop/start and across sessions. Linux+KVM uses Firecracker, otherwise \
-QEMU (macOS included)."
+        "Manage persistent Linux microVM instances. Actions: list, status, ensure, \
+create, start, stop, destroy. Prefer 'ensure' before any VM work — it \
+idempotently creates+starts the instance and returns once it's running. \
+Input: {\"type\": <action>, \"name\": <instance>, \"image\"?: string}. The \
+default instance is named \"default\". The VM's disk survives stop/start and \
+across sessions. Linux+KVM uses Firecracker, otherwise QEMU (macOS included)."
     }
     fn description(&self) -> &str {
         "Persistent Linux microVM lifecycle (Firecracker on Linux/KVM, QEMU on macOS)."
@@ -68,8 +69,8 @@ QEMU (macOS included)."
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["list", "status", "create", "start", "stop", "destroy", "viewer"],
-                    "description": "Lifecycle action. 'viewer' returns the VNC address for a human to watch/drive the live browser."
+                    "enum": ["list", "status", "ensure", "create", "start", "stop", "destroy", "viewer"],
+                    "description": "Lifecycle action. 'ensure' idempotently creates+starts the VM and returns once it's running (use this before any VM work). 'viewer' returns the VNC address for a human to watch/drive the live browser."
                 },
                 "name": {
                     "type": "string",
@@ -148,92 +149,44 @@ QEMU (macOS included)."
                 if load_instance(cwd, &name).is_some() {
                     return Ok(ToolResult::ok(format!("instance '{name}' already exists")));
                 }
-                let settings = load_vm_settings();
-                let backend = pick_backend(&settings);
-                let slot = next_slot(cwd);
-                let dir = instance_dir(cwd, &name);
-                std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("mkdir: {e}")))?;
-                // copy base rootfs
                 let image = input["image"].as_str().map(str::to_string);
-                let inst_image = image.unwrap_or_else(|| "rootfs-bare.ext4".into());
-                let assets = settings
-                    .assets_dir
-                    .map(PathBuf::from)
-                    .unwrap_or_else(vm_assets_dir);
-                let base = assets.join(&inst_image);
-                let rootfs = dir.join("rootfs.img");
-                std::fs::copy(&base, &rootfs).map_err(|e| {
-                    Error::Other(format!(
-                        "copy rootfs: {e} (expected at {}; run scripts/vm/build-image.sh)",
-                        base.display()
-                    ))
-                })?;
-                // Sparse-grow the instance disk; the guest's firstboot-growfs
-                // service expands p1 + the ext4 fs to match on first boot.
-                let target = (settings.default_disk_mb.unwrap_or(8192) as u64) * 1024 * 1024;
-                if rootfs.metadata().map(|m| m.len()).unwrap_or(0) < target {
-                    let f = std::fs::OpenOptions::new().write(true).open(&rootfs)
-                        .map_err(|e| Error::Other(format!("open rootfs: {e}")))?;
-                    f.set_len(target)
-                        .map_err(|e| Error::Other(format!("truncate rootfs: {e}")))?;
-                }
-                let now = chrono::Utc::now().timestamp();
-                let inst = VmInstance {
-                    name: name.clone(),
-                    backend,
-                    state: VmState::Stopped,
-                    slot,
-                    cpus: settings.default_cpus.unwrap_or(2),
-                    mem_mb: settings.default_mem_mb.unwrap_or(2048),
-                    disk_mb: settings.default_disk_mb.unwrap_or(8192),
-                    image: inst_image,
-                    created_at: now,
-                    updated_at: now,
-                    ssh_port: 0,
-                    cdp_port: 0,
-                    vnc_port: 0,
-                };
-                save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
-                ssh::ensure_key(cwd, &name).map_err(|e| Error::Other(e))?;
+                let (dir, backend) = create_instance(cwd, &name, image)?;
                 Ok(ToolResult::ok(format!(
                     "created instance '{name}' (backend={backend:?}) at {}",
                     dir.display()
                 )))
             }
             "start" => {
-                let mut inst = load_instance(cwd, &name)
+                let inst = load_instance(cwd, &name)
                     .ok_or_else(|| Error::Other(format!("no VM instance named '{name}'")))?;
                 if inst.state == VmState::Running {
                     return Ok(ToolResult::ok(format!("'{name}' already running")));
                 }
-                inst.state = VmState::Starting;
-                inst.ssh_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
-                inst.cdp_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
-                // VNC human-viewer port. Firecracker reaches the guest directly
-                // at its IP, so the port is the in-guest 5900. QEMU needs a free
-                // host port to hostfwd to guest 5900 (set before start()).
-                inst.vnc_port = match inst.backend {
-                    VmBackend::Firecracker => 5900,
-                    VmBackend::Qemu => free_port().await.map_err(|e| Error::Other(e.to_string()))?,
+                start_instance(cwd, inst).await
+            }
+            // Idempotent "make it ready": create the instance if missing, start
+            // it if not already running, and return immediately if it is. This
+            // is the single entry point used by session prewarm and by any
+            // tool that needs the VM up (callers never juggle create/start).
+            "ensure" => {
+                let image = input["image"].as_str().map(str::to_string);
+                let inst = match load_instance(cwd, &name) {
+                    Some(i) => i,
+                    None => {
+                        create_instance(cwd, &name, image)?;
+                        load_instance(cwd, &name).ok_or_else(|| {
+                            Error::Other(format!("instance '{name}' vanished after create"))
+                        })?
+                    }
                 };
-                save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
-                let sup = backend_for(&inst);
-                match sup.start(cwd, &inst).await {
-                    Ok(()) => {
-                        inst.state = VmState::Running;
-                        save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
-                        Ok(ToolResult::ok(format!(
-                            "'{name}' started: ip={} ssh={}",
-                            guest_ip_for(inst.slot),
-                            inst.ssh_port
-                        )))
-                    }
-                    Err(e) => {
-                        inst.state = VmState::Stopped;
-                        save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
-                        Err(Error::Other(format!("start failed: {e}")))
-                    }
+                if inst.state == VmState::Running {
+                    return Ok(ToolResult::ok(format!(
+                        "'{name}' already running: ip={} ssh={}",
+                        guest_ip_for(inst.slot),
+                        inst.ssh_port
+                    )));
                 }
+                start_instance(cwd, inst).await
             }
             "stop" => {
                 let mut inst = load_instance(cwd, &name)
@@ -260,6 +213,99 @@ QEMU (macOS included)."
                 Ok(ToolResult::ok(format!("destroyed '{name}' ({})", dir.display())))
             }
             other => Err(Error::Other(format!("unknown action '{other}'"))),
+        }
+    }
+}
+
+/// Materialise a new instance: pick backend, copy+grow the base rootfs, write
+/// the instance record and SSH key. Returns (instance dir, chosen backend).
+/// Shared by the `create` and `ensure` actions.
+fn create_instance(
+    cwd: &Path,
+    name: &str,
+    image: Option<String>,
+) -> Result<(PathBuf, VmBackend)> {
+    let settings = load_vm_settings();
+    let backend = pick_backend(&settings);
+    let slot = next_slot(cwd);
+    let dir = instance_dir(cwd, name);
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("mkdir: {e}")))?;
+    let inst_image = image.unwrap_or_else(|| "rootfs-bare.ext4".into());
+    let assets = settings
+        .assets_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(vm_assets_dir);
+    let base = assets.join(&inst_image);
+    let rootfs = dir.join("rootfs.img");
+    std::fs::copy(&base, &rootfs).map_err(|e| {
+        Error::Other(format!(
+            "copy rootfs: {e} (expected at {}; run scripts/vm/build-image.sh)",
+            base.display()
+        ))
+    })?;
+    // Sparse-grow the instance disk; the guest's firstboot-growfs service
+    // expands p1 + the ext4 fs to match on first boot.
+    let target = (settings.default_disk_mb.unwrap_or(8192) as u64) * 1024 * 1024;
+    if rootfs.metadata().map(|m| m.len()).unwrap_or(0) < target {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rootfs)
+            .map_err(|e| Error::Other(format!("open rootfs: {e}")))?;
+        f.set_len(target)
+            .map_err(|e| Error::Other(format!("truncate rootfs: {e}")))?;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let inst = VmInstance {
+        name: name.to_string(),
+        backend,
+        state: VmState::Stopped,
+        slot,
+        cpus: settings.default_cpus.unwrap_or(2),
+        mem_mb: settings.default_mem_mb.unwrap_or(2048),
+        disk_mb: settings.default_disk_mb.unwrap_or(8192),
+        image: inst_image,
+        created_at: now,
+        updated_at: now,
+        ssh_port: 0,
+        cdp_port: 0,
+        vnc_port: 0,
+    };
+    save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
+    ssh::ensure_key(cwd, name).map_err(Error::Other)?;
+    Ok((dir, backend))
+}
+
+/// Allocate ports, boot the backend, and flip the instance to Running (or back
+/// to Stopped on failure). Shared by the `start` and `ensure` actions.
+async fn start_instance(cwd: &Path, mut inst: VmInstance) -> Result<ToolResult> {
+    let name = inst.name.clone();
+    inst.state = VmState::Starting;
+    inst.ssh_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
+    inst.cdp_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
+    // VNC human-viewer port. Firecracker reaches the guest directly at its IP,
+    // so the port is the in-guest 5900. QEMU needs a free host port to hostfwd
+    // to guest 5900 (set before start()).
+    inst.vnc_port = match inst.backend {
+        VmBackend::Firecracker => 5900,
+        VmBackend::Qemu => free_port().await.map_err(|e| Error::Other(e.to_string()))?,
+    };
+    save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
+    let sup = backend_for(&inst);
+    match sup.start(cwd, &inst).await {
+        Ok(()) => {
+            inst.state = VmState::Running;
+            save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
+            Ok(ToolResult::ok(format!(
+                "'{name}' started: ip={} ssh={}",
+                guest_ip_for(inst.slot),
+                inst.ssh_port
+            )))
+        }
+        Err(e) => {
+            inst.state = VmState::Stopped;
+            save_instance(cwd, &inst).map_err(|e| Error::Other(e.to_string()))?;
+            Err(Error::Other(format!("start failed: {e}")))
         }
     }
 }
