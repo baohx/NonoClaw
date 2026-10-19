@@ -91,7 +91,7 @@ impl VmSupervisor for QemuBackend {
             if tokio::net::TcpStream::connect(("127.0.0.1", ssh_port)).await.is_ok() {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         Err("timeout waiting for guest SSH (120s)".into())
     }

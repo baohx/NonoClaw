@@ -283,7 +283,7 @@ async fn wait_guest_ready(cid: &str, guest_ip: &str) -> Result<(), String> {
                 .unwrap_or_default();
             return Err(format!("VM container exited during boot:\n{logs}"));
         }
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Err("timeout waiting for guest SSH (120s)".into())
 }

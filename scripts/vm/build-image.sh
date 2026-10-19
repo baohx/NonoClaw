@@ -158,6 +158,16 @@ apt-get -qq install -y openssh-server chromium xvfb xdotool fonts-noto-cjk \
 systemctl enable ssh
 systemctl enable systemd-networkd
 
+# Boot-time trim: disable services useless for an SSH+browser microVM. Measured
+# cold boot was 10.7s userspace; these three alone cost ~2.3s (resolved 1.66s,
+# avahi 0.67s) with zero value here. DNS uses a static /etc/resolv.conf (set
+# below), so disabling resolved does NOT break name resolution. timesyncd is
+# KEPT on purpose: a wrong clock breaks TLS cert validation in the browser.
+systemctl disable systemd-resolved.service 2>/dev/null || true
+systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+systemctl disable unattended-upgrades.service 2>/dev/null || true
+systemctl disable e2scrub_reap.service 2>/dev/null || true
+
 # Headless CDP chromium, split across three units. Two non-obvious reasons:
 #   1. Xvfb must be its OWN service, not a chromium ExecStartPre. Xvfb runs in
 #      the foreground and never daemonizes, so an ExecStartPre never returns —
