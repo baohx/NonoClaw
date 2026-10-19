@@ -316,6 +316,156 @@
   {
     "input_schema": {
       "properties": {
+        "image": {
+          "description": "Rootfs image path override (rarely needed).",
+          "type": "string"
+        },
+        "name": {
+          "description": "Instance name (default: \"default\").",
+          "type": "string"
+        },
+        "type": {
+          "description": "Lifecycle action.",
+          "enum": [
+            "list",
+            "status",
+            "create",
+            "start",
+            "stop",
+            "destroy"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "name": "Vm"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "command": {
+          "description": "bash -lc command line to run",
+          "type": "string"
+        },
+        "timeoutMs": {
+          "description": "default 60000",
+          "type": "integer"
+        },
+        "vm": {
+          "description": "Instance name (default: \"default\")",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "VmExec"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "localPath": {
+          "description": "host path (put/get)",
+          "type": "string"
+        },
+        "type": {
+          "description": "put: host→VM; get: VM→host; list: VM dir listing",
+          "enum": [
+            "put",
+            "get",
+            "list"
+          ],
+          "type": "string"
+        },
+        "vm": {
+          "type": "string"
+        },
+        "vmPath": {
+          "description": "VM path (put/get/list)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "name": "VmFs"
+  },
+  {
+    "input_schema": {
+      "properties": {
+        "dx": {
+          "description": "scroll delta x",
+          "type": "integer"
+        },
+        "dy": {
+          "description": "scroll delta y",
+          "type": "integer"
+        },
+        "expression": {
+          "description": "eval: JS expression",
+          "type": "string"
+        },
+        "fullPage": {
+          "description": "screenshot: capture full page",
+          "type": "boolean"
+        },
+        "submit": {
+          "description": "type: press Enter after",
+          "type": "boolean"
+        },
+        "text": {
+          "description": "type: text to enter",
+          "type": "string"
+        },
+        "type": {
+          "description": "browser action",
+          "enum": [
+            "navigate",
+            "snapshot",
+            "screenshot",
+            "click",
+            "type",
+            "scroll",
+            "eval",
+            "list-tabs",
+            "new-tab"
+          ],
+          "type": "string"
+        },
+        "url": {
+          "description": "navigate/new-tab",
+          "type": "string"
+        },
+        "vm": {
+          "type": "string"
+        },
+        "x": {
+          "description": "click/scroll viewport x",
+          "type": "integer"
+        },
+        "y": {
+          "description": "click/scroll viewport y",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "name": "VmBrowser"
+  },
+  {
+    "input_schema": {
+      "properties": {
         "action": {
           "description": "Action: search, save, forget, beads, bead_save, bead_done, wiki_search, wiki_ingest, wiki_lint",
           "enum": [

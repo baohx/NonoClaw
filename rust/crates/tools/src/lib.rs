@@ -15,6 +15,7 @@ pub mod sensitive;
 pub mod session_index;
 pub mod task_store;
 pub mod tool;
+pub mod vm;
 
 pub use builtin::register_all;
 pub use executor::{
@@ -28,6 +29,7 @@ pub use mcp::{
 pub use permissions::{pattern_matches, wildcard_match, PermissionGate};
 pub use registry::ToolRegistry;
 pub use task_store::{TaskItem, TaskPatch, TaskStore, TodoItem};
+pub use vm::tools::{VmBrowserTool, VmExecTool, VmFsTool, VmTool};
 pub use tool::{
     allow_if_read_only, matches_name, QuestionFormat, QuestionRequest, QuestionResolver,
     QuestionUrgency, SubagentRequest, SubagentRunner, Tool, ToolDefinition, ToolOptions,

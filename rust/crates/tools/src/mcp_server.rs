@@ -196,7 +196,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 25);
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"VideoGenerate"));
         assert!(names.contains(&"Graph"));

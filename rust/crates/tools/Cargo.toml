@@ -8,6 +8,8 @@ description = "Tool trait, registry, permission engine, and core tool implementa
 
 [dependencies]
 nonoclaw-core = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 nonoclaw-api = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
