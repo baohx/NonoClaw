@@ -189,6 +189,10 @@ pub const CONFIG_REFERENCE: &[ConfigFieldReference] = &[
         description: "Outbound proxy URL (e.g. \"http://127.0.0.1:20171\") exported as HTTP(S)_PROXY/ALL_PROXY for all HTTP clients. Loopback bypasses via NO_PROXY.",
     },
     ConfigFieldReference {
+        name: "vm",
+        description: "microVM settings consumed by the tools crate: { defaultExecution: \"vm\"|\"host\" (default vm — routes tasks to the microVM and prewarms it at serve start), backend: \"firecracker\"|\"qemu\" override, assetsDir, defaultMemMb, defaultCpus, defaultDiskMb }.",
+    },
+    ConfigFieldReference {
         name: "jev",
         description: "Jev (TypeSafe AI System One) decision-model integration: { apiKey, enabled, baseUrl, model }. Off unless a key is present and enabled.",
     },
