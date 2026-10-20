@@ -55,6 +55,7 @@ impl VmSupervisor for FirecrackerBackend {
             ));
         }
         ensure_runtime_image().await?;
+        warn_if_forwarding_disabled().await;
 
         let cid = container_name(name);
         // Fresh start if a stale container exists.
@@ -180,6 +181,22 @@ impl VmSupervisor for FirecrackerBackend {
 
 /// Script run inside the runtime container: tap up + NAT + exec firecracker.
 /// NAT rules are idempotent (guarded by -C checks).
+/// The runtime container shares the host netns, so `ip_forward` must be on for
+/// guest egress — but /proc/sys is read-only inside the container and the
+/// container's stderr only reaches `docker logs`. Check from the host side so a
+/// misconfiguration surfaces where the user can see it.
+async fn warn_if_forwarding_disabled() {
+    let path = "/proc/sys/net/ipv4/ip_forward";
+    match tokio::fs::read_to_string(path).await {
+        Ok(v) if v.trim() != "1" => tracing::warn!(
+            "{path} = {} — microVM guests will have no egress. \
+             Run: sudo sysctl -w net.ipv4.ip_forward=1",
+            v.trim()
+        ),
+        _ => {}
+    }
+}
+
 fn entry_script(tap_ip: &str, guest_ip: &str) -> String {
     format!(
         r#"set -eu
@@ -190,12 +207,32 @@ ip link delete tap0 2>/dev/null || true
 ip tuntap add mode tap dev tap0
 ip link set tap0 up
 ip addr add {tap_ip}/30 dev tap0
-sysctl -qw net.ipv4.ip_forward=1 || true
+# ip_forward lives in the HOST netns (--network host) and /proc/sys is
+# bind-mounted read-only here, so `sysctl -w` failed with EROFS and the old
+# `|| true` hid it -- the guest only had egress if the host already had it on.
+# Try the write, then fail loudly if it is still off.
+sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+  echo "nonoclaw-vm: WARNING net.ipv4.ip_forward=0 in host netns; guest egress will fail." >&2
+  echo "nonoclaw-vm: run 'sysctl -w net.ipv4.ip_forward=1' on the host." >&2
+fi
 # NAT for guest egress (idempotent; 172.29.0.0/16 is the VM subnet pool)
 iptables -t nat -C POSTROUTING -s 172.29.0.0/16 ! -o tap0 -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s 172.29.0.0/16 ! -o tap0 -j MASQUERADE
 iptables -C FORWARD -i tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -j ACCEPT
 iptables -C FORWARD -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o tap0 -j ACCEPT
+# Transparent-proxy bypass for the guest. Host firewall setups (v2rayA/tproxy)
+# install nat PREROUTING rules at `dstnat-5` that REDIRECT every dport-53 packet
+# to a loopback-only stub (observed: 127.0.0.1:52353) and tproxy other TCP to a
+# loopback proxy port. Packets arriving on tap0 match them, get rewritten to
+# 127.0.0.1, and die there -- the guest loses ALL DNS and direct TCP. Those rules
+# honour mark 0x80 as "bypass", so tag guest traffic (and our own upstream DNS
+# queries, which leave with saddr=tap_ip) at mangle priority, which runs before
+# dstnat-5.
+iptables -t mangle -C PREROUTING -i tap0 -j MARK --set-mark 0x80 2>/dev/null || \
+  iptables -t mangle -A PREROUTING -i tap0 -j MARK --set-mark 0x80
+iptables -t mangle -C OUTPUT -s {tap_ip} -j MARK --set-mark 0x80 2>/dev/null || \
+  iptables -t mangle -A OUTPUT -s {tap_ip} -j MARK --set-mark 0x80
 # DHCP + DNS for the single guest address on this /30
 dnsmasq --no-daemon --interface=tap0 --bind-interfaces \
   --except-interface=lo \
