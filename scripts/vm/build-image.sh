@@ -142,7 +142,7 @@ mount -t proc proc /mnt/vm/proc 2>/dev/null || true
 rm -f /mnt/vm/etc/resolv.conf
 echo "nameserver 223.5.5.5" > /mnt/vm/etc/resolv.conf
 
-chroot /mnt/vm /bin/bash -s <<CHROOT
+chroot /mnt/vm /bin/bash -s <<'CHROOT'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 # same fail-fast apt timeout config inside the guest rootfs
@@ -152,10 +152,20 @@ Acquire::https::Timeout "30";
 Acquire::Retries "3";
 APTCONF
 apt-get -qq update >/dev/null
-# openssh + X deps for headless chromium; socat for the CDP relay below
+# openssh + X deps for headless chromium; socat for the CDP relay below;
+# nfs-common for the shared /workspace mount (the NFS client is built into the
+# Firecracker kernel; only the mount.nfs helper is missing from the base image).
+# git/ripgrep/python3 are for Bash routed into the guest: the agent's commands
+# assume a developer image, and a bare Debian makes every routed command fail.
 apt-get -qq install -y openssh-server chromium xvfb xdotool fonts-noto-cjk \
-    ca-certificates curl less procps iproute2 cloud-guest-utils socat x11vnc >/dev/null
+    ca-certificates curl less procps iproute2 cloud-guest-utils socat x11vnc \
+    nfs-common git ripgrep python3 jq unzip tar gzip \
+    >/dev/null
 systemctl enable ssh
+# NFS exports use all_squash, so every file in /workspace shows up owned by the
+# anonymous uid while git runs as root. Without this, every git command inside
+# the guest dies with "detected dubious ownership in repository at '/workspace'".
+git config --system --add safe.directory /workspace
 systemctl enable systemd-networkd
 
 # Boot-time trim: disable services useless for an SSH+browser microVM. Measured
@@ -283,6 +293,62 @@ ln -sf /etc/systemd/system/firstboot-growfs.service /etc/systemd/system/multi-us
 cat > /etc/fstab <<'FSTAB'
 /dev/vda / ext4 rw,discard,errors=remount-ro 0 1
 FSTAB
+
+# Shared host project dir. The host exports <project> to this VM's tap /30 and
+# passes the full `<server>:<path>` spec on the kernel command line
+# (nonoclaw.nfsserver=...), because NFSv4 mounts the export's own root — a bare
+# server would land the guest on `/` instead of the project.
+# nfs4 only: the v3 client in this kernel rejects the options mount.nfs passes.
+# bg/soft so an unreachable export never blocks boot.
+mkdir -p /workspace
+cat > /usr/local/sbin/nonoclaw-workspace-mount <<'HELPER'
+#!/bin/sh
+spec="$(sed -n 's/.*nonoclaw\.nfsserver=\([^ ]*\).*/\1/p' /proc/cmdline)"
+[ -n "$spec" ] || exit 0
+mountpoint -q /workspace && exit 0
+exec mount -t nfs4 -o "bg,soft,timeo=50,retrans=2" "$spec" /workspace
+HELPER
+chmod +x /usr/local/sbin/nonoclaw-workspace-mount
+cat > /etc/systemd/system/workspace-mount.service <<'UNIT'
+[Unit]
+Description=Mount the host project directory at /workspace
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=/workspace
+ConditionKernelCommandLine=nonoclaw.nfsserver
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nonoclaw-workspace-mount
+ExecStop=/bin/umount -l /workspace
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable workspace-mount.service
+
+# Proxy for the guest, read from the same kernel cmdline (nonoclaw.proxy=host:port).
+# Exported via /etc/profile.d so interactive shells and apt/curl/pip pick it up.
+# Absent parameter -> no proxy, and the guest uses direct NAT.
+cat > /usr/local/sbin/nonoclaw-guest-proxy <<'HELPER'
+#!/bin/sh
+# Emit proxy exports for the guest, read from the kernel cmdline. Prints nothing
+# when no proxy was configured, so the guest falls back to direct NAT.
+proxy="$(sed -n 's/.*nonoclaw\.proxy=\([^ ]*\).*/\1/p' /proc/cmdline)"
+[ -n "$proxy" ] || exit 0
+echo "export http_proxy=http://$proxy"
+echo "export https_proxy=http://$proxy"
+echo "export HTTP_PROXY=http://$proxy"
+echo "export HTTPS_PROXY=http://$proxy"
+echo "export no_proxy=localhost,127.0.0.1,172.29.0.0/16"
+echo "export NO_PROXY=localhost,127.0.0.1,172.29.0.0/16"
+HELPER
+chmod +x /usr/local/sbin/nonoclaw-guest-proxy
+cat > /etc/profile.d/00-nonoclaw-proxy.sh <<'PROFILE'
+[ -x /usr/local/sbin/nonoclaw-guest-proxy ] && \
+  eval "$(/usr/local/sbin/nonoclaw-guest-proxy)"
+PROFILE
 
 # DHCP client for networkd
 apt-get -qq install -y systemd-resolved >/dev/null 2>&1 || true

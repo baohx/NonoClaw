@@ -55,6 +55,26 @@ impl VmSupervisor for FirecrackerBackend {
             ));
         }
         ensure_runtime_image().await?;
+        let guest_ip = guest_ip_for(inst.slot);
+        let tap_ip = host_tap_ip_for(inst.slot);
+        ensure_forwarding_enabled().await;
+        let proxy = detect_host_proxy().await;
+        bridge_host_proxy(&tap_ip, proxy).await;
+        // NFSv4 mounts the export's own root, so the guest must be handed the
+        // full `<tap_ip>:<dir>` spec — not just the server.
+        let nfs_spec = export_workspace(&tap_ip, cwd).await;
+        // Guest HTTP clients get the bridge (not the host's loopback port). Absent
+        // when no proxy runs, in which case the guest uses direct NAT.
+        let proxy_arg = match proxy {
+            Some(_) => format!(" nonoclaw.proxy={tap_ip}:{PROXY_BRIDGE_PORT}"),
+            None => String::new(),
+        };
+        // Empty when the export failed, so the guest simply skips /workspace.
+        let nfs_arg = if nfs_spec.is_empty() {
+            String::new()
+        } else {
+            format!(" nonoclaw.nfsserver={nfs_spec}")
+        };
 
         let cid = container_name(name);
         // Fresh start if a stale container exists.
@@ -67,13 +87,14 @@ impl VmSupervisor for FirecrackerBackend {
 
         // Write the firecracker config file into the instance dir
         // (bind-mounted at /vm inside the container).
-        let guest_ip = guest_ip_for(inst.slot);
-        let tap_ip = host_tap_ip_for(inst.slot);
         // The instance disk is a BARE ext4 filesystem (not a partitioned
         // disk), so the whole virtio-blk device IS the root fs: root=/dev/vda.
         // The minimal Firecracker CI kernel does not scan MBR partition tables,
         // so root=/dev/vda1 would never find the partition node.
-        let boot_args = "console=ttyS0 reboot=k panic=1 random.trust_cpu=on root=/dev/vda rw".to_string();
+        let boot_args = format!(
+            "console=ttyS0 reboot=k panic=1 random.trust_cpu=on root=/dev/vda rw\
+             {nfs_arg}{proxy_arg}"
+        );
         let initrd_path = "/host-assets/initrd.img".to_string();
         let cfg = serde_json::json!({
             "boot-source": {
@@ -178,6 +199,181 @@ impl VmSupervisor for FirecrackerBackend {
     }
 }
 
+/// Mount point inside the guest for the host project directory.
+pub(crate) const WORKSPACE_MOUNT: &str = "/workspace";
+
+/// Export the host project directory over NFS so the guest sees the same files.
+///
+/// Firecracker has no virtio-fs and no 9p, so the only way to share a directory
+/// with the guest is over the network. NFS is the one option the stock kernel
+/// already supports (nfs + nfs4 are built in; `mount.nfs` is baked into the
+/// image), and it rides the tap device we already set up.
+///
+/// `/etc/exports` is root-owned and `exportfs` is not in the passwordless sudo
+/// allow-list, so the rewrite is done through a privileged container pid-namespaced
+/// into the host — the same route the VM itself uses.
+async fn export_workspace(tap_ip: &str, cwd: &Path) -> String {
+    let Ok(dir) = cwd.canonicalize() else {
+        tracing::warn!("cannot resolve project dir {cwd:?}; guest /workspace will be empty");
+        return String::new();
+    };
+    let dir = dir.to_string_lossy().to_string();
+    // Host part of the tap /30 (172.29.N.1) -> scope to this VM's subnet.
+    let subnet = tap_ip.rsplit_once('.').map(|(s, _)| format!("{s}.0/30")).unwrap_or_default();
+    if subnet.is_empty() {
+        return String::new();
+    }
+    // NFSv4 mounts the export's own root, not the server's filesystem root, so
+    // the guest spec is `<tap_ip>:<dir>` and the mount lands exactly on /workspace.
+    let spec = format!("{tap_ip}:{dir}");
+    let line = format!("{dir} {subnet}(rw,sync,no_subtree_check,insecure,all_squash,anonuid=1000,anongid=1000)");
+    let script = format!(
+        r#"apk add --no-cache nfs-utils >/dev/null 2>&1
+if ! grep -qxF '{line}' /hostetc/exports 2>/dev/null; then
+  grep -v '^{dir} ' /hostetc/exports > /tmp/e 2>/dev/null || true
+  printf '%s\n' "{line}" >> /tmp/e
+  cp /tmp/e /hostetc/exports
+fi
+nsenter -t 1 -m -n exportfs -ra 2>&1 || echo EXPORTFS_FAILED"#
+    );
+    let out = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--privileged",
+            "--pid",
+            "host",
+            "-v",
+            "/etc:/hostetc",
+            "alpine",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("EXPORTFS_FAILED") => {
+            tracing::debug!("exported {dir} to {subnet} for guest {WORKSPACE_MOUNT}");
+            spec
+        }
+        Ok(o) => {
+            tracing::warn!(
+                "NFS export of {dir} failed: {}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::new()
+        }
+        Err(e) => {
+            tracing::warn!("NFS export of {dir} failed: {e}");
+            String::new()
+        }
+    }
+}
+
+/// Fixed port the host-side proxy bridge listens on (tap_ip side).
+pub(crate) const PROXY_BRIDGE_PORT: u16 = 20_172;
+
+/// Republish a loopback-only proxy on the tap address so the guest can use it.
+///
+/// Transparent-proxy firewalls (v2rayA) bind their inbound on 127.0.0.1 and
+/// redirect only loopback traffic, so they never see tap0 packets — the guest is
+/// left with no egress at all, and sites that need the proxy stay unreachable.
+/// `socat` re-publishes the proxy at `tap_ip:20_172`; the guest points its HTTP
+/// client there. When no proxy is running the bridge is torn down and the guest
+/// uses plain NAT, so behaviour follows whatever the host is configured for.
+async fn bridge_host_proxy(tap_ip: &str, proxy: Option<u16>) {
+    // Kill any bridge left over from a previous boot; its target port may differ.
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("TCP-LISTEN:{PROXY_BRIDGE_PORT},bind={tap_ip}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    let Some(port) = proxy else {
+        tracing::debug!("no host proxy detected; guest uses direct NAT");
+        return;
+    };
+    if !crate::vm::backend::have("socat").await {
+        tracing::warn!("host proxy on 127.0.0.1:{port} found but socat is missing; guest stays direct");
+        return;
+    }
+    // Detached: the bridge must outlive this call, and the guest container is
+    // stopped separately.
+    let spawned = Command::new("socat")
+        .args([
+            &format!("TCP-LISTEN:{PROXY_BRIDGE_PORT},bind={tap_ip},fork,reuseaddr"),
+            &format!("TCP:127.0.0.1:{port}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => tracing::info!("bridged host proxy 127.0.0.1:{port} -> {tap_ip}:{PROXY_BRIDGE_PORT}"),
+        Err(e) => tracing::warn!("failed to bridge host proxy: {e}"),
+    }
+}
+
+/// The runtime container shares the host netns, so `ip_forward` must be on for
+/// guest egress — but /proc/sys is read-only inside the container and the
+/// container's stderr only reaches `docker logs`. Ensure it from the host side
+/// and repair it when we can: the setting is not persisted across reboots by
+/// default (`/etc/sysctl.conf` ships it commented out), so a guest that worked
+/// yesterday is silently offline today.
+async fn ensure_forwarding_enabled() {
+    const PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+    if matches!(tokio::fs::read_to_string(PATH).await, Ok(v) if v.trim() == "1") {
+        return;
+    }
+    match Command::new("sudo")
+        .args(["-n", "sysctl", "-qw", "net.ipv4.ip_forward=1"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => tracing::info!("enabled net.ipv4.ip_forward for microVM egress"),
+        _ => tracing::warn!(
+            "{PATH} is not 1 — microVM guests will have no egress. \
+             Run: sudo sysctl -w net.ipv4.ip_forward=1"
+        ),
+    }
+}
+
+/// Port a local HTTP/SOCKS proxy listens on, if the host runs one.
+///
+/// Guests cannot reach a loopback-bound proxy directly, and the usual
+/// transparent-proxy setups (v2rayA/tproxy) redirect *loopback* traffic only, so
+/// they never see packets arriving from tap0 — without a bridge a guest has no
+/// egress at all while such a firewall is active. Bridging is also what makes
+/// blocked sites (pypi, raw.githubusercontent) reachable, so the guest follows
+/// whatever the host is configured to use: proxy when one is up, plain NAT when
+/// it is not.
+async fn detect_host_proxy() -> Option<u16> {
+    // Loopback HTTP proxies, most-common-conventional first.
+    for port in [20171, 20170, 7890, 10809, 8889] {
+        let ok = Command::new("curl")
+            .args([
+                "-sS",
+                "-o",
+                "/dev/null",
+                "--max-time",
+                "2",
+                "-x",
+                &format!("http://127.0.0.1:{port}"),
+                "http://www.gstatic.com/generate_204",
+            ])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// Script run inside the runtime container: tap up + NAT + exec firecracker.
 /// NAT rules are idempotent (guarded by -C checks).
 fn entry_script(tap_ip: &str, guest_ip: &str) -> String {
@@ -190,12 +386,33 @@ ip link delete tap0 2>/dev/null || true
 ip tuntap add mode tap dev tap0
 ip link set tap0 up
 ip addr add {tap_ip}/30 dev tap0
-sysctl -qw net.ipv4.ip_forward=1 || true
+# ip_forward lives in the HOST netns (--network host) and /proc/sys is
+# bind-mounted read-only here, so `sysctl -w` failed with EROFS and the old
+# `|| true` hid it -- the guest only had egress if the host already had it on.
+# Try the write, then fail loudly if it is still off.
+sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+  echo "nonoclaw-vm: WARNING net.ipv4.ip_forward=0 in host netns; guest egress will fail." >&2
+  echo "nonoclaw-vm: run 'sysctl -w net.ipv4.ip_forward=1' on the host." >&2
+fi
 # NAT for guest egress (idempotent; 172.29.0.0/16 is the VM subnet pool)
 iptables -t nat -C POSTROUTING -s 172.29.0.0/16 ! -o tap0 -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s 172.29.0.0/16 ! -o tap0 -j MASQUERADE
 iptables -C FORWARD -i tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tap0 -j ACCEPT
 iptables -C FORWARD -o tap0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o tap0 -j ACCEPT
+# Transparent-proxy bypass for the guest. Host firewall setups (v2rayA/tproxy)
+# install nat PREROUTING rules at `dstnat-5` that REDIRECT every dport-53 packet
+# to a loopback-only stub (observed: 127.0.0.1:52353) and redirect other TCP to a
+# loopback port. Packets arriving on tap0 match them, get rewritten to 127.0.0.1,
+# and die there -- the guest loses ALL DNS and direct TCP. Those rules honour mark
+# 0x80 as "bypass", so tag guest traffic (and dnsmasq's own upstream queries,
+# which leave with saddr=tap_ip) at mangle priority, which runs before dstnat-5.
+# Guest traffic therefore goes direct by default; when the host runs a proxy the
+# guest is pointed at the bridge instead (see HOST_PROXY in vmconfig/guest env).
+iptables -t mangle -C PREROUTING -i tap0 -j MARK --set-mark 0x80 2>/dev/null || \
+  iptables -t mangle -A PREROUTING -i tap0 -j MARK --set-mark 0x80
+iptables -t mangle -C OUTPUT -s {tap_ip} -j MARK --set-mark 0x80 2>/dev/null || \
+  iptables -t mangle -A OUTPUT -s {tap_ip} -j MARK --set-mark 0x80
 # DHCP + DNS for the single guest address on this /30
 dnsmasq --no-daemon --interface=tap0 --bind-interfaces \
   --except-interface=lo \

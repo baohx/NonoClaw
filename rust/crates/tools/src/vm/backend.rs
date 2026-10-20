@@ -166,7 +166,7 @@ pub fn scan_instances(cwd: &Path) -> Vec<VmInstance> {
             Ok(mut inst) => {
                 // Reconcile with reality: container/VM process may have died.
                 if inst.state == VmState::Running || inst.state == VmState::Starting {
-                    if !process_alive(&inst) {
+                    if !process_alive(cwd, &inst) {
                         inst.state = VmState::Stopped;
                     }
                 }
@@ -180,16 +180,43 @@ pub fn scan_instances(cwd: &Path) -> Vec<VmInstance> {
 }
 
 /// Whether the supervisor process for this instance is still alive.
-fn process_alive(_inst: &VmInstance) -> bool {
-    // The docker container name is `nonoclaw-vm-<name>` (Firecracker path) or
-    // the qemu PID is recorded in qemu.pid. Cheap check via docker/qemu.
-    true
+/// Firecracker: the `nonoclaw-vm-<name>` docker container must be running.
+/// QEMU: the PID recorded in `<instance dir>/qemu.pid` must exist under /proc.
+/// State on disk can be stale (e.g. host reboot SIGKILLs the container), so
+/// callers use this to reconcile `Running`/`Starting` → `Stopped`.
+fn process_alive(cwd: &Path, inst: &VmInstance) -> bool {
+    match inst.backend {
+        VmBackend::Firecracker => {
+            let cid = crate::vm::firecracker::container_name(&inst.name);
+            std::process::Command::new("docker")
+                .args(["inspect", "-f", "{{.State.Running}}", &cid])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+                .unwrap_or(false)
+        }
+        VmBackend::Qemu => {
+            let Ok(pid) = fs::read_to_string(instance_dir(cwd, &inst.name).join("qemu.pid")) else {
+                return false;
+            };
+            let pid = pid.trim();
+            !pid.is_empty() && Path::new("/proc").join(pid).exists()
+        }
+    }
 }
 
 pub fn load_instance(cwd: &Path, name: &str) -> Option<VmInstance> {
     let p = instance_dir(cwd, name).join("state.json");
     let raw = fs::read_to_string(p).ok()?;
-    serde_json::from_str(&raw).ok()
+    let mut inst: VmInstance = serde_json::from_str(&raw).ok()?;
+    // Reconcile with reality: a `Running`/`Starting` record survives host
+    // reboots and SIGKILLed containers. Without this, `ensure`/prewarm
+    // short-circuit on stale state and the VM never comes back up.
+    if inst.state == VmState::Running || inst.state == VmState::Starting {
+        if !process_alive(cwd, &inst) {
+            inst.state = VmState::Stopped;
+        }
+    }
+    Some(inst)
 }
 
 pub fn save_instance(cwd: &Path, inst: &VmInstance) -> std::io::Result<()> {

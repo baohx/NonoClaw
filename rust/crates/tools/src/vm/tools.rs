@@ -385,7 +385,7 @@ impl Tool for VmExecTool {
         &[
             "Prefer running tasks in the VM by default: use VmExec/VmFs/VmBrowser for building, running untrusted or network-facing code, browsing, and scratch work. Reach for the host Bash/Write/Edit tools only when the task is specifically about the host machine (host paths, host services, this repo's own files) or the user asks for the host.",
             "Call `Vm ensure` once before VM work — it creates+starts the instance if needed and returns immediately if it is already running.",
-            "The VM is disposable Linux — install packages freely with apt; they persist in the instance disk. To move files between host and VM use VmFs put/get (the host working directory is NOT mounted; the VM works out of /root/work).",
+            "The VM is disposable Linux — install packages freely with apt; they persist in the instance disk. The host project directory is NFS-mounted at /workspace (same files as the host), and VmExec starts there; VmFs put/get is still the way to move files outside the project.",
         ]
     }
     async fn check_permissions(&self, _input: &Value, _ctx: &ToolCtx<'_>) -> PermissionDecision {
@@ -423,7 +423,15 @@ impl Tool for VmExecTool {
         if inst.state != VmState::Running {
             return Ok(ToolResult::error(format!("VM {name:?} not running (state={:?})", inst.state)));
         }
-        let cmdline = format!("bash -lc {}", shell_quote(&command));
+        // The project is NFS-mounted at /workspace when the host exported it, so
+        // land there by default; fall back to root's home if the mount failed.
+        let cmdline = format!(
+            "bash -lc {}",
+            shell_quote(&format!(
+                "cd {} 2>/dev/null || true\n{command}",
+                super::firecracker::WORKSPACE_MOUNT
+            ))
+        );
         match ssh::exec(ctx.cwd, &inst, &cmdline, timeout_ms / 1000).await {
             Ok((code, out)) => Ok(ToolResult::ok(format!(
                 "[exit {code}]\n{out}"

@@ -13,6 +13,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Multi-Model & Multi-Provider](#multi-model--multi-provider)
 - [Cross-Session Memory (Mneme)](#cross-session-memory-mneme)
 - [Platform Differences](#platform-differences-linux-macos-windows)
+- [Building the microVM](#building-the-microvm)
 - [Permission Modes](#permission-modes)
 - [Web UI](#web-ui)
 - [Desktop app (Electron)](#desktop-app-electron-v023)
@@ -120,13 +121,13 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **Subagent Delegation** | `Agent` tool spawns a full subagent (autonomous, depth=1, non-interactive); `Coordinator` fans out parallel tasks. Both inherit CancellationToken + hooks + events. Child toolset excludes Agent/Coordinator/Graph (no recursion). **Graph tool** runs declarative DAG pipelines. |
 | **Agent Graphs** | **Declarative DAG pipelines** in `.nonoclaw/graphs/<name>.md`: YAML frontmatter defines nodes (subagent / LLM router / human gate) and `next` edges; fan-out parallelism + fan-in gathering; router picks branches dynamically; gate pauses for human approval; **checkpoint resume** after interruption. `Graph` tool for dynamic invocation + `/graph` slash command. Covers all 5 Anthropic workflow patterns. |
 | **Agent Profiles** | `.nonoclaw/agents/*.md` — pluggable agent personas with custom system prompts (`systemPromptAppend` or **`systemPromptOverride`**), tool allow/deny lists, and permission mode overrides. Referenced by `profile` field in `models[]`. Bundled **verifier profile** (v0.19): an adversarial verification agent whose job is to *break* the implementation — every conclusion must be backed by executed command output (no read-code-PASS), attack-vector checklist (boundaries / concurrency / idempotency / orphan operations), write tools denied, structured VERDICT (PASS/FAIL/INCONCLUSIVE). |
-| **Sandbox & ACP** | **Landlock sandbox** (v0.19): Linux LSM backstop for Bash (workspace-write / read-only modes) with kernel probe + graceful fallback. **ACP server** (v0.19): Agent Client Protocol over stdio (`initialize`/`session`/`new`/`prompt`/`cancel`) — Zed and other ACP clients can drive NonoClaw directly. |
+| **Sandbox & ACP** | **Landlock sandbox** (v0.19): Linux LSM backstop for Bash (workspace-write / read-only / strict modes; read-only and strict also block child TCP on Linux 5.19+) with kernel probe + graceful fallback. **ACP server** (v0.19): Agent Client Protocol over stdio (`initialize`/`session`/`new`/`prompt`/`cancel`) — Zed and other ACP clients can drive NonoClaw directly. |
 | **File Attachments** | Upload PDF/DOCX/DOC/TXT/MD/PNG/JPG via paperclip, drag-drop, or paste; **auto-OCR** via Mistral/DeepSeek configurable doc models; **direct text extraction** (pdftotext + ZIP XML) skips OCR when possible; **embedded image extraction** (pdfimages + word/media) with per-image OCR descriptions; **ContentBlock::Image injection** for multimodal models |
 | **Bash Background** | `run_in_background: true` spawns detached process with disk-persisted output, `<task_notification>` injection on completion |
 | **MCP** | Client (`--mcp-config`) + Server (`--mcp-serve`), **MCP prompts → skill bridge**, **session-pinned keyword selection** (advertise only the relevant MCP-tool subset per session so the tools array stays cache-stable; `autoSelectMcp`/`autoSelectMcpTopK`) |
 | **Unified Model Profiles** | All models in single `models[]` array with `role` tags (`main`/`doc`/`compact`); `docModel` and `compactModel` reference by name; **per-model contextWindow / maxTokens / charsPerToken**; **compactModel** independent summarization model |
 | **Multi-Model** | Model switching via UI dropdown or `/multi` slash command; `/multi` now shows syntax help on error |
-| **Permissions** | 7 modes: Default / AcceptEdits / Auto / SandboxWorkspaceWrite / SandboxReadOnly / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
+| **Permissions** | 8 modes: Default / AcceptEdits / Auto / SandboxWorkspaceWrite / SandboxReadOnly / SandboxStrict / BypassPermissions / Plan — switchable via UI dropdown. **REST API: `GET/POST /api/sessions/:id/permissions`** for external system approval. |
 | **Sessions** | JSONL persistence per-cwd, `--resume` / `--continue` / `--list-sessions`, **session naming**, progressive metadata |
 | **Context** | **Segments compaction** (keeps last 3 turns verbatim), **two-pass pre-compaction** (async background summarization at 80% threshold), **microCompact** (v0.19: cache-aware aggressive trim of old tool results — 2K threshold, head/tail kept, last 8 messages protected byte-for-byte; pushes autoCompact later without breaking the rolling cache breakpoint), configurable `contextWindow`, **Prompt Caching** with a **cache-stable prefix** (skill bodies load on demand via the `Skill` tool; the MCP subset is pinned per session) and **rolling `cache_control` breakpoints** (v0.19: last-message marker, 4-breakpoint cap, tool blocks marked directly — high cache hit rates on Anthropic-compatible providers), **exact BPE tokenization** via bundled `tiktoken` (OpenAI/DeepSeek/Qwen/Kimi/GLM/Mistral/MiniMax; heuristic fallback for Claude), **independent memory budget partitions** (beads/facts/wiki/index) |
 | **Token Efficiency** | **Exact BPE tokenizer** (`tiktoken` 3.8.3, pure-Rust with bundled rank tables — no runtime downloads); **cache hit-rate tracking** (DeepSeek `prompt_cache_hit_tokens` + standard `cached_tokens`); **cache hit-rate visualization** in Insight rail (segmented bar + percentage); **`extra_body` field** for provider-specific cache hints (OpenAI payload only) |
@@ -431,7 +432,7 @@ Inspired by [Andrej Karpathy's LLM Wiki pattern](https://github.com/karpathy/llm
 | Capability | Linux | macOS | Windows |
 |---|---|---|---|
 | Bash tool shell | `bash` (falls back to `sh` when absent, e.g. Alpine) | `bash` (falls back to `sh`) | `cmd /C` |
-| Sandbox (`sandbox-workspace-write` / `sandbox-read-only`) | Landlock (kernel probe + graceful fallback to normal permission checks) | Seatbelt via `sandbox-exec` (degrades to normal permission checks when unavailable) | Not available; modes degrade to normal permission checks |
+| Sandbox (`sandbox-workspace-write` / `sandbox-read-only` / `sandbox-strict`) | Landlock (kernel probe + graceful fallback to normal permission checks; child TCP blocked for read-only/strict on Linux 5.19+) | Seatbelt via `sandbox-exec` (degrades to normal permission checks when unavailable) | Not available; modes degrade to normal permission checks |
 | Raw API log viewing (`/api/logs/raw`) | Handle-relative dirfd backend (`/proc/self/fd`) | Handle-relative dirfd backend (`fdopendir` snapshot) | Unsupported |
 | Atomic log evolution (no-clobber / swap) | `renameat2` (`RENAME_NOREPLACE` / `RENAME_EXCHANGE`) | `renameatx_np` (`RENAME_EXCL` / `RENAME_SWAP`) | Unsupported |
 | Shell profile isolation | `--noprofile --norc` | `--noprofile --norc` | N/A (cmd) |
@@ -439,9 +440,45 @@ Inspired by [Andrej Karpathy's LLM Wiki pattern](https://github.com/karpathy/llm
 
 ---
 
+## Building the microVM
+
+The optional microVM subsystem gives the agent a disposable Linux machine (real
+Chromium + CDP, SSH shell, shared `/workspace`). The base image is **not** shipped
+in git — you build it once from a Debian cloud image.
+
+Prerequisites (all platforms):
+1. **docker** — the image build and the Linux runtime jailer both use it.
+2. Two large files placed in `release/vm/` (neither is tracked in git; URLs are
+   in the header of `scripts/vm/build-image.sh`):
+   - `debian-12-nocloud.qcow2` — [Debian 12 nocloud amd64 cloud image](https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-amd64.qcow2)
+   - `vmlinux-fc.bin` — Firecracker CI **uncompressed ELF** kernel, e.g.
+     `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.102`
+     (the Debian bzImage will **not** boot — Firecracker's loader rejects it).
+
+Build the shared assets:
+```bash
+bash scripts/vm/build-image.sh
+# outputs to ~/.nonoclaw/vm/: kernel.img, initrd.img, rootfs-bare.ext4, ssh_key{,.pub}
+```
+The build runs entirely inside a privileged docker container (loop mount +
+chroot), so **it only works on Linux**. Once built, the agent starts instances
+with the `Vm` tool (per-instance dirs under `<cwd>/.nonoclaw/vm/<name>/`), or you
+can route `Bash` into the guest via `defaultExecution=vm`.
+
+Platform differences:
+
+| | Build image | Runtime backend | Notes |
+|---|---|---|---|
+| **Linux + KVM** | native (docker) | **Firecracker** (docker as jailer, `/dev/kvm` passthrough) | primary path; full feature set |
+| **Linux, no KVM** | native (docker) | QEMU (TCG software emulation) | works, but slow |
+| **macOS** | not supported — pre-build on a Linux host, then copy `~/.nonoclaw/vm/` over | **QEMU** (Hypervisor.framework accel, user-mode net + hostfwd; fully unprivileged) | shares the same ext4/kernel assets |
+| **Windows** | not supported | none (no VM backend) | use WSL2 as a Linux target |
+
+---
+
 ## Permission Modes
 
-All seven modes are switchable at runtime via the UI dropdown. The CLI presents canonical kebab-case values; existing camelCase settings/API values remain accepted as compatibility aliases.
+All eight modes are switchable at runtime via the UI dropdown. The CLI presents canonical kebab-case values; existing camelCase settings/API values remain accepted as compatibility aliases.
 
 | Canonical CLI value | Compatibility alias | Behavior |
 |---|---|---|
@@ -449,7 +486,8 @@ All seven modes are switchable at runtime via the UI dropdown. The CLI presents 
 | `accept-edits` | `acceptEdits` | Auto-allow file edits; other operations such as Bash can still require approval |
 | `auto` | — | Auto-approve operations permitted by the rule engine/classifier |
 | `sandbox-workspace-write` | `sandboxWorkspaceWrite` | On supported Linux systems, allow writes inside the workspace under Landlock; outside writes still require approval |
-| `sandbox-read-only` | `sandboxReadOnly` | Apply a read-only Landlock posture; writes are denied |
+| `sandbox-read-only` | `sandboxReadOnly` | Apply a read-only Landlock posture; writes are denied. On Linux 5.19+ the Bash child's TCP (bind/connect) is also blocked |
+| `sandbox-strict` | `sandboxStrict` | Strictest posture: Landlock reads are narrowed to the workspace + essential system paths (`/usr`, `/bin`, `/lib`, …), writes are denied, and child TCP is blocked (Linux 5.19+). macOS uses a matching `(deny default)` Seatbelt profile |
 | `bypass-permissions` | `bypassPermissions` | Skip permission prompts (`--dangerously-skip-permissions`); trusted isolated workspaces only |
 | `plan` | — | Read-only planning posture; writes are hard-denied |
 
@@ -1026,7 +1064,7 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "run independent checks"
 | `-p`, `--print` | false | Explicit headless compatibility marker; local prompt/stdin runs are already headless |
 | `--tag TAG` | unset | Tag a created session; tagged sessions are skipped by auto-resume and dream outcome scanning |
 | `--model ID` | configured model | Override the conversation model |
-| `--permission-mode MODE` | `default` | Seven canonical values: `default`, `accept-edits`, `auto`, `sandbox-workspace-write`, `sandbox-read-only`, `bypass-permissions`, `plan`; legacy camelCase aliases remain accepted |
+| `--permission-mode MODE` | `default` | Eight canonical values: `default`, `accept-edits`, `auto`, `sandbox-workspace-write`, `sandbox-read-only`, `sandbox-strict`, `bypass-permissions`, `plan`; legacy camelCase aliases remain accepted |
 | `--allowed-tools LIST` / `--disallowed-tools LIST` | unset | Comma-separated tool filters |
 | `--max-turns N` / `--max-tokens N` | resolved config | Bound loop turns and output tokens |
 | `--append-system-prompt TXT` | unset | Append system instructions |
@@ -1203,7 +1241,7 @@ nonoclaw --serve-http 0.0.0.0:8765 --public-url http://192.168.1.42:8765
 | **子委托与编排** | `Agent` 工具生成完整子代理（自主、depth=1、非交互）；`Coordinator` 并行扇出多任务。全部继承 CancellationToken + hooks + 事件。子级工具集排除 Agent/Coordinator/Graph（禁止递归）。**Graph 工具**执行声明式 DAG 管线。 |
 | **Agent 图** | **声明式 DAG 管线**（`.nonoclaw/graphs/<name>.md`）：YAML frontmatter 定义节点（子代理 / LLM 路由 / 人工审批）和 `next` 边；fan-out 并行 + fan-in 汇聚；路由动态选择分支；看门暂停等待人工审批；**checkpoint 断点续跑**。`Graph` 工具动态调用 + `/graph` 斜杠命令。覆盖 Anthropic 全部 5 种工作流模式。 |
 | **Agent 配置文件** | `.nonoclaw/agents/*.md` — 可插拔的 agent 角色，自定义系统提示词、工具白名单/黑名单和权限模式。通过 `models[]` 中的 `profile` 字段引用。灵感来源于 Grok Build。内置 **verifier profile**（v0.19）：对抗性验证 agent——任务不是确认实现能工作，而是想方设法搞崩它；所有结论必须有实际执行的命令输出（禁止读码写 PASS）、攻击向量清单（边界/并发/幂等/孤儿操作）、禁用写工具、结构化 VERDICT（PASS/FAIL/INCONCLUSIVE）。 |
-| **沙箱与 ACP** | **Landlock 沙箱**（v0.19）：Linux LSM 为 Bash 提供兜底限制（workspace-write / read-only 模式），内核探测 + 不支持时优雅回退。**ACP 服务端**（v0.19）：Agent Client Protocol over stdio（`initialize`/`session`/`new`/`prompt`/`cancel`）——Zed 等 ACP 客户端可直接驱动 NonoClaw。 |
+| **沙箱与 ACP** | **Landlock 沙箱**（v0.19）：Linux LSM 为 Bash 提供兜底限制（workspace-write / read-only / strict 模式；read-only 与 strict 在 Linux 5.19+ 上同时阻断子进程 TCP），内核探测 + 不支持时优雅回退。**ACP 服务端**（v0.19）：Agent Client Protocol over stdio（`initialize`/`session`/`new`/`prompt`/`cancel`）——Zed 等 ACP 客户端可直接驱动 NonoClaw。 |
 | **文件附件** | 通过纸夹按钮、拖拽或粘贴上传 PDF/DOCX/DOC/TXT/MD/PNG/JPG；通过可配置的 Mistral/DeepSeek 文档模型**自动 OCR**；**直接文本提取**（pdftotext + ZIP XML）尽可能跳过 OCR；**嵌入图片提取**（pdfimages + word/media）并为每张图片生成 OCR 描述；多模态模型的 **ContentBlock::Image 注入** |
 | **Bash 后台任务** | `run_in_background: true` 启动分离进程，输出持久化到磁盘，完成时注入 `<task_notification>` |
 | **MCP** | 客户端（`--mcp-config`）+ 服务端（`--mcp-serve`），**MCP prompts → skill 桥接**，**会话级关键词选择**（每会话仅展示相关 MCP 工具子集，使 tools 数组缓存稳定；`autoSelectMcp`/`autoSelectMcpTopK`） |
@@ -1486,7 +1524,7 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 | 能力 | Linux | macOS | Windows |
 |---|---|---|---|
 | Bash 工具 shell | `bash`（缺失时回退 `sh`，如 Alpine） | `bash`（回退 `sh`） | `cmd /C` |
-| 沙箱（`sandbox-workspace-write` / `sandbox-read-only`） | Landlock（内核探测 + 优雅回退到常规权限检查） | Seatbelt（`sandbox-exec`，不可用时回退到常规权限检查） | 不可用；模式回退到常规权限检查 |
+| 沙箱（`sandbox-workspace-write` / `sandbox-read-only` / `sandbox-strict`） | Landlock（内核探测 + 优雅回退到常规权限检查；read-only/strict 在 Linux 5.19+ 上阻断子进程 TCP） | Seatbelt（`sandbox-exec`，不可用时回退到常规权限检查） | 不可用；模式回退到常规权限检查 |
 | 原始 API 日志查看（`/api/logs/raw`） | 句柄相对 dirfd 后端（`/proc/self/fd`） | 句柄相对 dirfd 后端（`fdopendir` 快照） | 不支持 |
 | 原子日志演化（no-clobber / swap） | `renameat2`（`RENAME_NOREPLACE` / `RENAME_EXCHANGE`） | `renameatx_np`（`RENAME_EXCL` / `RENAME_SWAP`） | 不支持 |
 | shell profile 隔离 | `--noprofile --norc` | `--noprofile --norc` | 不适用（cmd） |
@@ -1494,9 +1532,44 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 
 ---
 
+## 构建 microVM
+
+可选的 microVM 子系统给 agent 一台一次性 Linux 机器（真实 Chromium + CDP、SSH
+shell、共享 `/workspace`）。基础镜像**不随 git 分发**——你需要从 Debian 云镜像一次性
+构建它。
+
+前置条件（所有平台）：
+1. **docker**——构建镜像和 Linux 运行期 jailer 都用它。
+2. 两个大文件放入 `release/vm/`（均不在 git 跟踪内；下载 URL 写在
+   `scripts/vm/build-image.sh` 头部）：
+   - `debian-12-nocloud.qcow2` —— [Debian 12 nocloud amd64 云镜像](https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-amd64.qcow2)
+   - `vmlinux-fc.bin` —— Firecracker CI **未压缩 ELF** 内核，例如
+     `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.102`
+     （Debian 的 bzImage **无法**启动——Firecracker 加载器会拒绝）。
+
+构建共享资产：
+```bash
+bash scripts/vm/build-image.sh
+# 产物写入 ~/.nonoclaw/vm/：kernel.img、initrd.img、rootfs-bare.ext4、ssh_key{,.pub}
+```
+构建全程在特权 docker 容器内进行（loop mount + chroot），因此**只能在 Linux 上跑**。
+构建完成后，agent 用 `Vm` 工具启动实例（实例目录在 `<cwd>/.nonoclaw/vm/<name>/`），
+或通过 `defaultExecution=vm` 把 `Bash` 路由进 guest。
+
+平台差异：
+
+| | 构建镜像 | 运行期后端 | 说明 |
+|---|---|---|---|
+| **Linux + KVM** | 原生（docker） | **Firecracker**（docker 当 jailer，直通 `/dev/kvm`） | 主路径；功能最完整 |
+| **Linux，无 KVM** | 原生（docker） | QEMU（TCG 软件模拟） | 可用，但慢 |
+| **macOS** | 不支持——在 Linux 机器上预构建后，把 `~/.nonoclaw/vm/` 拷过来 | **QEMU**（Hypervisor.framework 加速，用户态网络 + hostfwd；完全无需 root） | 与 Linux 共用同一套 ext4/内核资产 |
+| **Windows** | 不支持 | 无（无 VM 后端） | 用 WSL2 当 Linux 目标 |
+
+---
+
 ## 权限模式
 
-七种模式都可在 UI 下拉框中动态切换。CLI 展示 canonical kebab-case 值；原有 settings/API 使用的 camelCase 值继续作为兼容别名接受。
+八种模式都可在 UI 下拉框中动态切换。CLI 展示 canonical kebab-case 值；原有 settings/API 使用的 camelCase 值继续作为兼容别名接受。
 
 | CLI 标准值 | 兼容别名 | 行为 |
 |---|---|---|
@@ -1504,7 +1577,8 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 | `accept-edits` | `acceptEdits` | 自动允许文件编辑；Bash 等其他操作仍可能请求审批 |
 | `auto` | — | 自动批准规则引擎/分类器允许的操作 |
 | `sandbox-workspace-write` | `sandboxWorkspaceWrite` | 在支持的 Linux 上通过 Landlock 允许工作区内写入；工作区外写入仍需审批 |
-| `sandbox-read-only` | `sandboxReadOnly` | 启用只读 Landlock 姿态，拒绝写入 |
+| `sandbox-read-only` | `sandboxReadOnly` | 启用只读 Landlock 姿态，拒绝写入。在 Linux 5.19+ 上同时阻断 Bash 子进程的 TCP（bind/connect） |
+| `sandbox-strict` | `sandboxStrict` | 最严姿态：Landlock 读被收窄到工作区 + 必要系统路径（`/usr`、`/bin`、`/lib` 等），拒绝写入，并阻断子进程 TCP（Linux 5.19+）。macOS 用对应的 `(deny default)` Seatbelt profile |
 | `bypass-permissions` | `bypassPermissions` | 跳过权限提示（`--dangerously-skip-permissions`）；仅用于可信隔离工作区 |
 | `plan` | — | 只读规划姿态，写入被硬拒绝 |
 
@@ -1850,7 +1924,7 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "并行运行独立检查"
 | `-p`, `--print` | false | 显式 headless 兼容标记；本地 prompt/stdin 原本就是 headless |
 | `--tag TAG` | 未设置 | 给新 session 打标签；带标签 session 不参与自动恢复和 dream outcome 扫描 |
 | `--model ID` | 配置模型 | 覆盖会话模型 |
-| `--permission-mode MODE` | `default` | 七个标准值：`default`、`accept-edits`、`auto`、`sandbox-workspace-write`、`sandbox-read-only`、`bypass-permissions`、`plan`；兼容旧 camelCase 别名 |
+| `--permission-mode MODE` | `default` | 八个标准值：`default`、`accept-edits`、`auto`、`sandbox-workspace-write`、`sandbox-read-only`、`sandbox-strict`、`bypass-permissions`、`plan`；兼容旧 camelCase 别名 |
 | `--allowed-tools LIST` / `--disallowed-tools LIST` | 未设置 | 逗号分隔的工具过滤器 |
 | `--max-turns N` / `--max-tokens N` | 解析后的配置 | 限制循环轮次和输出 tokens |
 | `--append-system-prompt TXT` | 未设置 | 追加系统提示词 |

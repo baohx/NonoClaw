@@ -84,6 +84,15 @@ impl Tool for BashTool {
         cancel: CancellationToken,
     ) -> Result<ToolResult> {
         let raw_command = require_command(&input)?;
+
+        // Route to the microVM when the user asked for VM-default execution and
+        // a running instance exists. The guest sees the project at /workspace
+        // (NFS), so relative paths and git work the same as on the host.
+        if let Some(result) = crate::vm::maybe_run_in_vm(ctx.cwd, &raw_command, &input, &cancel).await
+        {
+            return result;
+        }
+
         // sudo reads from the terminal by default — but stdin is closed and
         // there is no TTY. Insert `-n` (non-interactive) so that:
         //  - commands the user has allowed via NOPASSWD in sudoers succeed
@@ -304,6 +313,7 @@ fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
     let sandbox_mode = match mode {
         PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
         PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        PermissionMode::SandboxStrict => Some(SandboxMode::Strict),
         _ => None,
     };
     let Some(sandbox_mode) = sandbox_mode else {
@@ -335,6 +345,7 @@ fn seatbelt_argv(
     let sandbox_mode = match mode {
         PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
         PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        PermissionMode::SandboxStrict => Some(SandboxMode::Strict),
         _ => None,
     }?;
     if !sandbox::probe() {

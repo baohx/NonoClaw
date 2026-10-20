@@ -1000,6 +1000,7 @@ mod security_tests {
                 "auto",
                 "sandbox-workspace-write",
                 "sandbox-read-only",
+                "sandbox-strict",
                 "bypass-permissions",
                 "plan",
             ]

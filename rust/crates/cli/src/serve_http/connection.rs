@@ -2689,6 +2689,9 @@ async fn handle_ws(
                     "sandboxReadOnly" | "sandbox-read-only" => {
                         nonoclaw_core::PermissionMode::SandboxReadOnly
                     }
+                    "sandboxStrict" | "sandbox-strict" => {
+                        nonoclaw_core::PermissionMode::SandboxStrict
+                    }
                     _ => nonoclaw_core::PermissionMode::Default,
                 };
                 *state.permission_mode.lock().await = new_mode;

@@ -12,6 +12,7 @@
 //! - [`tools`]    — agent-facing tools: `Vm`, `VmExec`, `VmFs`, `VmBrowser`
 
 pub mod backend;
+pub mod bash_route;
 pub mod cdp;
 pub mod firecracker;
 pub mod qemu;
@@ -23,3 +24,4 @@ pub use backend::{
     VmSettings, VmState,
 };
 pub use tools::{prewarm_default, VmBrowserTool, VmExecTool, VmFsTool, VmTool};
+pub use bash_route::maybe_run_in_vm;
