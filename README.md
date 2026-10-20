@@ -13,6 +13,7 @@ A **Rust rewrite** of [Claude Code](https://claude.ai/code) (Anthropic's agent C
 - [Multi-Model & Multi-Provider](#multi-model--multi-provider)
 - [Cross-Session Memory (Mneme)](#cross-session-memory-mneme)
 - [Platform Differences](#platform-differences-linux-macos-windows)
+- [Building the microVM](#building-the-microvm)
 - [Permission Modes](#permission-modes)
 - [Web UI](#web-ui)
 - [Desktop app (Electron)](#desktop-app-electron-v023)
@@ -436,6 +437,42 @@ Inspired by [Andrej Karpathy's LLM Wiki pattern](https://github.com/karpathy/llm
 | Atomic log evolution (no-clobber / swap) | `renameat2` (`RENAME_NOREPLACE` / `RENAME_EXCHANGE`) | `renameatx_np` (`RENAME_EXCL` / `RENAME_SWAP`) | Unsupported |
 | Shell profile isolation | `--noprofile --norc` | `--noprofile --norc` | N/A (cmd) |
 | Installer | `install.sh` (XDG paths) | `install.sh` (XDG paths) | separate installer; behavior may differ |
+
+---
+
+## Building the microVM
+
+The optional microVM subsystem gives the agent a disposable Linux machine (real
+Chromium + CDP, SSH shell, shared `/workspace`). The base image is **not** shipped
+in git — you build it once from a Debian cloud image.
+
+Prerequisites (all platforms):
+1. **docker** — the image build and the Linux runtime jailer both use it.
+2. Two large files placed in `release/vm/` (neither is tracked in git; URLs are
+   in the header of `scripts/vm/build-image.sh`):
+   - `debian-12-nocloud.qcow2` — [Debian 12 nocloud amd64 cloud image](https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-amd64.qcow2)
+   - `vmlinux-fc.bin` — Firecracker CI **uncompressed ELF** kernel, e.g.
+     `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.102`
+     (the Debian bzImage will **not** boot — Firecracker's loader rejects it).
+
+Build the shared assets:
+```bash
+bash scripts/vm/build-image.sh
+# outputs to ~/.nonoclaw/vm/: kernel.img, initrd.img, rootfs-bare.ext4, ssh_key{,.pub}
+```
+The build runs entirely inside a privileged docker container (loop mount +
+chroot), so **it only works on Linux**. Once built, the agent starts instances
+with the `Vm` tool (per-instance dirs under `<cwd>/.nonoclaw/vm/<name>/`), or you
+can route `Bash` into the guest via `defaultExecution=vm`.
+
+Platform differences:
+
+| | Build image | Runtime backend | Notes |
+|---|---|---|---|
+| **Linux + KVM** | native (docker) | **Firecracker** (docker as jailer, `/dev/kvm` passthrough) | primary path; full feature set |
+| **Linux, no KVM** | native (docker) | QEMU (TCG software emulation) | works, but slow |
+| **macOS** | not supported — pre-build on a Linux host, then copy `~/.nonoclaw/vm/` over | **QEMU** (Hypervisor.framework accel, user-mode net + hostfwd; fully unprivileged) | shares the same ext4/kernel assets |
+| **Windows** | not supported | none (no VM backend) | use WSL2 as a Linux target |
 
 ---
 
@@ -1492,6 +1529,41 @@ NonoClaw 集成了 Karpathy 的 LLM Wiki 模式——LLM 充当**编译器**，�
 | 原子日志演化（no-clobber / swap） | `renameat2`（`RENAME_NOREPLACE` / `RENAME_EXCHANGE`） | `renameatx_np`（`RENAME_EXCL` / `RENAME_SWAP`） | 不支持 |
 | shell profile 隔离 | `--noprofile --norc` | `--noprofile --norc` | 不适用（cmd） |
 | 安装器 | `install.sh`（XDG 路径） | `install.sh`（XDG 路径） | 独立安装器；行为可能不同 |
+
+---
+
+## 构建 microVM
+
+可选的 microVM 子系统给 agent 一台一次性 Linux 机器（真实 Chromium + CDP、SSH
+shell、共享 `/workspace`）。基础镜像**不随 git 分发**——你需要从 Debian 云镜像一次性
+构建它。
+
+前置条件（所有平台）：
+1. **docker**——构建镜像和 Linux 运行期 jailer 都用它。
+2. 两个大文件放入 `release/vm/`（均不在 git 跟踪内；下载 URL 写在
+   `scripts/vm/build-image.sh` 头部）：
+   - `debian-12-nocloud.qcow2` —— [Debian 12 nocloud amd64 云镜像](https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-amd64.qcow2)
+   - `vmlinux-fc.bin` —— Firecracker CI **未压缩 ELF** 内核，例如
+     `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.102`
+     （Debian 的 bzImage **无法**启动——Firecracker 加载器会拒绝）。
+
+构建共享资产：
+```bash
+bash scripts/vm/build-image.sh
+# 产物写入 ~/.nonoclaw/vm/：kernel.img、initrd.img、rootfs-bare.ext4、ssh_key{,.pub}
+```
+构建全程在特权 docker 容器内进行（loop mount + chroot），因此**只能在 Linux 上跑**。
+构建完成后，agent 用 `Vm` 工具启动实例（实例目录在 `<cwd>/.nonoclaw/vm/<name>/`），
+或通过 `defaultExecution=vm` 把 `Bash` 路由进 guest。
+
+平台差异：
+
+| | 构建镜像 | 运行期后端 | 说明 |
+|---|---|---|---|
+| **Linux + KVM** | 原生（docker） | **Firecracker**（docker 当 jailer，直通 `/dev/kvm`） | 主路径；功能最完整 |
+| **Linux，无 KVM** | 原生（docker） | QEMU（TCG 软件模拟） | 可用，但慢 |
+| **macOS** | 不支持——在 Linux 机器上预构建后，把 `~/.nonoclaw/vm/` 拷过来 | **QEMU**（Hypervisor.framework 加速，用户态网络 + hostfwd；完全无需 root） | 与 Linux 共用同一套 ext4/内核资产 |
+| **Windows** | 不支持 | 无（无 VM 后端） | 用 WSL2 当 Linux 目标 |
 
 ---
 
