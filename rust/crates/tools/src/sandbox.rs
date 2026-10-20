@@ -27,7 +27,20 @@ pub enum SandboxMode {
     WorkspaceWrite,
     /// Read+execute the whole filesystem; deny all writes.
     ReadOnly,
+    /// Read+execute only the workspace and essential system paths (the dirs a
+    /// shell + language runtimes need to exec); deny all writes. Narrower than
+    /// [`SandboxMode::ReadOnly`], whose reads span the whole filesystem.
+    Strict,
 }
+
+/// System paths a sandboxed child needs read+execute on to run a shell and the
+/// usual language runtimes: libraries, interpreters, and the dynamic linker's
+/// config. Used only by [`SandboxMode::Strict`]; the looser modes read all of
+/// `/`. Missing entries are skipped (not every distro has every path).
+const STRICT_SYSTEM_PATHS: &[&str] = &[
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt",
+    "/proc", "/dev", "/sys", "/var",
+];
 
 // ── Linux: Landlock ─────────────────────────────────────────────────────────
 
@@ -35,8 +48,8 @@ pub enum SandboxMode {
 mod imp {
     use super::*;
     use landlock::{
-        path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, ABI,
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
     /// Target Landlock ABI. `BestEffort` compatibility downgrades this to
@@ -71,17 +84,46 @@ mod imp {
         let read_access = AccessFs::from_read(TARGET_ABI);
         let write_access = AccessFs::from_write(TARGET_ABI);
 
-        let mut ruleset = Ruleset::default()
-            .handle_access(AccessFs::from_all(TARGET_ABI))
-            .map_err(ruleset_io)?
-            .create()
-            .map_err(ruleset_io)?;
+        // Block child networking in the read-only / strict postures: handle
+        // AccessNet (TCP bind+connect) but add no net rules, so the kernel
+        // denies all TCP. WorkspaceWrite leaves net unhandled (allowed). Net
+        // control is ABI V4 (Linux 5.19+); on older kernels BestEffort drops
+        // it silently and the VM boundary remains the only network barrier.
+        let block_net =
+            matches!(mode, SandboxMode::ReadOnly | SandboxMode::Strict);
 
-        // Read + execute the whole filesystem (compilers and language runtimes
-        // read system libraries; the shell executes subcommands).
-        ruleset = ruleset
-            .add_rules(path_beneath_rules([Path::new("/")], read_access))
-            .map_err(ruleset_io)?;
+        let mut builder =
+            Ruleset::default().handle_access(AccessFs::from_all(TARGET_ABI)).map_err(ruleset_io)?;
+        if block_net {
+            builder = builder
+                .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)
+                .map_err(ruleset_io)?;
+        }
+        let mut ruleset = builder.create().map_err(ruleset_io)?;
+
+        // Read + execute set. The looser modes read the whole filesystem
+        // (compilers and runtimes read system libraries; the shell execs
+        // subcommands). Strict reads only the workspace + essential system
+        // paths, so files outside the project are invisible to the child.
+        if mode == SandboxMode::Strict {
+            let mut readable: Vec<PathBuf> = vec![workspace_root.to_path_buf()];
+            readable.extend(
+                STRICT_SYSTEM_PATHS
+                    .iter()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists()),
+            );
+            ruleset = ruleset
+                .add_rules(path_beneath_rules(
+                    readable.iter().map(PathBuf::as_path),
+                    read_access,
+                ))
+                .map_err(ruleset_io)?;
+        } else {
+            ruleset = ruleset
+                .add_rules(path_beneath_rules([Path::new("/")], read_access))
+                .map_err(ruleset_io)?;
+        }
 
         if mode == SandboxMode::WorkspaceWrite {
             let mut writable: Vec<PathBuf> = Vec::with_capacity(1 + extra_writable.len());
@@ -144,7 +186,27 @@ mod imp {
         fn resolved(path: &Path) -> PathBuf {
             std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
         }
-        let mut body = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+        // Strict denies reads by default and allows only the workspace +
+        // essential system paths; the looser modes read everywhere.
+        let mut body = if mode == SandboxMode::Strict {
+            let mut b = String::from("(version 1)\n(deny default)\n");
+            b.push_str(&format!(
+                "(allow file-read* process-exec (subpath \"{}\"))\n",
+                escape_subpath(&resolved(workspace_root))
+            ));
+            for sys in STRICT_SYSTEM_PATHS {
+                let p = Path::new(sys);
+                if p.exists() {
+                    b.push_str(&format!(
+                        "(allow file-read* process-exec (subpath \"{}\"))\n",
+                        escape_subpath(&resolved(p))
+                    ));
+                }
+            }
+            b
+        } else {
+            String::from("(version 1)\n(allow default)\n(deny file-write*)\n")
+        };
         if mode == SandboxMode::WorkspaceWrite {
             body.push_str(&format!(
                 "(allow file-write* (subpath \"{}\"))\n",
@@ -291,6 +353,140 @@ mod tests {
             "read-only sandbox must deny writes outside the workspace"
         );
         let _ = std::fs::remove_file(&target);
+    }
+
+    /// End-to-end Landlock check on Linux: strict mode narrows reads to the
+    /// workspace + system paths, so a file outside the workspace must be
+    /// unreadable even though read-only mode would allow it. Skipped when the
+    /// kernel lacks Landlock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_landlock_denies_reads_outside_workspace() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        if !probe() {
+            eprintln!("skipping: Landlock not supported on this kernel");
+            return;
+        }
+
+        // A readable file OUTSIDE the workspace. Put the workspace in a fresh
+        // subdir so the outside file is not beneath it.
+        let base =
+            std::env::temp_dir().join(format!("nonoclaw-strict-{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = base.join("secret.txt");
+        std::fs::write(&outside, b"classified").unwrap();
+
+        // `cat <outside>` needs read access the strict ruleset does not grant
+        // outside the workspace, so the child must fail.
+        let ws = workspace.clone();
+        let status = unsafe {
+            Command::new("cat")
+                .arg(&outside)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(move || apply(SandboxMode::Strict, &ws, &[]))
+                .status()
+        }
+        .expect("failed to spawn sandboxed child");
+
+        assert!(
+            !status.success(),
+            "strict sandbox must deny reads outside the workspace"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// End-to-end Landlock check on Linux: a read-only sandbox must deny the
+    /// child a TCP connect (AccessNet, ABI V4 / kernel 5.19+). Skipped when
+    /// the kernel is too old for network control (BestEffort drops it, so a
+    /// connect would succeed — which is the documented degraded behaviour,
+    /// not a test failure). Requires `python3`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_sandbox_denies_child_network() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        if !probe() {
+            eprintln!("skipping: Landlock not supported on this kernel");
+            return;
+        }
+        // Network control is ABI V4 (Linux 5.19+). Detect support by asking the
+        // crate to create a net-handling ruleset at the strict ABI; if the
+        // running kernel is older, BestEffort would silently drop net control
+        // and this test would be meaningless, so skip.
+        if !net_control_supported() {
+            eprintln!("skipping: Landlock network control (ABI V4) unavailable");
+            return;
+        }
+        if which("python3").is_none() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+
+        let workspace = std::env::temp_dir();
+        // A TCP connect to a definitely-closed local port. Without the sandbox
+        // this exits fast with ConnectionRefused (exit 0 from our script's
+        // perspective: "connect was attempted"); WITH the sandbox the socket
+        // call is blocked by the kernel (PermissionError) and the script exits
+        // non-zero. We assert the sandboxed run is blocked, not merely refused.
+        let script = "import socket,sys\n\
+                      s=socket.socket()\n\
+                      try:\n\
+                      \x20 s.connect(('127.0.0.1',9))\n\
+                      except PermissionError:\n\
+                      \x20 sys.exit(42)\n\
+                      except OSError:\n\
+                      \x20 sys.exit(0)\n\
+                      sys.exit(0)\n";
+        let ws = workspace.clone();
+        let status = unsafe {
+            Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(move || apply(SandboxMode::ReadOnly, &ws, &[]))
+                .status()
+        }
+        .expect("failed to spawn sandboxed child");
+
+        // Exit 42 == the connect raised PermissionError == the kernel blocked
+        // it. Any other code means networking was NOT blocked.
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "read-only sandbox must block child TCP connect (got {:?})",
+            status.code()
+        );
+    }
+
+    /// Whether the running kernel supports Landlock network control (ABI V4,
+    /// Linux 5.19+). Read the kernel release from `/proc/sys/kernel/osrelease`
+    /// and compare the `major.minor`.
+    #[cfg(target_os = "linux")]
+    fn net_control_supported() -> bool {
+        let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let mut parts = rel.split('.');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts
+            .next()
+            .and_then(|s| s.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+            .unwrap_or(0);
+        major > 5 || (major == 5 && minor >= 19)
+    }
+
+    /// Minimal PATH lookup for test prerequisites.
+    #[cfg(target_os = "linux")]
+    fn which(bin: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(bin))
+                .find(|p| p.is_file())
+        })
     }
 
     /// End-to-end Seatbelt enforcement check on macOS: a read-only profile

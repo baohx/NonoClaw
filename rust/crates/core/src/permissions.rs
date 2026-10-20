@@ -22,6 +22,9 @@ pub enum PermissionMode {
     SandboxWorkspaceWrite,
     /// Read-only posture under a Linux Landlock sandbox: no writes are allowed.
     SandboxReadOnly,
+    /// Strictest sandbox posture: reads narrowed to the workspace + system
+    /// paths (files outside the project are invisible), no writes allowed.
+    SandboxStrict,
     /// Skip all permission prompts (the `--dangerously-skip-permissions` flag).
     BypassPermissions,
     /// Read-only planning posture.
@@ -38,6 +41,7 @@ impl PermissionMode {
                 PermissionMode::SandboxWorkspaceWrite
             }
             "sandboxReadOnly" | "sandbox-read-only" => PermissionMode::SandboxReadOnly,
+            "sandboxStrict" | "sandbox-strict" => PermissionMode::SandboxStrict,
             "bypassPermissions" | "bypass-permissions" => PermissionMode::BypassPermissions,
             "plan" => PermissionMode::Plan,
             _ => return None,

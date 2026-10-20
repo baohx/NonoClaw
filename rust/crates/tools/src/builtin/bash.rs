@@ -313,6 +313,7 @@ fn apply_sandbox(cmd: &mut Command, mode: PermissionMode, cwd: &Path) {
     let sandbox_mode = match mode {
         PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
         PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        PermissionMode::SandboxStrict => Some(SandboxMode::Strict),
         _ => None,
     };
     let Some(sandbox_mode) = sandbox_mode else {
@@ -344,6 +345,7 @@ fn seatbelt_argv(
     let sandbox_mode = match mode {
         PermissionMode::SandboxWorkspaceWrite => Some(SandboxMode::WorkspaceWrite),
         PermissionMode::SandboxReadOnly => Some(SandboxMode::ReadOnly),
+        PermissionMode::SandboxStrict => Some(SandboxMode::Strict),
         _ => None,
     }?;
     if !sandbox::probe() {

@@ -65,8 +65,12 @@ impl PermissionGate {
             };
         }
 
-        // 4b. Sandbox read-only: reads allowed, writes denied (Landlock-backed).
-        if self.mode == PermissionMode::SandboxReadOnly {
+        // 4b. Sandbox read-only / strict: reads allowed, writes denied. The
+        //     kernel sandbox (Landlock/Seatbelt) is the real backstop; strict
+        //     additionally narrows the readable set at the OS level.
+        if self.mode == PermissionMode::SandboxReadOnly
+            || self.mode == PermissionMode::SandboxStrict
+        {
             return if is_read_only {
                 PermissionDecision::allow()
             } else {

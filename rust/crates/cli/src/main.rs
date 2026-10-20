@@ -57,6 +57,8 @@ enum PermissionModeArg {
     SandboxWorkspaceWrite,
     #[value(alias = "sandboxReadOnly")]
     SandboxReadOnly,
+    #[value(alias = "sandboxStrict")]
+    SandboxStrict,
     #[value(alias = "bypassPermissions")]
     BypassPermissions,
     Plan,
@@ -70,6 +72,7 @@ impl From<PermissionModeArg> for PermissionMode {
             PermissionModeArg::Auto => Self::Auto,
             PermissionModeArg::SandboxWorkspaceWrite => Self::SandboxWorkspaceWrite,
             PermissionModeArg::SandboxReadOnly => Self::SandboxReadOnly,
+            PermissionModeArg::SandboxStrict => Self::SandboxStrict,
             PermissionModeArg::BypassPermissions => Self::BypassPermissions,
             PermissionModeArg::Plan => Self::Plan,
         }
