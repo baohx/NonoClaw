@@ -460,6 +460,23 @@ Build the shared assets:
 bash scripts/vm/build-image.sh
 # outputs to ~/.nonoclaw/vm/: kernel.img, initrd.img, rootfs-bare.ext4, ssh_key{,.pub}
 ```
+
+No Linux host / docker? Run the **VM image** workflow (Actions → *VM image* →
+Run workflow, file `.github/workflows/vm-image.yml`); it performs the same
+build on an ubuntu runner and uploads `~/.nonoclaw/vm/` as an artifact —
+download and extract into your home `~/.nonoclaw/vm/`. Works from any OS.
+
+### macOS runtime
+
+macOS runs microVMs with QEMU (Hypervisor.framework accel; fully unprivileged —
+no docker needed at runtime), so you only need `qemu-system-x86_64` on PATH.
+On **macOS 12 (Intel)** Homebrew no longer provides bottles; see
+`scripts/vm/macos-qemu-launcher/README.md` for extracting QEMU 9.1.2 (hvf
+included) from the UTM 4.6.3 bundle with a tiny dlopen launcher.
+
+Note: `defaultExecution=vm` for Bash currently falls back to the host on macOS
+(the `/workspace` NFS share is a Linux/Firecracker feature). VM-backed Bash on
+macOS needs 9p/virtfs support — tracked separately.
 The build runs entirely inside a privileged docker container (loop mount +
 chroot), so **it only works on Linux**. Once built, the agent starts instances
 with the `Vm` tool (per-instance dirs under `<cwd>/.nonoclaw/vm/<name>/`), or you

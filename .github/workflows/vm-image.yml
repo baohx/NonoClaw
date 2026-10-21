@@ -1,0 +1,73 @@
+name: VM image
+
+# Builds the shared microVM assets (rootfs-bare.ext4 + kernel.img + initrd.img)
+# with scripts/vm/build-image.sh inside a privileged container. macOS hosts
+# cannot run the build (no privileged docker); this workflow is the documented
+# path for them: run it, download the artifact, extract into ~/.nonoclaw/vm/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_gb:
+        description: "rootfs size (GB)"
+        default: "3"
+      debian_build:
+        description: "Debian bookworm nocloud build id (empty = latest)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build VM image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SIZE_GB: ${{ github.event.inputs.size_gb || '3' }}
+      MIRROR: deb.debian.org
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest Debian build id
+        if: github.event.inputs.debian_build == ''
+        run: |
+          id="$(curl -fsSL https://cloud.debian.org/images/cloud/bookworm/ \
+            | grep -oE '2[0-9]{7}-[0-9]{4}' | sort -u | tail -1)"
+          echo "DEBIAN_BUILD=$id" >> "$GITHUB_ENV"
+          echo "resolved: $id"
+
+      - name: Download inputs
+        run: |
+          id="${{ github.event.inputs.debian_build || env.DEBIAN_BUILD }}"
+          mkdir -p release/vm
+          curl -fL --retry 3 -o release/vm/debian-12-nocloud.qcow2 \
+            "https://cloud.debian.org/images/cloud/bookworm/${id}/debian-12-nocloud-amd64.qcow2"
+          curl -fL --retry 3 -o release/vm/vmlinux-fc.bin \
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.102"
+          ls -l release/vm/
+
+      - name: Build image
+        run: bash scripts/vm/build-image.sh
+
+      - name: Verify outputs
+        run: |
+          vm_dir="$HOME/.nonoclaw/vm"
+          echo "VM_DIR=$vm_dir" >> "$GITHUB_ENV"
+          for f in rootfs-bare.ext4 kernel.img initrd.img ssh_key ssh_key.pub; do
+            [ -f "$vm_dir/$f" ] || { echo "missing $f"; exit 1; }
+          done
+          du -h "$vm_dir"/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonoclaw-vm-assets
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ env.VM_DIR }}/rootfs-bare.ext4
+            ${{ env.VM_DIR }}/kernel.img
+            ${{ env.VM_DIR }}/initrd.img
+            ${{ env.VM_DIR }}/ssh_key
+            ${{ env.VM_DIR }}/ssh_key.pub
