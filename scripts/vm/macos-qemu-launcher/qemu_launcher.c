@@ -18,14 +18,16 @@
 #define IMG     QEMU_DIR "/Frameworks/qemu-img.framework/Versions/A/qemu-img"
 #define SHARE   QEMU_DIR "/share"
 
-// softmmu dylibs export the modular API instead of main().
+// softmmu dylibs export the modular API instead of main(). qemu_init is void
+// in upstream softmmu/main.c (error paths exit() internally and never return);
+// misdeclaring it as int returns garbage in eax, so follow the real signature.
 static int run_softmmu(int argc, char **argv) {
     void *h = dlopen(SOFTMMU, RTLD_NOW | RTLD_GLOBAL);
     if (!h) { fprintf(stderr, "qemu-system-x86_64: %s\n", dlerror()); return 1; }
 
-    int  (*qemu_init)(int, char **) = dlsym(h, "qemu_init");
-    void (*qemu_main_loop)(void)    = dlsym(h, "qemu_main_loop");
-    void (*qemu_cleanup)(void)      = dlsym(h, "qemu_cleanup");
+    void (*qemu_init)(int, char **)  = dlsym(h, "qemu_init");
+    void (*qemu_main_loop)(void)     = dlsym(h, "qemu_main_loop");
+    void (*qemu_cleanup)(void)       = dlsym(h, "qemu_cleanup");
     if (!qemu_init || !qemu_main_loop || !qemu_cleanup) {
         fprintf(stderr, "qemu-system-x86_64: missing symbols: %s\n", dlerror());
         return 1;
@@ -41,12 +43,10 @@ static int run_softmmu(int argc, char **argv) {
     for (int i = 1; i < argc; i++) nargv[n++] = argv[i];
     nargv[n] = NULL;
 
-    int rc = qemu_init(n, nargv);
-    if (rc == 0) {
-        qemu_main_loop();
-        qemu_cleanup();
-    }
-    return rc;
+    qemu_init(n, nargv);
+    qemu_main_loop();
+    qemu_cleanup();
+    return 0;
 }
 
 // qemu-img dylib exports main(); forward argv verbatim.
