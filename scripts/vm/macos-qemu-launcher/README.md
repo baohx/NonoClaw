@@ -24,7 +24,18 @@ clang -arch x86_64 -O2 -rpath /usr/local/lib/qemu-utm/Frameworks \
 cp /tmp/qemu-launcher /usr/local/bin/qemu-system-x86_64
 cp /tmp/qemu-launcher /usr/local/bin/qemu-img
 
-# 3. verify
+# 3. ad-hoc sign with the hypervisor entitlement, else hvf aborts HV_DENIED
+#    (clang's default ad-hoc signature lacks it; qemu-img needs no entitlement)
+cat > /tmp/hv-ent.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.hypervisor</key><true/>
+</dict></plist>
+PLIST
+codesign -f -s - --entitlements /tmp/hv-ent.plist /usr/local/bin/qemu-system-x86_64
+
+# 4. verify
 qemu-system-x86_64 --version      # QEMU emulator version 9.1.2
 qemu-system-x86_64 -accel help    # tcg, hvf
 ```
