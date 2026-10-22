@@ -77,7 +77,10 @@ pub async fn maybe_run_in_vm(
         .map(|ms| (ms / 1000).max(1))
         .unwrap_or(120);
 
-    let script = format!("cd {WORKSPACE} && {command}");
+    // All host fallbacks are past; this command WILL run in the guest. Rewrite
+    // host project-root paths so absolute-path commands still find the files.
+    let translated = translate_to_workspace(command, &cwd.to_string_lossy());
+    let script = format!("cd {WORKSPACE} && {translated}");
     let run = ssh::exec(cwd, &inst, &script, timeout_secs);
     let result = tokio::select! {
         r = run => r,
@@ -101,11 +104,91 @@ pub async fn maybe_run_in_vm(
 /// Skips leading `VAR=value` assignments and `env`, so `FOO=1 apt-get update`
 /// is still classified as host-only.
 fn is_host_only(command: &str) -> bool {
-    command
+    let mut tokens = command
         .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
-        .find(|t| !t.is_empty() && *t != "env" && !is_assignment(t))
-        .map(|t| HOST_ONLY.contains(&t))
-        .unwrap_or(false)
+        .filter(|t| !t.is_empty() && *t != "env" && !is_assignment(t));
+    match tokens.next() {
+        Some(t) if HOST_ONLY.contains(&t) => true,
+        // Git network subcommands need host SSH credentials / host keys; the
+        // guest has neither, so they always fail there (Host key verification
+        // failed). Route them to the host like other credential-bound tools.
+        Some("git") => git_subcommand(tokens).map(is_git_network_subcommand).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// First non-flag token after `git` (the subcommand), skipping global flags
+/// and the value of flags that take one (`-C <path>`, `-c <cfg>`, ...).
+fn git_subcommand<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut skip_next = false;
+    for t in tokens {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if let Some(flag) = t.strip_prefix("--") {
+            // `--flag=value` carries its own value; bare long flags we know
+            // of (`--no-pager`, `--literal-pathspecs`) take none
+            if flag.contains('=') {
+                continue;
+            }
+            if matches!(t, "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+                skip_next = true;
+            }
+            continue;
+        }
+        if t.starts_with('-') && t.len() > 1 {
+            if matches!(t, "-C" | "-c") {
+                skip_next = true;
+            }
+            continue;
+        }
+        return Some(t);
+    }
+    None
+}
+
+/// Rewrite absolute host paths that point into the project to the guest mount
+/// (`/workspace`), so commands phrased with host paths (system prompts prefer
+/// absolute paths) still find the files in the guest. Only literal matches of
+/// the project root are translated — `~` is left alone (the guest home is a
+/// different directory).
+fn translate_to_workspace(command: &str, host_cwd: &str) -> String {
+    let cwd = host_cwd.trim_end_matches('/');
+    if cwd.len() < 2 || !command.contains(cwd) {
+        return command.to_string();
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while let Some(idx) = rest.find(cwd) {
+        let after = &rest[idx + cwd.len()..];
+        // Word boundary: the next char must not extend the path component
+        // (`/x/NonoClaw2` must not match a cwd of `/x/NonoClaw`).
+        let boundary_ok = after
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(true);
+        out.push_str(&rest[..idx]);
+        if boundary_ok {
+            out.push_str(WORKSPACE);
+        } else {
+            // False positive: a longer path component shares the prefix; keep
+            // the host text as-is and continue scanning after it.
+            out.push_str(cwd);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Git subcommands that talk to remotes and therefore need host credentials.
+fn is_git_network_subcommand(sub: &str) -> bool {
+    matches!(
+        sub,
+        "fetch" | "pull" | "push" | "clone" | "remote" | "ls-remote" | "submodule" | "bundle"
+    )
 }
 
 /// `NAME=value` with a shell-legal identifier on the left.
@@ -132,5 +215,53 @@ mod tests {
         assert!(is_host_only("env docker ps"));
         assert!(!is_host_only("git status"));
         assert!(!is_host_only("ls -la && cat x"));
+        // git network subcommands need host SSH credentials — route to host
+        assert!(is_host_only("git fetch origin"));
+        assert!(is_host_only("git push origin main"));
+        assert!(is_host_only("git pull"));
+        assert!(is_host_only("git clone https://example.com/repo.git"));
+        assert!(is_host_only("git -C /workspace fetch origin"));
+        // local git operations keep running in the guest (shared /workspace)
+        assert!(!is_host_only("git status"));
+        assert!(!is_host_only("git log --oneline -3"));
+        assert!(!is_host_only("git -C /workspace diff"));
+    }
+
+    #[test]
+    fn workspace_path_translation() {
+        let cwd = "/home/baohx/NonoClaw";
+        // absolute host paths are rewritten to the guest mount
+        assert_eq!(
+            translate_to_workspace("cd /home/baohx/NonoClaw && cargo test", cwd),
+            "cd /workspace && cargo test"
+        );
+        assert_eq!(
+            translate_to_workspace("cat /home/baohx/NonoClaw/docs/x.md", cwd),
+            "cat /workspace/docs/x.md"
+        );
+        // multiple occurrences
+        assert_eq!(
+            translate_to_workspace("cp /home/baohx/NonoClaw/a /home/baohx/NonoClaw/b", cwd),
+            "cp /workspace/a /workspace/b"
+        );
+        // longer components sharing the prefix are NOT rewritten
+        assert_eq!(
+            translate_to_workspace("ls /home/baohx/NonoClaw2", cwd),
+            "ls /home/baohx/NonoClaw2"
+        );
+        // no match -> unchanged; relative paths and ~ are untouched
+        assert_eq!(
+            translate_to_workspace("cargo test -p nonoclaw-tools", cwd),
+            "cargo test -p nonoclaw-tools"
+        );
+        assert_eq!(
+            translate_to_workspace("cat ~/.nonoclaw/NONOCLAW.md", cwd),
+            "cat ~/.nonoclaw/NONOCLAW.md"
+        );
+        // cwd with trailing slash normalizes
+        assert_eq!(
+            translate_to_workspace("cd /home/baohx/NonoClaw/rust", "/home/baohx/NonoClaw/"),
+            "cd /workspace/rust"
+        );
     }
 }
