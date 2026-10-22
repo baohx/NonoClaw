@@ -21,7 +21,16 @@ impl VmSupervisor for QemuBackend {
         let name = &inst.name;
         let dir = instance_dir(cwd, name);
         let assets = vm_assets_dir();
-        let kernel = assets.join("kernel.img");
+        // Prefer the Debian distro bzImage (kernel-qemu.img) — it has virtio-pci
+        // + PCI + ACPI, which QEMU q35 needs. The FC vmlinux (kernel.img) has
+        // none of those and never finds the disk under QEMU. Fall back to
+        // kernel.img for older asset sets that predate the split.
+        let kernel_qemu = assets.join("kernel-qemu.img");
+        let kernel = if kernel_qemu.is_file() {
+            kernel_qemu
+        } else {
+            assets.join("kernel.img")
+        };
         let rootfs = dir.join("rootfs.img");
         if !rootfs.is_file() {
             return Err(format!(
@@ -36,9 +45,11 @@ impl VmSupervisor for QemuBackend {
                 assets.display()
             ));
         }
-        // Same assets as the Firecracker backend: direct kernel boot, root on
-        // partition 1, DHCP (slirp serves 10.0.2.15 natively).
-        let kernel_args = "root=/dev/vda1 rw console=ttyS0".to_string();
+        // Same assets as the Firecracker backend: direct kernel boot with the
+        // bare ext4 rootfs (no partition table — the whole virtio-blk device
+        // IS the root fs, so root=/dev/vda; root=/dev/vda1 would never find
+        // the partition node). DHCP: slirp serves 10.0.2.15 natively.
+        let kernel_args = "root=/dev/vda rw console=ttyS0".to_string();
 
         // Stop any previous qemu for this instance.
         stop_qemu(&dir).await;
@@ -111,8 +122,15 @@ async fn stop_qemu(dir: &Path) {
                 .output()
                 .await;
             // Wait for exit so a subsequent start doesn't race the old process.
+            // kill -0: portable liveness probe (macOS has no /proc).
             for _ in 0..20 {
-                if !Path::new("/proc").join(pid).exists() {
+                if !Command::new("kill")
+                    .args(["-0", pid])
+                    .output()
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;

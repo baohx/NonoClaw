@@ -181,8 +181,9 @@ pub fn scan_instances(cwd: &Path) -> Vec<VmInstance> {
 
 /// Whether the supervisor process for this instance is still alive.
 /// Firecracker: the `nonoclaw-vm-<name>` docker container must be running.
-/// QEMU: the PID recorded in `<instance dir>/qemu.pid` must exist under /proc.
-/// State on disk can be stale (e.g. host reboot SIGKILLs the container), so
+/// QEMU: the PID recorded in `<instance dir>/qemu.pid` must be alive.
+/// `kill -0` checks liveness portably (macOS has no /proc).
+/// State on disk can be stale (e.g. host reboot SIGKILLs the VM), so
 /// callers use this to reconcile `Running`/`Starting` → `Stopped`.
 fn process_alive(cwd: &Path, inst: &VmInstance) -> bool {
     match inst.backend {
@@ -199,7 +200,14 @@ fn process_alive(cwd: &Path, inst: &VmInstance) -> bool {
                 return false;
             };
             let pid = pid.trim();
-            !pid.is_empty() && Path::new("/proc").join(pid).exists()
+            !pid.is_empty()
+                && std::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
         }
     }
 }

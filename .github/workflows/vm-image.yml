@@ -61,7 +61,7 @@ jobs:
         run: |
           vm_dir="$HOME/.nonoclaw/vm"
           echo "VM_DIR=$vm_dir" >> "$GITHUB_ENV"
-          for f in rootfs-bare.ext4 kernel.img initrd.img ssh_key ssh_key.pub; do
+          for f in rootfs-bare.ext4 kernel.img kernel-qemu.img initrd.img ssh_key ssh_key.pub; do
             [ -f "$vm_dir/$f" ] || { echo "missing $f"; exit 1; }
           done
           du -h "$vm_dir"/*
@@ -75,6 +75,7 @@ jobs:
           path: |
             ${{ env.VM_DIR }}/rootfs-bare.ext4
             ${{ env.VM_DIR }}/kernel.img
+            ${{ env.VM_DIR }}/kernel-qemu.img
             ${{ env.VM_DIR }}/initrd.img
             ${{ env.VM_DIR }}/ssh_key
             ${{ env.VM_DIR }}/ssh_key.pub

@@ -13,6 +13,9 @@
 #   kernel.img            — Firecracker CI ELF vmlinux (NOT the Debian bzImage:
 #                           Firecracker's loader rejects the LZMA bzImage with
 #                           InvalidElfMagicNumber). Sourced from release/vm/.
+#   kernel-qemu.img       — Debian distro bzImage (full virtio-pci + PCI + ACPI)
+#                           for the QEMU backend; the FC vmlinux can't find the
+#                           disk under QEMU. QEMU's loader accepts the bzImage.
 #   initrd.img            — matching Debian initrd
 #   ssh_key / ssh_key.pub — global VM keypair
 #
@@ -375,7 +378,13 @@ mkdir -p /assets
 cp /fc-kernel.bin /assets/kernel.img
 KVER=$(ls /mnt/vm/boot | grep -E '^vmlinuz-[0-9]' | sed 's/^vmlinuz-//' | sort -V | tail -1)
 cp "/mnt/vm/boot/initrd.img-$KVER" /assets/initrd.img
-echo "kernel: FC vmlinux (ELF); initrd: $KVER"
+# QEMU kernel: the Debian distro bzImage (full virtio-pci + PCI + ACPI). The FC
+# vmlinux has none of those — it boots under Firecracker (virtio-mmio, auto-
+# injected cmdline) but under QEMU q35 never finds /dev/vda and under microvm
+# freezes at ACPI init. QEMU's -kernel loader accepts the LZMA bzImage that
+# Firecracker's loader rejects, so macOS/QEMU boots this one instead.
+cp "/mnt/vm/boot/vmlinuz-$KVER" /assets/kernel-qemu.img
+echo "kernel: FC vmlinux (ELF) + Debian bzImage (QEMU); initrd: $KVER"
 # Sync the loop-mounted rootfs, then detach it. A plain `umount` here aborts the
 # build under `set -e` if the mount is briefly busy; lazy-unmount (-l) always
 # succeeds and the preceding sync guarantees data is flushed to the raw image.
