@@ -189,9 +189,6 @@ pub enum ApiFormat {
     /// Google Gemini native API (`/v1/models/<id>:streamGenerateContent`).
     /// Used by OpenCode Zen for Gemini model families.
     Gemini,
-    /// AWS Kiro (CodeWhisperer) `generateAssistantResponse`. Non-streaming;
-    /// no tool calling; auth via AWS SSO cached tokens.
-    Kiro,
 }
 
 impl ApiFormat {
@@ -202,30 +199,11 @@ impl ApiFormat {
             ApiFormat::OpenAI => "openai",
             ApiFormat::Responses => "responses",
             ApiFormat::Gemini => "gemini",
-            ApiFormat::Kiro => "kiro",
         }
     }
 
     pub fn capabilities(self) -> ProviderCapabilities {
         match self {
-            ApiFormat::Kiro => ProviderCapabilities {
-                tools: CapabilityStatus::Unsupported {
-                    reason: "Kiro backend does not expose tool calling",
-                },
-                streaming: CapabilityStatus::Unsupported {
-                    reason: "Kiro generateAssistantResponse is non-streaming",
-                },
-                thinking: CapabilityStatus::Unsupported {
-                    reason: "Kiro backend does not support extended thinking",
-                },
-                cache_usage: CapabilityStatus::Unsupported {
-                    reason: "Kiro backend does not report cache token counts",
-                },
-                prompt_caching: CapabilityStatus::Unsupported {
-                    reason: "Kiro backend does not support prompt caching",
-                },
-                images: CapabilityStatus::Supported,
-            },
             ApiFormat::Anthropic => ProviderCapabilities {
                 streaming: CapabilityStatus::Supported,
                 thinking: CapabilityStatus::Supported,
@@ -512,17 +490,11 @@ impl Client {
                 let base = self.base_url.trim().trim_end_matches('/');
                 let url = if base.contains("streamGenerateContent") {
                     base.to_string()
-                } else if base.ends_with("/v1") || base.contains("/v1/") {
+                } else if base.ends_with("/v1") || base.ends_with("/v1beta") || base.contains("/v1/") || base.contains("/v1beta/") {
                     format!("{}/models/{}:streamGenerateContent", base, params.model)
                 } else {
                     format!("{}/v1/models/{}:streamGenerateContent", base, params.model)
                 };
-                (url, body)
-            }
-            ApiFormat::Kiro => {
-                let body = crate::kiro_wire::serialize_body_kiro(params)?;
-                dump_prompt_openai(params, &body);
-                let url = crate::kiro_wire::KIRO_API_URL.to_string();
                 (url, body)
             }
         };
@@ -562,14 +534,10 @@ impl Client {
                     req = req.header("x-goog-api-key", key);
                 }
             }
-            ApiFormat::Kiro => {
-                // Kiro auth is handled in send_request() where async is
-                // available.  This branch is intentionally empty.
-            }
         }
         // OpenCode Go endpoints hard-require a stable per-conversation id
         // (`x-opencode-session`) for routing; other providers ignore it.
-        if self.base_url.contains("opencode.ai/zen/go") {
+        if self.base_url.contains("opencode.ai/zen/go") || self.base_url.contains("opencode.ai/inference/go") {
             let session = params.session_id.as_deref().unwrap_or("nonoclaw");
             req = req.header("x-opencode-session", session);
         }
@@ -616,7 +584,7 @@ impl Client {
                 let url =
                     if base.contains("streamGenerateContent") || base.contains("generateContent") {
                         base.to_string()
-                    } else if base.ends_with("/v1") || base.contains("/v1/") {
+                    } else if base.ends_with("/v1") || base.ends_with("/v1beta") || base.contains("/v1/") || base.contains("/v1beta/") {
                         format!("{}/models/{}:generateContent", base, model)
                     } else {
                         format!("{}/v1/models/{}:generateContent", base, model)
@@ -629,20 +597,6 @@ impl Client {
                     }))?,
                 )
             }
-            ApiFormat::Kiro => (
-                crate::kiro_wire::KIRO_API_URL.to_string(),
-                serde_json::to_string(&serde_json::json!({
-                    "conversationState": {
-                        "currentMessage": {
-                            "userInputMessage": {
-                                "content": "hi",
-                                "origin": "AI_EDITOR"
-                            }
-                        },
-                        "chatTriggerType": "MANUAL"
-                    }
-                }))?,
-            ),
         };
         // Reuse the canonical header set (auth per format) via build_request's
         // rules: keep this probe aligned with real request authentication.
@@ -672,22 +626,8 @@ impl Client {
                     req = req.header("x-goog-api-key", key);
                 }
             }
-            ApiFormat::Kiro => {
-                // Kiro auth is handled below after build_request returns.
-            }
         }
-        if self.format == ApiFormat::Kiro {
-            let token_manager = crate::kiro::KiroTokenManager::new();
-            match token_manager.access_token().await {
-                Ok(token) => {
-                    req = req.header("Authorization", format!("Bearer {token}"));
-                }
-                Err(e) => {
-                    return Ok((401, e.user_message()));
-                }
-            }
-        }
-        if self.base_url.contains("opencode.ai/zen/go") {
+        if self.base_url.contains("opencode.ai/zen/go") || self.base_url.contains("opencode.ai/inference/go") {
             req = req.header("x-opencode-session", "nonoclaw");
         }
         let resp = req
@@ -705,20 +645,6 @@ impl Client {
         params: &RequestParams,
     ) -> Result<(reqwest::Response, Option<RawApiLogger>)> {
         let (mut req, logger) = self.build_request(params)?;
-        // Kiro auth: read AWS SSO cached access token, refreshing if expired.
-        if self.format == ApiFormat::Kiro {
-            let token_manager = crate::kiro::KiroTokenManager::new();
-            match token_manager.access_token().await {
-                Ok(token) => {
-                    req = req.header("Authorization", format!("Bearer {token}"));
-                }
-                Err(e) => {
-                    let msg = e.user_message();
-                    tracing::error!("kiro auth: {msg}");
-                    return Err(Error::Auth(msg));
-                }
-            }
-        }
         let resp = req
             .send()
             .await
@@ -798,9 +724,6 @@ impl Client {
             }
             ApiFormat::Gemini => {
                 fold_gemini_stream(response.0, response.1, &mut on_event, &cancel).await
-            }
-            ApiFormat::Kiro => {
-                fold_kiro_non_stream(response.0, response.1, params, &mut on_event).await
             }
         };
         if let Err(failure) = &result {
@@ -2677,124 +2600,6 @@ fn uuid_timestamp() -> u128 {
         .unwrap_or_default()
 }
 
-/// Handle a Kiro `generateAssistantResponse` reply.
-///
-/// Kiro returns an AWS event-stream binary body (not JSON).  We read the full
-/// body, parse the event-stream frames, extract the assistant text from
-/// `assistantResponseEvent` frames, then synthesize the standard `StreamEvent`
-/// sequence (MessageStart → TextDelta → MessageStop) so the existing event
-/// consumers work without modification.
-async fn fold_kiro_non_stream(
-    response: reqwest::Response,
-    raw_log: Option<RawApiLogger>,
-    params: &RequestParams,
-    on_event: &mut impl FnMut(&StreamEvent),
-) -> std::result::Result<TurnOutput, StreamFailure> {
-    let status = response.status();
-    let body_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| {
-            StreamFailure::before_stream(ProviderError::from_core(
-                &nonoclaw_core::Error::Network(format!(
-                    "kiro: failed to read response body: {e}"
-                )),
-                "read_response",
-            ))
-        })?;
-
-    if let Some(_log) = &raw_log {
-        tracing::debug!(
-            "kiro raw response ({} bytes, hex): {}",
-            body_bytes.len(),
-            body_bytes.iter().take(200).map(|b| format!("{b:02x}")).collect::<String>()
-        );
-    }
-
-    if !status.is_success() {
-        let error_msg = format!(
-            "kiro: HTTP {status}: {}",
-            String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(300)])
-        );
-        return Err(StreamFailure::before_stream(ProviderError::from_core(
-            &nonoclaw_core::Error::Api {
-                status: status.as_u16(),
-                message: error_msg,
-                kind: nonoclaw_core::ApiErrorKind::NonRetryable,
-            },
-            "http_status",
-        )));
-    }
-
-    // Parse AWS event-stream frames.
-    let frames = crate::kiro_wire::parse_aws_event_stream(&body_bytes);
-    let text = crate::kiro_wire::extract_text_from_frames(&frames);
-    let tool_uses = crate::kiro_wire::extract_tool_uses_from_frames(&frames);
-
-    if text.is_empty() && tool_uses.is_empty() {
-        return Err(StreamFailure::before_stream(
-            ProviderError::invalid_response("kiro: empty response content".to_string()),
-        ));
-    }
-
-    let model_used = params.model.clone();
-    let message_id = String::new(); // Kiro event-stream does not provide message IDs.
-
-    // Emit simulated stream events.
-    on_event(&StreamEvent::MessageStart {
-        message_id: message_id.clone(),
-        model: model_used.clone(),
-        usage: nonoclaw_core::UsagePart {
-            input_tokens: Some(0),
-            output_tokens: Some(0),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        },
-    });
-    if !text.is_empty() {
-        on_event(&StreamEvent::TextDelta {
-            text: text.clone(),
-        });
-    }
-    let mut content: Vec<ContentBlock> = Vec::new();
-    if !text.is_empty() {
-        content.push(ContentBlock::Text {
-            text,
-            cache_control: None,
-        });
-    }
-    let mut stop_reason = nonoclaw_core::StopReason::EndTurn;
-    for (index, tu) in tool_uses.iter().enumerate() {
-        on_event(&StreamEvent::ToolUseStart {
-            index,
-            id: tu.tool_use_id.clone(),
-            name: tu.name.clone(),
-        });
-        let input_json = tu.input.to_string();
-        on_event(&StreamEvent::ToolUseInputDelta {
-            index,
-            partial_json: input_json.clone(),
-        });
-        on_event(&StreamEvent::BlockStop { index });
-        content.push(ContentBlock::ToolUse {
-            id: tu.tool_use_id.clone(),
-            name: tu.name.clone(),
-            input: tu.input.clone(),
-            cache_control: None,
-        });
-        stop_reason = nonoclaw_core::StopReason::ToolUse;
-    }
-    on_event(&StreamEvent::MessageStop);
-
-    Ok(TurnOutput {
-        message_id,
-        model: model_used,
-        content,
-        stop_reason: Some(stop_reason),
-        usage: Usage::default(),
-    })
-}
-
 async fn fold_gemini_stream(
     response: reqwest::Response,
     raw_log: Option<RawApiLogger>,
@@ -3726,6 +3531,43 @@ mod tests {
         assert_eq!(
             endpoint_url("https://gateway.example/v3beta", "v3beta/chat/completions"),
             "https://gateway.example/v3beta/chat/completions"
+        );
+    }
+
+    #[test]
+    fn gemini_urls_accept_v1beta_base() {
+        // OpenCode zen exposes Gemini via .../inference/go/google/v1beta; the
+        // version segment is already present and must not be doubled.
+        let base = "https://opencode.ai/inference/go/google/v1beta";
+        let expect_stream = format!("{base}/models/gemini-4-argon:streamGenerateContent");
+        let expect_once = format!("{base}/models/gemini-4-argon:generateContent");
+
+        // Streaming shape (build_request path).
+        let b = base.trim().trim_end_matches('/');
+        let url = if b.contains("streamGenerateContent") {
+            b.to_string()
+        } else if b.ends_with("/v1") || b.ends_with("/v1beta") || b.contains("/v1/") || b.contains("/v1beta/") {
+            format!("{b}/models/gemini-4-argon:streamGenerateContent")
+        } else {
+            format!("{b}/v1/models/gemini-4-argon:streamGenerateContent")
+        };
+        assert_eq!(url, expect_stream);
+
+        // One-shot shape (probe path).
+        let url = if b.contains("streamGenerateContent") || b.contains("generateContent") {
+            b.to_string()
+        } else if b.ends_with("/v1") || b.ends_with("/v1beta") || b.contains("/v1/") || b.contains("/v1beta/") {
+            format!("{b}/models/gemini-4-argon:generateContent")
+        } else {
+            format!("{b}/v1/models/gemini-4-argon:generateContent")
+        };
+        assert_eq!(url, expect_once);
+
+        // Unversioned root keeps the /v1 insertion.
+        let root = "https://generativelanguage.googleapis.com";
+        assert_eq!(
+            format!("{root}/v1/models/gemini-4-argon:streamGenerateContent"),
+            "https://generativelanguage.googleapis.com/v1/models/gemini-4-argon:streamGenerateContent"
         );
     }
 

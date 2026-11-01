@@ -256,34 +256,7 @@ function resolveNonoclawBin() {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 let serverProc = null;
-let kiroProxyProc = null;
 let shuttingDown = false;
-
-function startKiroProxy(env) {
-  if (!PORTABLE_ROOT) return;
-  const proxyDir = path.join(PORTABLE_ROOT, "runtime", "kiro-proxy");
-  const main = path.join(proxyDir, "main.py");
-  if (!fs.existsSync(main)) return;
-
-  const python = path.join(PORTABLE_ROOT, "runtime", "python", "python.exe");
-  kiroProxyProc = spawn(python, [main, "--host", "127.0.0.1", "--port", "8000"], {
-    cwd: proxyDir,
-    env: {
-      ...env,
-      ACCOUNTS_CONFIG_FILE: path.join(proxyDir, "credentials.json"),
-      ACCOUNTS_STATE_FILE: path.join(proxyDir, "state.json"),
-      PYTHONUTF8: "1",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  kiroProxyProc.stdout?.on("data", (d) => console.log(`[kiro-proxy] ${d.toString().trimEnd()}`));
-  kiroProxyProc.stderr?.on("data", (d) => console.error(`[kiro-proxy] ${d.toString().trimEnd()}`));
-  kiroProxyProc.on("exit", (code) => {
-    console.log(`[kiro-proxy] exited with code ${code}`);
-    kiroProxyProc = null;
-  });
-}
 
 function startServer(port) {
   const bin = resolveNonoclawBin();
@@ -336,7 +309,6 @@ function startServer(port) {
     fs.mkdirSync(cwd, { recursive: true });
     ensurePortableFirstRun(home);
     env = portableBackendEnv(home);
-    startKiroProxy(env);
     console.log(`[desktop] portable mode: NONOCLAW_HOME=${home}`);
   }
   serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`], {
@@ -363,10 +335,6 @@ function startServer(port) {
 
 function killServer() {
   shuttingDown = true;
-  if (kiroProxyProc) {
-    try { kiroProxyProc.kill("SIGTERM"); } catch { /* already gone */ }
-    kiroProxyProc = null;
-  }
   if (!serverProc) return;
   try {
     // SIGTERM lets tokio shut down gracefully (flush session writer actor).
