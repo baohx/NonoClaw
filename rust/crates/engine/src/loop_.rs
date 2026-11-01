@@ -1924,6 +1924,14 @@ impl QueryEngine {
         // disabled for the recovery turn (see the truncation branch below).
         let mut output_truncation_recoveries: u32 = 0;
         let mut suppress_thinking_next_turn = false;
+        // Thinking-truncation recovery also boosts the recovery turn's output
+        // cap: the models that hit this (glm/kimi/deepseek/qwen native
+        // reasoners) run `thinking: None`, where setting thinking to None is
+        // a no-op on the wire — the "thinking is disabled" nudge alone cannot
+        // stop them re-burning the same cap. Extra headroom gives the draft a
+        // chance to actually convert into text/tool calls. Cleared alongside
+        // suppress_thinking_next_turn after the turn completes.
+        let mut boost_max_tokens_next_turn = false;
         // Set by the graceful stream-truncation path when it fabricates a
         // MaxTokens stop reason for a turn that actually died mid-stream.
         // Read by the truncation-recovery gate below. Initialized (false) at
@@ -2628,7 +2636,13 @@ impl QueryEngine {
             max_tokens_stop_was_fabricated = false;
             let params = RequestParams {
                 model: self.options.model.clone(),
-                max_tokens: self.options.max_tokens,
+                max_tokens: if boost_max_tokens_next_turn {
+                    // Recovery turn: double the cap (saturating) so the model
+                    // can finish thinking AND emit the pending output.
+                    self.options.max_tokens.saturating_mul(2)
+                } else {
+                    self.options.max_tokens
+                },
                 system: request_system,
                 messages: request_messages,
                 tools: request_tools,
@@ -2820,6 +2834,7 @@ impl QueryEngine {
             });
             last_stop = turn.stop_reason.clone();
             suppress_thinking_next_turn = false;
+            boost_max_tokens_next_turn = false;
 
             // Collect assistant text for display + the transcript message.
             let assistant_text: String = turn
@@ -2959,9 +2974,10 @@ impl QueryEngine {
                     if output_truncation_recoveries < MAX_OUTPUT_TRUNCATION_RECOVERIES {
                         output_truncation_recoveries += 1;
                         suppress_thinking_next_turn = true;
+                        boost_max_tokens_next_turn = true;
                         let draft_tail = thinking_draft_tail(&turn.content);
                         let body = format!(
-                            "<recovery_notice>\nYour previous turn was cut off by the per-turn output limit while still thinking: no text or tool call reached the transcript, and prior thinking is not replayed to you on later turns. A tail of your unfinished draft follows.\nDo NOT restart the analysis and do NOT draft further in the thinking channel — thinking is disabled for this turn. Act now on what you already worked out: emit the pending Edit/Write/tool calls, or if the work is done, the final answer text. Keep this turn's output short.\n<unfinished_draft_tail>\n{}\n</unfinished_draft_tail>\n</recovery_notice>",
+                            "<recovery_notice>\nYour previous turn was cut off by the per-turn output limit while still thinking: no text or tool call reached the transcript, and prior thinking is not replayed to you on later turns. A tail of your unfinished draft follows.\nDo NOT restart the analysis and do NOT draft further in the thinking channel — keep thinking minimal this turn; your per-turn output cap has been raised. Act now on what you already worked out: emit the pending Edit/Write/tool calls, or if the work is done, the final answer text.\n<unfinished_draft_tail>\n{}\n</unfinished_draft_tail>\n</recovery_notice>",
                             draft_tail
                         );
                         let recovery_msg = Message::user(MessageContent::from_text(body));
@@ -2971,7 +2987,7 @@ impl QueryEngine {
                         on_event(&RunEvent::RecoveryApplied {
                             category: "max_tokens_thinking_truncation".into(),
                             detail: format!(
-                                "recovery nudge {}/{} injected; thinking disabled for the next turn",
+                                "recovery nudge {}/{} injected; output cap doubled for the next turn",
                                 output_truncation_recoveries, MAX_OUTPUT_TRUNCATION_RECOVERIES
                             ),
                             items_affected: 0,
