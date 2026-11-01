@@ -680,7 +680,6 @@ fn parse_model_api_format(value: &str) -> Option<ApiFormat> {
         "openai" | "openaicompatible" => Some(ApiFormat::OpenAI),
         "responses" | "openairesponses" => Some(ApiFormat::Responses),
         "gemini" | "google" | "googleai" => Some(ApiFormat::Gemini),
-        "kiro" | "codewhisperer" | "aws" => Some(ApiFormat::Kiro),
         _ => None,
     }
 }

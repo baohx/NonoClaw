@@ -316,26 +316,13 @@ if [ -f "$ZHY_SRC/zhihuiya-proxy.mjs" ]; then
   npm install --omit=dev --no-audit --no-fund --prefix "$RT/node-mcp/zhihuiya"
 fi
 
-mkdir -p "$RT/python-mcp" "$RT/kiro-proxy" "$PKG/.nonoclaw" "$PKG/workspace"
+mkdir -p "$RT/python-mcp" "$PKG/.nonoclaw" "$PKG/workspace"
 cp "$HOME/.nonoclaw/mcp-proxies/crawl4ai-proxy.py" "$RT/python-mcp/"
 cp "$HOME/.nonoclaw/mcp-proxies/miaoda-mcp.py" "$RT/python-mcp/"
 cp -a "$HOME/.nonoclaw/ontology-mcp" "$RT/python-mcp/ontology"
 rm -rf "$RT/python-mcp/ontology/__pycache__"
 cp -a "$HOME/.nonoclaw/plugins/drawio-scientific-illustrator" "$RT/node-mcp/drawio"
 rm -rf "$RT/node-mcp/drawio/.git"
-
-KIRO_SRC="${KIRO_PROXY_SOURCE:-$HOME/kiro-gateway}"
-[ -f "$KIRO_SRC/main.py" ] || { echo "kiro-proxy source missing: $KIRO_SRC"; exit 1; }
-cp "$KIRO_SRC/main.py" "$RT/kiro-proxy/"
-cp -a "$KIRO_SRC/kiro" "$RT/kiro-proxy/"
-cp "$KIRO_SRC/credentials.json" "$RT/kiro-proxy/"
-[ ! -f "$KIRO_SRC/state.json" ] || cp "$KIRO_SRC/state.json" "$RT/kiro-proxy/"
-# Keep the current proxy API key but remove machine-local Linux paths/proxies.
-if [ -f "$KIRO_SRC/.env" ]; then
-  grep -E '^(PROXY_API_KEY|DEBUG_MODE)=' "$KIRO_SRC/.env" > "$RT/kiro-proxy/.env" || true
-fi
-printf 'KIRO_CREDS_FILE=credentials.json\n' >> "$RT/kiro-proxy/.env"
-rm -rf "$RT/kiro-proxy/kiro/__pycache__"
 
 # Copy the current configuration, including API keys, and rewrite only paths.
 cp "$HOME/.nonoclaw/settings.json" "$PKG/templates/settings.json"
@@ -429,15 +416,14 @@ NonoClaw Windows 11 绿色版（免安装）
 目录不可写时应用会拒绝启动，不会回退写入用户目录。
 
 内置 Node、Python（含 venv）、Rust 工具链（rustc/cargo/rustup）、Git、
-rg、Poppler、MarkItDown、11 个当前 MCP，及 kiro-proxy。kiro-proxy 会随
-NonoClaw 自动启动于 127.0.0.1:8000。
-当前 settings.json（含 Key）和 Kiro 凭据已复制，无需重新输入。
+rg、Poppler、MarkItDown、11 个当前 MCP。
+当前 settings.json（含 Key）已复制，无需重新输入。
 需要联网或账号状态的 MCP 仍受网络、Token 有效期和 Windows 兼容性限制。
 
 网络：所有本地服务仅监听 127.0.0.1 回环地址，不会触发 Windows 防火墙
 管理员授权弹窗；外网访问仅由本机主动发起（HTTPS 出站）。
 
-安全：本包包含私密 API Key 和 Kiro 凭据，请勿发送给其他人。
+安全：本包包含私密 API Key，请勿发送给其他人。
 EOF
 
 # ---------------------------------------------------------------------------
@@ -451,8 +437,8 @@ for f in "$RT/node/node.exe" "$RT/python/python.exe" "$RT/bin/rg.exe" \
          "$RT/poppler/Library/bin/pdftotext.exe" \
          "$RT/vcrt/vcruntime140.dll" "$RT/vcrt/msvcp140.dll" \
          "$RT/node-mcp/context7.js" "$RT/node-mcp/playwright.js" \
-         "$RT/python-mcp/crawl4ai-proxy.py" "$RT/kiro-proxy/main.py" \
-         "$RT/kiro-proxy/credentials.json" "$PKG/resources/app.asar" \
+         "$RT/python-mcp/crawl4ai-proxy.py" \
+         "$PKG/resources/app.asar" \
          "$PKG/templates/settings.json"; do
   [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
 done

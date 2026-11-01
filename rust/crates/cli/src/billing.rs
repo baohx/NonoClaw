@@ -115,12 +115,6 @@ async fn query_one(
         return query_ark_agentplan(client, api_key).await;
     }
 
-    // Kiro gateway (local subscription proxy) likewise has no balance API.
-    // Probe the gateway's /v1/messages liveness via the default alias.
-    if provider == "kiro" {
-        return query_kiro_gateway(client, url, api_key).await;
-    }
-
     // Ark pay-as-you-go key: no API-Key-queryable balance either (wallet
     // endpoints need Access Key HMAC signing). The free /models listing is
     // the cheapest liveness probe: 200 = key active, and the model count is
@@ -269,58 +263,6 @@ fn ark_liveness_summary(body: &serde_json::Value) -> String {
     format!("Agent Plan 活跃 · {model}")
 }
 
-/// Liveness probe for the local Kiro gateway (subscription proxy, no balance
-/// API). Mirrors the ark-agentplan approach: minimal Messages call, 200 =
-/// gateway + auth OK. Uses the `auto-kiro` alias (defaults to the tier's
-/// default model) so the probe tracks the gateway's default routing.
-async fn query_kiro_gateway(client: &reqwest::Client, url: &str, api_key: &str) -> ProviderBalance {
-    let response = match client
-        .post(url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(12))
-        .body(
-            serde_json::json!({
-                "model": "auto-kiro",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
-            })
-            .to_string(),
-        )
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return kiro_fail(format!("request failed: {e}")),
-    };
-    let status = response.status();
-    if status.as_u16() == 429 {
-        return kiro_ok("活跃（限流中）".into());
-    }
-    if !status.is_success() {
-        return kiro_fail(format!("HTTP {status}"));
-    }
-    let body: serde_json::Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => return kiro_fail(format!("parse error: {e}")),
-    };
-    let model = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown");
-    kiro_ok(format!("Kiro 网关活跃 · {model}"))
-}
-
-fn kiro_fail(error: String) -> ProviderBalance {
-    ProviderBalance {
-        provider: "kiro".into(),
-        summary: String::new(),
-        ok: false,
-        error: Some(error),
-    }
-}
-
 /// Liveness probe for the Ark pay-as-you-go key via the free model listing
 /// (`GET {balanceUrl}` with Bearer auth, e.g. `/api/v3/models`). The listing
 /// endpoint is free, answers fast, and doubles as a "models reachable"
@@ -370,15 +312,6 @@ fn ark_pay_fail(error: String) -> ProviderBalance {
         summary: String::new(),
         ok: false,
         error: Some(error),
-    }
-}
-
-fn kiro_ok(summary: String) -> ProviderBalance {
-    ProviderBalance {
-        provider: "kiro".into(),
-        summary,
-        ok: true,
-        error: None,
     }
 }
 
@@ -826,19 +759,6 @@ mod tests {
         assert!(!fail.ok);
         assert!(fail.summary.is_empty());
         assert_eq!(fail.error.as_deref(), Some("HTTP 401"));
-    }
-
-    #[test]
-    fn kiro_helpers_build_provider_balance() {
-        let ok = kiro_ok("Kiro 网关活跃 · gpt-5.6-sol".into());
-        assert!(ok.ok);
-        assert_eq!(ok.provider, "kiro");
-        assert_eq!(ok.summary, "Kiro 网关活跃 · gpt-5.6-sol");
-
-        let fail = kiro_fail("HTTP 502".into());
-        assert!(!fail.ok);
-        assert!(fail.summary.is_empty());
-        assert_eq!(fail.error.as_deref(), Some("HTTP 502"));
     }
 
     #[test]
