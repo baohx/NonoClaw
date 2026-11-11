@@ -106,15 +106,17 @@ pub(super) async fn spawn_tunnel(local_addr: &str) -> Option<String> {
     // registers HA connections but the quick-tunnel hostname is never
     // published at the edge — every QR code scans to NXDOMAIN. HTTP/2 keeps
     // registration and hostname publishing on the same TCP connection.
+    //
+    // --config <empty>: opt out of ~/.cloudflared/config.yml. cloudflared
+    // merges the default config on every start; if it declares an `ingress:`
+    // table (e.g. a named tunnel for another service), its catch-all rule
+    // OVERRIDES --url and serves http_status:404 for every request — the
+    // quick-tunnel URL resolves and tunnels fine but every page 404s.
     let mut child = match tokio::process::Command::new("cloudflared")
-        .args([
-            "tunnel",
-            "--no-autoupdate",
-            "--protocol",
-            "http2",
-            "--url",
+        .args(&tunnel_args(
             &target,
-        ])
+            stage_isolated_config().as_deref(),
+        ))
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -165,4 +167,67 @@ pub(super) async fn spawn_tunnel(local_addr: &str) -> Option<String> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
     found
+}
+
+/// Build cloudflared CLI args, routing through an isolated config when
+/// available so the user's ~/.cloudflared/config.yml cannot override --url.
+fn tunnel_args(target: &str, isolated_config: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "tunnel".into(),
+        "--no-autoupdate".into(),
+        "--protocol".into(),
+        "http2".into(),
+    ];
+    if let Some(path) = isolated_config {
+        args.push("--config".into());
+        args.push(path.into());
+    }
+    args.push("--url".into());
+    args.push(target.into());
+    args
+}
+
+/// Write a minimal throwaway config for the quick tunnel. Falls back to
+/// cloudflared's default config lookup (None) if a temp file is unavailable —
+/// same behavior as before this isolation existed.
+fn stage_isolated_config() -> Option<String> {
+    let mut file = tempfile::NamedTempFile::new().ok()?;
+    std::io::Write::write_all(&mut file, b"no-autoupdate: true\n").ok()?;
+    file.into_temp_path().keep().ok().map(|p| p.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_args_routes_through_isolated_config_when_available() {
+        let with = tunnel_args("http://127.0.0.1:8765", Some("/tmp/nc-isolated.yml"));
+        assert_eq!(
+            with,
+            vec![
+                "tunnel",
+                "--no-autoupdate",
+                "--protocol",
+                "http2",
+                "--config",
+                "/tmp/nc-isolated.yml",
+                "--url",
+                "http://127.0.0.1:8765",
+            ]
+        );
+        // Without an isolated config the flag set must stay minimal — no
+        // dangling --config pointing at nothing.
+        let without = tunnel_args("http://127.0.0.1:8765", None);
+        assert!(!without.contains(&"--config".to_string()));
+        assert_eq!(without.last().unwrap(), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn stage_isolated_config_writes_usable_file_and_cleans_up() {
+        let path = stage_isolated_config().expect("temp config should stage");
+        let body = std::fs::read_to_string(&path).expect("staged config readable");
+        assert_eq!(body, "no-autoupdate: true\n");
+        std::fs::remove_file(&path).ok();
+    }
 }
