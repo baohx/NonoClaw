@@ -186,7 +186,7 @@ pub async fn get(
 
 /// Where downloaded files land on the host (per-instance spool).
 pub fn spool_dir(cwd: &Path, name: &str) -> PathBuf {
-    instance_dir(cwd, name).join("spool")
+    crate::vm::backend::vm_shared_root(cwd).join(name).join("spool")
 }
 
 #[cfg(test)]
