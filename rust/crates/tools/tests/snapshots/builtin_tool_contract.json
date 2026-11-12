@@ -576,11 +576,10 @@
           "type": "integer"
         },
         "operation": {
-          "description": "Operation: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol",
+          "description": "Operation: goToDefinition, findReferences, documentSymbol, workspaceSymbol",
           "enum": [
             "goToDefinition",
             "findReferences",
-            "hover",
             "documentSymbol",
             "workspaceSymbol"
           ],
