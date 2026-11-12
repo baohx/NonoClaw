@@ -1,6 +1,6 @@
 //! LSP tool — code intelligence via grep-based symbol search.
 //!
-//! Operations: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol.
+//! Operations: goToDefinition, findReferences, documentSymbol, workspaceSymbol.
 //! Uses ripgrep (rg) for symbol search. Falls back to grep if rg is unavailable.
 //! No language server installation required.
 
@@ -102,8 +102,8 @@ impl Tool for LspTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "Operation: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol",
-                    "enum": ["goToDefinition", "findReferences", "hover", "documentSymbol", "workspaceSymbol"]
+                    "description": "Operation: goToDefinition, findReferences, documentSymbol, workspaceSymbol",
+                    "enum": ["goToDefinition", "findReferences", "documentSymbol", "workspaceSymbol"]
                 },
                 "filePath": { "type": "string", "description": "File path (absolute)" },
                 "line": { "type": "integer", "description": "Line number (1-based)" },
@@ -220,5 +220,26 @@ impl Tool for LspTool {
                 message: format!("unknown operation: {op}"),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_does_not_advertise_unimplemented_operations() {
+        let schema = LspTool.input_schema();
+        let ops = schema["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("operation enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ops,
+            &["goToDefinition", "findReferences", "documentSymbol", "workspaceSymbol"]
+        );
+        assert!(!ops.contains(&"hover"), "hover is advertised but not implemented");
     }
 }
