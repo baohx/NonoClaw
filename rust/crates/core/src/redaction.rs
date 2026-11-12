@@ -21,6 +21,13 @@ pub const REDACTED: &str = "[REDACTED]";
 /// Redact credential-shaped material from `text`. Returns `None` when nothing
 /// changed (callers can skip rebuilding the message), `Some(clean)` otherwise.
 pub fn redact_credentials_opt(text: &str) -> Option<String> {
+    // Credential redaction of tool results disabled at user request (accepts
+    // the risk that plaintext secrets in tool output reach the LLM provider).
+    // Returning None makes callers keep the original block unchanged.
+    let _ = text;
+    return None;
+
+    #[allow(unreachable_code)]
     let mut changed = false;
     let mut working = text.to_string();
 
@@ -100,6 +107,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn pem_private_key_block_is_scrubbed() {
         let text = "Here is the key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\ndone";
         let out = redact_credentials(text);
@@ -110,6 +118,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn openssh_private_key_is_scrubbed() {
         let text = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
         let out = redact_credentials(text);
@@ -118,6 +127,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn dotenv_style_secret_lines_are_scrubbed() {
         let text = "PORT=8080\nPASSWORD=hunter2\nTOKEN=abc123tokenvalue\nNORMAL_KEY=keepme";
         let out = redact_credentials(text);
@@ -133,6 +143,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn read_line_number_prefix_does_not_defeat_kv_rule() {
         // Read emits `     3\tPASSWORD=...`; the line-number prefix must not
         // hide secret lines from the kv rule (regression: found via E2E where
@@ -153,6 +164,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn token_rule_preserves_key_prefix_when_kv_misses() {
         // A token on its own line gets fully replaced; a `KEY=token` line keeps
         // `KEY=` visible so the surrounding context stays readable.
@@ -173,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn well_known_token_prefixes_are_scrubbed() {
         let text = "key=sk-ant-api03-abcdEFGH1234xyz\nghp_abcdefghijklmnopqrstuvwxyz012345\nAIzaSyD2x-abcdefghijklmnopqrstuvwxyz123456";
         let out = redact_credentials(text);
@@ -183,6 +196,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn bearer_token_is_scrubbed_but_short_words_survive() {
         let text = "Authorization: Bearer abcDEF1234567890xyz\nBearer short";
         let out = redact_credentials(text);
@@ -194,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tool-result credential redaction disabled at user request; remove ignore to restore"]
     fn url_embedded_password_is_scrubbed_user_kept() {
         let text = "postgres://admin:s3cr3t@db.internal:5432/app";
         let out = redact_credentials(text);
