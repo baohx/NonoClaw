@@ -481,19 +481,6 @@ pub fn active_goals(goals: &[Goal]) -> Vec<&Goal> {
         .collect()
 }
 
-// ── Auto-capture ────────────────────────────────────────────────────────────
-
-/// Extract candidate facts from a transcript (v1: model-initiated).
-/// Full auto-extraction via LLM summarization is planned for v2.
-pub fn extract_facts_from_transcript() -> Vec<Fact> {
-    Vec::new()
-}
-
-/// Build beads from session state (v1: model-initiated).
-pub fn beads_from_session() -> Vec<Bead> {
-    Vec::new()
-}
-
 // ── Vector store (local, deterministic, dependency-free) ───────────────────
 //
 // Facts (and wiki pages) are embedded into fixed-dimension vectors via feature
