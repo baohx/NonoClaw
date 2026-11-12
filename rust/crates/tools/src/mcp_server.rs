@@ -6,7 +6,8 @@
 //! Only the process's own stdout carries JSON-RPC; tool child processes capture
 //! their stdout, and tracing goes to stderr, so the wire stays clean. The server
 //! trusts its client and runs tools under `BypassPermissions` (the client owns
-//! gating). `Agent` is excluded (no engine/client available to spawn subagents).
+//! gating). `Agent`, `Coordinator`, and `Graph` are excluded (no
+//! engine/client available to spawn subagents).
 
 use std::path::Path;
 
@@ -38,8 +39,9 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // Agent can't run here (no engine/client), so don't advertise it.
-    let served = registry.filtered(&["Agent"]);
+    // Agent can't run here (no engine/client to spawn subagents); Coordinator
+    // and Graph need the same subagent machinery, so they can't either.
+    let served = registry.filtered(&["Agent", "Coordinator", "Graph"]);
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -196,13 +198,14 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 25);
+        assert_eq!(names.len(), 23);
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"VideoGenerate"));
-        assert!(names.contains(&"Graph"));
         assert!(names.contains(&"TaskOutput"));
         assert!(names.contains(&"TaskStop"));
         assert!(!names.contains(&"Agent"));
+        assert!(!names.contains(&"Coordinator"));
+        assert!(!names.contains(&"Graph"));
 
         let call = json!({
             "jsonrpc": "2.0",
