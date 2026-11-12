@@ -1118,7 +1118,7 @@ impl Default for EngineOptions {
             mcp_no_match_policy: crate::tool_selector::McpNoMatchPolicy::default(),
             mcp_safe_tools: Vec::new(),
             add_dirs: Vec::new(),
-            max_turns: 10,
+            max_turns: crate::settings::DEFAULT_MAX_TURNS,
             finalize_on_max_turns: false,
             append_system_prompt: None,
             skills_manager: None,
@@ -4666,7 +4666,7 @@ mod tests {
     #[test]
     fn default_options() {
         let o = EngineOptions::default();
-        assert_eq!(o.max_turns, 10);
+        assert_eq!(o.max_turns, crate::settings::DEFAULT_MAX_TURNS);
         assert!(!o.finalize_on_max_turns);
         assert!(o.is_non_interactive);
     }
