@@ -3,8 +3,12 @@
 //! single message and keep the recent tail verbatim. Triggered by the engine
 //! loop based on a token estimate (see [`crate::tokens`]).
 //!
-//! Compaction is in-memory for the current run; the session file keeps the full
-//! history so a `--resume` gets maximum fidelity (and may re-compact).
+//! In-memory for the current run, then persisted by rewriting the session
+//! file's compacted message entries under a revision CAS (see
+//! [`crate::session::SessionWriter::replace_after_compact`]): the replaced
+//! entries collapse into the summary while the retained tail and all
+//! metadata/unknown entries survive, so a `--resume` starts from the
+//! compacted view (and may re-compact).
 
 use nonoclaw_api::{Client, RequestParams, SystemBlock};
 
