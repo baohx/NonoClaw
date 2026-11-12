@@ -33,7 +33,16 @@ pub fn ensure_key(_cwd: &Path, _name: &str) -> Result<(), String> {
 /// Guest-side user (root on the nocloud image).
 pub const VM_USER: &str = "root";
 
-fn base_ssh_args(_cwd: &Path, inst: &VmInstance) -> Vec<String> {
+/// Per-instance known_hosts file: first connect pins the guest's host key
+/// (TOFU), later connects fail on mismatch — a different guest reusing the
+/// slot's IP/port (or a hijacked tap) is caught instead of silently trusted.
+/// Lives in the per-project instance dir so it survives instance restarts and
+/// stays out of the user's personal known_hosts.
+fn known_hosts_path(cwd: &Path, inst: &VmInstance) -> PathBuf {
+    instance_dir(cwd, &inst.name).join("known_hosts")
+}
+
+fn base_ssh_args(cwd: &Path, inst: &VmInstance) -> Vec<String> {
     let key = vm_assets_dir().join("ssh_key");
     let ip = ssh_host_for(inst);
     vec![
@@ -41,9 +50,9 @@ fn base_ssh_args(_cwd: &Path, inst: &VmInstance) -> Vec<String> {
         "-i".into(),
         key.to_string_lossy().into(),
         "-o".into(),
-        "StrictHostKeyChecking=no".into(),
+        "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
-        "UserKnownHostsFile=/dev/null".into(),
+        format!("UserKnownHostsFile={}", known_hosts_path(cwd, inst).to_string_lossy()),
         "-o".into(),
         "LogLevel=ERROR".into(),
         "-o".into(),
@@ -177,5 +186,58 @@ pub async fn get(
 
 /// Where downloaded files land on the host (per-instance spool).
 pub fn spool_dir(cwd: &Path, name: &str) -> PathBuf {
-    instance_dir(cwd, name).join("spool")
+    crate::vm::backend::vm_shared_root(cwd).join(name).join("spool")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::backend::{VmBackend, VmState};
+
+    fn inst(slot: u16) -> VmInstance {
+        VmInstance {
+            name: format!("inst-{slot}"),
+            backend: VmBackend::Qemu,
+            state: VmState::Running,
+            slot,
+            cpus: 2,
+            mem_mb: 512,
+            disk_mb: 1024,
+            image: "base".into(),
+            created_at: 0,
+            updated_at: 0,
+            ssh_port: 2222,
+            cdp_port: 0,
+            vnc_port: 0,
+        }
+    }
+
+    #[test]
+    fn ssh_args_use_tofu_known_hosts_per_instance() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        let args = base_ssh_args(cwd, &inst(3));
+        let joined = args.join(" ");
+        // TOFU: pin on first connect, refuse on mismatch — never blanket-accept.
+        assert!(!joined.contains("StrictHostKeyChecking=no"), "{joined}");
+        assert!(joined.contains("StrictHostKeyChecking=accept-new"), "{joined}");
+        // known_hosts is per-instance, not /dev/null and not the user's file.
+        assert!(!joined.contains("/dev/null"), "{joined}");
+        let expected = instance_dir(cwd, "inst-3").join("known_hosts");
+        assert!(
+            joined.contains(expected.to_str().unwrap()),
+            "{joined} lacks {expected:?}"
+        );
+        // BatchMode stays on: no interactive prompts.
+        assert!(joined.contains("BatchMode=yes"), "{joined}");
+    }
+
+    #[test]
+    fn known_hosts_path_is_per_instance() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        assert_ne!(
+            known_hosts_path(cwd, &inst(1)),
+            known_hosts_path(cwd, &inst(2)),
+            "each instance pins its own guest identity"
+        );
+    }
 }

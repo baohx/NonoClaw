@@ -226,14 +226,20 @@ async fn export_workspace(tap_ip: &str, cwd: &Path) -> String {
     // NFSv4 mounts the export's own root, not the server's filesystem root, so
     // the guest spec is `<tap_ip>:<dir>` and the mount lands exactly on /workspace.
     let spec = format!("{tap_ip}:{dir}");
-    let line = format!("{dir} {subnet}(rw,sync,no_subtree_check,insecure,all_squash,anonuid=1000,anongid=1000)");
+    // exports(5): a directory's client list lives on ONE line, so concurrent
+    // instances must merge their tap subnets into that line instead of adding
+    // duplicate dir lines (exportfs rejects those). Idempotent: skip the entry
+    // when already present, append when missing, create the line for a first
+    // export of this dir.
+    let entry = format!("{subnet}(rw,sync,no_subtree_check,insecure,all_squash,anonuid=1000,anongid=1000)");
     let script = format!(
         r#"apk add --no-cache nfs-utils >/dev/null 2>&1
-if ! grep -qxF '{line}' /hostetc/exports 2>/dev/null; then
-  grep -v '^{dir} ' /hostetc/exports > /tmp/e 2>/dev/null || true
-  printf '%s\n' "{line}" >> /tmp/e
-  cp /tmp/e /hostetc/exports
-fi
+test -f /hostetc/exports || touch /hostetc/exports
+awk -v dir='{dir}' -v entry='{entry}' '
+  $1 == dir {{ if (index($0, entry) == 0) print $0 " " entry; else print $0; found=1; next }}
+  {{ print }}
+  END {{ if (!found) print dir " " entry }}
+' /hostetc/exports > /tmp/e && cp /tmp/e /hostetc/exports
 nsenter -t 1 -m -n exportfs -ra 2>&1 || echo EXPORTFS_FAILED"#
     );
     let out = Command::new("docker")

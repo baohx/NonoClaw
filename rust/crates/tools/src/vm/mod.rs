@@ -2,8 +2,9 @@
 //!
 //! A persistent microVM gives the agent a complete disposable Linux machine with
 //! a real browser (Chrome + CDP), a filesystem and terminal (SSH), MCP-style
-//! structured access, and Computer Use (CDP-driven). Instances live under
-//! `<cwd>/.nonoclaw/vm/<name>/` and survive across sessions.
+//! structured access, and Computer Use (CDP-driven). Private instance state
+//! lives under the per-project NonoClaw data root; screenshot spools stay in
+//! `<cwd>/.nonoclaw/vm/<name>/spool/` so the project can read them.
 //!
 //! Layout:
 //! - [`backend`]  — `VmBackend` trait, per-instance state, lifecycle (start/stop)

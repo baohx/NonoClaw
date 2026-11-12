@@ -15,8 +15,9 @@ use crate::tool::{Tool, ToolCtx, ToolResult};
 use nonoclaw_core::{Error, PermissionDecision, Result};
 
 use super::backend::{
-    backend_for, free_port, guest_ip_for, instance_dir, load_instance, load_vm_settings, next_slot,
-    save_instance, scan_instances, vm_assets_dir, VmBackend, VmInstance, VmState,
+    backend_for, free_port, guest_ip_for, instance_dir, load_instance, load_vm_settings,
+    migrate_legacy_instance, next_slot, save_instance, scan_instances, vm_assets_dir, VmBackend,
+    VmInstance, VmState,
 };
 use super::ssh;
 
@@ -210,6 +211,11 @@ across sessions. Linux+KVM uses Firecracker, otherwise QEMU (macOS included)."
                 }
                 let dir = instance_dir(cwd, &name);
                 std::fs::remove_dir_all(&dir).map_err(|e| Error::Other(format!("rm: {e}")))?;
+                let shared = crate::vm::backend::vm_shared_root(cwd).join(&name);
+                if shared.exists() {
+                    std::fs::remove_dir_all(&shared)
+                        .map_err(|e| Error::Other(format!("rm shared spool: {e}")))?;
+                }
                 Ok(ToolResult::ok(format!("destroyed '{name}' ({})", dir.display())))
             }
             other => Err(Error::Other(format!("unknown action '{other}'"))),
@@ -280,6 +286,8 @@ fn create_instance(
 /// to Stopped on failure). Shared by the `start` and `ensure` actions.
 async fn start_instance(cwd: &Path, mut inst: VmInstance) -> Result<ToolResult> {
     let name = inst.name.clone();
+    migrate_legacy_instance(cwd, &inst)
+        .map_err(|e| Error::Other(format!("migrate VM state: {e}")))?;
     inst.state = VmState::Starting;
     inst.ssh_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
     inst.cdp_port = free_port().await.map_err(|e| Error::Other(e.to_string()))?;
