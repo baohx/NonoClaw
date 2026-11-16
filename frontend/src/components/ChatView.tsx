@@ -1,5 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import VirtualChat, { type VirtualChatRow } from "./VirtualChat";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage, ClientMsg, SubagentRun, SubagentTool } from "../types";
 import { useStore } from "../store";
 import Markdown from "./Markdown";
@@ -39,58 +38,29 @@ interface Props {
   send: (message: ClientMsg) => void;
 }
 
-/** "Load earlier messages" affordance for tail-windowed sessions. Viewport
- * stability after a page prepend is handled by VirtualChat's anchor
- * compensation — the bar itself no longer participates. */
-const LoadOlderBar = memo(function LoadOlderBar({ send }: { send: (m: ClientMsg) => void }) {
-  const remaining = useStore((s) => s.historyOlderRemaining);
-  const loading = useStore((s) => s.historyLoading);
-  const requestOlderHistory = useStore((s) => s.requestOlderHistory);
-  if (remaining <= 0 && !loading) return null;
-  const onLoad = () => requestOlderHistory(send);
-  return (
-    <div className="load-older-bar">
-      <button className="load-older-btn" onClick={onLoad} disabled={loading}>
-        {loading ? "加载中…" : `加载更早的消息（还有 ${remaining} 条）`}
-      </button>
-    </div>
-  );
-});
-
 export default function ChatView({ toolsHidden, send }: Props) {
   // ChatView owns the message subscription: App.tsx stays out of the
   // streaming hot path entirely (one re-rendering subtree per frame).
   const messages = useStore((s) => s.messages);
-  // Default view: one virtual row per message; only the viewport (± overscan)
-  // is mounted. Deep-link anchors (`msg-${id}`) live on MessageCard itself.
-  const rows: VirtualChatRow[] = useMemo(
-    () =>
-      messages.map((msg) => ({
-        key: `m-${msg.id}`,
-        node: (
-          <MessageCard
-            msg={msg}
-            send={send}
-            isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
-          />
-        ),
-      })),
-    [messages, send],
-  );
 
   if (!toolsHidden) {
     return (
       <div>
         {messages.length === 0 && <WelcomeMessage />}
-        <LoadOlderBar send={send} />
-        <VirtualChat rows={rows} />
+        {messages.map((msg) => (
+          <MessageCard
+            key={msg.id}
+            msg={msg}
+            send={send}
+            isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
+          />
+        ))}
       </div>
     );
   }
 
   // toolsHidden: group consecutive tool messages into a single placeholder.
   const rendered: React.ReactNode[] = [];
-  const renderedKeys: string[] = [];
   let toolGroupCount = 0;
   let toolGroupFirstId = "";
   let groupKeyIndex = 0;
@@ -107,7 +77,6 @@ export default function ChatView({ toolsHidden, send }: Props) {
           isLastAssistant={msg.role === "assistant" && !msg.streaming && msg.content.trim().length > 0}
         />
       );
-      renderedKeys.push(msg.id);
       continue;
     }
     // This is a tool message — count it in the current group.
@@ -131,13 +100,12 @@ export default function ChatView({ toolsHidden, send }: Props) {
         </span>
       </div>
     );
-    renderedKeys.push(`tool-group-${toolGroupFirstId}`);
   }
 
   return (
     <div>
       {messages.length === 0 && <WelcomeMessage />}
-      <VirtualChat rows={rendered.map((node, i) => ({ key: renderedKeys[i], node }))} />
+      {rendered}
     </div>
   );
 }

@@ -39,9 +39,6 @@ export default function App() {
   const setShowGovernance = useStore((s) => s.setShowGovernance);
   const showVideoStudio = useStore((s) => s.showVideoStudio);
   const setShowVideoStudio = useStore((s) => s.setShowVideoStudio);
-  const historyOlderRemaining = useStore((s) => s.historyOlderRemaining);
-  const historyLoading = useStore((s) => s.historyLoading);
-  const requestOlderHistory = useStore((s) => s.requestOlderHistory);
   const compacting = useStore((s) => s.compacting);
   const pendingPermission = useStore((s) => s.pendingPermission);
   // Questions queue in FIFO order (parallel AskUserQuestion calls must not
@@ -64,7 +61,6 @@ export default function App() {
   const [showQr, setShowQr] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [showSurfacing, setShowSurfacing] = useState(false);
-  const [trajectoryHydrationSession, setTrajectoryHydrationSession] = useState<string | null>(null);
   const toolsHidden = useStore((s) => s.toolsHidden);
   const setToolsHidden = useStore((s) => s.setToolsHidden);
   const [railSections, setRailSections] = useState<{ files: boolean; sessions: boolean; git: boolean }>(() => {
@@ -133,11 +129,7 @@ export default function App() {
   // subscription here keeps App.tsx out of the streaming hot path.
   useEffect(() => {
     let lastLen = 0;
-    return useStore.subscribe((state, prev) => {
-      // An older history page just landed above the viewport: VirtualChat's
-      // anchor compensation owns the scroll position here — don't fight it
-      // by jumping to bottom.
-      if (prev.historyLoading && !state.historyLoading) return;
+    return useStore.subscribe((state) => {
       const len = state.messages.length;
       const streaming = state.streamingIdx !== null;
       if (len !== lastLen) {
@@ -183,34 +175,10 @@ export default function App() {
   const cancelling = useStore((s) => s.cancelling);
   const setCancelling = useStore((s) => s.setCancelling);
 
-  const hydrateTrajectoryHistory = useCallback(() => {
-    if (sessionId) setTrajectoryHydrationSession(sessionId);
-  }, [sessionId]);
-
-  // Governance is a modal entry point to the same trajectory data. Normal
-  // session restore remains tail-windowed; opening either trajectory surface
-  // opts this session into bounded 500-message pages until history is whole.
-  useEffect(() => {
-    if (showGovernance && sessionId) setTrajectoryHydrationSession(sessionId);
-  }, [showGovernance, sessionId]);
-
-  useEffect(() => {
-    if (trajectoryHydrationSession !== sessionId
-      || connectionStatus !== "connected"
-      || agentRunning
-      || historyLoading
-      || historyOlderRemaining <= 0) return;
-    requestOlderHistory(send, 500);
-  }, [
-    trajectoryHydrationSession,
-    sessionId,
-    connectionStatus,
-    agentRunning,
-    historyLoading,
-    historyOlderRemaining,
-    requestOlderHistory,
-    send,
-  ]);
+  // Restores now ship the full history, so trajectory surfaces need no
+  // separate hydration round-trip — the callback remains as a stable no-op
+  // anchor for the InsightRail prop.
+  const hydrateTrajectoryHistory = useCallback(() => {}, []);
 
   // ESC key during a run (foreground or background) sends an immediate
   // cancel. The backend CancellationToken tree stops provider streams,
