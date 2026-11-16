@@ -336,10 +336,14 @@ pub(super) fn messages_loaded(
         traces,
         ..
     } = snapshot;
-    let (window, total) = tail_window(messages, HISTORY_TAIL_MESSAGES);
+    // Full-history restore: the frontend renders the transcript as a plain
+    // scrollable list (no windowed renderer), so the 50-message tail window
+    // and its `load_older` paging are no longer needed. `total` equals the
+    // payload length; clients treat equality as "no older history".
+    let total = messages.len();
     messages_loaded_windowed(
         session_id,
-        window,
+        messages,
         total,
         revision,
         started,
@@ -349,9 +353,10 @@ pub(super) fn messages_loaded(
     )
 }
 
-/// Tail-windowed constructor used when restoring a session: send only the
-/// most recent `HISTORY_TAIL_MESSAGES` messages; `total` tells the client how
-/// much older history exists behind `load_older` paging.
+/// Session-restore payload constructor. Since the frontend moved to a plain
+/// scrollable transcript, restores send the full history in one message;
+/// `total` matches the payload length. The `load_older` paging path remains
+/// for older clients that still request pages explicitly.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn messages_loaded_windowed(
     session_id: &str,
@@ -411,19 +416,6 @@ pub(super) fn history_page(
             })
             .collect(),
         remaining,
-    }
-}
-
-/// Default session-restore tail window.
-pub(super) const HISTORY_TAIL_MESSAGES: usize = 50;
-
-/// Keep only the last `tail` messages, reporting the pre-window total.
-fn tail_window(mut messages: Vec<Message>, tail: usize) -> (Vec<Message>, usize) {
-    let total = messages.len();
-    if total <= tail {
-        (messages, total)
-    } else {
-        (messages.split_off(total - tail), total)
     }
 }
 
@@ -804,35 +796,6 @@ pub(super) fn split_socket(socket: WebSocket) -> (Tx, futures::stream::SplitStre
 mod tests {
     use super::*;
     use nonoclaw_core::{ImageSource, Role};
-
-    #[test]
-    fn tail_window_keeps_last_n_and_reports_total() {
-        let messages: Vec<Message> = (0..10)
-            .map(|i| Message {
-                role: Role::User,
-                content: nonoclaw_core::MessageContent::Text(format!("m{i}")),
-                ts: None,
-            })
-            .collect();
-        let (window, total) = tail_window(messages, 3);
-        assert_eq!(total, 10);
-        assert_eq!(window.len(), 3);
-        match &window[0].content {
-            nonoclaw_core::MessageContent::Text(text) => assert_eq!(text, "m7"),
-            _ => panic!("expected text"),
-        }
-        // Short sessions pass through untouched.
-        let short: Vec<Message> = (0..2)
-            .map(|i| Message {
-                role: Role::User,
-                content: nonoclaw_core::MessageContent::Text(format!("m{i}")),
-                ts: None,
-            })
-            .collect();
-        let (window, total) = tail_window(short, 3);
-        assert_eq!(total, 2);
-        assert_eq!(window.len(), 2);
-    }
 
     #[test]
     fn history_page_reports_remaining_before_start() {
