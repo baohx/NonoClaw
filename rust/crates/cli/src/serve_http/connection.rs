@@ -563,6 +563,102 @@ fn short_error(err: &str) -> String {
     }
 }
 
+// ── Auxiliary service probes (voice / OCR / video) ──────────────────────────
+
+/// Latency budget for the auxiliary service probes (simple GET/token calls,
+/// no generation, so they must answer much faster than a model probe).
+const SERVICE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Probe the ElevenLabs key via the free `GET /v1/user` endpoint (returns the
+/// subscription object; 401 means invalid key). `scribe_v2` speech-to-text
+/// availability follows from key validity.
+async fn probe_elevenlabs(http: &reqwest::Client, api_key: &str) -> (bool, Option<u64>, Option<String>) {
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        SERVICE_PROBE_TIMEOUT,
+        http.get("https://api.elevenlabs.io/v1/user")
+            .header("xi-api-key", api_key)
+            .send(),
+    )
+    .await;
+    match result {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            (true, Some(started.elapsed().as_millis() as u64), None)
+        }
+        Ok(Ok(resp)) => (false, None, Some(format!("HTTP {}", resp.status()))),
+        Ok(Err(err)) => (false, None, Some(short_error(&err.to_string()))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("timeout ({}s)", SERVICE_PROBE_TIMEOUT.as_secs())),
+        ),
+    }
+}
+
+/// Probe the Baidu OCR credential pair by exchanging it for an OAuth access
+/// token — the same call `attachments::process_baidu_unlimited` performs
+/// before every task, so token success ⇒ OCR pipeline is usable.
+async fn probe_baidu_ocr(http: &reqwest::Client, doc: &nonoclaw_engine::settings::DocModelConfig) -> (bool, Option<u64>, Option<String>) {
+    let api_key = doc.resolved_api_key();
+    let Some(api_secret) = doc.resolved_api_secret() else {
+        return (false, None, Some("baidu_unlimited requires apiSecret".into()));
+    };
+    let started = std::time::Instant::now();
+    let base = doc.base_url.trim_end_matches('/').to_string();
+    let result = tokio::time::timeout(
+        SERVICE_PROBE_TIMEOUT,
+        http.get(format!("{base}/oauth/2.0/token"))
+            .query(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", api_key.as_str()),
+                ("client_secret", api_secret.as_str()),
+            ])
+            .send(),
+    )
+    .await;
+    match result {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            (true, Some(started.elapsed().as_millis() as u64), None)
+        }
+        Ok(Ok(resp)) => (false, None, Some(format!("HTTP {}", resp.status()))),
+        Ok(Err(err)) => (false, None, Some(short_error(&err.to_string()))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("timeout ({}s)", SERVICE_PROBE_TIMEOUT.as_secs())),
+        ),
+    }
+}
+
+/// Probe a video model endpoint via the free model listing
+/// (`GET {base}/api/v3/models` with Bearer auth) — the same semantics as
+/// `billing::query_ark_pay`: the listing endpoint is free, answers fast, and
+/// proves both reachability and key validity. 429 also proves the key is
+/// valid (rate limited, not rejected).
+async fn probe_video_model(http: &reqwest::Client, base_url: &str, api_key: &str) -> (bool, Option<u64>, Option<String>) {
+    let started = std::time::Instant::now();
+    let base = base_url.trim_end_matches('/');
+    let result = tokio::time::timeout(
+        SERVICE_PROBE_TIMEOUT,
+        http.get(format!("{base}/api/v3/models"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .send(),
+    )
+    .await;
+    match result {
+        Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() == 429 => {
+            (true, Some(started.elapsed().as_millis() as u64), None)
+        }
+        Ok(Ok(resp)) => (false, None, Some(format!("HTTP {}", resp.status()))),
+        Ok(Err(err)) => (false, None, Some(short_error(&err.to_string()))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("timeout ({}s)", SERVICE_PROBE_TIMEOUT.as_secs())),
+        ),
+    }
+}
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,6 +1705,46 @@ async fn handle_ws(
                         let (ok, latency_ms, error) = probe_model_health(cfg).await;
                         super::protocol::ModelHealthEntry {
                             name,
+                            ok,
+                            latency_ms,
+                            error,
+                        }
+                    });
+                }
+                // Auxiliary services share the same probe: voice (ElevenLabs),
+                // the docModel OCR provider, and every configured video model.
+                let http = reqwest::Client::new();
+                if let Some(key) = config.elevenlabs_api_key() {
+                    let http = http.clone();
+                    tasks.spawn(async move {
+                        let (ok, latency_ms, error) = probe_elevenlabs(&http, &key).await;
+                        super::protocol::ModelHealthEntry {
+                            name: "voice · elevenlabs".into(),
+                            ok,
+                            latency_ms,
+                            error,
+                        }
+                    });
+                }
+                if let Some(doc) = config.doc_model().filter(|d| d.provider == "baidu_unlimited") {
+                    let http = http.clone();
+                    tasks.spawn(async move {
+                        let (ok, latency_ms, error) = probe_baidu_ocr(&http, &doc).await;
+                        super::protocol::ModelHealthEntry {
+                            name: format!("ocr · {}", doc.model),
+                            ok,
+                            latency_ms,
+                            error,
+                        }
+                    });
+                }
+                for video in config.video_models() {
+                    let http = http.clone();
+                    tasks.spawn(async move {
+                        let (ok, latency_ms, error) =
+                            probe_video_model(&http, &video.base_url, &video.api_key).await;
+                        super::protocol::ModelHealthEntry {
+                            name: format!("video · {}", video.name),
                             ok,
                             latency_ms,
                             error,

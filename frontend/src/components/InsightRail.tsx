@@ -137,8 +137,6 @@ export default function InsightRail({ info, onOpen, onRefresh, onTrajectoryOpen,
 
         <ModelsSection open={open.has("models")} onToggle={() => toggle("models")} send={send} />
 
-        <VideoTasksBadge />
-
         <Section
           id="cache"
           label="Cache"
@@ -580,26 +578,6 @@ function HooksSection({ configured }: { configured: { hook_type: string; matcher
   );
 }
 
-// ── Video tasks badge ───────────────────────────────────────────────────────
-
-/** "视频任务 N 个进行中" — hidden when 0; click opens the Video Studio. */
-function VideoTasksBadge() {
-  const inFlight = useStore((s) => s.projectInfo?.video_tasks_in_flight ?? 0);
-  if (inFlight === 0) return null;
-  return (
-    <div
-      className="insight-row"
-      style={{ cursor: "pointer", padding: "6px 10px", borderRadius: 8, background: "var(--bg-soft, #1c1c1e)", display: "flex", alignItems: "center", gap: 8 }}
-      onClick={() => useStore.getState().setShowVideoStudio(true)}
-      title="点击打开视频工作台"
-    >
-      <span>🎬</span>
-      <span className="insight-row__name">视频任务</span>
-      <span className="tag">{inFlight} 个进行中</span>
-    </div>
-  );
-}
-
 // ── Models section ──────────────────────────────────────────────────────────
 
 function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () => void; send: (msg: ClientMsg) => void }) {
@@ -672,6 +650,36 @@ function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () =
           </div>
           );
         })}
+        {/* Auxiliary services (voice / OCR / video) share the same health-check
+            results — entries with a known "kind ·" prefix. The prefix check
+            keeps conversation model names containing " · " out of this list. */}
+        {Object.values(health)
+          .filter((h) => /^(voice|ocr|video) · /.test(h.name))
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((h) => {
+            const [kind, id] = h.name.split(" · ");
+            const dotClass = h.ok ? "probe-ok" : checking ? "probe-pending" : "bad";
+            const dotTitle = h.ok ? `连通 · ${h.latency_ms}ms` : `失败 · ${h.error || "unknown"}`;
+            return (
+              <div key={h.name} className="insight-row">
+                <div className="insight-row__top">
+                  <span className={`dot ${dotClass}`} title={dotTitle} />
+                  <span className="insight-row__name">{id}</span>
+                  <span className="tag">{kind}</span>
+                  {h.ok && <span className="tag" title={dotTitle}>{h.latency_ms}ms</span>}
+                  {!h.ok && h.error && (
+                    <span className="tag" style={{ color: "var(--rose)" }} title={h.error}>
+                      {/^HTTP (\d+)/.exec(h.error)?.[1] ?? "fail"}
+                    </span>
+                  )}
+                </div>
+                <div className="insight-row__meta">{h.name}</div>
+                {!h.ok && h.error && (
+                  <div className="insight-row__meta" style={{ color: "var(--rose)" }} title={h.error}>{h.error}</div>
+                )}
+              </div>
+            );
+          })}
       </div>
     </Section>
   );
