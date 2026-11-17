@@ -41,6 +41,17 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
     [sessions],
   );
 
+  // Machine-generated sessions (AutoDream memory upkeep, bench smoke) are not
+  // conversations. Keep them out of the main list; show them under their own
+  // collapsed group so the history stays reachable without polluting the rail.
+  const MACHINE_TAGS = new Set(["dream", "bench-smoke"]);
+  const { conversations, machine } = useMemo(() => {
+    const conversations = sorted.filter((s) => !s.tag || !MACHINE_TAGS.has(s.tag));
+    const machine = sorted.filter((s) => s.tag && MACHINE_TAGS.has(s.tag));
+    return { conversations, machine };
+  }, [sorted]);
+  const [machineOpen, setMachineOpen] = useState(false);
+
   // Lazily fetch run prompts when a session row is expanded.
   useEffect(() => {
     if (!expandedId) return;
@@ -91,11 +102,11 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
       >
         <span className="sessionrail__head-caret">{collapsed ? "▸" : "▾"}</span>
         <span className="sessionrail__title">sessions</span>
-        <span className="sessionrail__head-count">{sessions.length}</span>
+        <span className="sessionrail__head-count">{conversations.length}</span>
       </button>
       {!collapsed && (
       <div className="sessionrail__list">
-        {sorted.length === 0 && (
+        {conversations.length === 0 && machine.length === 0 && (
           <div className="sessionrail__empty sessionrail__empty--guide">
             <span className="sessionrail__empty-icon">◌</span>
             你的对话会按创建时间列在这里
@@ -103,7 +114,7 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
             展开一个 session 可以看到每轮的第一个问题
           </div>
         )}
-        {sorted.map((s) => {
+        {conversations.map((s) => {
           const expanded = expandedId === s.id;
           const prompts = sessionPrompts[s.id];
           return (
@@ -139,6 +150,42 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
             </div>
           );
         })}
+        {machine.length > 0 && (
+          <div className="sessionrail__machine">
+            <button
+              className="sessionrail__row sessionrail__row--machine"
+              onClick={() => setMachineOpen(!machineOpen)}
+              title="后台自动生成的会话（AutoDream 记忆整理 / bench smoke），不参与 auto-resume"
+            >
+              <span className="sessionrail__caret">{machineOpen ? "▾" : "▸"}</span>
+              <span className="sessionrail__date">⚙ 后台会话</span>
+              <span className="sessionrail__count">{machine.length}</span>
+            </button>
+            {machineOpen && (
+              <div className="sessionrail__prompts">
+                {machine.map((s) => (
+                  <button
+                    key={s.id}
+                    className="sessionrail__prompt"
+                    title={s.id}
+                    onClick={() => {
+                      // Machine sessions resume from the top (message index 0
+                      // of their ledger); no prompt preview is fetched.
+                      if (s.id === currentId) return;
+                      useStore.getState().prepareSessionSwitch(s.id);
+                      send({ type: "resume_session", id: s.id });
+                    }}
+                  >
+                    <span className="sessionrail__prompt-num">{s.tag === "dream" ? "✿" : "◇"}</span>
+                    <span className="sessionrail__prompt-text">
+                      {formatStarted(s.started) || s.id.slice(0, 8)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
       )}
     </div>
