@@ -53,6 +53,15 @@ pub enum SessionEntry {
     Mode {
         mode: String,
     },
+    /// Append-only marker: every line before it in the file is transcript
+    /// superseded by a compaction. Those lines are kept on disk verbatim
+    /// (excluded from the live message list) so the original history is
+    /// never destroyed. Compaction appends this marker plus the replacement
+    /// messages instead of rewriting the file.
+    CompactionBoundary {
+        /// Session revision at the time compaction replaced the transcript.
+        revision: u64,
+    },
     /// Versioned, redacted replay facts for one completed root run. Version 1
     /// is the legacy timing-only batch; version 2 keeps the complete low-
     /// frequency root stream plus scoped child lifecycle/tool facts.
@@ -804,6 +813,11 @@ pub fn failure_category(status: &str, finish_detail: &str) -> &'static str {
 struct SessionState {
     revision: u64,
     header: SessionEntry,
+    /// Number of leading `preserved` entries superseded by the newest
+    /// compaction boundary (the boundary line itself included). Entries
+    /// before this index are verbatim history kept on disk but excluded
+    /// from the live message list; `rewrite()` still writes them.
+    superseded: usize,
     preserved: Vec<serde_json::Value>,
     started: Option<String>,
     summary: String,
@@ -830,6 +844,7 @@ impl SessionState {
         Self {
             revision: 0,
             header,
+            superseded: 0,
             preserved: Vec::new(),
             started,
             summary: String::new(),
@@ -861,6 +876,7 @@ impl SessionState {
         let mut cumulative_usage = None;
         let mut repairs = Vec::new();
         let mut revision = 0;
+        let mut superseded = 0;
         let mut traces = Vec::new();
 
         for (index, raw) in text.lines().enumerate() {
@@ -894,6 +910,7 @@ impl SessionState {
                         | "mode"
                         | "cumulative_usage"
                         | "trace"
+                        | "compaction_boundary"
                 )
             );
             if !known {
@@ -955,6 +972,17 @@ impl SessionState {
                 SessionEntry::Mode { mode: value_mode } => {
                     mode = Some(value_mode);
                     preserved.push(value);
+                    revision += 1;
+                }
+                SessionEntry::CompactionBoundary { .. } => {
+                    // Append-only compaction history: the boundary and every
+                    // line before it stay in `preserved` verbatim so
+                    // `rewrite()` keeps them on disk, while the live message
+                    // list restarts from the replacement messages that
+                    // follow. Multiple boundaries simply re-clear.
+                    messages.clear();
+                    preserved.push(value);
+                    superseded = preserved.len();
                     revision += 1;
                 }
                 SessionEntry::RunOutcome { .. } => {
@@ -1034,9 +1062,13 @@ impl SessionState {
                 detail: "removed orphaned tool_use/tool_result content from the resumed transcript"
                     .into(),
             });
-            preserved.retain(|value| {
+            // Rebuild only the live tail; pre-boundary history stays verbatim
+            // so append-only compaction never destroys it via a repair.
+            let mut live = preserved.split_off(superseded);
+            live.retain(|value| {
                 value.get("kind").and_then(|kind| kind.as_str()) != Some("message")
             });
+            preserved.append(&mut live);
             for message in &messages {
                 preserved.push(serde_json::to_value(SessionEntry::Message(
                     message.clone(),
@@ -1048,6 +1080,7 @@ impl SessionState {
             revision,
             header,
             preserved,
+            superseded,
             started,
             summary,
             messages,
@@ -1126,21 +1159,12 @@ impl SessionState {
                 });
             }
             SessionEntry::Session { .. } | SessionEntry::Message(_) => {}
+            // Boundaries are only ever appended by ReplaceAfterCompact, which
+            // updates in-memory state itself; no metadata folding needed.
+            SessionEntry::CompactionBoundary { .. } => {}
         }
     }
 
-    fn replace_messages(&mut self, messages: Vec<Message>) -> std::io::Result<()> {
-        self.messages = messages;
-        self.preserved
-            .retain(|value| value.get("kind").and_then(|kind| kind.as_str()) != Some("message"));
-        for message in &self.messages {
-            self.preserved
-                .push(serde_json::to_value(SessionEntry::Message(
-                    message.clone(),
-                ))?);
-        }
-        Ok(())
-    }
 }
 
 fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<SessionCommand>) {
@@ -1189,15 +1213,47 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
                         current: state.revision,
                     })
                 } else {
-                    state
-                        .replace_messages(messages)
-                        .map_err(SessionError::Io)
-                        .and_then(|()| {
-                            rewrite(&path, &state)?;
-                            state.needs_rewrite = false;
-                            state.revision += 1;
-                            Ok(state.revision)
-                        })
+                    (|| {
+                        // Append-only compaction: the superseded transcript
+                        // stays in the file, verbatim, behind a boundary
+                        // marker; the live message list restarts after it
+                        // (see `load` / `superseded`). The file is rewritten
+                        // only when repairs are pending.
+                        let boundary = serde_json::to_value(SessionEntry::CompactionBoundary {
+                            revision: state.revision,
+                        })?;
+                        let mut pushed = 0usize;
+                        let outcome = (|| -> SessionResult<()> {
+                            state.preserved.push(boundary);
+                            pushed += 1;
+                            for message in &messages {
+                                state.preserved.push(serde_json::to_value(
+                                    SessionEntry::Message(message.clone()),
+                                )?);
+                                pushed += 1;
+                            }
+                            if state.needs_rewrite || !path.exists() {
+                                rewrite(&path, &state)?;
+                                state.needs_rewrite = false;
+                            } else {
+                                let start = state.preserved.len() - pushed;
+                                for value in &state.preserved[start..] {
+                                    append_value(&path, value)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = outcome {
+                            for _ in 0..pushed {
+                                state.preserved.pop();
+                            }
+                            return Err(error);
+                        }
+                        state.superseded = state.preserved.len() - messages.len();
+                        state.messages = messages;
+                        state.revision += 1;
+                        Ok(state.revision)
+                    })()
                 };
                 let _ = reply.send(result);
             }
@@ -1207,6 +1263,7 @@ fn writer_loop(path: PathBuf, mut state: SessionState, rx: mpsc::Receiver<Sessio
                         revision: state.revision,
                         header: state.header.clone(),
                         preserved: Vec::new(),
+                        superseded: 0,
                         started: state.started.clone(),
                         summary: String::new(),
                         messages: Vec::new(),
@@ -1871,6 +1928,170 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["kind"], "session");
         assert_eq!(lines[1]["content"], "fresh");
+    }
+
+    #[tokio::test]
+    async fn compaction_is_append_only_and_history_survives() {
+        let (path, session) = open_temp().await;
+        session
+            .append(Message::user(MessageContent::from_text("old-1")))
+            .await
+            .unwrap();
+        session
+            .append(Message::user(MessageContent::from_text("old-2")))
+            .await
+            .unwrap();
+        let replacement = vec![Message::user(MessageContent::from_text("summary"))];
+        assert_eq!(
+            session.replace_after_compact(replacement, 2).await.unwrap(),
+            3
+        );
+        session
+            .append(Message::user(MessageContent::from_text("new-1")))
+            .await
+            .unwrap();
+
+        // Live view: summary + post-compaction messages only.
+        let snapshot = session.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision, 4);
+        assert_eq!(snapshot.messages.len(), 2);
+        assert!(matches!(
+            &snapshot.messages[0].content,
+            MessageContent::Text(text) if text == "summary"
+        ));
+        assert!(matches!(
+            &snapshot.messages[1].content,
+            MessageContent::Text(text) if text == "new-1"
+        ));
+
+        // Disk keeps everything: header, old messages, boundary, replacement,
+        // post-compaction append — in file order.
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0]["kind"], "session");
+        assert_eq!(lines[1]["content"], "old-1");
+        assert_eq!(lines[2]["content"], "old-2");
+        assert_eq!(lines[3]["kind"], "compaction_boundary");
+        assert_eq!(lines[3]["revision"], 2);
+        assert_eq!(lines[4]["content"], "summary");
+        assert_eq!(lines[5]["content"], "new-1");
+
+        // Reopen: load() must replay the same split — live messages restart
+        // after the boundary, history stays on disk, revisions continue.
+        drop(session);
+        let reopened = SessionService::new()
+            .open_path(path.clone(), "id-1", Path::new("/proj"), "model-x")
+            .unwrap();
+        let resnap = reopened.snapshot().await.unwrap();
+        assert_eq!(resnap.revision, 5);
+        assert_eq!(resnap.messages.len(), 2);
+        assert!(matches!(
+            &resnap.messages[0].content,
+            MessageContent::Text(text) if text == "summary"
+        ));
+        assert!(matches!(
+            &resnap.messages[1].content,
+            MessageContent::Text(text) if text == "new-1"
+        ));
+        assert_eq!(
+            reopened
+                .append(Message::user(MessageContent::from_text("new-2")))
+                .await
+                .unwrap(),
+            6
+        );
+
+        // Second compaction after reopen: another boundary, first boundary's
+        // history still on disk, live view restarts again. (Reloaded revision
+        // replays every persisted line: 2 old messages + boundary + summary +
+        // new-1 = 5, then new-2 = 6.)
+        let replacement2 = vec![Message::user(MessageContent::from_text("summary-2"))];
+        assert_eq!(
+            reopened
+                .replace_after_compact(replacement2, 6)
+                .await
+                .unwrap(),
+            7
+        );
+        let re2 = reopened.snapshot().await.unwrap();
+        assert_eq!(re2.messages.len(), 1);
+        assert!(matches!(
+            &re2.messages[0].content,
+            MessageContent::Text(text) if text == "summary-2"
+        ));
+        let lines2: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines2.len(), 9);
+        assert_eq!(lines2[5]["content"], "new-1");
+        assert_eq!(lines2[6]["content"], "new-2");
+        assert_eq!(lines2[7]["kind"], "compaction_boundary");
+        assert_eq!(lines2[7]["revision"], 6);
+        assert_eq!(lines2[8]["content"], "summary-2");
+
+        // A repair-driven rewrite after compaction must not lose history:
+        // reopen with a dangling tool_use (no result) triggers
+        // tool_pairing_repaired → needs_rewrite; the next append rewrites the
+        // file and must still contain every historical line.
+        drop(reopened);
+        let (dangle_path, dangling) = open_temp().await;
+        dangling
+            .append(Message::user(MessageContent::from_text("keep-me")))
+            .await
+            .unwrap();
+        let _ = dangling
+            .replace_after_compact(
+                vec![Message::assistant(MessageContent::from_blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: "tool-9".into(),
+                        name: "Read".into(),
+                        cache_control: None,
+                        input: serde_json::json!({}),
+                    },
+                ]))],
+                1,
+            )
+            .await
+            .unwrap();
+        drop(dangling);
+        let repaired = SessionService::new()
+            .open_path(dangle_path.clone(), "id-1", Path::new("/proj"), "model-x")
+            .unwrap();
+        assert!(repaired
+            .snapshot()
+            .await
+            .unwrap()
+            .repairs
+            .iter()
+            .any(|repair| repair.kind == SessionRepairKind::ToolPairing));
+        repaired
+            .append(Message::user(MessageContent::from_text("post-repair")))
+            .await
+            .unwrap();
+        let repaired_lines: Vec<String> = std::fs::read_to_string(dangle_path)
+            .unwrap()
+            .lines()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(repaired_lines.len() >= 4);
+        assert!(
+            repaired_lines
+                .iter()
+                .any(|line| line.contains("keep-me")),
+            "pre-boundary history must survive the repair rewrite"
+        );
+        assert!(
+            repaired_lines
+                .iter()
+                .any(|line| line.contains("compaction_boundary")),
+            "boundary marker must survive the repair rewrite"
+        );
     }
 
     #[tokio::test]
