@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Multipart, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures::StreamExt;
 use nonoclaw_core::{AppError, ErrorCode};
@@ -29,10 +29,11 @@ const ALLOWED_AUDIO_TYPES: &[&str] = &[
 
 pub(super) async fn stt_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return stt_error(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Authentication,
