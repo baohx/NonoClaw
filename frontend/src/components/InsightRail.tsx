@@ -594,9 +594,16 @@ function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () =
     if (b.ok && b.summary) balanceMap.set(b.provider, b.summary);
   }
 
+  /** Auxiliary services (OCR / video) share the same health-check
+      results — entries with a known "kind ·" prefix. The prefix check
+      keeps conversation model names containing " · " out of this list. */
+  const auxServices = Object.values(health)
+    .filter((h) => /^(ocr|video) · /.test(h.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   if (models.length === 0) return null;
   return (
-    <Section id="models" label="Models" count={models.length} open={open} onToggle={onToggle}
+    <Section id="models" label="Models" count={models.length + auxServices.length} open={open} onToggle={onToggle}
       headerExtra={
         <button
           className="models-probe-btn"
@@ -649,10 +656,7 @@ function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () =
         {/* Auxiliary services (OCR / video) share the same health-check
             results — entries with a known "kind ·" prefix. The prefix check
             keeps conversation model names containing " · " out of this list. */}
-        {Object.values(health)
-          .filter((h) => /^(ocr|video) · /.test(h.name))
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map((h) => {
+        {auxServices.map((h) => {
             const [kind, id] = h.name.split(" · ");
             const dotClass = h.ok ? "probe-ok" : checking ? "probe-pending" : "bad";
             const dotTitle = h.ok ? `连通 · ${h.latency_ms}ms` : `失败 · ${h.error || "unknown"}`;
