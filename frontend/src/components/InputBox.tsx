@@ -33,17 +33,12 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
   const updateAttachment = useStore((state) => state.updateAttachment);
   const removeMediaAttachment = useStore((state) => state.removeAttachment);
   const clearAttachments = useStore((state) => state.clearAttachments);
-  const recording = useStore((state) => state.recording);
-  const setRecording = useStore((state) => state.setRecording);
   const sessionId = useStore((state) => state.sessionId);
   const model = useStore((state) => state.model);
   const availableModels = useStore((state) => state.availableModels);
   const permissionMode = useStore((state) => state.permissionMode);
   const [dragOver, setDragOver] = useState(false);
   const dragCounter = useRef(0);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const recordingStreamRef = useRef<MediaStream | null>(null);
-  const cancelRecordingRef = useRef(false);
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -51,70 +46,11 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
 
   useEffect(() => {
     return () => {
-      cancelRecordingRef.current = true;
-      const recorder = recorderRef.current;
-      recorderRef.current = null;
-      if (recorder?.state === "recording") {
-        try { recorder.stop(); } catch {}
-      }
-      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-      recordingStreamRef.current = null;
       const state = useStore.getState();
       state.attachments.forEach((a) => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
-      state.setRecording(false);
       state.clearAttachments();
     };
   }, [sessionId]);
-
-  // ── Voice input (ElevenLabs STT) ────────────────────────────────────────
-
-  const startRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      recordingStreamRef.current = stream;
-      cancelRecordingRef.current = false;
-      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      recorderRef.current = recorder;
-      const chunks: BlobPart[] = [];
-      recorder.ondataavailable = (e) => chunks.push(e.data);
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((track) => track.stop());
-        recordingStreamRef.current = null;
-        if (cancelRecordingRef.current) return;
-        const blob = new Blob(chunks, { type: "audio/webm" });
-        if (blob.size < 500) return; // too short — ignore
-        try {
-          const form = new FormData();
-          form.append("audio", blob, "recording.webm");
-          const resp = await fetch(authenticatedApiUrl("/api/stt"), { method: "POST", body: form });
-          if (!resp.ok) return;
-          const data = await resp.json();
-          const text = typeof data.text === "string" ? data.text : "";
-          if (text && text !== "error") {
-            const el = textareaRef.current;
-            if (!el) return;
-            const start = el.selectionStart ?? el.value.length;
-            const end = el.selectionEnd ?? el.value.length;
-            const value = el.value.slice(0, start) + text + el.value.slice(end);
-            setDraft(value);
-            window.requestAnimationFrame(() => {
-              el.focus();
-              el.setSelectionRange(start + text.length, start + text.length);
-            });
-          }
-        } catch { /* STT failed silently */ }
-      };
-      recorder.start();
-      setRecording(true);
-    } catch { /* mic denied */ }
-  }, [setDraft, setRecording]);
-
-  const stopRecording = useCallback(() => {
-    if (recorderRef.current?.state === "recording") {
-      recorderRef.current.stop();
-    }
-    setRecording(false);
-  }, [setRecording]);
 
   // ── File upload ─────────────────────────────────────────────────────────
 
@@ -356,7 +292,7 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
           onKeyDown={handleKeyDown}
           onChange={(event) => setDraft(event.target.value)}
           disabled={disabled}
-          placeholder={recording ? "🎙️ listening…" : disabled ? "connecting…" : "message NonoClaw…"}
+          placeholder={disabled ? "connecting…" : "message NonoClaw…"}
           rows={1}
         />
         <div className="composer__hint">
@@ -372,27 +308,8 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
               </svg>
             </button>
-            <button
-              className={`composer__mic${recording ? " composer__mic--active" : ""}`}
-              onMouseDown={(e) => { e.preventDefault(); startRecording(); }}
-              onMouseUp={stopRecording}
-              onMouseLeave={stopRecording}
-              onTouchStart={(e) => { e.preventDefault(); startRecording(); }}
-              onTouchEnd={stopRecording}
-              disabled={disabled}
-              aria-label="Voice input"
-              title="Hold to record voice · Space to dictate"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill={recording ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
-                <path d="M19 10v2a7 7 0 01-14 0v-2"/>
-                <line x1="12" y1="19" x2="12" y2="23"/>
-                <line x1="8" y1="23" x2="16" y2="23"/>
-              </svg>
-            </button>
             <span className="composer__shortcuts">
-              <span className="composer__shortcut-key"><kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd> · </span>
-              <span className="composer__commands">/clear /compact</span>
+              <span className="composer__shortcut-key"><kbd>⌘/Ctrl</kbd> + <kbd>Enter</kbd></span>
             </span>
             <div className="composer__run-options" aria-label="Next run settings">
               <label>
