@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{Multipart, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use nonoclaw_core::{AppError, ErrorCode};
 use nonoclaw_engine::ClientPurpose;
@@ -33,10 +33,11 @@ pub(super) struct StoredAttachment {
 
 pub(super) async fn upload_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return upload_error(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Authentication,

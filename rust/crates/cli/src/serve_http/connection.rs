@@ -142,6 +142,23 @@ impl AppState {
         token_is_authorized(self.require_auth, &self.auth_token, supplied_token)
     }
 
+    /// Authenticate a browser-facing REST endpoint. Extends [`Self::authorized`]
+    /// with the header channels the local Web UI actually uses: the local
+    /// browser holds no query token (HttpOnly bootstrap ticket instead), so a
+    /// serve that requires auth must accept the cookie, plus Bearer for API
+    /// automation. Loopback keeps the frictionless no-token path.
+    pub(super) fn authorized_with_headers(
+        &self,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> bool {
+        self.authorized(query_token)
+            || bearer_token(headers)
+                .is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
+            || cookie_token(headers, LOCAL_AUTH_COOKIE)
+                .is_some_and(|token| constant_time_token_eq(&self.local_ws_ticket, token))
+    }
+
     pub(super) fn download_authorized(&self, supplied_token: Option<&str>) -> bool {
         supplied_token.is_some_and(|token| constant_time_token_eq(&self.auth_token, token))
     }
@@ -3641,6 +3658,51 @@ async fn handle_ws(
 #[cfg(test)]
 mod characterization_tests {
     use super::*;
+
+    #[test]
+    fn browser_rest_auth_accepts_cookie_bearer_and_query_token() {
+        // Mirror a serve with require_auth = true (non-loopback bind, tunnel,
+        // or public URL). The local Web UI holds no query token — it only has
+        // the HttpOnly bootstrap cookie — so these REST endpoints must accept
+        // the cookie, the Bearer token, or a valid query token.
+        let cwd = std::env::temp_dir();
+        let settings_path = cwd.join("settings.json");
+        let config = Arc::new(nonoclaw_engine::load_resolved_config(
+            &cwd,
+            Some(&settings_path),
+            None,
+        ));
+        let mut state = upload_exploration_state(cwd, config, std::env::temp_dir().join("uploads"));
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.auth_token = "serve-auth-token".into();
+        state.local_ws_ticket = "local-ticket".into();
+        state.require_auth = true;
+
+        // 1. The local-browser path that produced the 401: cookie, no token.
+        let cookie_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            HeaderValue::from_static("nonoclaw_local_ticket=local-ticket"),
+        )]);
+        assert!(state.authorized_with_headers(&cookie_headers, None));
+
+        // 2. API automation: Bearer token.
+        let bearer_headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer serve-auth-token"),
+        )]);
+        assert!(state.authorized_with_headers(&bearer_headers, None));
+
+        // 3. Remote/mobile launch: query token.
+        assert!(state.authorized_with_headers(&HeaderMap::new(), Some("serve-auth-token")));
+
+        // 4. Reject wrong/absent credentials.
+        let wrong_cookie = HeaderMap::from_iter([(
+            header::COOKIE,
+            HeaderValue::from_static("nonoclaw_local_ticket=wrong"),
+        )]);
+        assert!(!state.authorized_with_headers(&wrong_cookie, None));
+        assert!(!state.authorized_with_headers(&HeaderMap::new(), None));
+    }
 
     #[test]
     fn provider_failures_expose_only_safe_http_status() {

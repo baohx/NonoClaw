@@ -22,7 +22,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -381,9 +381,10 @@ fn empty_list(enabled: bool, dir: &FsPath) -> Response {
 /// `GET /api/logs/raw` — list raw API log entries (newest first).
 pub async fn list_raw_logs(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    if !state.authorized(query.token.as_deref()) {
+    if !state.authorized_with_headers(&headers, query.token.as_deref()) {
         return unauthorized();
     }
 
@@ -478,10 +479,11 @@ pub async fn list_raw_logs(
 /// `GET /api/logs/raw/:file` — return a single log file's content.
 pub async fn get_raw_log(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(file_name): Path<String>,
     Query(query): Query<ContentQuery>,
 ) -> Response {
-    if !state.authorized(query.token.as_deref()) {
+    if !state.authorized_with_headers(&headers, query.token.as_deref()) {
         return unauthorized();
     }
     if !raw_api_log_enabled() || parse_log_file_name(&file_name).is_none() {

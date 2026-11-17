@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
@@ -191,9 +191,10 @@ fn video_error(status: StatusCode, message: &str) -> Response {
 /// GET /api/video/models — sanitized video model profiles (no api keys).
 pub(super) async fn models_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let profiles = state.project().config().video_models();
@@ -248,10 +249,11 @@ fn default_ratio() -> String {
 /// (spawned per create) submits to Ark when a concurrency slot frees up.
 pub(super) async fn create_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let project = state.project();
@@ -667,9 +669,10 @@ fn reqwest_client() -> reqwest::Client {
 /// GET /api/video/tasks — ledger view; refreshes in-flight remote statuses.
 pub(super) async fn list_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let cwd = state.project().cwd().to_path_buf();
@@ -692,10 +695,11 @@ pub(super) async fn list_handler(
 /// GET /api/video/tasks/:id — one remote status refresh + detail.
 pub(super) async fn get_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Path(task_id): Path<String>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let cwd = state.project().cwd().to_path_buf();
@@ -783,10 +787,11 @@ async fn refresh_remote(state: &Arc<AppState>, cwd: &std::path::Path, task: &mut
 /// tasks cannot be cancelled (Ark rejects); we keep the local record.
 pub(super) async fn delete_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Path(task_id): Path<String>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let cwd = state.project().cwd().to_path_buf();
@@ -850,10 +855,11 @@ pub(super) async fn delete_handler(
 /// GET /api/video/tasks/:id/file — stream the persisted mp4.
 pub(super) async fn file_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Path(task_id): Path<String>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let cwd = state.project().cwd().to_path_buf();
@@ -931,10 +937,11 @@ fn enhance_client(
 /// (Anthropic / OpenAI / Responses / Gemini) and auth scheme just works.
 pub(super) async fn enhance_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     Json(body): Json<EnhanceParams>,
 ) -> Response {
-    if !state.authorized(params.get("token").map(String::as_str)) {
+    if !state.authorized_with_headers(&headers, params.get("token").map(String::as_str)) {
         return video_error(StatusCode::UNAUTHORIZED, "invalid or missing auth token");
     }
     let action = body.action.as_deref().unwrap_or("enhance");
