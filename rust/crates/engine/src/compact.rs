@@ -3,12 +3,13 @@
 //! single message and keep the recent tail verbatim. Triggered by the engine
 //! loop based on a token estimate (see [`crate::tokens`]).
 //!
-//! In-memory for the current run, then persisted by rewriting the session
-//! file's compacted message entries under a revision CAS (see
-//! [`crate::session::SessionWriter::replace_after_compact`]): the replaced
-//! entries collapse into the summary while the retained tail and all
-//! metadata/unknown entries survive, so a `--resume` starts from the
-//! compacted view (and may re-compact).
+//! In-memory for the current run, then persisted append-only: a compaction
+//! boundary marker plus the replacement messages are appended to the session
+//! file under a revision CAS (see
+//! [`crate::session::SessionWriter::replace_after_compact`]). The superseded
+//! transcript lines stay on disk, verbatim, behind the boundary; a `--resume`
+//! starts from the compacted view (and may re-compact) while the original
+//! history remains recoverable.
 
 use nonoclaw_api::{Client, RequestParams, SystemBlock};
 

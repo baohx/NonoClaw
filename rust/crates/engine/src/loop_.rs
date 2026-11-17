@@ -6002,15 +6002,38 @@ mod tests {
         fixture_task.await.unwrap();
 
         // On-disk transcript must now contain the micro marker — the pruned
-        // bytes, not the original full text.
+        // bytes are the live view. Append-only compaction additionally keeps
+        // the superseded original on disk behind the boundary.
         let disk = std::fs::read_to_string(cwd.join("micro-persist.jsonl")).unwrap();
         assert!(
             disk.contains(crate::compact::MICRO_MARKER),
             "micro-compact rewrites must be persisted to disk"
         );
         assert!(
-            !disk.contains(&"x".repeat(crate::compact::MICRO_THRESHOLD_CHARS + 100)),
-            "the oversized original text must not remain on disk"
+            disk.contains(&"x".repeat(crate::compact::MICRO_THRESHOLD_CHARS + 100)),
+            "append-only compaction must keep the superseded original on disk"
+        );
+        assert!(
+            disk.contains("\"kind\":\"compaction_boundary\""),
+            "the compaction boundary must be persisted"
+        );
+        drop(engine);
+        let reopened = crate::session::SessionService::new()
+            .open_path(
+                cwd.join("micro-persist.jsonl"),
+                "micro-persist-id",
+                &cwd,
+                "fixture-requested-model",
+            )
+            .unwrap();
+        let snap = reopened.snapshot().await.unwrap();
+        assert!(
+            !snap.messages.iter().any(|message| {
+                serde_json::to_string(message)
+                    .unwrap()
+                    .contains(&"x".repeat(crate::compact::MICRO_THRESHOLD_CHARS + 100))
+            }),
+            "live view after reload must carry the pruned bytes only"
         );
         std::fs::remove_dir_all(cwd).ok();
     }
