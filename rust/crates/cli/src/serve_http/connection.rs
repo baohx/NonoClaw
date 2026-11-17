@@ -563,37 +563,11 @@ fn short_error(err: &str) -> String {
     }
 }
 
-// ── Auxiliary service probes (voice / OCR / video) ──────────────────────────
+// ── Auxiliary service probes (OCR / video) ──────────────────────────────────
 
 /// Latency budget for the auxiliary service probes (simple GET/token calls,
 /// no generation, so they must answer much faster than a model probe).
 const SERVICE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
-
-/// Probe the ElevenLabs key via the free `GET /v1/user` endpoint (returns the
-/// subscription object; 401 means invalid key). `scribe_v2` speech-to-text
-/// availability follows from key validity.
-async fn probe_elevenlabs(http: &reqwest::Client, api_key: &str) -> (bool, Option<u64>, Option<String>) {
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        SERVICE_PROBE_TIMEOUT,
-        http.get("https://api.elevenlabs.io/v1/user")
-            .header("xi-api-key", api_key)
-            .send(),
-    )
-    .await;
-    match result {
-        Ok(Ok(resp)) if resp.status().is_success() => {
-            (true, Some(started.elapsed().as_millis() as u64), None)
-        }
-        Ok(Ok(resp)) => (false, None, Some(format!("HTTP {}", resp.status()))),
-        Ok(Err(err)) => (false, None, Some(short_error(&err.to_string()))),
-        Err(_) => (
-            false,
-            None,
-            Some(format!("timeout ({}s)", SERVICE_PROBE_TIMEOUT.as_secs())),
-        ),
-    }
-}
 
 /// Probe the Baidu OCR credential pair by exchanging it for an OAuth access
 /// token — the same call `attachments::process_baidu_unlimited` performs
@@ -1711,21 +1685,9 @@ async fn handle_ws(
                         }
                     });
                 }
-                // Auxiliary services share the same probe: voice (ElevenLabs),
-                // the docModel OCR provider, and every configured video model.
+                // Auxiliary services share the same probe: the docModel OCR
+                // provider and every configured video model.
                 let http = reqwest::Client::new();
-                if let Some(key) = config.elevenlabs_api_key() {
-                    let http = http.clone();
-                    tasks.spawn(async move {
-                        let (ok, latency_ms, error) = probe_elevenlabs(&http, &key).await;
-                        super::protocol::ModelHealthEntry {
-                            name: "voice · elevenlabs".into(),
-                            ok,
-                            latency_ms,
-                            error,
-                        }
-                    });
-                }
                 if let Some(doc) = config.doc_model().filter(|d| d.provider == "baidu_unlimited") {
                     let http = http.clone();
                     tasks.spawn(async move {

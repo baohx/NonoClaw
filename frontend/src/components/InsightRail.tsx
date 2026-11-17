@@ -318,10 +318,6 @@ export default function InsightRail({ info, onOpen, onRefresh, onTrajectoryOpen,
           <ConfigRef items={info?.config_reference ?? []} />
         </Section>
 
-        <Section id="slash" label="Slash commands" count={3} open={open.has("slash")} onToggle={toggle}>
-          <SlashRef />
-        </Section>
-
         <Section id="cli" label="CLI reference" count={info?.cli_reference.length ?? 0} open={open.has("cli")} onToggle={toggle}>
           <CliRef items={info?.cli_reference ?? []} />
         </Section>
@@ -650,11 +646,11 @@ function ModelsSection({ open, onToggle, send }: { open: boolean; onToggle: () =
           </div>
           );
         })}
-        {/* Auxiliary services (voice / OCR / video) share the same health-check
+        {/* Auxiliary services (OCR / video) share the same health-check
             results — entries with a known "kind ·" prefix. The prefix check
             keeps conversation model names containing " · " out of this list. */}
         {Object.values(health)
-          .filter((h) => /^(voice|ocr|video) · /.test(h.name))
+          .filter((h) => /^(ocr|video) · /.test(h.name))
           .sort((a, b) => a.name.localeCompare(b.name))
           .map((h) => {
             const [kind, id] = h.name.split(" · ");
@@ -739,38 +735,6 @@ function CacheSection() {
       </div>
       <div className="insight-row__meta" style={{ marginTop: 2 }}>
         in {fmt(input)} · out {fmt(output)} · cache r/w {fmt(cacheRead)}/{fmt(cacheWrite)}
-      </div>
-    </div>
-  );
-}
-
-// ── Slash commands reference ────────────────────────────────────────────────
-
-function SlashRef() {
-  return (
-    <div className="acc-body">
-      <div className="insight-row">
-        <div className="insight-row__top">
-          <span className="tag mcp">/clear</span>
-          <span className="insight-row__name">Reset conversation</span>
-        </div>
-        <div className="insight-row__meta">Clear all messages and start fresh</div>
-      </div>
-      <div className="insight-row">
-        <div className="insight-row__top">
-          <span className="tag mcp">/compact</span>
-          <span className="insight-row__name">Summarise long context</span>
-        </div>
-        <div className="insight-row__meta">Compress older messages into a summary to free context window</div>
-      </div>
-      <div className="insight-row">
-        <div className="insight-row__top">
-          <span className="tag mcp">/multi</span>
-          <span className="insight-row__name">Multi-model compare</span>
-        </div>
-        <div className="insight-row__meta">
-          Syntax: /multi deepseek-chat,glm-4-plus {"<prompt>"} — compare model answers sequentially
-        </div>
       </div>
     </div>
   );

@@ -118,7 +118,7 @@ function WelcomeMessage() {
       </div>
       <div className="welcome__sub">A Rust agent CLI. Type a prompt below to begin.</div>
       <div className="welcome__hint">
-        Ctrl / Enter to send · /clear to reset · the reef breathes with the token stream
+        Ctrl / Enter to send · the reef breathes with the token stream
       </div>
     </div>
   );

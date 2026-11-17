@@ -31,7 +31,6 @@ const base: ChatStreamState = {
   resolvedPermissionIds: [],
   resolvedQuestionIds: [],
   attachments: [],
-  recording: false,
   outboundQueue: [],
   activeRunId: null,
   agentRunning: false,

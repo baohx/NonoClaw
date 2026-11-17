@@ -255,13 +255,11 @@ export interface MediaAttachment {
 export interface MediaSlice {
   draft: string;
   attachments: MediaAttachment[];
-  recording: boolean;
   setDraft: (draft: string) => void;
   addAttachment: (attachment: MediaAttachment) => void;
   updateAttachment: (id: string, update: Partial<MediaAttachment>) => void;
   removeAttachment: (id: string) => void;
   clearAttachments: () => void;
-  setRecording: (recording: boolean) => void;
 }
 
 export interface BreathSlice {
@@ -356,7 +354,6 @@ function boundaryCleanup(state: AppState, sessionId: string): Partial<AppState> 
     resolvedPermissionIds: [],
     resolvedQuestionIds: [],
     attachments: [],
-    recording: false,
     outboundQueue: [],
   };
 }
@@ -793,7 +790,6 @@ function initialDraft(): string {
 export const createMediaSlice: Slice<MediaSlice> = (set) => ({
   draft: initialDraft(),
   attachments: [],
-  recording: false,
   setDraft: (draft) => {
     try {
       if (typeof localStorage !== "undefined") {
@@ -813,7 +809,6 @@ export const createMediaSlice: Slice<MediaSlice> = (set) => ({
   })),
   removeAttachment: (id) => set((state) => ({ attachments: state.attachments.filter((attachment) => attachment.id !== id) })),
   clearAttachments: () => set({ attachments: [] }),
-  setRecording: (recording) => set({ recording }),
 });
 
 export const createBreathSlice: Slice<BreathSlice> = (set) => ({
