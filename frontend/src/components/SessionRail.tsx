@@ -22,6 +22,18 @@ function formatStarted(started: string | null): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
 }
 
+function formatSessionDate(started: string | null): string {
+  if (!started) return "Undated";
+  const date = new Date(started);
+  if (isNaN(date.getTime())) return "Undated";
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return date.toLocaleDateString("en-US", { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }) });
+}
+
+function sessionLabel(session: SessionInfoWire): string {
+  return session.title?.trim() || session.summary.trim() || formatSessionDate(session.started);
+}
+
 /**
  * Left-rail session browser. Sessions sort newest-first by creation time;
  * expanding one lazily fetches the first user prompt of each run. Clicking a
@@ -101,7 +113,7 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
         title={collapsed ? "Expand sessions" : "Collapse sessions"}
       >
         <span className="sessionrail__head-caret">{collapsed ? "▸" : "▾"}</span>
-        <span className="sessionrail__title">sessions</span>
+        <span className="sessionrail__title">Conversations</span>
         <span className="sessionrail__head-count">{conversations.length}</span>
       </button>
       {!collapsed && (
@@ -125,8 +137,11 @@ export default function SessionRail({ sessions, currentId, send, collapsed, onTo
                 title={s.id}
               >
                 <span className="sessionrail__caret">{expanded ? "▾" : "▸"}</span>
-                <span className="sessionrail__date">{formatStarted(s.started) || s.id.slice(0, 8)}</span>
-                <span className="sessionrail__count">{s.message_count}</span>
+                <span className="sessionrail__session-title">{sessionLabel(s)}</span>
+                <span className="sessionrail__session-meta">
+                  <span className="sessionrail__session-date">{formatSessionDate(s.started)}</span>
+                  <span className="sessionrail__session-count">{s.message_count} messages</span>
+                </span>
               </button>
               {expanded && (
                 <div className="sessionrail__prompts">

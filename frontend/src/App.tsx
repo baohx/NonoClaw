@@ -1,9 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import { breathController } from "./breath";
 import { useStore } from "./store";
-import { THEME_IS_DARK } from "./store/slices";
 import { useWebSocket } from "./websocket";
-import BreathField from "./components/BreathField";
 import ChatView from "./components/ChatView";
 import ApiLogDrawer from "./components/ApiLogDrawer";
 import CommitDialog from "./components/CommitDialog";
@@ -54,7 +52,6 @@ export default function App() {
   const insightCollapsed = useStore((s) => s.insightCollapsed);
   const toggleLeftRail = useStore((s) => s.toggleLeftRail);
   const toggleInsight = useStore((s) => s.toggleInsight);
-  const theme = useStore((s) => s.theme);
   const setBreathState = useStore((s) => s.setBreathState);
   const locatedMessageId = useStore((s) => s.locatedMessageId);
   const setLocatedMessage = useStore((s) => s.setLocatedMessage);
@@ -105,12 +102,6 @@ export default function App() {
       setShowSurfacing(false);
     }
   }, [connectionStatus, everConnected]);
-
-  // Apply CSS theme to <html> so [data-theme] variable overrides take effect.
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-    document.documentElement.setAttribute("data-color-scheme", THEME_IS_DARK[theme] ? "dark" : "light");
-  }, [theme]);
 
   const chatRef = useRef<HTMLDivElement>(null);
 
@@ -389,10 +380,6 @@ export default function App() {
 
   return (
     <>
-      <BreathField />
-      <div className="aurora-grain" />
-      <div className="aurora-noise" />
-
       <div className="app-root">
         <StatusBar
           model={model}

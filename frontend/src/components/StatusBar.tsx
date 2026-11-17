@@ -1,7 +1,4 @@
-import { useState, useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
 import { useStore } from "../store";
-import { THEME_COLORS, type Theme } from "../store/slices";
 
 interface Props {
   model: string;
@@ -18,8 +15,6 @@ interface Props {
   onOpenVideoStudio: () => void;
   onToggleGovernance: () => void;
 }
-
-const ALL_THEMES = Object.keys(THEME_COLORS) as Theme[];
 
 export default function StatusBar({
   model,
@@ -38,8 +33,6 @@ export default function StatusBar({
 }: Props) {
   const inputTokens = useStore((s) => s.inputTokens);
   const outputTokens = useStore((s) => s.outputTokens);
-  const theme = useStore((s) => s.theme);
-  const setTheme = useStore((s) => s.setTheme);
   const hasMobileAccessToken = useStore((s) => s.hasMobileAccessToken);
   const permissionMode = useStore((s) => s.permissionMode);
   const availableModels = useStore((s) => s.availableModels);
@@ -61,32 +54,6 @@ export default function StatusBar({
     return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
   })();
 
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const [pickerPos, setPickerPos] = useState<{ top: number; left: number } | null>(null);
-  const dotRef = useRef<HTMLButtonElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
-          dotRef.current && !dotRef.current.contains(e.target as Node)) {
-        setPickerOpen(false);
-      }
-    };
-    if (pickerOpen) document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [pickerOpen]);
-
-  const openPicker = () => {
-    if (dotRef.current) {
-      const r = dotRef.current.getBoundingClientRect();
-      setPickerPos({ top: r.bottom + 6, left: r.left + r.width / 2 });
-    }
-    setPickerOpen(true);
-  };
-
-  const dotColor = THEME_COLORS[theme];
-
   const dotClass = [
     "breath-dot",
     breathState === "connecting" || breathState === "reconnecting" || breathState.startsWith("waiting")
@@ -104,11 +71,17 @@ export default function StatusBar({
           onClick={onToggleLeftRail}
           title={leftRailCollapsed ? "Show file tree + git" : "Hide file tree + git"}
           aria-label="Toggle left rail"
+          aria-pressed={!leftRailCollapsed}
         >
-          {leftRailCollapsed ? "»" : "«"}
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+            <rect x="3" y="3" width="14" height="14" rx="2" /><path d="M7 3v14" />
+          </svg>
         </button>
         <span className="statusbar__brand">
-          Nono<i>Claw</i>
+          <svg className="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+            <path d="m8 6-5 6 5 6M16 6l5 6-5 6M14 3l-4 18" />
+          </svg>
+          NonoClaw
         </span>
         {model ? (
           <>
@@ -132,50 +105,30 @@ export default function StatusBar({
             {sessionId.slice(0, 8)}{sessionDateLabel ? ` · ${sessionDateLabel}` : ""} ▾
           </button>
         )}
-        <button
-          ref={dotRef}
-          className="theme-dot"
-          style={{ background: dotColor }}
-          onClick={openPicker}
-          title={`Theme: ${theme} (click to change)`}
-          aria-label="Pick theme color"
-        />
-        {pickerOpen && pickerPos && createPortal(
-          <div
-            ref={dropdownRef}
-            className="theme-dropdown"
-            style={{ top: pickerPos.top, left: pickerPos.left }}
-          >
-            {ALL_THEMES.map((name) => (
-              <button
-                key={name}
-                className="theme-option"
-                style={{ background: THEME_COLORS[name] }}
-                onClick={() => { setTheme(name); setPickerOpen(false); }}
-                title={name}
-                aria-label={`Theme: ${name}`}
-              >
-                {name === theme && <span className="theme-check" />}
-              </button>
-            ))}
-          </div>,
-          document.body
-        )}
+        <span className="session-status" role="status" title={`${breathLabel} · ${connectionStatus}`} aria-live="polite">
+          <span className={dotClass} data-phase={breathState} aria-hidden="true" />
+          <span className="breath-status">{breathLabel === "idle" ? "Ready" : breathLabel}</span>
+        </span>
         <button
           className="iconbtn"
           onClick={onToggleInsight}
           title={insightCollapsed ? "Show insight panel" : "Hide insight panel"}
           aria-label="Toggle insight rail"
+          aria-pressed={!insightCollapsed}
         >
-          {insightCollapsed ? "«" : "»"}
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+            <rect x="3" y="3" width="14" height="14" rx="2" /><path d="M13 3v14" />
+          </svg>
         </button>
         <button
           className="iconbtn"
           onClick={onToggleApiLog}
-          title="Show / hide raw API log viewer"
+          title="Show raw API log viewer"
           aria-label="Toggle API log viewer"
         >
-          &#x1f4dd;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+            <path d="m7 5-4 5 4 5m6-10 4 5-4 5M11 3l-2 14" />
+          </svg>
         </button>
         <button
           className="iconbtn"
@@ -183,7 +136,9 @@ export default function StatusBar({
           title="Video generation studio (Seedance)"
           aria-label="Open video studio"
         >
-          &#x1f3ac;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+            <rect x="3" y="6" width="10" height="9" rx="1.5" /><path d="m13 9 4-2v7l-4-2M6 6V3m5 3V3" />
+          </svg>
         </button>
         <button
           className="iconbtn"
@@ -191,7 +146,9 @@ export default function StatusBar({
           title="Trajectory governance — tree, loop/retry/drift detection"
           aria-label="Toggle trajectory governance"
         >
-          &#x1f333;
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+            <circle cx="10" cy="4" r="2" /><circle cx="5" cy="16" r="2" /><circle cx="15" cy="16" r="2" /><path d="M10 6v4m0 0-5 4m5-4 5 4" />
+          </svg>
         </button>
         {hasMobileAccessToken && (
           <button
@@ -200,13 +157,12 @@ export default function StatusBar({
             title="Show QR code for mobile access"
             aria-label="Show QR code"
           >
-            &#x25f0;
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+              <path d="M3 8V3h5m4 0h5v5M3 12v5h5m4 0h5v-5M7 7h1m4 0h1M7 12h1m4 0h1" />
+            </svg>
           </button>
         )}
-        <span className="breath-status" role="status" aria-live="polite">
-          {breathLabel}
-        </span>
-        <span className={dotClass} title={`${breathLabel} · ${connectionStatus}`} data-phase={breathState} />
+
       </div>
     </div>
   );

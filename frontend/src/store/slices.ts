@@ -50,46 +50,6 @@ import {
 } from "./transitions";
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
-export type Theme = "biolume" | "amber" | "frost"
-  | "meadow" | "crimson" | "teal" | "indigo"
-  | "burgundy" | "gold" | "aqua" | "scarlet"
-  | "espresso" | "ember" | "navy";
-
-/** Hex color for each theme displayed as the status-bar dot. */
-export const THEME_COLORS: Record<Theme, string> = {
-  biolume: "#0071e3",
-  amber:   "#ff9f0a",
-  frost:   "#64d2ff",
-  meadow:  "#34c759",
-  crimson: "#ff3b30",
-  teal:    "#5ac8fa",
-  indigo:  "#5856d6",
-  burgundy:"#af52de",
-  gold:    "#ffd60a",
-  aqua:    "#00CED9",
-  scarlet: "#ff2d55",
-  espresso:"#a2845e",
-  ember:   "#ff6b35",
-  navy:    "#0a84ff",
-};
-
-/** Whether each theme uses a dark background (affects canvas blending, etc). */
-export const THEME_IS_DARK: Record<Theme, boolean> = {
-  biolume: false,
-  amber:   false,
-  frost:   true,
-  meadow:  false,
-  crimson: false,
-  teal:    false,
-  indigo:  true,
-  burgundy: true,
-  gold:    false,
-  aqua:    false,
-  scarlet: false,
-  espresso: true,
-  ember:   false,
-  navy:    true,
-};
 export type BreathState = BreathPhase;
 
 export interface ConnectionSlice extends ConnectionState {
@@ -271,7 +231,6 @@ export interface BreathSlice {
 export interface UiSlice {
   leftRailCollapsed: boolean;
   insightCollapsed: boolean;
-  theme: Theme;
   permissionMode: PermissionMode;
   /** Chat message id to scroll into view and highlight (rail session jump). */
   locatedMessageId: string | null;
@@ -293,7 +252,6 @@ export interface UiSlice {
   toggleInsight: () => void;
   setShowApiLog: (show: boolean) => void;
   setShowGovernance: (show: boolean) => void;
-  setTheme: (theme: Theme) => void;
   setPermissionMode: (mode: PermissionMode) => void;
   setLocatedMessage: (id: string | null) => void;
   setToolsHidden: (hidden: boolean) => void;
@@ -817,20 +775,9 @@ export const createBreathSlice: Slice<BreathSlice> = (set) => ({
   setBreathState: (breathState, breathLabel = breathState) => set({ breathState, breathLabel }),
 });
 
-function initialTheme(): Theme {
-  if (typeof localStorage === "undefined") return "frost";
-  try {
-    const value = localStorage.getItem("nonoclaw:theme");
-    return Object.prototype.hasOwnProperty.call(THEME_COLORS, value as string)
-      ? (value as Theme)
-      : "frost";
-  } catch { return "frost"; }
-}
-
 export const createUiSlice: Slice<UiSlice> = (set) => ({
   leftRailCollapsed: false,
   insightCollapsed: false,
-  theme: initialTheme(),
   permissionMode: "auto",
   locatedMessageId: null,
   xrayBudget: null,
@@ -847,10 +794,6 @@ export const createUiSlice: Slice<UiSlice> = (set) => ({
   setInsightCollapsed: (insightCollapsed) => set({ insightCollapsed }),
   toggleLeftRail: () => set((state) => ({ leftRailCollapsed: !state.leftRailCollapsed })),
   toggleInsight: () => set((state) => ({ insightCollapsed: !state.insightCollapsed })),
-  setTheme: (theme) => {
-    try { if (typeof localStorage !== "undefined") localStorage.setItem("nonoclaw:theme", theme); } catch {}
-    set({ theme });
-  },
   setPermissionMode: (permissionMode) => set({ permissionMode }),
   setLocatedMessage: (locatedMessageId) => set({ locatedMessageId }),
 });

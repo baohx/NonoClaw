@@ -112,15 +112,20 @@ export default function ChatView({ toolsHidden, send }: Props) {
 
 function WelcomeMessage() {
   return (
-    <div className="welcome">
-      <div className="welcome__mark">
-        Nono<i>Claw</i>
+    <section className="welcome" aria-labelledby="welcome-title">
+      <div className="welcome__eyebrow">
+        <span className="welcome__eyebrow-line" />
+        Your engineering workspace
       </div>
-      <div className="welcome__sub">A Rust agent CLI. Type a prompt below to begin.</div>
-      <div className="welcome__hint">
-        Ctrl / Enter to send · the reef breathes with the token stream
+      <h1 className="welcome__mark" id="welcome-title">Make something<span>.</span></h1>
+      <p className="welcome__sub">
+        Ask a question, explore your codebase, or ship your next change.
+      </p>
+      <div className="welcome__actions">
+        <span className="welcome__hint"><kbd>Ctrl</kbd><span>+</span><kbd>Enter</kbd> to send</span>
+        <span className="welcome__context">Current directory · NonoClaw</span>
       </div>
-    </div>
+    </section>
   );
 }
 
