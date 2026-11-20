@@ -138,7 +138,12 @@ impl McpClient {
         }
         let transport = if let Some(url) = http_url {
             Transport::Http {
-                http: reqwest::Client::new(),
+                // Per-request timeout so even unwrapped notifications
+                // (initialized) cannot hang spawn forever.
+                http: reqwest::Client::builder()
+                    .timeout(CALL_TIMEOUT)
+                    .build()
+                    .map_err(|e| Error::Config(format!("mcp server `{server_name}`: http client: {e}")))?,
                 url: expand_placeholders(url),
                 headers: cfg
                     .headers
@@ -631,6 +636,11 @@ impl SseMatcher {
             return;
         }
         self.buf.push_str(&String::from_utf8_lossy(chunk));
+        // SSE lines may end with CRLF; strip CR so the blank-line delimiter
+        // is always a plain "\n\n" (raw CR cannot appear inside JSON data).
+        if self.buf.contains('\r') {
+            self.buf = self.buf.replace('\r', "");
+        }
         while self.matched.is_none() {
             let Some(pos) = self.buf.find("\n\n") else {
                 break;
@@ -1032,6 +1042,13 @@ mod tests {
         let mut m = SseMatcher::new(Some(99));
         m.feed(body.as_bytes());
         let got = m.take().expect("first event matches id 99");
+        assert_eq!(got["result"]["a"], 1);
+
+        // CRLF framing: blank-line delimiter still splits events during feed.
+        let crlf = body.replace('\n', "\r\n");
+        let mut m = SseMatcher::new(Some(99));
+        m.feed(crlf.as_bytes());
+        let got = m.take().expect("CRLF event matched during feed");
         assert_eq!(got["result"]["a"], 1);
 
         // Notification-first body, any-message mode: skip non-matching ids
