@@ -11,7 +11,7 @@
 //! starts from the compacted view (and may re-compact) while the original
 //! history remains recoverable.
 
-use nonoclaw_api::{Client, RequestParams, SystemBlock};
+use nonoclaw_api::{RequestParams, SystemBlock};
 
 use nonoclaw_core::{ContentBlock, Message, MessageContent, Result, ToolResultContent};
 use serde_json::Value;
@@ -126,7 +126,7 @@ fn is_plain_user_prompt(m: &Message) -> bool {
 /// (interpretation depends on `mode`). `max_input_chars` hard-bounds the
 /// summarizer request payload; `max_summary_tokens` caps its output.
 pub async fn compact_messages(
-    client: &Client,
+    client: &dyn nonoclaw_api::TurnClient,
     model: &str,
     messages: &[Message],
     keep_recent: usize,
@@ -209,7 +209,10 @@ pub async fn compact_messages(
         // endpoints keep routing the compaction summary to the same session.
         session_id: prefix_template.and_then(|tpl| tpl.session_id.clone()),
     };
-    let turn = client.run_turn(&params, |_| {}).await?;
+    let turn = client
+        .run_turn(&params, &mut |_| {})
+        .await
+        .map_err(|failure| failure.into_core())?;
     let summary: String = turn
         .content
         .iter()
