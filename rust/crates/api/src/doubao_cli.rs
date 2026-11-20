@@ -286,20 +286,11 @@ impl CliParser {
                     usage: Default::default(),
                 });
             }
-            "assistant" => {
-                for block in event
-                    .message
-                    .map(|message| message.content)
-                    .unwrap_or_default()
-                {
-                    if block.kind != "text" || block.text.is_none() {
-                        return Err(Error::Config(
-                            "doubao_cli does not support the CLI's internal tool output".into(),
-                        ));
-                    }
-                }
-                // The assistant message repeats streamed deltas. Never emit it twice.
-            }
+            // The CLI is itself an agent: it runs its own tools and replays
+            // them as `assistant` (tool_use) / `user` (tool_result) frames.
+            // NonoClaw only consumes the streamed text deltas and the final
+            // result; skip these opaque internal frames.
+            "assistant" | "user" => {}
             "stream_event" => {
                 #[derive(Deserialize)]
                 struct Envelope {
@@ -329,12 +320,9 @@ impl CliParser {
                             self.text.push_str(text);
                             on_event(&StreamEvent::TextDelta { text: text.into() });
                         }
-                        Some(other) => {
-                            return Err(Error::Config(format!(
-                                "Doubao CLI content type `{other}` is not supported"
-                            )));
-                        }
-                        None => return Err(Error::Other("missing Doubao CLI delta type".into())),
+                        // Internal thinking/tool deltas are not part of the
+                        // final text; skip them.
+                        _ => {}
                     }
                 }
             }
@@ -462,7 +450,83 @@ fn render_prompt(params: &RequestParams) -> Result<String> {
         }
         prompt.push_str(&format!("\n</{role}>\n"));
     }
+    enforce_prompt_budget(&mut prompt);
     Ok(prompt)
+}
+
+/// Hard stdin limit of the Doubao CLI (`error.message_too_long` beyond this).
+const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+/// The CLI also caps a single user message at this many characters
+/// (`消息过长：…/262144 个字符`).
+const MAX_MESSAGE_CHARS: usize = 262_144;
+/// Headroom (bytes) reserved for the truncation marker and tags.
+const BUDGET_HEADROOM: usize = 1024;
+
+/// The Doubao CLI enforces two input limits, both reported as
+/// `message_too_long`: the whole stdin payload must stay under 1 MiB of
+/// bytes and under 262,144 characters (the CLI treats stdin as a single
+/// user message). Long NonoClaw sessions would otherwise fail every turn
+/// with a generic provider error. Drop the oldest content — preferring
+/// message boundaries, falling back to a UTF-8 boundary inside a huge
+/// single message — and mark the cut.
+fn enforce_prompt_budget(prompt: &mut String) {
+    let max_bytes = MAX_PROMPT_BYTES - BUDGET_HEADROOM;
+    let max_chars = MAX_MESSAGE_CHARS - BUDGET_HEADROOM;
+    let len = prompt.len();
+    let chars = prompt.chars().count();
+    if len <= max_bytes && chars <= max_chars {
+        return;
+    }
+    // Byte offset from which the remaining suffix fits the character budget.
+    let char_start = if chars > max_chars {
+        let mut remaining = max_chars;
+        let mut idx = 0;
+        for (i, _) in prompt.char_indices().rev() {
+            if remaining == 0 {
+                idx = i;
+                break;
+            }
+            remaining -= 1;
+        }
+        idx
+    } else {
+        0
+    };
+    let byte_start = len.saturating_sub(max_bytes);
+    // Start from the stricter of the two budgets, then prefer the earliest
+    // message boundary at or after it so whole recent messages survive.
+    let start = byte_start.max(char_start).max(1);
+    let mut cut = None;
+    let mut i = start;
+    while i < len {
+        if prompt.is_char_boundary(i)
+            && (prompt[i..].starts_with("\n<user>\n") || prompt[i..].starts_with("\n<assistant>\n"))
+        {
+            cut = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    // A single oversized message has no internal boundary: cut it at a UTF-8
+    // boundary instead so its tail (which contains the latest question) is
+    // preserved.
+    let cut = cut.unwrap_or_else(|| {
+        let mut i = start;
+        while i < len && !prompt.is_char_boundary(i) {
+            i += 1;
+        }
+        i.min(len)
+    });
+    let dropped_bytes = cut;
+    let dropped_chars = prompt[..cut].chars().count();
+    let rest = prompt.split_off(cut);
+    prompt.clear();
+    prompt.push_str(&format!(
+        "\n<system>\n[Earlier conversation truncated by NonoClaw: {dropped_bytes} bytes / \
+         {dropped_chars} characters dropped to fit the Doubao CLI input limits (1 MiB / \
+         262144 chars).]\n</system>\n"
+    ));
+    prompt.push_str(&rest);
 }
 
 struct ScratchDir(PathBuf);
@@ -720,6 +784,79 @@ mod tests {
     }
 
     #[test]
+    fn prompt_budget_keeps_recent_history_and_marks_dropped_prefix() {
+        let filler = "x".repeat(64 * 1024);
+        let mut prompt = String::new();
+        for i in 0..40 {
+            prompt.push_str(&format!("\n<user>\nmsg-{i} {filler}\n</user>\n"));
+        }
+        prompt.push_str("\n<user>\nfinal question\n</user>\n");
+        assert!(prompt.len() > MAX_PROMPT_BYTES);
+        enforce_prompt_budget(&mut prompt);
+        assert!(prompt.len() <= MAX_PROMPT_BYTES, "cut must respect the CLI limit");
+        assert!(
+            prompt.chars().count() <= MAX_MESSAGE_CHARS,
+            "cut must respect the per-message character limit"
+        );
+        assert!(
+            prompt.contains("final question"),
+            "the latest user message must survive the cut"
+        );
+        assert!(
+            prompt.contains("dropped to fit the Doubao CLI"),
+            "dropped prefix must be marked"
+        );
+        assert!(!prompt.contains("msg-0"), "oldest messages are dropped");
+    }
+
+    #[test]
+    fn prompt_budget_leaves_short_prompts_untouched() {
+        let mut prompt = String::from("\n<user>\nhello\n</user>\n");
+        let before = prompt.clone();
+        enforce_prompt_budget(&mut prompt);
+        assert_eq!(prompt, before);
+    }
+
+    #[test]
+    fn prompt_budget_cuts_a_single_oversized_message_at_utf8_boundary() {
+        let mut prompt = String::from("\n<user>\n");
+        prompt.push_str(&"词".repeat(600_000)); // 1.8 MB inside one message
+        prompt.push_str("\n最终问题：请只回答 OK\n</user>\n");
+        assert!(prompt.len() > MAX_PROMPT_BYTES);
+        enforce_prompt_budget(&mut prompt);
+        assert!(prompt.len() <= MAX_PROMPT_BYTES, "must fit the CLI limit");
+        assert!(
+            prompt.chars().count() <= MAX_MESSAGE_CHARS,
+            "must fit the character limit"
+        );
+        assert!(
+            prompt.contains("请只回答 OK"),
+            "the tail of the single message must survive"
+        );
+        assert!(prompt.contains("dropped to fit the Doubao CLI"));
+    }
+
+    #[test]
+    fn prompt_budget_respects_char_limit_when_bytes_fit() {
+        // ~750 KB of Chinese text: under the 1 MiB byte cap but ~260k chars
+        // would still exceed... make it clearly over 262,144 chars while
+        // staying under 1 MiB: 300k chars × 3 bytes = 900 KB.
+        let mut prompt = String::from("\n<user>\n");
+        prompt.push_str(&"词".repeat(300_000));
+        prompt.push_str("\n最后请只回答 OK\n</user>\n");
+        assert!(prompt.len() < MAX_PROMPT_BYTES, "bytes must already fit");
+        assert!(prompt.chars().count() > MAX_MESSAGE_CHARS);
+        enforce_prompt_budget(&mut prompt);
+        assert!(prompt.chars().count() <= MAX_MESSAGE_CHARS, "chars must fit");
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+        assert!(
+            prompt.contains("请只回答 OK"),
+            "the latest question must survive"
+        );
+        assert!(prompt.contains("characters dropped"));
+    }
+
+    #[test]
     fn rejects_tools_and_internal_tool_output() {
         let mut request = params();
         request.tools.push(crate::ToolSchema {
@@ -734,10 +871,26 @@ mod tests {
                 .to_string()
                 .contains("tools")
         );
+        // The CLI runs its own internal tools (assistant tool_use → user
+        // tool_result frames). These are opaque noise: the parser must skip
+        // them and still surface the streamed text.
         let mut parser = CliParser::new("4".into());
-        assert!(parser
+        parser
             .push(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#, &mut |_| {})
-            .is_err());
+            .unwrap();
+        parser
+            .push(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"ls"}]}]}}"#, &mut |_| {})
+            .unwrap();
+        parser
+            .push(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}}"#, &mut |_| {})
+            .unwrap();
+        parser
+            .push(r#"{"type":"result","subtype":"success","is_error":false,"result":{"type":"text","content":"done"}}"#, &mut |_| {})
+            .unwrap();
+        let output = parser
+            .finish()
+            .unwrap();
+        assert_eq!(text(&output), "done");
     }
 
     #[test]
