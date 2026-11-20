@@ -4,12 +4,12 @@
 //! event type and matcher replaces the user hook, preserving the historical
 //! override contract.
 
-use nonoclaw_api::{RequestParams, SystemBlock, TurnClient};
+use nonoclaw_api::{Client, RequestParams, SystemBlock};
 use nonoclaw_core::{
     ContentBlock, Message, MessageContent, PermissionDecision, RunEvent, TechnicalStatus,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -344,7 +344,7 @@ enum HookRunError {
 #[derive(Clone)]
 pub struct HookRuntime {
     hooks: Arc<Vec<(HookType, HookDef)>>,
-    prompt_client: Option<Arc<dyn TurnClient>>,
+    prompt_client: Option<Arc<Client>>,
     default_model: String,
     cancel: CancellationToken,
     http: reqwest::Client,
@@ -354,7 +354,7 @@ pub struct HookRuntime {
 impl HookRuntime {
     pub fn new(
         hooks: Vec<(HookType, HookDef)>,
-        prompt_client: Option<Arc<dyn TurnClient>>,
+        prompt_client: Option<Arc<Client>>,
         default_model: impl Into<String>,
         cancel: CancellationToken,
     ) -> Self {
@@ -546,7 +546,7 @@ impl HookRuntime {
             session_id: None,
         };
         let output = client
-            .run_turn_with_cancel(&params, &mut |_| {}, self.cancel.child_token())
+            .run_turn_with_cancel(&params, |_| {}, self.cancel.child_token())
             .await
             .map_err(|_| HookRunError::Failed("prompt request"))?;
         let text: String = output
@@ -843,7 +843,6 @@ fn redact_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nonoclaw_api::Client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn temp_project() -> PathBuf {
@@ -1011,8 +1010,7 @@ mod tests {
             );
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                body.len(), body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
@@ -1114,8 +1112,7 @@ mod tests {
             let body = r#"{"decision":"ask","message":"approve local hook"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                body.len(), body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });

@@ -22,17 +22,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nonoclaw_api::{
-    ApiFormat, ClientConfig, ClientFactory, ClientPurpose, DEFAULT_BASE_URL, DoubaoCliConfig,
-    ThinkingConfig, TurnClient,
+    ApiFormat, Client, ClientConfig, ClientFactory, ClientPurpose, ThinkingConfig, DEFAULT_BASE_URL,
 };
-use nonoclaw_core::{PermissionMode, RunEvent, TechnicalStatus, display_path};
+use nonoclaw_core::{display_path, PermissionMode, RunEvent, TechnicalStatus};
 use nonoclaw_tools::McpServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::EngineOptions;
 use crate::agents::AgentProfile;
 use crate::budget::{ContextBudget, ContextBudgetSettings, TokenMode};
+use crate::EngineOptions;
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
 pub const DEFAULT_MAX_TURNS: u32 = 200;
@@ -625,9 +624,9 @@ pub struct ModelProfile {
     pub name: String,
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(rename = "baseUrl", default)]
+    #[serde(rename = "baseUrl")]
     pub base_url: String,
-    #[serde(rename = "apiKey", default)]
+    #[serde(rename = "apiKey")]
     pub api_key: String,
     #[serde(default)]
     pub default: bool,
@@ -643,12 +642,6 @@ pub struct ModelProfile {
     pub profile: Option<String>,
     #[serde(rename = "apiFormat", default)]
     pub api_format: Option<String>,
-    #[serde(rename = "cliCommand", default)]
-    pub cli_command: Option<String>,
-    #[serde(default)]
-    pub effort: Option<String>,
-    #[serde(rename = "timeoutSecs", default)]
-    pub timeout_secs: Option<u64>,
     /// Explicit billing provider key (from `providerBilling.providers`) for
     /// balance display. Overrides `base_url` inference.
     #[serde(rename = "billingProvider", default)]
@@ -697,19 +690,6 @@ impl ModelProfile {
             .as_deref()
             .and_then(parse_model_api_format)
             .unwrap_or(ApiFormat::Anthropic)
-    }
-
-    pub fn is_doubao_cli(&self) -> bool {
-        self.api_format
-            .as_deref()
-            .map(|format| {
-                format
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .collect::<String>()
-                    .eq_ignore_ascii_case("doubaocli")
-            })
-            .unwrap_or(false)
     }
 
     pub fn is_conversation_model(&self) -> bool {
@@ -1353,7 +1333,6 @@ impl ResolvedConfig {
                 api_key: nonempty(self.resolve_reference(&profile.api_key)),
                 auth_token: None,
                 api_format: profile.api_format(),
-                cli: self.doubao_cli_config(&profile.name),
             };
         }
         ResolvedClientConfig {
@@ -1372,27 +1351,7 @@ impl ResolvedConfig {
                 .get("ANTHROPIC_AUTH_TOKEN")
                 .map(ToOwned::to_owned),
             api_format: ApiFormat::Anthropic,
-            cli: None,
         }
-    }
-
-    fn doubao_cli_config(&self, model: &str) -> Option<DoubaoCliConfig> {
-        let profile = self
-            .all_models()
-            .iter()
-            .find(|profile| profile.name == model)?;
-        if !profile.is_doubao_cli() {
-            return None;
-        }
-        Some(DoubaoCliConfig {
-            command: profile
-                .cli_command
-                .clone()
-                .unwrap_or_else(|| "doubao".into())
-                .into(),
-            effort: profile.effort.clone(),
-            timeout: std::time::Duration::from_secs(profile.timeout_secs.unwrap_or(300)),
-        })
     }
 
     pub fn model_for(&self, purpose: ClientPurpose, requested_model: Option<&str>) -> String {
@@ -1432,7 +1391,7 @@ impl ResolvedConfig {
         &self,
         purpose: ClientPurpose,
         requested_model: Option<&str>,
-    ) -> nonoclaw_core::Result<Arc<dyn TurnClient>> {
+    ) -> nonoclaw_core::Result<Arc<Client>> {
         if purpose == ClientPurpose::Document {
             if let Some(document) = self.doc_model() {
                 let api_format = self
@@ -1452,7 +1411,6 @@ impl ResolvedConfig {
                         api_key: nonempty(document.api_key),
                         auth_token: None,
                         api_format,
-                        cli: None,
                     },
                 );
             }
@@ -2571,7 +2529,7 @@ fn validate_settings(
             }
         }
         if let Some(format) = model.api_format.as_deref() {
-            if !model.is_doubao_cli() && parse_model_api_format(format).is_none() {
+            if parse_model_api_format(format).is_none() {
                 diagnostics.push(ConfigDiagnostic::error(
                     "invalid_api_format",
                     format!("model `{}` has unknown apiFormat `{format}`", model.name),
@@ -3271,9 +3229,6 @@ fn diagnose_unknown_fields(
             "charsPerToken",
             "profile",
             "apiFormat",
-            "cliCommand",
-            "effort",
-            "timeoutSecs",
             "billingProvider",
         ];
         for (index, model) in models.iter().filter_map(Value::as_object).enumerate() {
@@ -3572,7 +3527,6 @@ pub fn apply_settings(options: &mut EngineOptions, settings: &SettingsFile) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn source(name: &str) -> ConfigSource {
         ConfigSource::ExplicitSettings {
@@ -3604,16 +3558,12 @@ mod tests {
             &source("reference"),
             &mut diagnostics,
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.field.as_deref() == Some("unknownReferenceField"))
-        );
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.field.as_deref() == Some("models"))
-        );
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.field.as_deref() == Some("unknownReferenceField")));
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.field.as_deref() == Some("models")));
     }
 
     #[test]
@@ -3856,12 +3806,10 @@ mod tests {
             resolved.client_config(Some("sonnet-proxy")).api_format,
             ApiFormat::OpenAI
         );
-        assert!(
-            !resolved
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "invalid_api_format")
-        );
+        assert!(!resolved
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_api_format"));
     }
 
     #[test]
@@ -3991,12 +3939,10 @@ mod tests {
                 .command,
             "high"
         );
-        assert!(
-            resolved
-                .mcp_servers
-                .iter()
-                .any(|server| server.name == "kept")
-        );
+        assert!(resolved
+            .mcp_servers
+            .iter()
+            .any(|server| server.name == "kept"));
     }
 
     #[test]
@@ -4066,56 +4012,6 @@ mod tests {
     }
 
     #[test]
-    fn doubao_cli_profile_does_not_require_http_credentials() {
-        let resolved = resolve_layers(
-            &[layer(
-                "models.json",
-                serde_json::json!({
-                    "models": [{
-                        "name": "local-cli",
-                        "model": "4",
-                        "apiFormat": "doubao_cli",
-                        "cliCommand": "doubao",
-                        "effort": "low",
-                        "timeoutSecs": 45,
-                        "default": true
-                    }]
-                }),
-            )],
-            &ConfigEnvironment::default(),
-            Path::new("/project"),
-        );
-        let config = resolved.client_config(None);
-        assert!(config.cli.is_some());
-        assert!(
-            resolved.diagnostics.is_empty(),
-            "{:?}",
-            resolved.diagnostics
-        );
-        assert_eq!(
-            config.cli.as_ref().unwrap().timeout,
-            Duration::from_secs(45)
-        );
-        assert_eq!(config.cli.as_ref().unwrap().effort.as_deref(), Some("low"));
-        assert_eq!(
-            config.cli.as_ref().unwrap().command,
-            PathBuf::from("doubao")
-        );
-        let client = resolved
-            .client_for(ClientPurpose::Conversation, Some("local-cli"))
-            .unwrap();
-        assert_eq!(client.label(), "doubao_cli");
-        assert_eq!(client.api_format(), None);
-        assert!(!client.capabilities_for_model("4").tools.is_supported());
-        assert_eq!(config.api_key, None);
-        assert!(
-            resolved.diagnostics.is_empty(),
-            "{:?}",
-            resolved.diagnostics
-        );
-    }
-
-    #[test]
     fn client_factory_selects_profiles_by_purpose_and_caches_switches() {
         let resolved = resolve_layers(
             &[layer(
@@ -4162,11 +4058,17 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &switched));
         assert!(Arc::ptr_eq(&first, &first_again));
         assert_eq!(
-            resolved.client_config(Some("cheap")).base_url,
+            resolved
+                .client_for(ClientPurpose::Compact, Some("main-b"))
+                .unwrap()
+                .base_url(),
             "https://cheap"
         );
         assert_eq!(
-            resolved.client_config(Some("worker")).base_url,
+            resolved
+                .client_for(ClientPurpose::Subagent, Some("main-b"))
+                .unwrap()
+                .base_url(),
             "https://worker"
         );
         assert_eq!(
@@ -4174,7 +4076,7 @@ mod tests {
                 .client_for(ClientPurpose::Document, None)
                 .unwrap()
                 .api_format(),
-            Some(ApiFormat::OpenAI)
+            ApiFormat::OpenAI
         );
     }
 
@@ -4222,12 +4124,10 @@ mod tests {
                 "missing diagnostic {code}"
             );
         }
-        assert!(
-            resolved
-                .diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.source.is_some())
-        );
+        assert!(resolved
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.source.is_some()));
     }
 
     #[test]

@@ -9,13 +9,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use nonoclaw_api::{
-    ProviderFeature, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolSchema,
-    TurnClient,
+    Client, ProviderFeature, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolSchema,
 };
 use nonoclaw_core::{
-    CacheControl, ContentBlock, Message, MessageContent, PermissionDecision, PermissionMode,
-    Result, Role, RunEvent, SessionRepair, StopReason, StreamState, TechnicalStatus,
-    TokenBudgetComponent, ToolResultContent, Usage, UsagePart, display_path,
+    display_path, CacheControl, ContentBlock, Message, MessageContent, PermissionDecision,
+    PermissionMode, Result, Role, RunEvent, SessionRepair, StopReason, StreamState,
+    TechnicalStatus, TokenBudgetComponent, ToolResultContent, Usage, UsagePart,
 };
 use nonoclaw_tools::permissions::PermissionGate;
 use nonoclaw_tools::tool::{GraphRunner, QuestionResolver, SubagentRunner};
@@ -29,12 +28,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::SubagentLifecycle;
-use crate::compact::{KEEP_RECENT_TURNS, compact_messages};
+use crate::compact::{compact_messages, KEEP_RECENT_TURNS};
 use crate::context::{
     get_system_context_with_limit, get_user_context_with_limit, load_memory_prompt_with_partitions,
 };
 use crate::run::{RunContext, RunController, RunLimits, RunTerminalStatus};
-use crate::session::{Session, SessionError, SessionSnapshot, new_session_id};
+use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
 use crate::skills::SkillsManager;
 use crate::tokens::{estimate_total_for_model, message_char_len};
 use nonoclaw_tools::BackgroundTaskRegistry;
@@ -612,7 +611,11 @@ fn redact_inner_text_blocks(inner: &[ContentBlock]) -> Option<Vec<ContentBlock>>
             _ => b.clone(),
         })
         .collect();
-    if changed { Some(out) } else { None }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Mark prefix breakpoints for Anthropic prompt caching.
@@ -1050,9 +1053,9 @@ pub struct EngineOptions {
     pub compact_max_tokens: u32,
     /// Client selected by the canonical factory for compaction. Falls back to
     /// the conversation client if construction failed during configuration.
-    pub compact_client: Option<Arc<dyn TurnClient>>,
+    pub compact_client: Option<Arc<Client>>,
     /// Client selected by the canonical factory for child agents.
-    pub subagent_client: Option<Arc<dyn TurnClient>>,
+    pub subagent_client: Option<Arc<Client>>,
     /// Chars-per-token divisor for the token estimator. Default 4 (Claude).
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
@@ -1360,7 +1363,7 @@ impl Default for EngineCache {
 }
 
 pub struct QueryEngine {
-    client: Arc<dyn TurnClient>,
+    client: Arc<Client>,
     registry: Arc<ToolRegistry>,
     todos: Arc<TodoStore>,
     options: EngineOptions,
@@ -1377,7 +1380,7 @@ pub struct QueryEngine {
 
 impl QueryEngine {
     pub fn new(
-        client: Arc<dyn TurnClient>,
+        client: Arc<Client>,
         registry: Arc<ToolRegistry>,
         todos: Arc<TodoStore>,
         options: EngineOptions,
@@ -1400,7 +1403,7 @@ impl QueryEngine {
     /// Construct an engine from a canonical session snapshot. All subsequent
     /// transcript mutations are committed through that session's writer actor.
     pub fn with_session(
-        client: Arc<dyn TurnClient>,
+        client: Arc<Client>,
         registry: Arc<ToolRegistry>,
         todos: Arc<TodoStore>,
         options: EngineOptions,
@@ -1546,7 +1549,7 @@ impl QueryEngine {
         &mut self,
         user_content: MessageContent,
         cwd: &Path,
-        mut on_event: impl FnMut(&EngineEvent) + Send,
+        mut on_event: impl FnMut(&EngineEvent),
     ) -> Result<FinalResult> {
         let context = self.run_context(cwd.to_path_buf());
         // Direct-call entry (tests, embedders): record into the run's trace
@@ -1571,7 +1574,7 @@ impl QueryEngine {
         &mut self,
         user_content: MessageContent,
         context: &RunContext,
-        mut on_event: impl FnMut(&EngineEvent) + Send,
+        mut on_event: impl FnMut(&EngineEvent),
     ) -> Result<FinalResult> {
         let cwd = context.cwd.as_path();
         if context.cancel.is_cancelled() {
@@ -2543,18 +2546,16 @@ impl QueryEngine {
                     ),
                 );
             }
-            let process_transport = self.client.api_format().is_none();
-            let request_tools = if finalizing_after_max_turns || process_transport {
+            let request_tools = if finalizing_after_max_turns {
                 Vec::new()
             } else {
                 tool_defs.clone()
             };
-            let supports_images = !process_transport
-                && self
-                    .client
-                    .capabilities_for_model(&self.options.model)
-                    .status(ProviderFeature::Images)
-                    .is_supported();
+            let supports_images = self
+                .client
+                .capabilities_for_model(&self.options.model)
+                .status(ProviderFeature::Images)
+                .is_supported();
             let request_messages = prepare_messages_for_request(
                 &self.messages,
                 supports_images,
@@ -2646,7 +2647,7 @@ impl QueryEngine {
                 messages: request_messages,
                 tools: request_tools,
                 tool_choice: None,
-                thinking: if self.client.api_format().is_none() || suppress_thinking_next_turn {
+                thinking: if suppress_thinking_next_turn {
                     None
                 } else {
                     self.options.thinking.clone()
@@ -2666,7 +2667,7 @@ impl QueryEngine {
             // replay its system blocks + raw history prefix for KV-cache reuse.
             self.cache.last_request = Some(Arc::new(params.clone()));
 
-            let provider = self.client.label().to_string();
+            let provider = format!("{:?}", self.client.api_format()).to_lowercase();
             on_event(&RunEvent::ModelRequestStarted {
                 requested_model: self.options.model.clone(),
                 provider: provider.clone(),
@@ -2682,7 +2683,7 @@ impl QueryEngine {
                 .client
                 .run_turn_with_cancel(
                     &params,
-                    &mut |ev| {
+                    |ev| {
                         forward_stream_event(
                             ev,
                             &requested_model,
@@ -2702,9 +2703,6 @@ impl QueryEngine {
                     // graceful truncation path, even if partial content was
                     // received before the stream stopped.
                     if failure.error.code == nonoclaw_api::ProviderErrorCode::Cancelled {
-                        return Err(failure.into_core());
-                    }
-                    if self.client.api_format().is_none() {
                         return Err(failure.into_core());
                     }
                     // Graceful truncation: when the provider stream produced
@@ -2793,7 +2791,7 @@ impl QueryEngine {
                                 self.client
                                     .run_turn_with_cancel(
                                         &params2,
-                                        &mut |ev| {
+                                        |ev| {
                                             forward_stream_event(
                                                 ev,
                                                 &requested_model,
@@ -2927,8 +2925,7 @@ impl QueryEngine {
                         detail: format!(
                             "synthetic error tool_results injected for {} truncated call(s); recovery nudge {}/{}",
                             affected,
-                            output_truncation_recoveries,
-                            MAX_OUTPUT_TRUNCATION_RECOVERIES
+                            output_truncation_recoveries, MAX_OUTPUT_TRUNCATION_RECOVERIES
                         ),
                         items_affected: affected,
                     });
@@ -3724,7 +3721,7 @@ fn subagent_max_turns(parent_max_turns: u32) -> u32 {
 /// and TaskStore so child todos are scope-isolated while the task graph remains
 /// available. Children exclude Agent/Coordinator to prevent recursion.
 pub(crate) struct EngineSubagent {
-    client: Arc<dyn TurnClient>,
+    client: Arc<Client>,
     registry: Arc<ToolRegistry>,
     options: EngineOptions,
     cwd: PathBuf,
@@ -4235,7 +4232,6 @@ pub fn repair_tool_pairing(messages: &mut Vec<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nonoclaw_api::Client;
 
     #[test]
     fn repair_tool_pairing_converges_in_one_pass() {
@@ -4311,11 +4307,9 @@ mod tests {
         let MessageContent::Blocks(blocks) = &filtered[0].content else {
             panic!("extracted text should keep the block message non-empty");
         };
-        assert!(
-            !blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Image { .. }))
-        );
+        assert!(!blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })));
         assert!(blocks.iter().any(
             |block| matches!(block, ContentBlock::Text { text, .. } if text == "extracted OCR text")
         ));
@@ -4324,11 +4318,9 @@ mod tests {
         let MessageContent::Blocks(blocks) = &vision[0].content else {
             panic!("vision provider should keep block content");
         };
-        assert!(
-            blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Image { .. }))
-        );
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })));
     }
 
     #[test]
@@ -4456,20 +4448,18 @@ mod tests {
 
         let tiny = history_window(&messages, 48);
         assert!(payload_history_chars(&tiny) <= 48);
-        assert!(
-            !tiny
-                .iter()
-                .flat_map(|message| match &message.content {
-                    MessageContent::Blocks(blocks) => blocks.as_slice(),
-                    MessageContent::Text(_) => &[],
-                })
-                .any(|block| matches!(
-                    block,
-                    ContentBlock::Thinking { .. }
-                        | ContentBlock::ToolUse { .. }
-                        | ContentBlock::ToolResult { .. }
-                ))
-        );
+        assert!(!tiny
+            .iter()
+            .flat_map(|message| match &message.content {
+                MessageContent::Blocks(blocks) => blocks.as_slice(),
+                MessageContent::Text(_) => &[],
+            })
+            .any(|block| matches!(
+                block,
+                ContentBlock::Thinking { .. }
+                    | ContentBlock::ToolUse { .. }
+                    | ContentBlock::ToolResult { .. }
+            )));
     }
 
     #[test]
@@ -4520,13 +4510,11 @@ mod tests {
                 input: serde_json::json!({"file_path": "/tmp/.env"}),
                 cache_control: None,
             }])),
-            Message::user(MessageContent::from_blocks(vec![
-                ContentBlock::tool_result(
-                    "tool-1".into(),
-                    "PASSWORD=hunter2\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\nok",
-                    false,
-                ),
-            ])),
+            Message::user(MessageContent::from_blocks(vec![ContentBlock::tool_result(
+                "tool-1".into(),
+                "PASSWORD=hunter2\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\nok",
+                false,
+            )])),
         ];
         let prepared = prepare_messages_for_request(&messages, true, 1_000_000, 10_000, 0);
         let serialized = serde_json::to_string(&prepared).unwrap();
@@ -5073,16 +5061,12 @@ mod tests {
         // The orphaned tool_use should be removed; the assistant message keeps its text.
         assert_eq!(msgs.len(), 3);
         if let MessageContent::Blocks(ref blocks) = msgs[1].content {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { .. }))
-            );
-            assert!(
-                !blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            );
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. })));
+            assert!(!blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         } else {
             panic!("expected blocks");
         }
@@ -5139,11 +5123,9 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         // tu_3 remains because its result is present.
         if let MessageContent::Blocks(ref blocks) = msgs[1].content {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            );
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         }
     }
 
@@ -5171,16 +5153,12 @@ mod tests {
         // The orphaned tool_use should be removed; the assistant keeps its text.
         assert_eq!(msgs.len(), 2);
         if let MessageContent::Blocks(ref blocks) = msgs[1].content {
-            assert!(
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { .. }))
-            );
-            assert!(
-                !blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-            );
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. })));
+            assert!(!blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
         } else {
             panic!("expected blocks");
         }
@@ -5210,7 +5188,7 @@ mod tests {
     async fn spawn_provider_fixture(
         answers: Vec<&'static str>,
     ) -> (
-        Arc<dyn TurnClient>,
+        Arc<Client>,
         tokio::sync::mpsc::Receiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -5278,7 +5256,7 @@ mod tests {
     async fn spawn_tool_then_final_fixture(
         final_answer: &'static str,
     ) -> (
-        Arc<dyn TurnClient>,
+        Arc<Client>,
         tokio::sync::mpsc::Receiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -5356,9 +5334,7 @@ mod tests {
         (Arc::new(client), request_rx, task)
     }
 
-    async fn spawn_single_sse_fixture(
-        sse: String,
-    ) -> (Arc<dyn TurnClient>, tokio::task::JoinHandle<()>) {
+    async fn spawn_single_sse_fixture(sse: String) -> (Arc<Client>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5403,7 +5379,7 @@ mod tests {
         (Arc::new(client), task)
     }
 
-    fn fixture_engine(client: Arc<dyn TurnClient>) -> QueryEngine {
+    fn fixture_engine(client: Arc<Client>) -> QueryEngine {
         let (registry, todos) = nonoclaw_tools::register_all();
         let options = EngineOptions {
             model: "fixture-requested-model".into(),
@@ -5423,7 +5399,7 @@ mod tests {
     async fn spawn_truncated_tool_call_fixture(
         final_answer: &'static str,
     ) -> (
-        Arc<dyn TurnClient>,
+        Arc<Client>,
         tokio::sync::mpsc::Receiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -5656,23 +5632,17 @@ mod tests {
 
         let first: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
         let final_request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
-        assert!(
-            first["tools"]
-                .as_array()
-                .is_some_and(|tools| !tools.is_empty())
-        );
+        assert!(first["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()));
         assert!(final_request.get("tools").is_none());
         assert!(final_request.get("tool_choice").is_none());
-        assert!(
-            final_request["system"]
-                .to_string()
-                .contains("Subagent finalization")
-        );
-        assert!(
-            final_request["messages"]
-                .to_string()
-                .contains("tool_result")
-        );
+        assert!(final_request["system"]
+            .to_string()
+            .contains("Subagent finalization"));
+        assert!(final_request["messages"]
+            .to_string()
+            .contains("tool_result"));
         std::fs::remove_dir_all(cwd).ok();
     }
 
@@ -6206,9 +6176,9 @@ mod tests {
         // turn's refresh will populate it (not skip).
         let opts = EngineOptions::default();
         let _ = opts; // field set through QueryEngine::new, not options
-        // Indirectly verify via QueryEngine::new: the cache starts empty.
-        // (Direct field access from tests is fine because they're in the same
-        // crate; see the struct definition for the field.)
+                      // Indirectly verify via QueryEngine::new: the cache starts empty.
+                      // (Direct field access from tests is fine because they're in the same
+                      // crate; see the struct definition for the field.)
     }
 
     #[test]

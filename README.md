@@ -1343,9 +1343,6 @@ Insight 的工具、CLI 与顶层配置参考分别来自 `ToolRegistry`、Clap 
 
 **每模型字段**: `contextWindow`（总 tokens）、`maxTokens`（输出上限）、`charsPerToken`（分词器估算）——覆盖全局默认值。
 
-`apiFormat: "doubao_cli"` 可选择已登录的官方 Doubao CLI 作为 `main` 文本 transport（无需 `baseUrl`/`apiKey`）：可选 `cliCommand`（默认 `doubao`）、`effort`、`timeoutSecs`（默认 300）。仅支持 Linux + `bubblewrap`；每轮在隔离文件系统和白名单环境中独立运行，通过公开 `stream-json` 显式重放文本历史。不转发 NonoClaw 工具、图片或 thinking，不读取 CLI 凭据，也不提供 HTTP 余额查询。文档/OCR 和视频增强仍需 HTTP 多模态模型。
-
-
 **运行时切换**: 状态栏的模型名称变为下拉框（需配置 2+ 个 `main` 模型）。切换会为每次运行重建 API `Client`——无需重启。
 
 **`/multi` 斜杠命令**: 用多个模型对比回答：

@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -275,7 +275,7 @@ pub(super) async fn create_handler(
                     return video_error(
                         StatusCode::BAD_REQUEST,
                         &format!("invalid params: {error}"),
-                    );
+                    )
                 }
             }
         } else if name == "image" {
@@ -925,15 +925,10 @@ fn enhance_client(
     project: &ProjectContext,
     requested_model: Option<&str>,
 ) -> Result<Arc<Client>, String> {
-    let config = project.config().client_config(requested_model);
-    if config.cli.is_some() {
-        return Err(
-            "video enhancement requires an HTTP multimodal model profile, not doubao_cli".into(),
-        );
-    }
-    Client::new(config.api_key, config.auth_token, config.base_url)
-        .map(|client| Arc::new(client.with_format(config.api_format)))
-        .map_err(|error| format!("no HTTP chat client available: {error}"))
+    project
+        .config()
+        .client_for(ClientPurpose::Conversation, requested_model)
+        .map_err(|error| format!("no chat client available: {error}"))
 }
 
 /// POST /api/video/enhance — prompt enhancement / reference-image reading
@@ -1043,7 +1038,7 @@ each ≤40 字, ready to paste into a video prompt. No preamble, no numbering."
             return video_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("enhance request failed: {error}"),
-            );
+            )
         }
     };
     // Fold text blocks out of the turn output.

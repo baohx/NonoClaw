@@ -18,9 +18,6 @@ use serde::Deserialize;
 /// - bigmodel.cn → "glm-api"
 /// - jiekou.ai or highwayapi.ai → "jiekou"
 pub fn model_provider(model: &ModelProfile) -> Option<String> {
-    if model.is_doubao_cli() {
-        return None;
-    }
     if let Some(provider) = model.billing_provider.as_deref().filter(|p| !p.is_empty()) {
         return Some(provider.to_string());
     }
@@ -547,9 +544,6 @@ mod tests {
             chars_per_token: None,
             profile: None,
             api_format: None,
-            cli_command: None,
-            effort: None,
-            timeout_secs: None,
             billing_provider: None,
         }
     }
@@ -615,14 +609,12 @@ mod tests {
         let map = model_provider_map(&models);
         // deepseek + kimi resolved; anthropic has no match → excluded
         assert_eq!(map.len(), 2);
-        assert!(
-            map.iter()
-                .any(|m| m.model == "deepseek-chat" && m.provider == "deepseek")
-        );
-        assert!(
-            map.iter()
-                .any(|m| m.model == "kimi-k2" && m.provider == "kimi")
-        );
+        assert!(map
+            .iter()
+            .any(|m| m.model == "deepseek-chat" && m.provider == "deepseek"));
+        assert!(map
+            .iter()
+            .any(|m| m.model == "kimi-k2" && m.provider == "kimi"));
         assert!(!map.iter().any(|m| m.model == "claude-sonnet-4-5"));
     }
 
