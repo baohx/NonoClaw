@@ -1101,6 +1101,19 @@ impl EngineOptions {
             self.compact_threshold_tokens = cw * 3 / 4;
         }
     }
+
+    /// Effective history token budget. The history partition is an inner
+    /// slice of the compaction envelope, so it never exceeds the compact
+    /// threshold: when a model profile's context window raises the
+    /// threshold above the preset, the full budget applies; when the
+    /// threshold is smaller (default or user-tightened), the dead headroom
+    /// above it is reclaimed instead of letting the assembly cap and the
+    /// compaction trigger point disagree.
+    pub fn history_budget(&self) -> usize {
+        self.context_budget
+            .history_tokens
+            .min(self.compact_threshold_tokens)
+    }
 }
 
 impl Default for EngineOptions {
@@ -1661,6 +1674,7 @@ impl QueryEngine {
         // mechanism.
         let chars_per_token = self.options.chars_per_token.max(1);
         let context_budget = self.options.context_budget;
+        let history_budget = self.options.history_budget();
         let prompt_limits = crate::prompt::PromptBuildLimits {
             system_prompt_chars: crate::budget::ContextBudget::chars(
                 context_budget.system_prompt_tokens,
@@ -2319,10 +2333,10 @@ impl QueryEngine {
                     est,
                     self.options.compact_threshold_tokens,
                     history_est,
-                    context_budget.history_tokens,
+                    history_budget,
                 );
                 let max_compact_input_chars = crate::budget::ContextBudget::chars(
-                    context_budget.history_tokens,
+                    history_budget,
                     chars_per_token,
                 );
                 // P0-2: prune oversized tool results before summarizing. When
@@ -2347,7 +2361,7 @@ impl QueryEngine {
                             est_after,
                             self.options.compact_threshold_tokens,
                             history_after,
-                            context_budget.history_tokens,
+                            history_budget,
                         );
                         self.messages = pruned;
                         self.cache.invalidate_message_char_cache();
@@ -2559,7 +2573,7 @@ impl QueryEngine {
             let request_messages = prepare_messages_for_request(
                 &self.messages,
                 supports_images,
-                crate::budget::ContextBudget::chars(context_budget.history_tokens, chars_per_token),
+                crate::budget::ContextBudget::chars(history_budget, chars_per_token),
                 crate::budget::ContextBudget::chars(
                     context_budget.attachment_tokens,
                     chars_per_token,
@@ -2773,7 +2787,7 @@ impl QueryEngine {
                                         &self.messages,
                                         supports_images,
                                         crate::budget::ContextBudget::chars(
-                                            context_budget.history_tokens,
+                                            history_budget,
                                             chars_per_token,
                                         ),
                                         crate::budget::ContextBudget::chars(
@@ -3498,7 +3512,7 @@ impl QueryEngine {
             KEEP_RECENT_TURNS,
             crate::compact::CompactMode::Segments,
             crate::budget::ContextBudget::chars(
-                self.options.context_budget.history_tokens,
+                self.options.history_budget(),
                 self.options.chars_per_token,
             ),
             self.options.compact_max_tokens,
@@ -4669,6 +4683,22 @@ mod tests {
         assert_eq!(o.max_turns, crate::settings::DEFAULT_MAX_TURNS);
         assert!(!o.finalize_on_max_turns);
         assert!(o.is_non_interactive);
+    }
+
+    #[test]
+    fn history_budget_is_clamped_by_compact_threshold() {
+        let mut o = EngineOptions::default();
+        // Default: the standard preset history (450k) exceeds the default
+        // compact threshold (150k); the effective budget reclaims the dead
+        // headroom so assembly cap and compaction trigger agree.
+        assert_eq!(o.history_budget(), 150_000);
+        // A context-window-derived threshold above the preset keeps the full
+        // history budget.
+        o.compact_threshold_tokens = 750_000;
+        assert_eq!(o.history_budget(), o.context_budget.history_tokens);
+        // A tighter threshold (user-set compactThreshold) wins over the preset.
+        o.compact_threshold_tokens = 10_000;
+        assert_eq!(o.history_budget(), 10_000);
     }
 
     #[test]
