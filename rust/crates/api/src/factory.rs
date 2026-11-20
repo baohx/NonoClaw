@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use nonoclaw_core::Result;
 
-use crate::{ApiFormat, Client};
+use crate::{ApiFormat, Client, DoubaoCliClient, DoubaoCliConfig, TurnClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientPurpose {
@@ -27,6 +27,7 @@ pub struct ClientConfig {
     pub api_key: Option<String>,
     pub auth_token: Option<String>,
     pub api_format: ApiFormat,
+    pub cli: Option<DoubaoCliConfig>,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -50,6 +51,7 @@ struct CacheKey {
     api_key: Option<String>,
     auth_token: Option<String>,
     api_format: ApiFormat,
+    cli: Option<DoubaoCliConfig>,
 }
 
 /// The sole constructor for configured provider clients.
@@ -58,7 +60,7 @@ struct CacheKey {
 /// endpoint credentials and wire format are safe to share across models,
 /// purposes, sessions, and concurrent runs.
 pub struct ClientFactory {
-    clients: Mutex<HashMap<CacheKey, Arc<Client>>>,
+    clients: Mutex<HashMap<CacheKey, Arc<dyn TurnClient>>>,
     http: Arc<reqwest::Client>,
 }
 
@@ -91,12 +93,17 @@ impl ClientFactory {
         }
     }
 
-    pub fn client(&self, purpose: ClientPurpose, config: ClientConfig) -> Result<Arc<Client>> {
+    pub fn client(
+        &self,
+        purpose: ClientPurpose,
+        config: ClientConfig,
+    ) -> Result<Arc<dyn TurnClient>> {
         let key = CacheKey {
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
             auth_token: config.auth_token.clone(),
             api_format: config.api_format,
+            cli: config.cli.clone(),
         };
         let mut clients = self.clients.lock().unwrap();
         if let Some(client) = clients.get(&key).cloned() {
@@ -104,10 +111,14 @@ impl ClientFactory {
             return Ok(client);
         }
 
-        let client = Arc::new(
-            Client::new(config.api_key, config.auth_token, config.base_url)?
-                .with_format(config.api_format),
-        );
+        let client: Arc<dyn TurnClient> = if let Some(cli) = config.cli {
+            Arc::new(DoubaoCliClient::new(cli)?)
+        } else {
+            Arc::new(
+                Client::new(config.api_key, config.auth_token, config.base_url)?
+                    .with_format(config.api_format),
+            )
+        };
         clients.insert(key, Arc::clone(&client));
         tracing::debug!(?purpose, model = %config.model, "created configured client");
         Ok(client)
@@ -136,6 +147,7 @@ mod tests {
             api_key: Some(key.into()),
             auth_token: None,
             api_format: ApiFormat::Anthropic,
+            cli: None,
         }
     }
 
