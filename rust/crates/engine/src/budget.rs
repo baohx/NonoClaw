@@ -130,37 +130,37 @@ pub struct ContextBudget {
 impl ContextBudget {
     pub const fn standard() -> Self {
         Self {
-            system_prompt_tokens: 12_000,
-            tool_schema_tokens: 8_000,
-            skill_index_tokens: 500,
-            project_rules_tokens: 8_000,
-            memory_tokens: 12_500,
-            memory_beads_tokens: 2_500,
-            memory_facts_tokens: 4_000,
-            memory_wiki_tokens: 3_000,
-            memory_index_tokens: 3_000,
-            git_tokens: 1_000,
-            single_tool_result_tokens: 7_500,
-            history_tokens: 150_000,
-            attachment_tokens: 25_000,
+            system_prompt_tokens: 16_000,
+            tool_schema_tokens: 24_000,
+            skill_index_tokens: 2_000,
+            project_rules_tokens: 16_000,
+            memory_tokens: 32_000,
+            memory_beads_tokens: 6_000,
+            memory_facts_tokens: 10_000,
+            memory_wiki_tokens: 10_000,
+            memory_index_tokens: 6_000,
+            git_tokens: 8_000,
+            single_tool_result_tokens: 20_000,
+            history_tokens: 450_000,
+            attachment_tokens: 150_000,
         }
     }
 
     pub const fn ultra() -> Self {
         Self {
-            system_prompt_tokens: 1_200,
-            tool_schema_tokens: 1_600,
-            skill_index_tokens: 128,
-            project_rules_tokens: 800,
-            memory_tokens: 400,
-            memory_beads_tokens: 100,
-            memory_facts_tokens: 100,
-            memory_wiki_tokens: 100,
-            memory_index_tokens: 100,
-            git_tokens: 200,
-            single_tool_result_tokens: 2_000,
-            history_tokens: 12_000,
-            attachment_tokens: 4_000,
+            system_prompt_tokens: 4_000,
+            tool_schema_tokens: 8_000,
+            skill_index_tokens: 500,
+            project_rules_tokens: 4_000,
+            memory_tokens: 8_000,
+            memory_beads_tokens: 2_000,
+            memory_facts_tokens: 2_000,
+            memory_wiki_tokens: 2_000,
+            memory_index_tokens: 2_000,
+            git_tokens: 2_000,
+            single_tool_result_tokens: 5_000,
+            history_tokens: 80_000,
+            attachment_tokens: 20_000,
         }
     }
 
