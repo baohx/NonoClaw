@@ -336,19 +336,33 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
 }
 
 /// Coarse fingerprint of the session directory: (count, latest mtime).
+/// Dream transcripts are excluded so a dream cannot trigger its successor.
 fn session_fingerprint(dir: &Path) -> Option<(usize, SystemTime)> {
     let mut count = 0usize;
     let mut latest: Option<SystemTime> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            count += 1;
-            if let Ok(meta) = entry.metadata() {
-                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                latest = Some(match latest {
-                    Some(cur) if cur >= mtime => cur,
-                    _ => mtime,
-                });
-            }
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let is_dream = std::fs::read_to_string(entry.path()).is_ok_and(|raw| {
+            raw.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                    value.get("kind").and_then(|kind| kind.as_str()) == Some("tag")
+                        && value.get("tag").and_then(|tag| tag.as_str())
+                            == Some(nonoclaw_engine::session::DREAM_SESSION_TAG)
+                })
+            })
+        });
+        if is_dream {
+            continue;
+        }
+        count += 1;
+        if let Ok(meta) = entry.metadata() {
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            latest = Some(match latest {
+                Some(cur) if cur >= mtime => cur,
+                _ => mtime,
+            });
         }
     }
     latest.map(|l| (count, l))
@@ -1941,6 +1955,26 @@ mod tests {
         let b = reloaded.iter().find(|b| b.id == "bbb").unwrap();
         assert_eq!(b.priority, 5, "good bead untouched");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fingerprint_ignores_dream_sessions() {
+        let dir = std::env::temp_dir()
+            .join(format!("dream-fingerprint-{}", uuid::Uuid::new_v4()))
+            .join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.jsonl");
+        std::fs::write(&user, r#"{"kind":"session","id":"user"}"#).unwrap();
+        let initial = session_fingerprint(&dir).unwrap();
+        std::fs::write(
+            dir.join("dream.jsonl"),
+            r#"{"kind":"session","id":"dream"}
+{"kind":"tag","tag":"dream"}
+{"kind":"run_outcome","session_id":"dream","status":"done"}"#,
+        )
+        .unwrap();
+        assert_eq!(session_fingerprint(&dir), Some(initial));
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
     #[test]
