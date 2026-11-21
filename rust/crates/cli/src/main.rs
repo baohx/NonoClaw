@@ -587,6 +587,7 @@ async fn main() -> Result<()> {
                 turns,
                 &detail,
                 &terminal.usage(),
+                terminal.api_format().label(),
             )
             .await
         {

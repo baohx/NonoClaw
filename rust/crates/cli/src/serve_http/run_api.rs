@@ -544,6 +544,7 @@ async fn run_handler_inner(
                     turns,
                     &detail,
                     &terminal.usage(),
+                    terminal.api_format().label(),
                 )
                 .await
             {
