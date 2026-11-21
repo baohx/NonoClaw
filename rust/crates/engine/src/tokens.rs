@@ -34,6 +34,13 @@ pub const fn image_budget_chars() -> usize {
 /// Wraps `tiktoken::encoding_for_model` (bundled rank tables). `None` for
 /// unknown models → callers fall back to the heuristic.
 pub fn encoding_for_model(model: &str) -> Option<&'static CoreBpe> {
+    // The bare `deepseek-flash` name (the 2026 on-sale V4.1 Flash model, per
+    // docs/deepseek-intel-2026-10.md) falls into tiktoken's generic `deepseek`
+    // prefix, which maps to the V3 rank table. Pin it to V4 before the
+    // passthrough so token counts use the correct encoding.
+    if model.eq_ignore_ascii_case("deepseek-flash") {
+        return tiktoken::get_encoding("deepseek_v4");
+    }
     tiktoken::encoding_for_model(model)
 }
 
@@ -270,6 +277,34 @@ mod tests {
         assert!(encoding_for_model("deepseek-chat").is_some());
         let tokens = count_text_tokens(Some("deepseek-chat"), "Hello world");
         assert!(tokens > 0);
+    }
+
+    #[test]
+    fn deepseek_flash_bare_name_uses_v4_encoding() {
+        // docs/deepseek-intel-2026-10.md L149: the 2026 on-sale API model name
+        // is the bare `deepseek-flash` (V4.1 Flash). tiktoken's prefix table
+        // maps `deepseek-v4-flash` → deepseek_v4 but the bare `deepseek-flash`
+        // falls into the generic `deepseek` prefix → deepseek_v3, which is the
+        // wrong rank table for a V4 model.
+        //
+        // Discriminator: v4's added-token table has 1,283 entries vs v3's 818
+        // (encoding.rs deepseek_v4 doc comment) — `num_special_tokens()` is a
+        // direct structural probe, no text-encoding assumptions needed.
+        let v4 = tiktoken::get_encoding("deepseek_v4").unwrap();
+        let v3 = tiktoken::get_encoding("deepseek_v3").unwrap();
+        assert_ne!(
+            v4.num_special_tokens(),
+            v3.num_special_tokens(),
+            "v4 and v3 must differ in special-token table size"
+        );
+        let flash = encoding_for_model("deepseek-flash").expect("bare name must resolve");
+        assert_eq!(
+            flash.num_special_tokens(),
+            v4.num_special_tokens(),
+            "deepseek-flash must use the V4 table, not V3"
+        );
+        // Behavior check: `<think>` is a V4-only special token (id 128821).
+        assert!(flash.encode_with_special_tokens("<think>").contains(&128821));
     }
 
     #[test]
