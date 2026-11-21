@@ -903,6 +903,9 @@ pub fn render_memory_partitioned(
     facts_max_chars: usize,
 ) -> String {
     let mut out = String::new();
+    // Each partition gets its OWN counter: sharing one running total would let
+    // a fat beads block starve the facts partition — exactly the crowding-out
+    // the per-partition budgets exist to prevent.
     let mut chars = 0usize;
 
     // Active beads first — they're critical for task continuity.
@@ -944,9 +947,9 @@ pub fn render_memory_partitioned(
     if !sorted_facts.is_empty() && facts_max_chars > 0 {
         let header = "## Key Facts\n\n";
         out.push_str(header);
-        chars += header.len();
+        let mut fact_chars = header.len();
         for (i, f) in sorted_facts.iter().enumerate() {
-            if i >= 10 || chars >= facts_max_chars {
+            if i >= 10 || fact_chars >= facts_max_chars {
                 break;
             }
             let line = format!(
@@ -955,8 +958,8 @@ pub fn render_memory_partitioned(
                 t = f.fact_type,
                 body = truncate_words(&f.content, 30),
             );
-            chars += line.len();
-            if chars > facts_max_chars {
+            fact_chars += line.len();
+            if fact_chars > facts_max_chars {
                 break;
             }
             out.push_str(&line);
@@ -1013,6 +1016,49 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "use-tsinghua-mirror");
         assert_eq!(loaded[0].content, "Use Tsinghua mirror for pip.");
+    }
+
+    #[test]
+    fn partitioned_memory_budgets_are_independent() {
+        // Regression: `render_memory_partitioned` shared one running char
+        // counter between the beads and facts partitions, so a beads block
+        // close to its own budget starved the facts partition entirely —
+        // the exact crowding-out the per-partition budgets exist to prevent.
+        let beads: Vec<Bead> = (0..5)
+            .map(|i| Bead {
+                id: format!("bead-{i}"),
+                title: format!("task {i}"),
+                status: BeadStatus::InProgress,
+                priority: 3,
+                created: String::new(),
+                updated: String::new(),
+                session: String::new(),
+                content: "word ".repeat(40),
+            })
+            .collect();
+        let bead_refs: Vec<&Bead> = beads.iter().collect();
+        let fact = Fact {
+            name: "critical-fact".into(),
+            title: "Critical fact".into(),
+            content: "facts must survive a fat beads block".into(),
+            fact_type: FactType::Convention,
+            importance: 0.95,
+            confidence: 0.9,
+            created: String::new(),
+            updated: String::new(),
+            sources: vec![],
+            supersedes: None,
+            tags: vec![],
+        };
+        let rendered = render_memory_partitioned(&bead_refs, &[&fact], 1_500, 1_000);
+        assert!(
+            rendered.contains("## Active Tasks (beads)"),
+            "beads section missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("Critical fact"),
+            "facts partition starved by beads char usage — budgets must be independent"
+        );
     }
 
     #[test]
