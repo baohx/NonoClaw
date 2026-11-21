@@ -715,6 +715,17 @@ fn error_indicates_length_limit(message: &str) -> bool {
         || lower.contains("context length")
 }
 
+/// Decide whether a finished compaction result should replace the live
+/// transcript. `removed` alone is NOT enough: segments mode keeps the last
+/// `keep_recent` turns verbatim, so when the removed prefix is small relative
+/// to the kept tail, summary + tail can be LARGER than the original. Applying
+/// such a result destroys the prompt cache and ratchets the token estimate
+/// upward, re-triggering compaction forever (production 2026-11-22:
+/// 120079 → 121860 → … → 138915 across a single run).
+fn should_apply_compaction(removed: usize, chars_before: usize, chars_after: usize) -> bool {
+    removed > 0 && chars_after < chars_before
+}
+
 fn truncation_notice(is_length_limit: bool) -> &'static str {
     if is_length_limit {
         "\n\n---\n⚠️ 输出被截断（已达到输出长度上限）\n[Output truncated — output length limit reached]"
@@ -2185,7 +2196,9 @@ impl QueryEngine {
                     Ok(Ok(compacted)) => {
                         let kept = compacted.len();
                         let removed = msg_count_at_spawn.saturating_sub(kept);
-                        if removed > 0
+                        let chars_after =
+                            total_message_chars(&compacted, system_chars, tools_chars);
+                        if should_apply_compaction(removed, chars_at_spawn, chars_after)
                             && msg_count_at_spawn == self.messages.len()
                             && self
                                 .persist_compaction(compacted.clone(), revision_at_spawn)
@@ -2195,8 +2208,6 @@ impl QueryEngine {
                             // count by the character-count reduction. This is far
                             // more accurate than chars/4 because it uses the
                             // provider-reported input_tokens as the baseline.
-                            let chars_after =
-                                total_message_chars(&compacted, system_chars, tools_chars);
                             let tokens_after =
                                 ratio_tokens(tokens_at_spawn, chars_at_spawn, chars_after);
                             self.messages = compacted;
@@ -2495,14 +2506,13 @@ impl QueryEngine {
                             self.cache.last_request.as_ref().map(|p| p.as_ref()),
                         ) => result?,
                     };
-                    let tokens_after = {
-                        let chars_after =
-                            total_message_chars(&compacted, system_chars, tools_chars);
-                        ratio_tokens(tokens_before, chars_before, chars_after)
-                    };
+                    let chars_after =
+                        total_message_chars(&compacted, system_chars, tools_chars);
+                    let tokens_after =
+                        ratio_tokens(tokens_before, chars_before, chars_after);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
-                    if removed > 0
+                    if should_apply_compaction(removed, chars_before, chars_after)
                         && self
                             .persist_compaction(compacted.clone(), compact_revision)
                             .await
@@ -4683,6 +4693,32 @@ mod tests {
         assert_eq!(o.max_turns, crate::settings::DEFAULT_MAX_TURNS);
         assert!(!o.finalize_on_max_turns);
         assert!(o.is_non_interactive);
+    }
+
+    #[test]
+    fn compaction_that_grew_the_transcript_is_not_applied() {
+        // Regression (2026-11-22, session 23ee91f8 / run bbb95636): segments
+        // mode keeps the last `keep_recent` turns verbatim, so when the
+        // removed prefix is small relative to the kept tail, summary + tail
+        // is LARGER than the original. Production saw exactly this:
+        // 120079 -> 121860 tokens (+1.5%) with removed=7. Applying such a
+        // result destroys the prompt cache and ratchets the estimate upward
+        // (120079 -> 121860 -> ... -> 138915 re-fire chain). The gate must
+        // refuse a compaction that did not shrink the transcript.
+        let chars_before = 96_000 + 480_000; // system + messages
+        let chars_after = 96_000 + 487_000; // messages part GREW 1.5%
+        assert!(
+            !should_apply_compaction(7, chars_before, chars_after),
+            "gate accepted a compaction that grew chars ({chars_before} -> {chars_after})"
+        );
+        // A genuinely shrinking compaction still applies.
+        assert!(should_apply_compaction(
+            7,
+            chars_before,
+            96_000 + 336_000
+        ));
+        // No messages removed (compact failed / nothing to remove): never apply.
+        assert!(!should_apply_compaction(0, chars_before, chars_after));
     }
 
     #[test]
