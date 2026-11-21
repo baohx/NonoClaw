@@ -122,9 +122,8 @@ impl Tool for BashTool {
                     "Background task started.\nTask ID: {task_id}\nUse TaskOutput to read results."
                 )));
             }
-            return Ok(ToolResult::ok(
-                "Background execution requested but no task registry available. Command will run inline."
-            ));
+            // Without a registry, fall through to foreground rather than
+            // returning without executing the requested command.
         }
 
         if cancel.is_cancelled() {
@@ -456,6 +455,40 @@ mod tests {
             ensure_sudo_noninteractive("echo foo | sudo tee /x"),
             "echo foo | sudo tee /x"
         );
+    }
+
+    #[tokio::test]
+    async fn runs_inline_when_background_registry_is_unavailable() {
+        let options = crate::tool::ToolOptions {
+            model: "test".into(),
+            permission_mode: PermissionMode::Default,
+            is_non_interactive: true,
+            max_budget_usd: None,
+        };
+        let cancel = CancellationToken::new();
+        let ctx = ToolCtx {
+            cwd: Path::new("/tmp"),
+            options: &options,
+            cancel: &cancel,
+            tool_use_id: "test",
+            task_scope: None,
+            subagent: None,
+            graph_runner: None,
+            question: None,
+            background_registry: None,
+        };
+        let result = BashTool
+            .call(
+                serde_json::json!({
+                    "command": "printf inline-fallback-ran",
+                    "run_in_background": true
+                }),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.data.contains("inline-fallback-ran"));
     }
 
     #[test]
