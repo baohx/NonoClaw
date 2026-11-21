@@ -921,7 +921,7 @@ Full example at `~/.nonoclaw/settings.json`:
 | `compactMaxTokens` | Compaction summarizer output cap (default 4096; increase for long conversations) |
 | `autoCompact` | Enable/disable auto-compaction (default `true`) |
 | `autoSelectMcp` | Narrow advertised MCP tools to a keyword-relevant subset, pinned per session for a cache-stable tools array (default `true`) |
-| `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `15`) |
+| `autoSelectMcpTopK` | Cap on advertised MCP tools once narrowing applies (default `5`) |
 | `dreamEnabled` | Enable the AutoDream idle memory consolidation run (default `true`) |
 | `dreamIdleMinutes` | Idle minutes before a dream run may start (default `10`) |
 | `localHistoryRedaction` | Redact sensitive values (paths, env, keys) in tool inputs/results and thinking when session history is restored to the local Web UI, in live-streamed run events, and in the persisted session replay file; the browser-side sanitizer follows the same flag (default `true`) |
@@ -1867,7 +1867,7 @@ nonoclaw --plugin-add https://github.com/... # Git URL
 | `compactThreshold` | 自动压缩触发阈值（估算 tokens） |
 | `autoCompact` | 启用/禁用自动压缩 |
 | `autoSelectMcp` | 将展示的 MCP 工具收窄为关键词相关子集，并按会话固定以保持 tools 数组缓存稳定（默认 `true`） |
-| `autoSelectMcpTopK` | 收窄时展示的 MCP 工具数量上限（默认 `15`） |
+| `autoSelectMcpTopK` | 收窄时展示的 MCP 工具数量上限（默认 `5`） |
 | `dreamEnabled` | 启用 AutoDream 闲置记忆整理 run（默认 `true`） |
 | `dreamIdleMinutes` | 触发 dream run 所需的闲置分钟数（默认 `10`） |
 
