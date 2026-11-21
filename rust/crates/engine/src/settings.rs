@@ -3317,9 +3317,12 @@ fn diagnose_mcp_unknown_fields(
     if let Some(servers) = value.get("mcpServers").and_then(Value::as_object) {
         for (name, server) in servers {
             if let Some(server) = server.as_object() {
-                for key in server
-                    .keys()
-                    .filter(|key| !matches!(key.as_str(), "type" | "command" | "args" | "env"))
+                for key in server.keys().filter(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "type" | "command" | "args" | "env" | "url" | "headers"
+                    )
+                })
                 {
                     unknown_field(&format!("mcpServers.{name}.{key}"), source, diagnostics);
                 }
@@ -3717,6 +3720,26 @@ mod tests {
         assert!(!diagnostics.iter().any(|diagnostic| {
             diagnostic.field.as_deref() == Some("contextBudget.historyTokens")
         }));
+    }
+
+    #[test]
+    fn mcp_http_fields_are_known_not_unknown() {
+        let mut diagnostics = Vec::new();
+        diagnose_mcp_unknown_fields(
+            &serde_json::json!({
+                "mcpServers": {
+                    "remote": {
+                        "url": "https://mcp.example.com/mcp",
+                        "headers": {"X-Trace": "abc"}
+                    },
+                    "local": {"command": "npx", "args": ["-y", "pkg"]}
+                }
+            }),
+            &source("settings.json"),
+            &mut diagnostics,
+        );
+
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
