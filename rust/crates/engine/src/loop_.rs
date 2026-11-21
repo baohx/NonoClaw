@@ -53,6 +53,18 @@ fn normalize_prompt_tokens(format: ApiFormat, usage: &nonoclaw_core::Usage) -> u
     }
 }
 
+/// After a compaction is applied, the provider-reported `last_input_tokens`
+/// describes the PRE-compaction transcript and must not feed the next
+/// compaction decision (stale ~135k estimate over a fresh 45k transcript
+/// triggers a wasted summary call that the #39 shrink gate then rejects).
+/// All three apply paths (background prefire, sync force, manual
+/// `compact_now`) call this alongside `invalidate_message_char_cache`.
+fn invalidate_after_compaction(cache: &mut EngineCache) {
+    // Zero the stale estimate; the next iteration falls back to the
+    // chars-based heuristic until the provider reports a fresh count.
+    cache.last_input_tokens = 0;
+}
+
 /// Ratio-based token estimate: scales a known real `tokens_before` by the
 /// character-count ratio of after/before. Much more accurate than chars/4
 /// because it's calibrated against the provider's real token count.
@@ -2227,6 +2239,7 @@ impl QueryEngine {
                                 ratio_tokens(tokens_at_spawn, chars_at_spawn, chars_after);
                             self.messages = compacted;
                             self.cache.invalidate_message_char_cache();
+                            invalidate_after_compaction(&mut self.cache);
                             self.cache.frozen_idx = 0;
                             on_event(&EngineEvent::Compacted {
                                 removed,
@@ -2534,6 +2547,7 @@ impl QueryEngine {
                     {
                         self.messages = compacted;
                         self.cache.invalidate_message_char_cache();
+                        invalidate_after_compaction(&mut self.cache);
                         self.cache.frozen_idx = 0;
                         on_event(&EngineEvent::Compacted {
                             removed,
@@ -3555,6 +3569,7 @@ impl QueryEngine {
         {
             self.messages = compacted;
             self.cache.invalidate_message_char_cache();
+            invalidate_after_compaction(&mut self.cache);
             self.cache.frozen_idx = 0;
             let removed = before - kept;
             runtime
@@ -4682,6 +4697,26 @@ mod tests {
         assert_eq!(compaction_decision(10, 1_000, 81, 100), (true, false));
         assert_eq!(compaction_decision(10, 1_000, 101, 100), (false, true));
         assert_eq!(compaction_decision(801, 1_000, 10, 100), (true, false));
+    }
+
+    #[test]
+    fn applying_a_compaction_invalidates_the_provider_token_estimate() {
+        // Regression: the two prune paths (micro-compact, tool-result prune)
+        // clear `last_input_tokens` after rewriting messages, but none of the
+        // three LLM-compaction apply paths did. The next iteration then read
+        // the PRE-compaction estimate (e.g. 135k) over the freshly compacted
+        // transcript (e.g. 45k) and spawned a wasted summary call that the
+        // #39 shrink gate could only reject after paying for it.
+        let mut cache = EngineCache {
+            last_input_tokens: 135_000,
+            ..Default::default()
+        };
+        assert_eq!(cache.last_input_tokens, 135_000);
+        invalidate_after_compaction(&mut cache);
+        assert_eq!(
+            cache.last_input_tokens, 0,
+            "apply path left the pre-compaction provider estimate in place"
+        );
     }
 
     #[test]
