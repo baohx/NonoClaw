@@ -392,7 +392,13 @@ impl SessionHub {
     /// Accumulate real API token usage for a session (called when a run completes).
     /// Updates the in-memory cache and persists to the session JSONL file so the
     /// value survives server restarts.
-    pub(super) async fn accumulate_usage(&self, session_id: &str, usage: &nonoclaw_core::Usage) {
+    pub(super) async fn accumulate_usage(
+        &self,
+        session_id: &str,
+        usage: &nonoclaw_core::Usage,
+        format: nonoclaw_api::ApiFormat,
+    ) {
+        let usage = normalize_usage_to_anthropic_shape(usage, format);
         // 1. Update in-memory cache.
         let wire = {
             let mut cum = self.cumulative_usages.lock().await;
@@ -490,6 +496,39 @@ pub(super) fn resume_session(
         .map_err(|error| format!("load failed: {error}"))
 }
 
+/// Split a provider usage report into the Anthropic three-bucket shape the
+/// frontend expects (`input` EXCLUDES cache siblings; read/write are
+/// siblings). Anthropic rows already arrive in this shape. The OpenAI-style
+/// dialects report `prompt_tokens` WITH cached tokens already embedded, so
+/// feeding them straight into `input_tokens` double-counts the cache in the
+/// frontend's `base = input + read + write` hit-rate formula (InsightRail).
+/// Splitting at accumulation time also makes the JSONL totals
+/// dialect-homogeneous, so mixed-dialect sessions stay correct.
+fn normalize_usage_to_anthropic_shape(
+    usage: &nonoclaw_core::Usage,
+    format: nonoclaw_api::ApiFormat,
+) -> nonoclaw_core::Usage {
+    let mut out = *usage;
+    match format {
+        nonoclaw_api::ApiFormat::Anthropic => {
+            // Already the three-bucket shape: input excludes siblings.
+        }
+        nonoclaw_api::ApiFormat::OpenAI
+        | nonoclaw_api::ApiFormat::Responses
+        | nonoclaw_api::ApiFormat::Gemini => {
+            // prompt_tokens embeds the cached tokens: peel them out of
+            // input so `input + read + write` reconstructs the true total
+            // exactly once. saturating_sub guards providers that report a
+            // malformed cached > total pair.
+            let cached = out
+                .cache_read_input_tokens
+                .saturating_add(out.cache_creation_input_tokens);
+            out.input_tokens = out.input_tokens.saturating_sub(cached);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +538,40 @@ mod tests {
         assert!(valid_session_id("abc-123"));
         assert!(!valid_session_id("../abc"));
         assert!(!valid_session_id(""));
+    }
+
+    #[test]
+    fn openai_usage_is_split_into_anthropic_three_bucket_shape() {
+        // OpenAI dialect: prompt_tokens=1000 with 700 already cached. The
+        // embedded cache must be peeled out into the sibling buckets so the
+        // frontend's `base = input + read + write` doesn't double-count it
+        // (raw passthrough would give base = 1000 + 700 = 1700, an inflated
+        // denominator that under-reports the hit rate).
+        let raw = nonoclaw_core::Usage {
+            input_tokens: 1000,
+            output_tokens: 5,
+            cache_read_input_tokens: 700,
+            cache_creation_input_tokens: 0,
+        };
+        let normalized = normalize_usage_to_anthropic_shape(&raw, nonoclaw_api::ApiFormat::OpenAI);
+        assert_eq!(normalized.input_tokens, 300, "uncached remainder");
+        assert_eq!(normalized.cache_read_input_tokens, 700);
+        assert_eq!(normalized.cache_creation_input_tokens, 0);
+        assert_eq!(normalized.output_tokens, 5);
+    }
+
+    #[test]
+    fn anthropic_usage_passes_through_unchanged() {
+        let raw = nonoclaw_core::Usage {
+            input_tokens: 300,
+            output_tokens: 5,
+            cache_read_input_tokens: 700,
+            cache_creation_input_tokens: 100,
+        };
+        let normalized =
+            normalize_usage_to_anthropic_shape(&raw, nonoclaw_api::ApiFormat::Anthropic);
+        assert_eq!(normalized.input_tokens, 300, "already excludes siblings");
+        assert_eq!(normalized.cache_read_input_tokens, 700);
+        assert_eq!(normalized.cache_creation_input_tokens, 100);
     }
 }

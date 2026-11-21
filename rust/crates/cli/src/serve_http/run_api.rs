@@ -557,7 +557,7 @@ async fn run_handler_inner(
                 if let Some(r) = terminal.result {
                     state_for_run
                         .session_hub
-                        .accumulate_usage(&session_id, &r.usage)
+                        .accumulate_usage(&session_id, &r.usage, r.api_format)
                         .await;
                     let finish = match &terminal.reason {
                         nonoclaw_engine::RunFinishReason::Completed { .. } => "completed",

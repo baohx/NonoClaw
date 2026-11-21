@@ -2615,7 +2615,9 @@ async fn handle_ws(
                             );
                             // Accumulate real API token usage for the session so
                             // the frontend can restore it after a page refresh.
-                            s.session_hub.accumulate_usage(&session_id, &r.usage).await;
+                            s.session_hub
+                                .accumulate_usage(&session_id, &r.usage, r.api_format)
+                                .await;
                             // Incrementally refresh the session vector index
                             // (fingerprints make unchanged files a no-op).
                             {
