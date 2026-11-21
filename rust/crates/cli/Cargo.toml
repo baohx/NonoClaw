@@ -36,3 +36,6 @@ zip = "2"
 notify = { workspace = true }
 chrono = { workspace = true }
 pdf-inspector = "0.1.7"
+
+[dev-dependencies]
+filetime = "0.2"
