@@ -425,6 +425,18 @@ impl Client {
                     "DeepSeek Anthropic-compatible endpoint does not accept image content blocks",
             };
         }
+        // DeepSeek V4-Pro is text-only on every wire format (only the Flash
+        // sibling takes images — docs/deepseek-intel-2026-10.md L149). The
+        // OpenAI-wire passthrough would otherwise ship image blocks upstream
+        // and die with provider 400s instead of stripping them locally.
+        if (deepseek_model || deepseek_endpoint) && {
+            let m = model.to_ascii_lowercase();
+            m.contains("v4-pro") || m.contains("v4_pro")
+        } {
+            capabilities.images = CapabilityStatus::Unsupported {
+                reason: "DeepSeek V4-Pro is text-only; use deepseek-flash for images".into(),
+            };
+        }
         capabilities
     }
 
@@ -4314,6 +4326,37 @@ mod tests {
             .capabilities_for_model("claude-sonnet-4-5-20250929")
             .images
             .is_supported());
+    }
+
+    #[test]
+    fn deepseek_v4_pro_openai_wire_is_text_only() {
+        // docs/deepseek-intel-2026-10.md L149: `deepseek-v4-pro` is the
+        // flagship **text-only** model; only `deepseek-flash` takes images.
+        // The OpenAI-wire passthrough previously marked every DeepSeek model
+        // image-capable, so V4-Pro requests carried image blocks upstream and
+        // died with provider 400s instead of being stripped locally.
+        let deepseek_openai = Client::new(
+            Some("fixture-key".into()),
+            None,
+            "https://api.deepseek.com".into(),
+        )
+        .unwrap()
+        .with_format(ApiFormat::OpenAI);
+        assert!(
+            !deepseek_openai
+                .capabilities_for_model("deepseek-v4-pro")
+                .images
+                .is_supported(),
+            "V4-Pro on the OpenAI wire must be text-only"
+        );
+        // The Flash sibling keeps image support on the same wire.
+        assert!(
+            deepseek_openai
+                .capabilities_for_model("deepseek-flash")
+                .images
+                .is_supported(),
+            "Flash on the OpenAI wire must keep images"
+        );
     }
 
     #[test]
