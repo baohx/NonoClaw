@@ -409,9 +409,20 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) < since {
-            continue;
-        }
+        let file_mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        // Window membership is decided per entry by the run_outcome's own
+        // `ts`, not by file mtime: a compaction rewrite or a restored backup
+        // can leave a file's mtime older than `since` while it holds fresh
+        // entries (mtime-sliced windows made those permanently invisible).
+        // Entries with no ts (legacy rows) fall back to the file mtime.
+        let since_secs = since
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let file_mtime_secs = file_mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let session_id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -431,6 +442,17 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
                 continue;
             };
             if value.get("kind").and_then(|k| k.as_str()) != Some("run_outcome") {
+                continue;
+            }
+            // Per-entry window filter: the entry's own ts is authoritative;
+            // ts==0 (legacy rows without the field) falls back to file mtime.
+            let entry_ts = value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+            let effective_ts = if entry_ts > 0 {
+                entry_ts
+            } else {
+                file_mtime_secs
+            };
+            if effective_ts < since_secs {
                 continue;
             }
             out.push(OutcomeSummary {
@@ -1631,6 +1653,57 @@ mod tests {
     }
 
     #[test]
+    fn scan_window_uses_entry_ts_not_file_mtime() {
+        // Fact: reward brief windows were sliced by file mtime, so an entry
+        // whose run_outcome.ts is newer than `since` was permanently invisible
+        // when the file's mtime was older (compaction rewrite, cross-dream
+        // ledger write touching another file first, restored backup).
+        let dir = std::env::temp_dir().join("dream_scan_entry_ts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale_secs = now_secs - 10 * 24 * 3600;
+        // File mtime is set 10 days in the past; the entry inside carries a
+        // fresh ts (now). Under mtime-only filtering this entry is invisible.
+        let f = dir.join("oldfile111111-aaaa.jsonl");
+        std::fs::write(
+            &f,
+            format!(
+                "{{\"kind\":\"run_outcome\",\"run_id\":\"fresh1\",\"status\":\"error\",\"reward\":-1.0,\"turns\":5,\"detail\":\"fresh failure in old file\",\"ts\":{now_secs}}}\n"
+            ),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(stale_secs as i64, 0))
+            .unwrap();
+        let out = scan_run_outcomes(&dir, now - DREAM_BRIEF_WINDOW);
+        assert_eq!(
+            out.len(),
+            1,
+            "entry with fresh ts in an old-mtime file must be visible: {out:?}"
+        );
+        assert_eq!(out[0].run_id, "fresh1");
+
+        // Legacy rows without a ts field still fall back to file mtime.
+        let f2 = dir.join("legacy1111111-aaaa.jsonl");
+        std::fs::write(
+            &f2,
+            "{\"kind\":\"run_outcome\",\"run_id\":\"legacy1\",\"status\":\"done\",\"reward\":0.0,\"turns\":1,\"detail\":\"no ts field\"}\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(&f2, filetime::FileTime::from_unix_time(stale_secs as i64, 0))
+            .unwrap();
+        let out2 = scan_run_outcomes(&dir, now - DREAM_BRIEF_WINDOW);
+        assert!(
+            out2.iter().all(|o| o.run_id != "legacy1"),
+            "legacy ts-less row in a stale-mtime file stays excluded: {out2:?}"
+        );
+    }
+
+    #[test]
     fn ledger_skips_analyzed_sessions_in_brief() {
         let dir = std::env::temp_dir().join("dream_ledger_skip");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1671,7 +1744,6 @@ mod tests {
         let dir = std::env::temp_dir().join("dream_ledger_new_runs");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let now = SystemTime::now();
         let f = dir.join("sess22222222-aaaa.jsonl");
         let old_ts = 1000u64;
         let new_ts = 2000u64;
@@ -1689,8 +1761,11 @@ mod tests {
         .unwrap();
         let mut analyzed = std::collections::HashSet::new();
         analyzed.insert("sess22222222-aaaa".to_string());
+        // The fixture uses small synthetic ts values (1000/2000). Open the
+        // window to the epoch so the per-entry ts filter admits both runs;
+        // the assertion under test is ledger resurfacing, not window bounds.
         let (brief, listed) =
-            reward_brief_with_ledger(&dir, now - DREAM_BRIEF_WINDOW, &analyzed, 1500);
+            reward_brief_with_ledger(&dir, SystemTime::UNIX_EPOCH, &analyzed, 1500);
         assert!(
             brief.contains("max_tokens"),
             "post-dream run on analyzed session must surface: {brief}"
