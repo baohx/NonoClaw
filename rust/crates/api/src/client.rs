@@ -257,6 +257,59 @@ impl ApiFormat {
     }
 }
 
+/// Split a provider usage report into the Anthropic three-bucket shape the
+/// frontend expects (`input` EXCLUDES cache siblings; read/write are
+/// siblings). Anthropic rows already arrive in this shape. The OpenAI-style
+/// dialects report `prompt_tokens` WITH cached tokens already embedded, so
+/// feeding them straight into `input_tokens` double-counts the cached share
+/// everywhere the UI sums the three buckets (`base = input + read + write`).
+/// Shared by the engine's live event emission, the CLI terminal/REST layers,
+/// and the session usage accumulator (#43/#44 in the compaction ratchet
+/// chain). Raw dialect numbers stay untouched in `run_outcome` / raw logs.
+pub fn normalize_usage_to_anthropic_shape(
+    usage: &nonoclaw_core::Usage,
+    format: ApiFormat,
+) -> nonoclaw_core::Usage {
+    match format {
+        ApiFormat::Anthropic => usage.clone(),
+        _ => {
+            let read = usage.cache_read_input_tokens;
+            let creation = usage.cache_creation_input_tokens;
+            nonoclaw_core::Usage {
+                input_tokens: usage.input_tokens.saturating_sub(read + creation),
+                output_tokens: usage.output_tokens,
+                cache_creation_input_tokens: creation,
+                cache_read_input_tokens: read,
+            }
+        }
+    }
+}
+
+/// `UsagePart` variant of [`normalize_usage_to_anthropic_shape`] for
+/// mid-stream parts (`Option<u64>` fields). Anthropic parts pass through
+/// unchanged — its `message_start` legitimately reports input, read, and
+/// creation as sibling fields where input already excludes the cache shares.
+pub fn normalize_usage_part_to_anthropic_shape(
+    part: &UsagePart,
+    format: ApiFormat,
+) -> UsagePart {
+    match format {
+        ApiFormat::Anthropic => part.clone(),
+        _ => {
+            let read = part.cache_read_input_tokens.unwrap_or(0);
+            let creation = part.cache_creation_input_tokens.unwrap_or(0);
+            UsagePart {
+                input_tokens: part
+                    .input_tokens
+                    .map(|input| input.saturating_sub(read + creation)),
+                output_tokens: part.output_tokens,
+                cache_creation_input_tokens: part.cache_creation_input_tokens,
+                cache_read_input_tokens: part.cache_read_input_tokens,
+            }
+        }
+    }
+}
+
 /// Join a provider base URL with its canonical endpoint without duplicating
 /// the common `/v1` suffix. Profiles in the wild use both host roots and
 /// versioned roots (for example `https://api.anthropic.com/v1`).
