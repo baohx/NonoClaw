@@ -372,6 +372,8 @@ struct OutcomeSummary {
     input_tokens: u64,
     /// Cumulative prompt-cache READ hits.
     cache_read_tokens: u64,
+    /// Cumulative prompt-cache WRITES.
+    cache_creation_tokens: u64,
 }
 
 /// Truncate a run-outcome `detail` for the dream brief, but never cut the
@@ -455,6 +457,10 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
                     .unwrap_or(0),
                 cache_read_tokens: value
                     .get("cache_read_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_tokens: value
+                    .get("cache_creation_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
             });
@@ -723,16 +729,31 @@ fn reward_brief_with_ledger(
         if outcome.input_tokens == 0 {
             continue;
         }
-        input_total += outcome.input_tokens;
+        // `run_outcome` stores raw provider counters whose `input_tokens`
+        // dialect differs by provider: Anthropic reports input EXCLUDING its
+        // cache siblings, OpenAI-style providers embed cached tokens inside
+        // `prompt_tokens`. When the siblings exceed input the entry is in the
+        // Anthropic dialect and the denominator must include them (otherwise
+        // the ratio inflates past 100% and low-hit runs go unreported; see
+        // usage_json_with_base in api/client.rs for the same split).
+        let cache_siblings = outcome
+            .cache_read_tokens
+            .saturating_add(outcome.cache_creation_tokens);
+        let denominator = if cache_siblings > outcome.input_tokens {
+            outcome.input_tokens + cache_siblings
+        } else {
+            outcome.input_tokens
+        };
+        input_total += denominator;
         cache_read_total += outcome.cache_read_tokens;
-        if (outcome.cache_read_tokens as f64) < 0.6 * outcome.input_tokens as f64 {
+        if (outcome.cache_read_tokens as f64) < 0.6 * denominator as f64 {
             low_hit_runs.push(format!(
                 "session {} run {}（{}/{}，{:.0}%）",
                 &outcome.session_id.chars().take(8).collect::<String>(),
                 &outcome.run_id.chars().take(8).collect::<String>(),
                 outcome.cache_read_tokens,
-                outcome.input_tokens,
-                100.0 * outcome.cache_read_tokens as f64 / outcome.input_tokens as f64,
+                denominator,
+                100.0 * outcome.cache_read_tokens as f64 / denominator as f64,
             ));
         }
     }
@@ -1451,6 +1472,48 @@ mod tests {
     }
 
     #[test]
+    fn reward_brief_cache_triage_detects_anthropic_dialect_denominator() {
+        let dir = std::env::temp_dir().join("dream_cache_dialect_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Anthropic semantics: `input_tokens` EXCLUDES its cache siblings, so
+        // the naive read/input ratio is inflated (977%-style absurdities) and
+        // the denominator must include the siblings.
+        std::fs::write(
+            dir.join("anthhigh0-aaaa.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"a\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r1\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\",\"input_tokens\":10000,\"cache_read_tokens\":97700,\"cache_creation_tokens\":0}\n",
+            ),
+        )
+        .unwrap();
+        // Same shape, genuinely low hit even on the corrected denominator.
+        std::fs::write(
+            dir.join("anthlow00-bbbb.jsonl"),
+            concat!(
+                "{\"kind\":\"session\",\"id\":\"b\"}\n",
+                "{\"kind\":\"run_outcome\",\"run_id\":\"r2\",\"status\":\"done\",\"reward\":1.0,\"turns\":2,\"detail\":\"ok\",\"input_tokens\":10000,\"cache_read_tokens\":3000,\"cache_creation_tokens\":0}\n",
+            ),
+        )
+        .unwrap();
+
+        let brief = reward_brief(&dir, SystemTime::now() - DREAM_BRIEF_WINDOW);
+        // Corrected overall = (97700+3000)/((10000+97700)+10000) = 86%. The
+        // unfixed code prints 504% here.
+        assert!(
+            brief.contains("86%"),
+            "anthropic-denominator overall hit rate: {brief}"
+        );
+        assert!(!brief.contains("504%"), "no inflated ratio: {brief}");
+        assert!(brief.contains("anthlow0"), "low-hit run listed: {brief}");
+        assert!(
+            !brief.contains("anthhigh"),
+            "high-hit anthropic run not flagged: {brief}"
+        );
+    }
+
+    #[test]
     fn reward_brief_aggregates_and_targets_worst() {
         let dir = std::env::temp_dir().join("dream_reward_brief_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1680,6 +1743,7 @@ mod tests {
             ts: 0,
             input_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_tokens: 0,
         }
     }
 
@@ -1879,6 +1943,7 @@ mod tests {
                 ts: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
             OutcomeSummary {
                 session_id: "b".into(),
@@ -1890,6 +1955,7 @@ mod tests {
                 ts: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
         ];
         assert!(!has_headroom(&clean), "saturated window skips dreaming");
@@ -1904,6 +1970,7 @@ mod tests {
                 ts: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
             OutcomeSummary {
                 session_id: "c".into(),
@@ -1915,6 +1982,7 @@ mod tests {
                 ts: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
         ];
         assert!(has_headroom(&dirty), "one non-done outcome is headroom");
