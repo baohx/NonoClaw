@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nonoclaw_api::normalize_usage_to_anthropic_shape;
 use nonoclaw_engine::session::CumulativeUsageWire;
 use nonoclaw_engine::{ResolvedConfig, RunController, Session, SessionService};
 use tokio::sync::{watch, Mutex};
@@ -496,38 +497,11 @@ pub(super) fn resume_session(
         .map_err(|error| format!("load failed: {error}"))
 }
 
-/// Split a provider usage report into the Anthropic three-bucket shape the
-/// frontend expects (`input` EXCLUDES cache siblings; read/write are
-/// siblings). Anthropic rows already arrive in this shape. The OpenAI-style
-/// dialects report `prompt_tokens` WITH cached tokens already embedded, so
-/// feeding them straight into `input_tokens` double-counts the cache in the
-/// frontend's `base = input + read + write` hit-rate formula (InsightRail).
-/// Splitting at accumulation time also makes the JSONL totals
-/// dialect-homogeneous, so mixed-dialect sessions stay correct.
-fn normalize_usage_to_anthropic_shape(
-    usage: &nonoclaw_core::Usage,
-    format: nonoclaw_api::ApiFormat,
-) -> nonoclaw_core::Usage {
-    let mut out = *usage;
-    match format {
-        nonoclaw_api::ApiFormat::Anthropic => {
-            // Already the three-bucket shape: input excludes siblings.
-        }
-        nonoclaw_api::ApiFormat::OpenAI
-        | nonoclaw_api::ApiFormat::Responses
-        | nonoclaw_api::ApiFormat::Gemini => {
-            // prompt_tokens embeds the cached tokens: peel them out of
-            // input so `input + read + write` reconstructs the true total
-            // exactly once. saturating_sub guards providers that report a
-            // malformed cached > total pair.
-            let cached = out
-                .cache_read_input_tokens
-                .saturating_add(out.cache_creation_input_tokens);
-            out.input_tokens = out.input_tokens.saturating_sub(cached);
-        }
-    }
-    out
-}
+/// Usage dialect normalization lives in `nonoclaw_api`
+/// (`normalize_usage_to_anthropic_shape`): the Anthropic three-bucket shape
+/// the frontend expects, with OpenAI-style embedded cache tokens peeled out
+/// of `input_tokens` so `base = input + read + write` counts the true prompt
+/// exactly once (#43/#44). See that helper's docs for the rationale.
 
 #[cfg(test)]
 mod tests {

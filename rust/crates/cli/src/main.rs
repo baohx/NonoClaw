@@ -613,18 +613,27 @@ async fn main() -> Result<()> {
             "type": "result",
             "text": result.text,
             "turns": result.turns,
-            "usage": usage_json(&result.usage),
+            "usage": usage_json(&nonoclaw_api::normalize_usage_to_anthropic_shape(
+                &result.usage,
+                result.api_format,
+            )),
             "stop_reason": result.stop_reason.as_ref().map(|s| s.as_str()),
         }));
     } else {
         // Text was streamed live; just print the usage summary on stderr.
+        // Displayed numbers follow the Anthropic three-bucket shape so the
+        // `in + cache read + cache write` sum equals the true prompt (#44).
+        let display_usage = nonoclaw_api::normalize_usage_to_anthropic_shape(
+            &result.usage,
+            result.api_format,
+        );
         eprintln!(
             "\n[turns: {}, in: {}, out: {}, cache read: {}, cache write: {}]",
             result.turns,
-            result.usage.input_tokens,
-            result.usage.output_tokens,
-            result.usage.cache_read_input_tokens,
-            result.usage.cache_creation_input_tokens,
+            display_usage.input_tokens,
+            display_usage.output_tokens,
+            display_usage.cache_read_input_tokens,
+            display_usage.cache_creation_input_tokens,
         );
     }
 

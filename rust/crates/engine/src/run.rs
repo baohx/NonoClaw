@@ -273,7 +273,15 @@ impl RunController {
                     reason: format!("{reason:?}"),
                     duration_ms: 0,
                     turns: result.as_ref().map(|value| value.turns).unwrap_or(0),
-                    usage: result.as_ref().map(|value| value.usage).unwrap_or_default(),
+                    usage: result
+                        .as_ref()
+                        .map(|value| {
+                            nonoclaw_api::normalize_usage_to_anthropic_shape(
+                                &value.usage,
+                                value.api_format,
+                            )
+                        })
+                        .unwrap_or_default(),
                 },
             ));
         }

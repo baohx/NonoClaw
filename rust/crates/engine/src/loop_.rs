@@ -2749,6 +2749,7 @@ impl QueryEngine {
                             &provider,
                             turns_made,
                             usage_before_turn,
+                            self.client.api_format(),
                             &mut on_event,
                         )
                     },
@@ -2857,6 +2858,7 @@ impl QueryEngine {
                                                 &provider,
                                                 turns_made,
                                                 usage_before_turn,
+                                                self.client.api_format(),
                                                 &mut on_event,
                                             )
                                         },
@@ -2883,21 +2885,32 @@ impl QueryEngine {
             // OpenAI-style `prompt_tokens` already embeds cached tokens.
             self.cache.last_input_tokens =
                 normalize_prompt_tokens(self.client.api_format(), &turn.usage);
-            on_event(&RunEvent::UsageUpdated {
-                turn: turns_made,
-                turn_usage: UsagePart {
+            // Events/UI consume the Anthropic three-bucket shape (input
+            // excludes cache siblings); OpenAI-style dialects embed cached
+            // tokens inside `prompt_tokens`, which would double-count once
+            // the frontend sums input + read + creation (#44).
+            let turn_usage_normalized = nonoclaw_api::normalize_usage_part_to_anthropic_shape(
+                &UsagePart {
                     input_tokens: Some(turn.usage.input_tokens),
                     output_tokens: Some(turn.usage.output_tokens),
                     cache_creation_input_tokens: Some(turn.usage.cache_creation_input_tokens),
                     cache_read_input_tokens: Some(turn.usage.cache_read_input_tokens),
                 },
-                total: self.cache.total_usage,
+                self.client.api_format(),
+            );
+            let total_normalized = nonoclaw_api::normalize_usage_to_anthropic_shape(
+                &self.cache.total_usage,
+                self.client.api_format(),
+            );
+            on_event(&RunEvent::UsageUpdated {
+                turn: turns_made,
+                turn_usage: turn_usage_normalized,
+                total: total_normalized,
                 max_budget_usd: self.options.max_budget_usd,
             });
             last_stop = turn.stop_reason.clone();
             suppress_thinking_next_turn = false;
             boost_max_tokens_next_turn = false;
-
             // Collect assistant text for display + the transcript message.
             let assistant_text: String = turn
                 .content
@@ -3466,7 +3479,10 @@ impl QueryEngine {
             reason: format!("{finish_reason:?}"),
             duration_ms: run_started_at.elapsed().as_millis() as u64,
             turns: turns_made,
-            usage: self.cache.total_usage,
+            usage: nonoclaw_api::normalize_usage_to_anthropic_shape(
+                &self.cache.total_usage,
+                self.client.api_format(),
+            ),
         });
         Ok(FinalResult {
             text: final_text,
@@ -3605,6 +3621,7 @@ fn forward_stream_event(
     provider: &str,
     turn: u32,
     total_before_turn: Usage,
+    format: nonoclaw_api::ApiFormat,
     on_event: &mut impl FnMut(&EngineEvent),
 ) {
     match event {
@@ -3624,8 +3641,8 @@ fn forward_stream_event(
             total.update_from_part(usage);
             on_event(&RunEvent::UsageUpdated {
                 turn,
-                turn_usage: usage.clone(),
-                total,
+                turn_usage: nonoclaw_api::normalize_usage_part_to_anthropic_shape(usage, format),
+                total: nonoclaw_api::normalize_usage_to_anthropic_shape(&total, format),
                 max_budget_usd: None,
             });
         }
@@ -3657,8 +3674,8 @@ fn forward_stream_event(
             total.update_from_part(usage);
             on_event(&RunEvent::UsageUpdated {
                 turn,
-                turn_usage: usage.clone(),
-                total,
+                turn_usage: nonoclaw_api::normalize_usage_part_to_anthropic_shape(usage, format),
+                total: nonoclaw_api::normalize_usage_to_anthropic_shape(&total, format),
                 max_budget_usd: None,
             });
         }
@@ -5705,6 +5722,149 @@ mod tests {
 
     /// Full non-interactive engine success through a local Anthropic SSE
     /// Provider fixture; no external API is contacted. Feature Matrix: §2.2 headless.
+    /// OpenAI-dialect SSE fixture: one turn, prompt_tokens=1000 with 700 of
+    /// them already cached, 5 completion tokens. Drives the full engine run
+    /// loop so the UsageUpdated / RunFinished payload shapes are exercised
+    /// end-to-end (the frontend consumes exactly these events).
+    async fn spawn_openai_usage_fixture() -> (
+        Arc<Client>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drain the request (headers + body); the body is not inspected.
+            let mut request = Vec::new();
+            let mut header_end = None;
+            while header_end.is_none() {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "fixture request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(pos + 4);
+                }
+            }
+            let header_end = header_end.unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "fixture request body was truncated");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            // OpenAI chat/completions SSE: bare `data:` frames, one carrying
+            // the usage block, terminated by the [DONE] sentinel.
+            let sse = "data: {\"id\":\"x\",\"model\":\"fixture-openai\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"openai fixture answer\"},\"finish_reason\":null}]}\n\n\
+                       data: {\"id\":\"x\",\"model\":\"fixture-openai\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":700}}}\n\n\
+                       data: [DONE]\n\n"
+                .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = Client::new(Some("fixture-key".into()), None, format!("http://{addr}"))
+            .unwrap()
+            .with_format(ApiFormat::OpenAI);
+        (Arc::new(client), task)
+    }
+
+    #[tokio::test]
+    async fn openai_live_usage_events_are_anthropic_shaped() {
+        let (client, fixture_task) = spawn_openai_usage_fixture().await;
+        let mut engine = fixture_engine(client);
+        let cwd = std::env::temp_dir().join(format!(
+            "nonoclaw-openai-usage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut events = Vec::new();
+        let result = engine
+            .run(MessageContent::from_text("fixture prompt"), &cwd, |event| {
+                events.push(event.clone())
+            })
+            .await
+            .unwrap();
+        fixture_task.await.unwrap();
+
+        assert_eq!(result.text, "openai fixture answer");
+
+        // Invariant the frontend relies on (InsightRail base = input + read +
+        // write; ledger per-run sums): every live usage payload must be in the
+        // Anthropic three-bucket shape, i.e. the true prompt size is counted
+        // exactly once. Raw OpenAI passthrough (input=prompt_tokens=1000 with
+        // cached=700 embedded, creation=prompt-read=300) sums to 2000 — the
+        // cache is double-counted.
+        let mut checked_usage_updated = 0;
+        let mut checked_run_finished = 0;
+        for event in &events {
+            match event {
+                EngineEvent::UsageUpdated { turn_usage, total, .. } => {
+                    for usage in [
+                        Usage {
+                            input_tokens: turn_usage.input_tokens.unwrap_or(0),
+                            output_tokens: turn_usage.output_tokens.unwrap_or(0),
+                            cache_creation_input_tokens: turn_usage
+                                .cache_creation_input_tokens
+                                .unwrap_or(0),
+                            cache_read_input_tokens: turn_usage
+                                .cache_read_input_tokens
+                                .unwrap_or(0),
+                        },
+                        *total,
+                    ] {
+                        // Mid-stream events before the first usage frame carry
+                        // all zeros — nothing to double-count there yet.
+                        if usage.input_tokens == 0
+                            && usage.output_tokens == 0
+                            && usage.cache_creation_input_tokens == 0
+                            && usage.cache_read_input_tokens == 0
+                        {
+                            continue;
+                        }
+                        let base = usage.input_tokens
+                            + usage.cache_read_input_tokens
+                            + usage.cache_creation_input_tokens;
+                        assert_eq!(
+                            base, 1000,
+                            "UsageUpdated payload must count the true prompt exactly once"
+                        );
+                        checked_usage_updated += 1;
+                    }
+                }
+                EngineEvent::RunFinished { usage, .. } => {
+                    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+                        continue;
+                    }
+                    let base = usage.input_tokens
+                        + usage.cache_read_input_tokens
+                        + usage.cache_creation_input_tokens;
+                    assert_eq!(base, 1000, "RunFinished usage must count the true prompt exactly once");
+                    checked_run_finished += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(checked_usage_updated >= 1, "fixture must emit UsageUpdated");
+        assert!(checked_run_finished == 1, "run must finish exactly once");
+    }
+
     #[tokio::test]
     async fn headless_minimal_success_path_uses_provider_fixture() {
         let (client, mut requests, fixture_task) =

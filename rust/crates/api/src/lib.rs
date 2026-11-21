@@ -9,7 +9,8 @@ pub mod sse;
 
 pub use client::{
     ApiFormat, Client, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolChoice,
-    ToolSchema, TurnOutput, DEFAULT_BASE_URL,
+    ToolSchema, TurnOutput, DEFAULT_BASE_URL, normalize_usage_part_to_anthropic_shape,
+    normalize_usage_to_anthropic_shape,
 };
 pub use factory::{ClientConfig, ClientFactory, ClientPurpose};
 pub use provider::{

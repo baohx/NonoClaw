@@ -122,8 +122,10 @@ pub enum RunEvent {
     ContextPrepared {
         /// Estimated token count for the initial context. This is an estimate
         /// (chars/4 heuristic) because the real token count is only available
-        /// after the first API call. Use `UsageUpdated.total.input_tokens` for
-        /// the ground-truth value once the first turn completes.
+        /// after the first API call. Use the sum `UsageUpdated.total.input +
+        /// cache_read + cache_creation` for the ground-truth prompt size once
+        /// the first turn completes (all dialects are normalized to the
+        /// Anthropic three-bucket shape where input excludes cache siblings).
         estimated_tokens: usize,
         /// Whether the token count is based on chars/4 estimation (always true
         /// before the first turn).

@@ -2296,8 +2296,13 @@ async fn handle_ws(
                                             sequence,
                                             timestamp_ms,
                                             text: result.text,
-                                            usage: serde_json::to_value(result.usage)
-                                                .unwrap_or_default(),
+                                            usage: serde_json::to_value(
+                                                nonoclaw_api::normalize_usage_to_anthropic_shape(
+                                                    &result.usage,
+                                                    result.api_format,
+                                                ),
+                                            )
+                                            .unwrap_or_default(),
                                             turns: result.turns,
                                             stop_reason: result
                                                 .stop_reason
@@ -2648,7 +2653,13 @@ async fn handle_ws(
                                 sequence,
                                 timestamp_ms,
                                 text: r.text,
-                                usage: serde_json::to_value(r.usage).unwrap_or_default(),
+                                usage: serde_json::to_value(
+                                    nonoclaw_api::normalize_usage_to_anthropic_shape(
+                                        &r.usage,
+                                        r.api_format,
+                                    ),
+                                )
+                                .unwrap_or_default(),
                                 turns: r.turns,
                                 stop_reason: r.stop_reason.as_ref().map(|s| s.as_str().to_string()),
                             };
