@@ -3694,6 +3694,48 @@ mod tests {
     }
 
     #[test]
+    fn config_reference_and_typed_fields_are_in_bijection() {
+        // The settings schema lives in three places that must stay in sync:
+        // the `SettingsFile` struct, the `CONFIG_REFERENCE` list, and the
+        // `merge_settings_value` branches. This test closes the gap between
+        // the first two by reflecting the struct's serialized keys, so a new
+        // field that lands in one but not the other fails here instead of
+        // surfacing as a spurious unknown_field warning (or silently dropped
+        // data) in production.
+        let struct_names = serde_json::to_value(SettingsFile::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let reference_names = config_reference()
+            .iter()
+            .map(|field| field.name.to_string())
+            .collect::<BTreeSet<_>>();
+
+        let undocumented = struct_names
+            .difference(&reference_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            undocumented.is_empty(),
+            "typed SettingsFile fields missing from CONFIG_REFERENCE: {undocumented:?}"
+        );
+
+        let known_extra = BTreeSet::from(["vm".to_string()]);
+        let unbacked = reference_names
+            .iter()
+            .filter(|name| !struct_names.contains(*name) && !known_extra.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unbacked.is_empty(),
+            "CONFIG_REFERENCE names with no typed field and no exemption: {unbacked:?}"
+        );
+    }
+
+    #[test]
     fn video_models_field_is_known_and_parses() {
         // Regression guard: `videoModels` (SettingsFile field) must stay in
         // CONFIG_REFERENCE, otherwise every settings.json using the video
