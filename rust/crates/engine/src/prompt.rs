@@ -711,76 +711,37 @@ ask: can stdlib or existing deps already do this? Justify every addition."#;
 
 const MEMORY_GUIDE: &str = r#"## Memory (Mneme — three-layer cross-session memory)
 
-NonoClaw has a three-layer memory system so you don't start fresh every session:
+- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`, one file per fact \
+  with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, `tags`, \
+  `supersedes`). Never deleted — wrong ones are superseded.
+- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Frontmatter: `id`, \
+  `title`, `status` (todo/in_progress/blocked/done), `priority`. **Critical**: save \
+  beads at session end so the next session knows what you were working on.
+- **Transcript** — per-session JSONL, persisted automatically.
 
-- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`. One `.md` file per fact \
-  with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, \
-  `tags`, `supersedes`). Types: preference, convention, decision, architecture, \
-  bug. Facts are never deleted — wrong ones are superseded.
-- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Each bead tracks one active \
-  task. YAML frontmatter (`id`, `title`, `status`, `priority`). Status: todo, \
-  in_progress, blocked, done. **Critical**: save beads at session end so the \
-  next session knows what you were working on.
-- **Transcript** — per-session JSONL. Automatically persisted.
-
-### When to use facts
-- The user states a preference ("always use X"), makes a design decision, \
-  reports a bug pattern, or establishes a convention.
-- The user gives feedback on your work ("don't do Y again").
-- You discover a project-invariant (architecture, dependency constraints).
-- **Before creating**: use Read tool to check `.nonoclaw/memory/facts/` for existing \
-  similar facts. Update if found; create new if not.
-
-### When to use beads
-- At the start of a session: check `.nonoclaw/memory/beads/` for active tasks from \
-  previous sessions. Resume where you left off.
-- During work: save a bead when you're blocked or the task spans multiple turns.
-- At session end: save current progress as beads so work can continue later.
-
-### Search
-Use the `Memory` tool or Grep over `.nonoclaw/memory/facts/` to find relevant knowledge \
-before starting work. The context already includes the top facts and active \
-beads, but you may need to search for specifics."#;
+Write a fact when the user states a preference/decision/convention, gives feedback, \
+or you discover a project-invariant. Before creating: check `.nonoclaw/memory/facts/` \
+for a similar fact — update if found, create if not. Save a bead when blocked or a \
+task spans multiple turns. Use the `Memory` tool or Grep to search; context already \
+includes top facts and active beads."#;
 
 const WIKI_GUIDE: &str = r#"## Wiki (LLM Wiki — structured knowledge compilation)
 
-NonoClaw supports Karpathy's LLM Wiki pattern. Knowledge is stored as structured, \
-interlinked Markdown pages in `.nonoclaw/wiki/` — not fragmented vectors. \
-The LLM acts as a compiler: raw sources → wiki pages.
+Structured, interlinked Markdown pages in `.nonoclaw/wiki/` (not vectors). You act \
+as a compiler: raw sources → wiki pages. Layout: `WIKI.md` (schema), `index.md` \
+(catalog), `log.md` (ingest log), page dirs by type — `concepts/`, `entities/`, \
+`comparisons/`, `decisions/`, `sources/` — plus `.nonoclaw/raw/` for immutable \
+source documents.
 
-### Directory layout
-```
-.nonoclaw/wiki/
-  WIKI.md          — schema + writing conventions (read this first)
-  index.md         — catalog of all pages
-  log.md           — append-only ingest log
-  concepts/        — "How does X work?"
-  entities/        — "What is X?" (components, APIs, tools)
-  comparisons/     — "X vs Y?"
-  decisions/       — "Why did we choose X?"
-  sources/         — per-source summaries
-.nonoclaw/raw/     — immutable source documents (never modified by you)
-```
+Operations: **Ingest** — place source in `raw/`, call `Memory wiki_ingest <path>`, \
+update affected pages + `index.md` + `log.md`. **Query** — `Memory wiki_search` \
+(index is injected at session start). **Lint** — `Memory wiki_lint` for untagged \
+pages, unsourced claims, low-confidence info.
 
-### Operations
-- **Ingest**: Place a source file in `raw/`, then call `Memory wiki_ingest` with \
-  the path. Read the source, create/update wiki pages following the schema, \
-  update `index.md`, and log the ingest to `log.md`. One source typically \
-  updates 5-15 pages.
-- **Query**: Use `Memory wiki_search <query>` to find pages. The wiki index \
-  is injected into context at session start so you know what exists.
-- **Lint**: Use `Memory wiki_lint` periodically to find untagged pages, \
-  unsourced claims, and low-confidence information.
-
-### Writing conventions
-- Every page has YAML frontmatter: `title`, `type` (concept/entity/comparison/\
-  decision/source), `domain`, `summary`, `confidence` (high/medium/low), \
-  `tags`, `sources`
-- Cross-reference with `[[page-name]]` wikilinks
-- Write for humans AND future LLM sessions — be precise, cite sources, note \
-  confidence levels
-- Facts in `.nonoclaw/memory/facts/` capture session-specific learning; wiki pages \
-  capture structured domain knowledge that compounds over time"#;
+Conventions: YAML frontmatter (`title`, `type`, `domain`, `summary`, `confidence`, \
+`tags`, `sources`); `[[page-name]]` wikilinks; write for humans and future LLM \
+sessions — precise, sourced, confidence-noted. Facts hold session-specific \
+learning; wiki pages hold compounding domain knowledge."#;
 
 const DIAGRAM_GUIDE: &str = r#"## Diagrams and visual output
 
@@ -910,76 +871,37 @@ ask: can stdlib or existing deps already do this? Justify every addition.
 
 ## Memory (Mneme — three-layer cross-session memory)
 
-NonoClaw has a three-layer memory system so you don't start fresh every session:
+- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`, one file per fact \
+  with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, `tags`, \
+  `supersedes`). Never deleted — wrong ones are superseded.
+- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Frontmatter: `id`, \
+  `title`, `status` (todo/in_progress/blocked/done), `priority`. **Critical**: save \
+  beads at session end so the next session knows what you were working on.
+- **Transcript** — per-session JSONL, persisted automatically.
 
-- **Facts** — immutable knowledge in `.nonoclaw/memory/facts/*.md`. One `.md` file per fact \
-  with YAML frontmatter (`name`, `title`, `type`, `importance`, `confidence`, \
-  `tags`, `supersedes`). Types: preference, convention, decision, architecture, \
-  bug. Facts are never deleted — wrong ones are superseded.
-- **Beads** — task continuity in `.nonoclaw/memory/beads/*.md`. Each bead tracks one active \
-  task. YAML frontmatter (`id`, `title`, `status`, `priority`). Status: todo, \
-  in_progress, blocked, done. **Critical**: save beads at session end so the \
-  next session knows what you were working on.
-- **Transcript** — per-session JSONL. Automatically persisted.
-
-### When to use facts
-- The user states a preference ("always use X"), makes a design decision, \
-  reports a bug pattern, or establishes a convention.
-- The user gives feedback on your work ("don't do Y again").
-- You discover a project-invariant (architecture, dependency constraints).
-- **Before creating**: use Read tool to check `.nonoclaw/memory/facts/` for existing \
-  similar facts. Update if found; create new if not.
-
-### When to use beads
-- At the start of a session: check `.nonoclaw/memory/beads/` for active tasks from \
-  previous sessions. Resume where you left off.
-- During work: save a bead when you're blocked or the task spans multiple turns.
-- At session end: save current progress as beads so work can continue later.
-
-### Search
-Use the `Memory` tool or Grep over `.nonoclaw/memory/facts/` to find relevant knowledge \
-before starting work. The context already includes the top facts and active \
-beads, but you may need to search for specifics.
+Write a fact when the user states a preference/decision/convention, gives feedback, \
+or you discover a project-invariant. Before creating: check `.nonoclaw/memory/facts/` \
+for a similar fact — update if found, create if not. Save a bead when blocked or a \
+task spans multiple turns. Use the `Memory` tool or Grep to search; context already \
+includes top facts and active beads.
 
 ## Wiki (LLM Wiki — structured knowledge compilation)
 
-NonoClaw supports Karpathy's LLM Wiki pattern. Knowledge is stored as structured, \
-interlinked Markdown pages in `.nonoclaw/wiki/` — not fragmented vectors. \
-The LLM acts as a compiler: raw sources → wiki pages.
+Structured, interlinked Markdown pages in `.nonoclaw/wiki/` (not vectors). You act \
+as a compiler: raw sources → wiki pages. Layout: `WIKI.md` (schema), `index.md` \
+(catalog), `log.md` (ingest log), page dirs by type — `concepts/`, `entities/`, \
+`comparisons/`, `decisions/`, `sources/` — plus `.nonoclaw/raw/` for immutable \
+source documents.
 
-### Directory layout
-```
-.nonoclaw/wiki/
-  WIKI.md          — schema + writing conventions (read this first)
-  index.md         — catalog of all pages
-  log.md           — append-only ingest log
-  concepts/        — "How does X work?"
-  entities/        — "What is X?" (components, APIs, tools)
-  comparisons/     — "X vs Y?"
-  decisions/       — "Why did we choose X?"
-  sources/         — per-source summaries
-.nonoclaw/raw/     — immutable source documents (never modified by you)
-```
+Operations: **Ingest** — place source in `raw/`, call `Memory wiki_ingest <path>`, \
+update affected pages + `index.md` + `log.md`. **Query** — `Memory wiki_search` \
+(index is injected at session start). **Lint** — `Memory wiki_lint` for untagged \
+pages, unsourced claims, low-confidence info.
 
-### Operations
-- **Ingest**: Place a source file in `raw/`, then call `Memory wiki_ingest` with \
-  the path. Read the source, create/update wiki pages following the schema, \
-  update `index.md`, and log the ingest to `log.md`. One source typically \
-  updates 5-15 pages.
-- **Query**: Use `Memory wiki_search <query>` to find pages. The wiki index \
-  is injected into context at session start so you know what exists.
-- **Lint**: Use `Memory wiki_lint` periodically to find untagged pages, \
-  unsourced claims, and low-confidence information.
-
-### Writing conventions
-- Every page has YAML frontmatter: `title`, `type` (concept/entity/comparison/\
-  decision/source), `domain`, `summary`, `confidence` (high/medium/low), \
-  `tags`, `sources`
-- Cross-reference with `[[page-name]]` wikilinks
-- Write for humans AND future LLM sessions — be precise, cite sources, note \
-  confidence levels
-- Facts in `.nonoclaw/memory/facts/` capture session-specific learning; wiki pages \
-  capture structured domain knowledge that compounds over time
+Conventions: YAML frontmatter (`title`, `type`, `domain`, `summary`, `confidence`, \
+`tags`, `sources`); `[[page-name]]` wikilinks; write for humans and future LLM \
+sessions — precise, sourced, confidence-noted. Facts hold session-specific \
+learning; wiki pages hold compounding domain knowledge.
 
 ## Diagrams and visual output
 
@@ -1273,6 +1195,20 @@ mod tests {
             ratio * 100.0,
             minimal.len(),
             full.len()
+        );
+    }
+
+    #[test]
+    fn full_static_prompt_stays_within_budget() {
+        // Static Block-1 body budget (chars, pre-cache). The memory/wiki guides
+        // duplicate per-session injected content (facts block, wiki index) —
+        // keep them tight so Block 1 stays cache-cheap. Baseline before
+        // tightening: 9613 chars.
+        let full = build_system_prompt_sections(&PromptProfile::Full);
+        assert!(
+            full.chars().count() <= 8600,
+            "Full static prompt grew past 8600 chars ({}); trim redundant guidance",
+            full.chars().count()
         );
     }
 
