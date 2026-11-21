@@ -190,7 +190,7 @@ pub async fn run_handler_for_dream(
 
 async fn run_handler_inner(
     state: Arc<AppState>,
-    req: RunRequest,
+    mut req: RunRequest,
     expected_project_generation: Option<u64>,
 ) -> Response {
     let project_transition = state.projects.lock_transition().await;
@@ -260,6 +260,12 @@ async fn run_handler_inner(
 
     let session = session_handle.session.clone();
     let session_id = session.id().to_string();
+    // The dream prompt is assembled before the session exists; inject the real
+    // ID now so its phase-1 `ls -t` instruction names (and skips) the live
+    // transcript it is about to write.
+    if req.dream {
+        req.prompt = super::dream::inject_own_session_id(&req.prompt, &session_id);
+    }
     let mut run_lease = match state.session_hub.try_acquire_run(&session_id, None).await {
         Ok(lease) => lease,
         Err(()) => {

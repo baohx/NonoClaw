@@ -303,6 +303,23 @@ fn write_dream_marker(marker: &Path, analyzed_sessions: &[String]) {
     let _ = std::fs::write(marker, payload.to_string());
 }
 
+/// Placeholder embedded in the dream prompt's phase-1 `ls -t` instruction. The
+/// run dispatcher replaces it with the dream's own live transcript file name
+/// (`<id>.jsonl`) once the session ID is known, so the dream can name-and-skip
+/// the transcript it is currently writing instead of re-reading it as a past
+/// session.
+pub(super) const DREAM_OWN_SESSION_PLACEHOLDER: &str = "__DREAM_OWN_SESSION_ID__";
+
+/// Replace the own-session placeholder with the dream's live transcript file
+/// name, leaving the rest of the prompt untouched. Pure so it can be unit
+/// tested without a live provider.
+pub(super) fn inject_own_session_id(prompt: &str, session_id: &str) -> String {
+    prompt.replace(
+        DREAM_OWN_SESSION_PLACEHOLDER,
+        &format!("{session_id}.jsonl"),
+    )
+}
+
 /// Fixed dream prompt: four-phase REM consolidation. `reward_brief` is the
 /// Level-1 RL signal summary (aggregates + pointers, never trajectory text)
 /// that steers which fragments the dream reviews first.
@@ -324,7 +341,7 @@ pub(super) fn dream_prompt_with_brief(
 你正在执行 AutoDream 后台记忆整理（用户离线期间运行）。严格按四个阶段工作，全程只读 + 写记忆，不修改任何项目代码：\n\n\
 {brief}\
 {sessions_dir}\
-1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。有会话目录时，直接用 Bash `ls -t` 定位该目录中的 JSONL（跳过 dream tag 会话），不要再搜索目录；没有时再看最近改动的文件。\n\
+1. 【碎片收集】优先检索 Reward 简报里列出的低 reward 轨迹（session_search 用其 detail 中的关键词：取消原因、错误信息）；再做常规收集：用 Memory session_search 检索最近的会话片段（多个关键词：最近的 bug、修复、决策、配置、用户反馈）。有会话目录时，直接用 Bash `ls -t` 定位该目录中的 JSONL（跳过 dream tag 会话以及当前正在写入的 __DREAM_OWN_SESSION_ID__），不要再搜索目录；没有时再看最近改动的文件。\n\
 2. 【关联分析】找出碎片之间的关联：重复出现的错误模式、前后因果（如旧配置问题和后续报错）、跨会话重复做的事。若简报里有失败/被打断的轨迹，做对比反思：检索同类任务的成功轨迹，高分 vs 低分逐段对照，定位第一个分歧点——是哪个编排决策（任务拆解方式、子代理/工具选择、步骤顺序）不同导致结果分岔。\n\
 3. 【知识萃取·即写】只把【可复用、非显而易见】的知识提炼为结构化事实，且【每萃取一条立即用 Write 落盘一条，再分析下一条】——dream 随时可能被轮次截断，『全部析完再统一写』的批处理模式下一次截断就归零。每条事实：类型选 preference/convention/decision/architecture/bug，写法遵循 .nonoclaw/memory/facts 的 YAML frontmatter 格式，importance 1-5，用 Write 写入 .nonoclaw/memory/facts/<slug>.md（必须带 .nonoclaw/ 前缀，写到顶层 memory/ 的文件引擎不会加载）。supersede 旧事实、关闭 stale bead 这类纯记忆写操作也在分析到位的当场用 Edit 完成，绝不推迟或留委托。\n\
 4. 【改进建议落盘】如果分析中产生了【需要对项目代码/配置做实质修改】的建议（bug 该修、模块该重构、常量该调整等——这类内容不属于 facts），用 Write 工具把它写成一条 bead：.nonoclaw/memory/beads/<uuid>.md，frontmatter 含 id（UUID）、title、status: todo、priority（1-7，影响面大取高）、created/updated（ISO-8601）、session（留空），正文写清楚建议内容、依据（引用来源会话/事实）、验收标准。已有近似 bead 则用 Edit 更新（改 updated 和正文），不要重复新建。没有实质建议就跳过本阶段。\n\
@@ -1970,6 +1987,29 @@ mod tests {
         assert!(prompt.contains("ls -t"));
         assert!(prompt.contains("dream tag"));
         assert!(!prompt.contains("会话目录：/tmp/projectsessions"));
+    }
+
+    #[test]
+    fn dream_prompt_marks_and_skips_own_live_transcript() {
+        let prompt = dream_prompt_with_brief(None, None);
+        // The own-session placeholder sits in phase 1 (the `ls -t` instruction),
+        // before phase 2, so the dream skips its own live transcript.
+        let phase_two = prompt.find("2. 【关联分析】").unwrap();
+        let placeholder = prompt.find(DREAM_OWN_SESSION_PLACEHOLDER).unwrap();
+        assert!(
+            placeholder < phase_two,
+            "own-session placeholder must be in phase 1"
+        );
+
+        // Injection names the live transcript in phase 1 and leaves no
+        // placeholder behind.
+        let injected = inject_own_session_id(&prompt, "abc123");
+        assert!(
+            !injected.contains(DREAM_OWN_SESSION_PLACEHOLDER),
+            "injection must replace the placeholder"
+        );
+        let id = injected.find("abc123.jsonl").unwrap();
+        assert!(id < phase_two, "injected transcript must be in phase 1");
     }
 
     #[test]
