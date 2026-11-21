@@ -1905,6 +1905,15 @@ fn merge_settings_value(
     ) {
         base.local_history_redaction = overlay.local_history_redaction;
     }
+    if present("dreamEnabled", overlay.dream_enabled.is_some()) {
+        base.dream_enabled = overlay.dream_enabled;
+    }
+    if present(
+        "dreamIdleMinutes",
+        overlay.dream_idle_minutes.is_some(),
+    ) {
+        base.dream_idle_minutes = overlay.dream_idle_minutes;
+    }
     if present(
         "skillIndexMaxTokens",
         overlay.skill_index_max_tokens.is_some(),
@@ -1979,6 +1988,13 @@ fn merge_settings_value(
     }
     if present("videoModels", overlay.video_models.is_some()) {
         base.video_models.clone_from(&overlay.video_models);
+    }
+    if present(
+        "attachmentConverter",
+        overlay.attachment_converter.is_some(),
+    ) {
+        base.attachment_converter
+            .clone_from(&overlay.attachment_converter);
     }
     if let Some(executables) = &overlay.executables {
         base.executables = Some(match &base.executables {
@@ -4278,6 +4294,36 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "doubao-seedance-2-0-mini-260615");
         assert_eq!(profiles[0].base_url, "https://ark.cn-beijing.volces.com");
+    }
+
+    #[test]
+    fn dream_and_attachment_fields_survive_layer_merging() {
+        // Regression: dreamEnabled / dreamIdleMinutes / attachmentConverter are
+        // typed SettingsFile fields and known config fields, but were missing
+        // branches in merge_settings_value — so a user/global layer value was
+        // silently dropped once a project layer merged on top. That makes
+        // `dreamEnabled: false` unable to disable the scheduler (it reads
+        // `unwrap_or(true)`), and makes idle-minutes / converter overrides no-ops.
+        let user = layer(
+            "user.json",
+            serde_json::json!({
+                "dreamEnabled": false,
+                "dreamIdleMinutes": 45,
+                "attachmentConverter": "markitdown"
+            }),
+        );
+        let project = layer("project.json", serde_json::json!({ "maxTurns": 64 }));
+        let resolved = resolve_layers(
+            &[user, project],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+        assert_eq!(resolved.settings.dream_enabled, Some(false));
+        assert_eq!(resolved.settings.dream_idle_minutes, Some(45));
+        assert_eq!(
+            resolved.settings.attachment_converter.as_deref(),
+            Some("markitdown")
+        );
     }
 
     #[test]
