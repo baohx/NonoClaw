@@ -3732,14 +3732,22 @@ mod tests {
                         "url": "https://mcp.example.com/mcp",
                         "headers": {"X-Trace": "abc"}
                     },
-                    "local": {"command": "npx", "args": ["-y", "pkg"]}
+                    "local": {"command": "npx", "args": ["-y", "pkg"]},
+                    "typoed": {"command": "x", "comand": "y"}
                 }
             }),
             &source("settings.json"),
             &mut diagnostics,
         );
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "unknown_field")
+                .map(|diagnostic| diagnostic.field.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("mcpServers.typoed.comand")],
+        );
     }
 
     #[test]
