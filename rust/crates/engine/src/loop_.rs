@@ -9,7 +9,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use nonoclaw_api::{
-    Client, ProviderFeature, RequestParams, StreamEvent, SystemBlock, ThinkingConfig, ToolSchema,
+    ApiFormat, Client, ProviderFeature, RequestParams, StreamEvent, SystemBlock, ThinkingConfig,
+    ToolSchema,
 };
 use nonoclaw_core::{
     display_path, CacheControl, ContentBlock, Message, MessageContent, PermissionDecision,
@@ -37,6 +38,20 @@ use crate::session::{new_session_id, Session, SessionError, SessionSnapshot};
 use crate::skills::SkillsManager;
 use crate::tokens::{estimate_total_for_model, message_char_len};
 use nonoclaw_tools::BackgroundTaskRegistry;
+
+/// Provider-reported full prompt token count for compaction calibration.
+///
+/// Dialects differ in what `usage.input_tokens` means: OpenAI-style providers
+/// embed cached tokens inside `prompt_tokens` (already the full prompt), while
+/// Anthropic's `input_tokens` EXCLUDES its cache siblings — the full prompt is
+/// `input + cache_read + cache_creation` (see `usage_json_with_base` in
+/// `nonoclaw_api`). Normalizing here keeps `last_input_tokens` dialect-safe.
+fn normalize_prompt_tokens(format: ApiFormat, usage: &nonoclaw_core::Usage) -> usize {
+    match format {
+        ApiFormat::Anthropic => usage.effective_prompt_tokens(),
+        _ => usage.input_tokens as usize,
+    }
+}
 
 /// Ratio-based token estimate: scales a known real `tokens_before` by the
 /// character-count ratio of after/before. Much more accurate than chars/4
@@ -2841,10 +2856,13 @@ impl QueryEngine {
 
             self.cache.total_usage.accumulate(&turn.usage);
             // Track the provider-reported prompt size for precise compact
-            // threshold calibration. The per-turn `input_tokens` from Anthropic
-            // (before cache deduction) is the full prompt token count — much
-            // more accurate than the chars/4 heuristic (~20-30% off).
-            self.cache.last_input_tokens = turn.usage.input_tokens as usize;
+            // threshold calibration. Normalized by dialect: Anthropic's
+            // `input_tokens` excludes its cache siblings (832 reported while
+            // the real prompt is ~120k under a high cache-hit turn — the
+            // low-token compaction re-fire chain in run bbb95636), while
+            // OpenAI-style `prompt_tokens` already embeds cached tokens.
+            self.cache.last_input_tokens =
+                normalize_prompt_tokens(self.client.api_format(), &turn.usage);
             on_event(&RunEvent::UsageUpdated {
                 turn: turns_made,
                 turn_usage: UsagePart {
@@ -4664,6 +4682,41 @@ mod tests {
         assert_eq!(compaction_decision(10, 1_000, 81, 100), (true, false));
         assert_eq!(compaction_decision(10, 1_000, 101, 100), (false, true));
         assert_eq!(compaction_decision(801, 1_000, 10, 100), (true, false));
+    }
+
+    #[test]
+    fn anthropic_prompt_token_estimate_includes_cache_siblings() {
+        // Regression (2026-11-22, run bbb95636 low-token re-fire chain):
+        // Anthropic's `input_tokens` EXCLUDES cache_read/cache_creation
+        // siblings. Under a high cache-hit turn the engine recorded 832
+        // while the real prompt was ~120k, so `est` collapsed and the
+        // total-token compaction gate went blind. The normalized count
+        // must include the cache siblings for the Anthropic dialect.
+        let usage = nonoclaw_core::Usage {
+            input_tokens: 832,
+            output_tokens: 300,
+            cache_creation_input_tokens: 1_743,
+            cache_read_input_tokens: 118_614,
+        };
+        let full = normalize_prompt_tokens(ApiFormat::Anthropic, &usage);
+        assert_eq!(full, 832 + 1_743 + 118_614);
+        assert!(full > 120_000, "high-cache turn collapsed to {full}");
+
+        // OpenAI-style dialects embed cached tokens inside prompt_tokens;
+        // summing siblings there would double-count. The normalized count
+        // must stay at the raw value.
+        assert_eq!(
+            normalize_prompt_tokens(ApiFormat::OpenAI, &usage),
+            usage.input_tokens as usize
+        );
+        assert_eq!(
+            normalize_prompt_tokens(ApiFormat::Responses, &usage),
+            usage.input_tokens as usize
+        );
+        assert_eq!(
+            normalize_prompt_tokens(ApiFormat::Gemini, &usage),
+            usage.input_tokens as usize
+        );
     }
 
     #[test]

@@ -17,6 +17,17 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Full prompt token count under Anthropic dialect semantics: Anthropic's
+    /// `input_tokens` EXCLUDES `cache_read`/`cache_creation` siblings, so the
+    /// true prompt size is the sum of all three (mirrors `usage_json_with_base`
+    /// in `nonoclaw_api`). Callers on OpenAI-style dialects should use
+    /// `input_tokens` alone — `prompt_tokens` there already embeds cached
+    /// tokens and the sum would double-count.
+    pub fn effective_prompt_tokens(&self) -> usize {
+        self.input_tokens as usize
+            + self.cache_read_input_tokens as usize
+            + self.cache_creation_input_tokens as usize
+    }
     /// Merge a streaming usage fragment, keeping the positive value for each
     /// field (mirrors the `!== null && > 0 ? part : current` logic). Fields the
     /// fragment omits are left untouched.
