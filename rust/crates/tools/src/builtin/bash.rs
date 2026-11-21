@@ -104,7 +104,13 @@ impl Tool for BashTool {
             .min(MAX_TIMEOUT_MS);
 
         // Background execution: spawn and return task ID immediately.
-        if input["run_in_background"].as_bool().unwrap_or(false) {
+        if input["run_in_background"].as_bool().unwrap_or(false)
+            && !background_bash_disabled(
+                std::env::var("NONOCLAW_DISABLE_BACKGROUND_BASH")
+                    .ok()
+                    .as_deref(),
+            )
+        {
             if let Some(ref reg) = ctx.background_registry {
                 let task_id = reg.lock().unwrap().spawn_in_with_cancel(
                     &command,
@@ -246,6 +252,13 @@ fn require_command(input: &Value) -> Result<&str> {
         tool: "Bash".into(),
         message: "missing required string field `command`".into(),
     })
+}
+
+/// Whether `NONOCLAW_DISABLE_BACKGROUND_BASH` forces `run_in_background`
+/// requests to run in the foreground. Truthy spellings match the other env
+/// gates (`1` / `true` / `yes`, case-insensitive).
+fn background_bash_disabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// Insert `-n` after `sudo` so it runs in non-interactive mode.
@@ -443,5 +456,16 @@ mod tests {
             ensure_sudo_noninteractive("echo foo | sudo tee /x"),
             "echo foo | sudo tee /x"
         );
+    }
+
+    #[test]
+    fn disable_background_bash_env_values() {
+        assert!(background_bash_disabled(Some("1")));
+        assert!(background_bash_disabled(Some("true")));
+        assert!(background_bash_disabled(Some("YES")));
+        assert!(!background_bash_disabled(Some("")));
+        assert!(!background_bash_disabled(Some("0")));
+        assert!(!background_bash_disabled(Some("off")));
+        assert!(!background_bash_disabled(None));
     }
 }
