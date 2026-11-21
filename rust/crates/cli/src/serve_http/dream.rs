@@ -335,6 +335,23 @@ pub(super) fn dream_prompt_with_brief(reward_brief: Option<String>) -> String {
     )
 }
 
+/// The existing session schema is the single source of truth for machine tags.
+/// Avoid substring checks that depend on incidental JSON whitespace or key order.
+fn is_machine_session(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        serde_json::from_str::<nonoclaw_engine::session::SessionEntry>(line).is_ok_and(
+            |entry| {
+                matches!(
+                    entry,
+                    nonoclaw_engine::session::SessionEntry::Tag { ref tag }
+                        if tag == nonoclaw_engine::session::DREAM_SESSION_TAG
+                            || tag == nonoclaw_engine::session::BENCH_SMOKE_SESSION_TAG
+                )
+            },
+        )
+    })
+}
+
 /// Coarse fingerprint of the session directory: (count, latest mtime).
 /// Dream transcripts are excluded so a dream cannot trigger its successor.
 fn session_fingerprint(dir: &Path) -> Option<(usize, SystemTime)> {
@@ -344,15 +361,8 @@ fn session_fingerprint(dir: &Path) -> Option<(usize, SystemTime)> {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let is_dream = std::fs::read_to_string(entry.path()).is_ok_and(|raw| {
-            raw.lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-                    value.get("kind").and_then(|kind| kind.as_str()) == Some("tag")
-                        && value.get("tag").and_then(|tag| tag.as_str())
-                            == Some(nonoclaw_engine::session::DREAM_SESSION_TAG)
-                })
-            })
-        });
+        let is_dream = std::fs::read_to_string(entry.path())
+            .is_ok_and(|raw| is_machine_session(&raw));
         if is_dream {
             continue;
         }
@@ -445,10 +455,9 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Skip dream sessions (self-counting) and bench-smoke harness
-        // sessions (low-value marker runs after every dream) so the brief
-        // only describes real work.
-        if text.contains("\"tag\":\"dream\"") || text.contains("\"tag\":\"bench-smoke\"") {
+        // Only real user work contributes reward signals; dream and bench-smoke
+        // transcripts must not create a self-referential feedback loop.
+        if is_machine_session(&text) {
             continue;
         }
         for line in text.lines() {
@@ -1505,6 +1514,31 @@ mod tests {
             !brief.contains("legacy0000"),
             "legacy run without cache fields skipped: {brief}"
         );
+    }
+
+    #[test]
+    fn dream_session_filter_uses_structured_tag_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "dream-scan-structured-tag-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dream.jsonl"),
+            r#"{"kind":"session","id":"dream-session-id","cwd":"/tmp","model":"test","started":"now"}
+{"kind":"tag", "tag": "dream"}
+{"kind":"run_outcome","session_id":"dream-session-id","status":"error","reward":-1.0,"turns":1,"detail":"truncated","ts":9999999999}"#,
+        )
+        .unwrap();
+        let (brief, listed) = reward_brief_with_ledger(
+            &dir,
+            SystemTime::UNIX_EPOCH,
+            &Default::default(),
+            0,
+        );
+        assert!(brief.contains("没有带 reward 标签的新轨迹"));
+        assert!(listed.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
