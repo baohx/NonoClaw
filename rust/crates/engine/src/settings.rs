@@ -34,7 +34,7 @@ use crate::budget::{ContextBudget, ContextBudgetSettings, TokenMode};
 use crate::EngineOptions;
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
-pub const DEFAULT_MAX_TURNS: u32 = 200;
+pub const DEFAULT_MAX_TURNS: u32 = 99_999;
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 pub const DEFAULT_COMPACT_THRESHOLD: usize = 150_000;
 const COMPACT_SAFETY_MARGIN: usize = 2048;

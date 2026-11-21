@@ -907,7 +907,7 @@ Full example at `~/.nonoclaw/settings.json`:
 | `contextWindow` | Global context window (overridden by per-model `contextWindow`) |
 | `maxTokens` | Global max output per turn (overridden by per-model `maxTokens`) |
 | `charsPerToken` | Global chars-per-token estimator (default 4; overridden per-model) |
-| `maxTurns` | Maximum agent turns per run (default 200) |
+| `maxTurns` | Maximum agent turns per run (default 99999, i.e. effectively unlimited) |
 | `promptProfile` | System-prompt profile: `"full"` (default) or `"minimal"` (~60% smaller, keeps identity+safety+task-completion only) |
 | `env` | Configuration inputs and `$ENV` references resolved server-side; existing process values take precedence without mutating process state |
 | `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken`, `profile`, `apiFormat` |
