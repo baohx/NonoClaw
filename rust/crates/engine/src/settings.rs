@@ -867,7 +867,7 @@ fn default_chars_per_token() -> usize {
 
 fn resolve_process_env_ref(raw: &str) -> String {
     raw.strip_prefix('$')
-        .and_then(|name| std::env::var(name).ok())
+        .and_then(|name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
         .unwrap_or_else(|| raw.to_string())
 }
 
@@ -1022,7 +1022,9 @@ impl fmt::Debug for ConfigEnvironment {
 impl ConfigEnvironment {
     pub fn capture() -> Self {
         Self {
-            values: std::env::vars().collect(),
+            values: std::env::vars_os()
+                .filter_map(|(key, value)| decode_env_pair(key, value))
+                .collect(),
         }
     }
 
@@ -1035,6 +1037,16 @@ impl ConfigEnvironment {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
     }
+}
+
+/// Convert one process-env pair to UTF-8 config values. Non-UTF-8 *names* are
+/// dropped (config lookup is by UTF-8 key); non-UTF-8 *values* are lossily
+/// decoded so `$VAR` references still resolve instead of silently staying as
+/// the literal `$VAR` string.
+fn decode_env_pair(key: std::ffi::OsString, value: std::ffi::OsString) -> Option<(String, String)> {
+    let key = key.into_string().ok()?;
+    let value = value.to_string_lossy().into_owned();
+    Some((key, value))
 }
 
 #[derive(Debug, Clone)]
@@ -3631,6 +3643,24 @@ mod tests {
     }
 
     #[test]
+    fn env_capture_survives_non_utf8_name_and_decodes_non_utf8_value() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // Non-UTF-8 *name* is dropped rather than panicking (regression: the
+        // old `std::env::vars()` collect would panic the whole capture).
+        let bad_name = OsString::from_vec(vec![b'P', 0xff, b'A', b'T', b'H']);
+        assert_eq!(decode_env_pair(bad_name, OsString::from("x")), None);
+
+        // Non-UTF-8 *value* is lossily decoded so a `$VAR` reference can still
+        // resolve instead of silently remaining the literal `$VAR`.
+        let bad_value = OsString::from_vec(vec![0xc3, 0x28]); // invalid UTF-8
+        let (key, value) = decode_env_pair(OsString::from("API_KEY"), bad_value).unwrap();
+        assert_eq!(key, "API_KEY");
+        assert_eq!(value, "\u{fffd}("); // U+FFFD replacement for the bad byte
+    }
+
+    #[test]
     fn proxy_and_dream_fields_are_known_config_fields() {
         // Regression: `proxy` (SettingsFile field) and the dream scheduler
         // toggles were missing from CONFIG_REFERENCE, so every real user
@@ -4439,6 +4469,28 @@ mod tests {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    #[test]
+    fn capture_does_not_panic_on_non_utf8_env_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+
+        // A name that is not valid UTF-8 (unix-only). The old
+        // `std::env::vars().collect()` panicked the whole `capture()` on this.
+        let bytes: &[u8] = &[b'N', b'O', b'N', b'O', 0xff, b'X'];
+        let bad_name = std::ffi::OsStr::from_bytes(bytes);
+        unsafe { std::env::remove_var(bad_name) };
+        unsafe { std::env::set_var(bad_name, "value") };
+
+        // Must return (no panic) and still capture the normal variables.
+        let captured = ConfigEnvironment::capture();
+        assert!(
+            captured.get("HOME").is_some() || captured.get("PATH").is_some(),
+            "capture() should still contain ordinary UTF-8 variables"
+        );
+
+        unsafe { std::env::remove_var(bad_name) };
     }
 
     #[test]
