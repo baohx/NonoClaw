@@ -2567,6 +2567,7 @@ async fn handle_ws(
                                 turns,
                                 &detail,
                                 &terminal.usage(),
+                                terminal.api_format().label(),
                             )
                             .await
                         {

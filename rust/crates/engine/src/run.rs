@@ -204,6 +204,16 @@ impl RunTerminal {
             .map(|value| value.usage)
             .unwrap_or_default()
     }
+
+    /// Provider wire dialect for the run (from the run's `FinalResult`).
+    /// Lets `write_run_outcome` record which cache-token semantics the raw
+    /// counters use; `Default` (Anthropic) for runs without a result payload.
+    pub fn api_format(&self) -> nonoclaw_api::ApiFormat {
+        self.result
+            .as_ref()
+            .map(|value| value.api_format)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone)]

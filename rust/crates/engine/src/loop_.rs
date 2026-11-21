@@ -1243,6 +1243,12 @@ pub struct FinalResult {
     pub turns: u32,
     pub stop_reason: Option<StopReason>,
     pub finish_reason: RunFinishReason,
+    /// Provider wire dialect used for this run. The usage counters have
+    /// different cache semantics per dialect (Anthropic `input_tokens`
+    /// excludes cache siblings; OpenAI-style `prompt_tokens` embeds them),
+    /// so downstream consumers (run_outcome cache triage) need to know it.
+    #[serde(skip)]
+    pub api_format: ApiFormat,
 }
 
 /// Cancels run-owned child work on every return path, including provider/tool
@@ -3468,6 +3474,7 @@ impl QueryEngine {
             turns: turns_made,
             stop_reason: last_stop,
             finish_reason,
+            api_format: self.client.api_format(),
         })
     }
 

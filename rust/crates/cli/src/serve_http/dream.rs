@@ -422,6 +422,43 @@ struct OutcomeSummary {
     cache_read_tokens: u64,
     /// Cumulative prompt-cache WRITES.
     cache_creation_tokens: u64,
+    /// Provider wire dialect label ("anthropic" | "openai" | "responses" |
+    /// "gemini"; "" for legacy rows written before the field existed).
+    /// Anthropic `input_tokens` EXCLUDES cache siblings; OpenAI-style
+    /// dialects embed cached tokens inside `prompt_tokens` — the
+    /// cache-hit denominator differs accordingly.
+    api_format: String,
+}
+
+/// Denominator for the per-run cache-hit ratio, in tokens.
+///
+/// Dialect semantics (see PR #40 / `Usage::effective_prompt_tokens`):
+/// - Anthropic: `input_tokens` excludes the cache siblings, so the full
+///   prompt is input + cache_read + cache_creation.
+/// - OpenAI-style (`prompt_tokens`): cached tokens are already inside the
+///   reported input; adding siblings would double-count.
+/// - Legacy rows (empty label, written before the field existed) fall back
+///   to the counter-shape heuristic: siblings > input implies Anthropic.
+fn cache_denominator(
+    input_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    api_format: &str,
+) -> u64 {
+    let siblings = cache_read.saturating_add(cache_creation);
+    let anthropic = match api_format {
+        "anthropic" => true,
+        "openai" | "responses" | "gemini" => false,
+        // Legacy heuristic (rows written before the label existed): only
+        // the Anthropic dialect can report cache siblings exceeding the
+        // uncached input.
+        _ => siblings > input_tokens,
+    };
+    if anthropic {
+        input_tokens.saturating_add(siblings)
+    } else {
+        input_tokens
+    }
 }
 
 /// Truncate a run-outcome `detail` for the dream brief, but never cut the
@@ -532,6 +569,11 @@ fn scan_run_outcomes(dir: &Path, since: SystemTime) -> Vec<OutcomeSummary> {
                     .get("cache_creation_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
+                api_format: value
+                    .get("api_format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             });
         }
     }
@@ -798,21 +840,18 @@ fn reward_brief_with_ledger(
         if outcome.input_tokens == 0 {
             continue;
         }
-        // `run_outcome` stores raw provider counters whose `input_tokens`
-        // dialect differs by provider: Anthropic reports input EXCLUDING its
-        // cache siblings, OpenAI-style providers embed cached tokens inside
-        // `prompt_tokens`. When the siblings exceed input the entry is in the
-        // Anthropic dialect and the denominator must include them (otherwise
-        // the ratio inflates past 100% and low-hit runs go unreported; see
-        // usage_json_with_base in api/client.rs for the same split).
-        let cache_siblings = outcome
-            .cache_read_tokens
-            .saturating_add(outcome.cache_creation_tokens);
-        let denominator = if cache_siblings > outcome.input_tokens {
-            outcome.input_tokens + cache_siblings
-        } else {
-            outcome.input_tokens
-        };
+        // Dialect-exact denominator via the persisted `api_format` label;
+        // legacy rows (no label) keep the counter-shape heuristic.
+        // Without the label, an Anthropic run with MIDDLING hit rates
+        // (siblings < input, e.g. read=40k < input=50k) was classified as
+        // OpenAI-style, its denominator shrank to the uncached input alone,
+        // and genuinely low-hit runs escaped the triage list.
+        let denominator = cache_denominator(
+            outcome.input_tokens,
+            outcome.cache_read_tokens,
+            outcome.cache_creation_tokens,
+            &outcome.api_format,
+        );
         input_total += denominator;
         cache_read_total += outcome.cache_read_tokens;
         if (outcome.cache_read_tokens as f64) < 0.6 * denominator as f64 {
@@ -1896,6 +1935,7 @@ mod tests {
             input_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            api_format: String::new(),
         }
     }
 
@@ -2151,6 +2191,7 @@ mod tests {
                 input_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                api_format: String::new(),
             },
             OutcomeSummary {
                 session_id: "b".into(),
@@ -2163,6 +2204,7 @@ mod tests {
                 input_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                api_format: String::new(),
             },
         ];
         assert!(!has_headroom(&clean), "saturated window skips dreaming");
@@ -2178,6 +2220,7 @@ mod tests {
                 input_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                api_format: String::new(),
             },
             OutcomeSummary {
                 session_id: "c".into(),
@@ -2190,6 +2233,7 @@ mod tests {
                 input_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                api_format: String::new(),
             },
         ];
         assert!(has_headroom(&dirty), "one non-done outcome is headroom");
@@ -2202,5 +2246,26 @@ mod tests {
     fn dream_prompt_mentions_shadow_proposal_path() {
         let p = dream_prompt_with_brief(None, None);
         assert!(p.contains("shadow"), "prompt must instruct shadow staging");
+    }
+
+    #[test]
+    fn cache_denominator_uses_the_persisted_dialect_label() {
+        // Anthropic dialect: input EXCLUDES cache siblings, so the full
+        // prompt (denominator) must add them back — even when the hit rate
+        // is middling (siblings < input), which is exactly the case the old
+        // counter-shape heuristic misclassified as OpenAI-style.
+        let denom = cache_denominator(50_000, 40_000, 8_000, "anthropic");
+        assert_eq!(denom, 98_000, "anthropic label must include siblings");
+
+        // OpenAI dialect: prompt_tokens already embeds cached tokens; adding
+        // siblings would double-count.
+        let denom = cache_denominator(50_000, 40_000, 0, "openai");
+        assert_eq!(denom, 50_000, "openai label must not add siblings");
+
+        // Legacy row (no label): fall back to the counter-shape heuristic.
+        // Siblings exceed input => Anthropic shape.
+        assert_eq!(cache_denominator(10_000, 40_000, 8_000, ""), 58_000);
+        // Siblings below input => cannot tell; keep input alone (old behavior).
+        assert_eq!(cache_denominator(50_000, 40_000, 8_000, ""), 50_000);
     }
 }

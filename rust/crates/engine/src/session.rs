@@ -103,6 +103,15 @@ pub enum SessionEntry {
         /// Cumulative prompt-cache WRITES (`cache_creation_input_tokens`).
         #[serde(default)]
         cache_creation_tokens: u64,
+        /// Provider wire dialect label ("anthropic" | "openai" |
+        /// "responses" | "gemini"). Determines the denominator semantics
+        /// for the cache-hit ratio: Anthropic `input_tokens` EXCLUDES the
+        /// cache siblings (denominator = input + read + creation), the
+        /// OpenAI-style dialects embed cached tokens inside `prompt_tokens`
+        /// (denominator = input alone). `default` keeps old JSONL parseable
+        /// (legacy rows fall back to the counter-shape heuristic).
+        #[serde(default)]
+        api_format: String,
     },
     /// Running total of real API token usage (accumulated across all
     /// completed runs). Used to restore the frontend right-rail in/out
@@ -316,6 +325,10 @@ impl Session {
     }
 
     /// Append a Level-1 RL reward label for one completed run.
+    /// `api_format_label` is `ApiFormat::label()` — persisted so offline
+    /// consumers (dream cache triage) pick the right denominator semantics;
+    /// pass an empty string only in tests that don't care.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_run_outcome(
         &self,
         run_id: &str,
@@ -324,6 +337,7 @@ impl Session {
         turns: u32,
         detail: &str,
         usage: &nonoclaw_core::usage::Usage,
+        api_format_label: &str,
     ) -> SessionResult<u64> {
         self.append_metadata(SessionEntry::RunOutcome {
             run_id: run_id.to_string(),
@@ -338,6 +352,7 @@ impl Session {
             input_tokens: usage.input_tokens,
             cache_read_tokens: usage.cache_read_input_tokens,
             cache_creation_tokens: usage.cache_creation_input_tokens,
+            api_format: api_format_label.to_string(),
         })
         .await
     }
@@ -1544,7 +1559,7 @@ mod tests {
             cache_read_input_tokens: 9_000,
             ..Default::default()
         };
-        s.write_run_outcome("run-1", "done", 1.0, 4, "all good", &usage)
+        s.write_run_outcome("run-1", "done", 1.0, 4, "all good", &usage, "anthropic")
             .await
             .unwrap();
         s.write_run_outcome(
@@ -1554,6 +1569,7 @@ mod tests {
             0,
             "provider 500",
             &Default::default(),
+            "openai",
         )
         .await
         .unwrap();
