@@ -107,11 +107,6 @@ pub(super) enum ClientMsg {
     RemoveProject {
         path: String,
     },
-    /// List the sessions stored for an arbitrary project directory without
-    /// switching the active project.
-    ListProjectSessions {
-        path: String,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,12 +286,6 @@ pub(super) enum ServerMsg {
     /// add/remove so every client stays in sync.
     ProjectsList {
         projects: Vec<RegisteredProject>,
-    },
-    /// Sessions stored under an arbitrary project directory, returned for
-    /// `list_project_sessions`. Never changes the active project.
-    ProjectSessionsList {
-        path: String,
-        sessions: Vec<SessionInfoWire>,
     },
 }
 
@@ -1055,7 +1044,6 @@ mod tests {
             ClientMsg::ListProjects => "list_projects",
             ClientMsg::AddProject { .. } => "add_project",
             ClientMsg::RemoveProject { .. } => "remove_project",
-            ClientMsg::ListProjectSessions { .. } => "list_project_sessions",
         }
     }
 

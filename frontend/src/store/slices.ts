@@ -176,18 +176,13 @@ export interface ProjectSlice {
   modelsHealthChecking: boolean;
   /** Server-side project registry, refreshed by `projects_list` frames. */
   projects: RegisteredProject[];
-  /** Sessions per registered project path, from `project_sessions_list`. */
-  projectSessions: Record<string, SessionInfoWire[]>;
-  /** Project tree node currently expanded to show its session list. */
-  expandedProjectPath: string | null;  setFileTree: (root: string, entries: FileEntry[]) => void;
+  setFileTree: (root: string, entries: FileEntry[]) => void;
   setProjectInfo: (info: ProjectInfo) => void;
   beginInsightRefresh: () => void;
   beginModelsHealthCheck: () => void;
   setModelsHealth: (results: ModelHealthEntry[]) => void;
   setSessionPrompts: (sessionId: string, prompts: SessionRunPrompt[]) => void;
   setProjects: (projects: RegisteredProject[]) => void;
-  setProjectSessions: (path: string, sessions: SessionInfoWire[]) => void;
-  setExpandedProjectPath: (path: string | null) => void;
 }
 
 export interface DialogSlice {
@@ -688,8 +683,6 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
   modelsHealth: {},
   modelsHealthChecking: false,
   projects: [],
-  projectSessions: {},
-  expandedProjectPath: null,
   setFileTree: (fileTreeRoot, fileTree) => set({ fileTreeRoot, fileTree }),
   beginInsightRefresh: () => set({ insightRefreshing: true }),
   setProjectInfo: (projectInfo) => set({ projectInfo: sanitizeProjectInfo(projectInfo), insightRefreshing: false }),
@@ -703,10 +696,6 @@ export const createProjectSlice: Slice<ProjectSlice> = (set) => ({
     sessionPrompts: { ...state.sessionPrompts, [sessionId]: prompts },
   })),
   setProjects: (projects) => set({ projects }),
-  setProjectSessions: (path, sessions) => set((state) => ({
-    projectSessions: { ...state.projectSessions, [path]: sessions },
-  })),
-  setExpandedProjectPath: (expandedProjectPath) => set({ expandedProjectPath }),
 });
 
 export const createDialogSlice: Slice<DialogSlice> = (set) => ({

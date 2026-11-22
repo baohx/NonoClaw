@@ -49,9 +49,6 @@ export default function App() {
   const fileTree = useStore((s) => s.fileTree);
   const fileTreeRoot = useStore((s) => s.fileTreeRoot);
   const projects = useStore((s) => s.projects);
-  const projectSessions = useStore((s) => s.projectSessions);
-  const expandedProjectPath = useStore((s) => s.expandedProjectPath);
-  const setExpandedProjectPath = useStore((s) => s.setExpandedProjectPath);
   const projectInfo = useStore((s) => s.projectInfo);
   const leftRailCollapsed = useStore((s) => s.leftRailCollapsed);
   const insightCollapsed = useStore((s) => s.insightCollapsed);
@@ -408,11 +405,7 @@ export default function App() {
               <ProjectTree
                 projects={projects}
                 activePath={fileTreeRoot}
-                expandedPath={expandedProjectPath}
-                sessionsByPath={projectSessions}
                 send={send}
-                onToggleExpand={setExpandedProjectPath}
-                onOpenSession={handleResume}
               />
             </div>
             <div className={`rail__files${railSections.files ? "" : " rail__files--collapsed"}`}>
