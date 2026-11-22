@@ -3,6 +3,7 @@
 //! This module is the sole owner of WebSocket tags and fields. Keep changes
 //! synchronized with `frontend/src/protocol-fixtures.json`.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
@@ -92,6 +93,23 @@ pub(super) enum ClientMsg {
     /// the most recent non-dream session of the new project (or creates a
     /// fresh one).
     SwitchProject {
+        path: String,
+    },
+    /// List every project in the server-side project registry.
+    ListProjects,
+    /// Register a project directory in the registry. The path is canonicalized
+    /// and must exist and be a directory. Idempotent by canonical path.
+    AddProject {
+        path: String,
+    },
+    /// Remove a project from the registry. Only the registry entry is deleted;
+    /// nothing on disk is touched. Removal of the active project is refused.
+    RemoveProject {
+        path: String,
+    },
+    /// List the sessions stored for an arbitrary project directory without
+    /// switching the active project.
+    ListProjectSessions {
         path: String,
     },
 }
@@ -269,6 +287,28 @@ pub(super) enum ServerMsg {
     ModelsHealth {
         results: Vec<ModelHealthEntry>,
     },
+    /// The full project registry, returned for `list_projects` and after any
+    /// add/remove so every client stays in sync.
+    ProjectsList {
+        projects: Vec<RegisteredProject>,
+    },
+    /// Sessions stored under an arbitrary project directory, returned for
+    /// `list_project_sessions`. Never changes the active project.
+    ProjectSessionsList {
+        path: String,
+        sessions: Vec<SessionInfoWire>,
+    },
+}
+
+/// A project directory registered in the server-side project registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct RegisteredProject {
+    /// Canonical absolute path of the project root.
+    pub path: PathBuf,
+    /// Display name, derived from the path basename at registration time.
+    pub name: String,
+    /// RFC 3339 timestamp of when the entry was added.
+    pub added_at: String,
 }
 
 /// One model's outcome from a minimal liveness request (`max_tokens=8`,
@@ -1012,6 +1052,10 @@ mod tests {
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
             ClientMsg::SwitchProject { .. } => "switch_project",
+            ClientMsg::ListProjects => "list_projects",
+            ClientMsg::AddProject { .. } => "add_project",
+            ClientMsg::RemoveProject { .. } => "remove_project",
+            ClientMsg::ListProjectSessions { .. } => "list_project_sessions",
         }
     }
 

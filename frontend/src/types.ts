@@ -593,6 +593,28 @@ export interface GitShowMsg {
   output: string;
 }
 
+export interface ModelsHealthMsg {
+  type: "models_health";
+  results: ModelHealthEntry[];
+}
+
+export interface RegisteredProject {
+  path: string;
+  name: string;
+  added_at: string;
+}
+
+export interface ProjectsListMsg {
+  type: "projects_list";
+  projects: RegisteredProject[];
+}
+
+export interface ProjectSessionsListMsg {
+  type: "project_sessions_list";
+  path: string;
+  sessions: SessionInfoWire[];
+}
+
 export type ServerMsg =
   | EventMsg
   | PermissionRequired
@@ -608,7 +630,9 @@ export type ServerMsg =
   | ProjectInfoMsg
   | SystemProbeMsg
   | GitShowMsg
-  | ModelsHealthMsg;
+  | ModelsHealthMsg
+  | ProjectsListMsg
+  | ProjectSessionsListMsg;
 
 // ── Browser → Server messages ─────────────────────────────────────────────
 
@@ -686,6 +710,25 @@ export interface SwitchProjectRequest {
   path: string;
 }
 
+export interface ListProjectsRequest {
+  type: "list_projects";
+}
+
+export interface AddProjectRequest {
+  type: "add_project";
+  path: string;
+}
+
+export interface RemoveProjectRequest {
+  type: "remove_project";
+  path: string;
+}
+
+export interface ListProjectSessionsRequest {
+  type: "list_project_sessions";
+  path: string;
+}
+
 export interface OpenFileRequest {
   type: "open_file";
   path: string;
@@ -724,6 +767,10 @@ export type ClientMsg =
   | FileTreeRequest
   | OpenFileRequest
   | SwitchProjectRequest
+  | ListProjectsRequest
+  | AddProjectRequest
+  | RemoveProjectRequest
+  | ListProjectSessionsRequest
   | ProjectInfoRefreshRequest
   | ModelsHealthCheckRequest
   | GitShowRequest

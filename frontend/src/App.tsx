@@ -10,6 +10,7 @@ import GitPane from "./components/GitPane";
 import InsightRail from "./components/InsightRail";
 import InputBox from "./components/InputBox";
 import PermissionDialog from "./components/PermissionDialog";
+import ProjectTree from "./components/ProjectTree";
 import QrDialog from "./components/QrDialog";
 import QuestionDialog from "./components/QuestionDialog";
 import SessionPicker from "./components/SessionPicker";
@@ -47,6 +48,10 @@ export default function App() {
   const clearMessages = useStore((s) => s.clearMessages);
   const fileTree = useStore((s) => s.fileTree);
   const fileTreeRoot = useStore((s) => s.fileTreeRoot);
+  const projects = useStore((s) => s.projects);
+  const projectSessions = useStore((s) => s.projectSessions);
+  const expandedProjectPath = useStore((s) => s.expandedProjectPath);
+  const setExpandedProjectPath = useStore((s) => s.setExpandedProjectPath);
   const projectInfo = useStore((s) => s.projectInfo);
   const leftRailCollapsed = useStore((s) => s.leftRailCollapsed);
   const insightCollapsed = useStore((s) => s.insightCollapsed);
@@ -108,6 +113,7 @@ export default function App() {
   useEffect(() => {
     if (connectionStatus === "connected") {
       send({ type: "file_tree" });
+      send({ type: "list_projects" });
       // Sync the frontend's initial permission mode to the server.
       const mode = useStore.getState().permissionMode;
       send({ type: "set_permission_mode", mode });
@@ -398,6 +404,17 @@ export default function App() {
         />
         <div className={bodyClass}>
           <aside className="rail">
+            <div className="rail__projects">
+              <ProjectTree
+                projects={projects}
+                activePath={fileTreeRoot}
+                expandedPath={expandedProjectPath}
+                sessionsByPath={projectSessions}
+                send={send}
+                onToggleExpand={setExpandedProjectPath}
+                onOpenSession={handleResume}
+              />
+            </div>
             <div className={`rail__files${railSections.files ? "" : " rail__files--collapsed"}`}>
               <FileTree
                 root={fileTreeRoot}

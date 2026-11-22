@@ -121,6 +121,12 @@ function outboundKey(message: ClientMsg): string {
       return `${message.type}:${message.name}`;
     case "switch_project":
       return `${message.type}:${message.path}`;
+    case "list_projects":
+      return message.type;
+    case "add_project":
+    case "remove_project":
+    case "list_project_sessions":
+      return `${message.type}:${message.path}`;
     case "run":
       return `${message.type}:${JSON.stringify(message)}`;
   }
