@@ -1,38 +1,18 @@
 import { useState } from "react";
-import type { ClientMsg, RegisteredProject, SessionInfoWire } from "../types";
+import type { ClientMsg, RegisteredProject } from "../types";
 
 interface Props {
   projects: RegisteredProject[];
   activePath: string;
-  expandedPath: string | null;
-  sessionsByPath: Record<string, SessionInfoWire[]>;
   send: (msg: ClientMsg) => void;
-  /** Called when a project node should expand (path) or collapse (null). */
-  onToggleExpand: (path: string | null) => void;
-  onOpenSession: (sessionId: string) => void;
 }
 
-function sessionLabel(s: SessionInfoWire): string {
-  if (s.title?.trim()) return s.title.trim();
-  if (s.summary?.trim()) {
-    const first = s.summary.trim().split("\n")[0];
-    return first.length > 42 ? `${first.slice(0, 42)}…` : first;
-  }
-  return s.started
-    ? new Date(s.started).toLocaleDateString()
-    : s.id.slice(0, 8);
-}
-
-/** Cursor-style project tree: top-level nodes are projects; expanding a
- *  project lists its sessions without switching the active project. */
+/** Clickable project list in the left rail. Clicking a project switches the
+ *  active project; its sessions already live in the conversations rail. */
 export default function ProjectTree({
   projects,
   activePath,
-  expandedPath,
-  sessionsByPath,
   send,
-  onToggleExpand,
-  onOpenSession,
 }: Props) {
   const [adding, setAdding] = useState(false);
   const [addPath, setAddPath] = useState("");
@@ -77,27 +57,10 @@ export default function ProjectTree({
       )}
       <div className="projecttree__list">
         {projects.map((p) => {
-          const expanded = expandedPath === p.path;
           const isActive = p.path === activePath;
-          const sessions = sessionsByPath[p.path];
           return (
             <div key={p.path} className="projecttree__node">
               <div className="projecttree__row">
-                <button
-                  className={`projecttree__caret${expanded ? " projecttree__caret--open" : ""}`}
-                  onClick={() => {
-                    if (expanded) {
-                      onToggleExpand(null);
-                    } else {
-                      send({ type: "list_project_sessions", path: p.path });
-                      onToggleExpand(p.path);
-                    }
-                  }}
-                  aria-expanded={expanded}
-                  title={expanded ? "Collapse" : "Show sessions"}
-                >
-                  {expanded ? "▾" : "▸"}
-                </button>
                 <button
                   className={`projecttree__name${isActive ? " projecttree__name--active" : ""}`}
                   onClick={() => {
@@ -118,36 +81,6 @@ export default function ProjectTree({
                   </button>
                 )}
               </div>
-              {expanded && (
-                <div className="projecttree__sessions">
-                  {sessions === undefined && (
-                    <div className="projecttree__empty">loading…</div>
-                  )}
-                  {sessions !== undefined && sessions.length === 0 && (
-                    <div className="projecttree__empty">no sessions</div>
-                  )}
-                  {sessions?.map((s) => (
-                    <button
-                      key={s.id}
-                      className="projecttree__session"
-                      title={
-                        isActive
-                          ? s.id
-                          : "Switch to this project to open its sessions"
-                      }
-                      disabled={!isActive}
-                      onClick={() => onOpenSession(s.id)}
-                    >
-                      <span className="projecttree__session-title">
-                        {sessionLabel(s)}
-                      </span>
-                      <span className="projecttree__session-meta">
-                        {s.message_count} msg
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
           );
         })}

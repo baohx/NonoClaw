@@ -1688,28 +1688,6 @@ async fn handle_ws(
                     }
                 }
             }
-            ClientMsg::ListProjectSessions { path } => {
-                let sessions =
-                    list_sessions_wire_for(state.session_service.clone(), PathBuf::from(&path))
-                        .await;
-                let response_path = match std::fs::canonicalize(&path) {
-                    Ok(canonical) => nonoclaw_core::display_path(&canonical),
-                    Err(_) => path.clone(),
-                };
-                if !send_ws_project_msg(
-                    &state,
-                    &tx,
-                    project_generation,
-                    ServerMsg::ProjectSessionsList {
-                        path: response_path,
-                        sessions,
-                    },
-                )
-                .await
-                {
-                    continue;
-                }
-            }
             ClientMsg::ProjectInfoRefresh => {
                 let project_transition = state.projects.lock_transition().await;
                 let project = state.project();
@@ -3933,7 +3911,6 @@ mod characterization_tests {
             ClientMsg::ListProjects => "list_projects",
             ClientMsg::AddProject { .. } => "add_project",
             ClientMsg::RemoveProject { .. } => "remove_project",
-            ClientMsg::ListProjectSessions { .. } => "list_project_sessions",
         }
     }
 

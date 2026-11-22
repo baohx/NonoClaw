@@ -609,12 +609,6 @@ export interface ProjectsListMsg {
   projects: RegisteredProject[];
 }
 
-export interface ProjectSessionsListMsg {
-  type: "project_sessions_list";
-  path: string;
-  sessions: SessionInfoWire[];
-}
-
 export type ServerMsg =
   | EventMsg
   | PermissionRequired
@@ -631,8 +625,7 @@ export type ServerMsg =
   | SystemProbeMsg
   | GitShowMsg
   | ModelsHealthMsg
-  | ProjectsListMsg
-  | ProjectSessionsListMsg;
+  | ProjectsListMsg;
 
 // ── Browser → Server messages ─────────────────────────────────────────────
 
@@ -724,11 +717,6 @@ export interface RemoveProjectRequest {
   path: string;
 }
 
-export interface ListProjectSessionsRequest {
-  type: "list_project_sessions";
-  path: string;
-}
-
 export interface OpenFileRequest {
   type: "open_file";
   path: string;
@@ -770,7 +758,6 @@ export type ClientMsg =
   | ListProjectsRequest
   | AddProjectRequest
   | RemoveProjectRequest
-  | ListProjectSessionsRequest
   | ProjectInfoRefreshRequest
   | ModelsHealthCheckRequest
   | GitShowRequest
