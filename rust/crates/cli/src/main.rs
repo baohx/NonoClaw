@@ -277,6 +277,11 @@ struct Cli {
     #[arg(long, requires = "serve_http", help_heading = "Web UI")]
     tunnel: bool,
 
+    /// Skip opening the browser after --serve-http starts (for embedded
+    /// launchers like the desktop app).
+    #[arg(long, requires = "serve_http", help_heading = "Web UI")]
+    no_open: bool,
+
     /// Connect to a remote session server at ADDR and run the prompt.
     #[arg(long, value_name = "ADDR", help_heading = "Advanced integrations")]
     remote: Option<String>,
@@ -502,7 +507,6 @@ async fn main() -> Result<()> {
     // Web UI server: HTTP + WebSocket. All model, compact, document, media,
     // permission, and MCP values are derived from this same resolved snapshot.
     if let Some(addr) = &cli.serve_http {
-        tracing::info!("open http://{addr} in your browser");
         serve_http::serve(
             addr,
             registry,
@@ -512,6 +516,7 @@ async fn main() -> Result<()> {
             Arc::clone(&resolved),
             cli.public_url.clone(),
             cli.tunnel,
+            !cli.no_open,
         )
         .await?;
         return Ok(());
