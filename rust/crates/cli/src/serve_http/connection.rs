@@ -55,6 +55,7 @@ use nonoclaw_engine::{EngineEvent, EventEnvelope};
 use super::http_error::model_client_error;
 use super::permission_api::PendingPermissionMeta;
 use super::project_context::{upload_dir_for, ProjectContext, ProjectContextStore};
+use super::project_registry::ProjectRegistry;
 use super::project_service::ProjectService;
 use super::run_handler::{
     build_options, enrich_prompt_with_attachments, PermissionMap, QuestionMap, WsQuestionResolver,
@@ -105,6 +106,8 @@ pub(super) struct AppState {
     pub(super) active_model: Arc<Mutex<String>>,
     /// Canonical owner for session discovery and per-session writer actors.
     pub(super) session_service: SessionService,
+    /// Persistent project registry backing the Web UI project tree.
+    pub(super) project_registry: ProjectRegistry,
     /// Session peer registration and revisioned broadcast owner.
     pub(super) session_hub: SessionHub,
     pub(super) pending_permissions: Arc<PermissionMap>,
@@ -404,6 +407,7 @@ pub(super) fn upload_exploration_state(
         public_url: None,
         active_model: Arc::new(Mutex::new(config.active_model.value.clone())),
         session_service: SessionService::new(),
+        project_registry: ProjectRegistry::load_or_ephemeral(),
         session_hub: SessionHub::new(),
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
@@ -418,6 +422,12 @@ pub(super) fn upload_exploration_state(
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
         video_queue: Arc::new(super::video_service::VideoStore::new()),
     })
+}
+
+/// Register the active project with the registry after startup so the Web UI
+/// project tree always lists the currently served project.
+async fn ensure_startup_project_registered(state: &Arc<AppState>) {
+    state.project_registry.ensure(state.project().cwd()).await;
 }
 
 /// Resolve the initial permission mode from settings.json's `permissions.defaultMode`.
@@ -724,6 +734,7 @@ pub async fn serve(
         require_auth,
         public_url,
         session_service: SessionService::new(),
+        project_registry: ProjectRegistry::load_or_ephemeral(),
         session_hub: SessionHub::new(),
         pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         pending_questions: Arc::new(Mutex::new(HashMap::new())),
@@ -738,6 +749,7 @@ pub async fn serve(
         last_activity: Arc::new(Mutex::new(std::time::SystemTime::now())),
         video_queue: Arc::new(super::video_service::VideoStore::new()),
     });
+    ensure_startup_project_registered(&state).await;
 
     // Load persisted pending permissions (survives server restarts).
     state.load_pending_permissions().await;
@@ -1600,6 +1612,98 @@ async fn handle_ws(
                     &tx,
                     project_generation,
                     ServerMsg::FileTree { root, entries },
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+
+            // ── Project registry (frontend project tree) ────────────────────
+            ClientMsg::ListProjects => {
+                let projects = state.project_registry.list().await;
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::ProjectsList { projects },
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+            ClientMsg::AddProject { path } => match state.project_registry.add(&path).await {
+                Ok(projects) => {
+                    if !send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        ServerMsg::ProjectsList { projects },
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                }
+                Err(reason) => {
+                    if !send_ws_project_msg(
+                        &state,
+                        &tx,
+                        project_generation,
+                        safe_error(ErrorCode::InvalidRequest, reason, false, "add_project"),
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                }
+            },
+            ClientMsg::RemoveProject { path } => {
+                let active_cwd = state.project().cwd().to_path_buf();
+                match state.project_registry.remove(&path, &active_cwd).await {
+                    Ok(projects) => {
+                        if !send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            ServerMsg::ProjectsList { projects },
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                    Err(reason) => {
+                        if !send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(ErrorCode::InvalidRequest, reason, false, "remove_project"),
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
+            ClientMsg::ListProjectSessions { path } => {
+                let sessions =
+                    list_sessions_wire_for(state.session_service.clone(), PathBuf::from(&path))
+                        .await;
+                let response_path = match std::fs::canonicalize(&path) {
+                    Ok(canonical) => nonoclaw_core::display_path(&canonical),
+                    Err(_) => path.clone(),
+                };
+                if !send_ws_project_msg(
+                    &state,
+                    &tx,
+                    project_generation,
+                    ServerMsg::ProjectSessionsList {
+                        path: response_path,
+                        sessions,
+                    },
                 )
                 .await
                 {
@@ -3826,6 +3930,10 @@ mod characterization_tests {
             ClientMsg::SetPermissionMode { .. } => "set_permission_mode",
             ClientMsg::SetModel { .. } => "set_model",
             ClientMsg::SwitchProject { .. } => "switch_project",
+            ClientMsg::ListProjects => "list_projects",
+            ClientMsg::AddProject { .. } => "add_project",
+            ClientMsg::RemoveProject { .. } => "remove_project",
+            ClientMsg::ListProjectSessions { .. } => "list_project_sessions",
         }
     }
 

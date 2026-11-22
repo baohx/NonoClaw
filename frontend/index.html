@@ -104,6 +104,145 @@
       }
       .rail__files { flex: 1; min-height: 0; display: flex; flex-direction: column; }
       .rail__files--collapsed { flex: 0 0 auto; }
+      .rail__projects {
+        border-bottom: 1px solid var(--border);
+        max-height: 36vh;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      .projecttree { display: flex; flex-direction: column; min-height: 0; font-family: var(--font-sans); }
+      .projecttree__head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px 8px;
+        gap: 6px;
+      }
+      .projecttree__title {
+        color: var(--text);
+        font-weight: 600;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        opacity: 0.7;
+      }
+      .projecttree__add {
+        border: none;
+        background: none;
+        cursor: pointer;
+        color: var(--text);
+        font-size: 15px;
+        line-height: 1;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+      .projecttree__add:hover { background: var(--bg-hover, rgba(0,0,0,0.06)); color: var(--accent); }
+      .projecttree__addform {
+        display: flex;
+        gap: 6px;
+        padding: 0 10px 8px;
+      }
+      .projecttree__input {
+        flex: 1;
+        min-width: 0;
+        box-sizing: border-box;
+        padding: 5px 8px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 12px;
+        font-family: var(--font-mono);
+      }
+      .projecttree__confirm {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 12px;
+        cursor: pointer;
+        padding: 5px 10px;
+      }
+      .projecttree__confirm:hover { color: var(--accent); border-color: var(--accent); }
+      .projecttree__list { overflow: auto; min-height: 0; }
+      .projecttree__node { display: flex; flex-direction: column; }
+      .projecttree__row {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+      }
+      .projecttree__row:hover { background: var(--bg-hover, rgba(0,0,0,0.04)); }
+      .projecttree__caret {
+        border: none;
+        background: none;
+        cursor: pointer;
+        color: var(--text);
+        font-size: 10px;
+        width: 16px;
+        padding: 2px 0;
+        flex: 0 0 auto;
+      }
+      .projecttree__caret--open { color: var(--accent); }
+      .projecttree__name {
+        flex: 1;
+        min-width: 0;
+        border: none;
+        background: none;
+        cursor: pointer;
+        text-align: left;
+        color: var(--text);
+        font-size: 12.5px;
+        font-weight: 500;
+        padding: 3px 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .projecttree__name:hover { color: var(--accent); }
+      .projecttree__name--active { color: var(--accent); font-weight: 600; }
+      .projecttree__activemark { font-size: 8px; vertical-align: middle; }
+      .projecttree__remove {
+        border: none;
+        background: none;
+        cursor: pointer;
+        color: var(--text);
+        opacity: 0.4;
+        font-size: 13px;
+        line-height: 1;
+        padding: 2px 4px;
+        border-radius: 6px;
+        flex: 0 0 auto;
+      }
+      .projecttree__remove:hover { opacity: 1; color: #d33; }
+      .projecttree__sessions {
+        display: flex;
+        flex-direction: column;
+        padding: 0 8px 4px 28px;
+        gap: 1px;
+      }
+      .projecttree__session {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        border: none;
+        background: none;
+        cursor: pointer;
+        text-align: left;
+        color: var(--text);
+        font-size: 12px;
+        padding: 3px 6px;
+        border-radius: 6px;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .projecttree__session:hover { background: var(--bg-hover, rgba(0,0,0,0.04)); color: var(--accent); }
+      .projecttree__session:disabled { opacity: 0.45; cursor: default; background: none; color: var(--text); }
+      .projecttree__session-title { overflow: hidden; text-overflow: ellipsis; }
+      .projecttree__session-meta { font-size: 10px; opacity: 0.5; flex: 0 0 auto; }
+      .projecttree__empty { padding: 4px 6px 6px; font-size: 11.5px; opacity: 0.5; }
       .rail__sessions {
         border-top: 1px solid var(--border);
         max-height: 30vh;

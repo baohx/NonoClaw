@@ -367,6 +367,12 @@ export function dispatchServerMessage(message: ServerMsg): void {
     case "models_health":
       state.setModelsHealth(message.results);
       break;
+    case "projects_list":
+      state.setProjects(message.projects);
+      break;
+    case "project_sessions_list":
+      state.setProjectSessions(message.path, message.sessions);
+      break;
     case "system_probe":
       if (state.projectInfo) {
         state.setProjectInfo({ ...state.projectInfo, system: message.system });
