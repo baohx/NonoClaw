@@ -130,7 +130,12 @@ export default function ProjectTree({
                     <button
                       key={s.id}
                       className="projecttree__session"
-                      title={s.id}
+                      title={
+                        isActive
+                          ? s.id
+                          : "Switch to this project to open its sessions"
+                      }
+                      disabled={!isActive}
                       onClick={() => onOpenSession(s.id)}
                     >
                       <span className="projecttree__session-title">
