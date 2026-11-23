@@ -311,7 +311,7 @@ function startServer(port) {
     env = portableBackendEnv(home);
     console.log(`[desktop] portable mode: NONOCLAW_HOME=${home}`);
   }
-  serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`], {
+  serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`, "--no-open"], {
     cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"],

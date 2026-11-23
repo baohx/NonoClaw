@@ -338,7 +338,7 @@ function startServer(port) {
     const seeded = fs.existsSync(path.join(home, "settings.json"));
     console.log(`[desktop] settings.json seeded=${seeded}`);
   }
-  serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`], {
+  serverProc = spawn(bin, ["--serve-http", `127.0.0.1:${port}`, "--no-open"], {
     cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"],

@@ -493,6 +493,36 @@ fn listener_requires_auth(addr: &str, tunnel: bool, public_url: Option<&str>) ->
             .unwrap_or(true)
 }
 
+fn browser_url(addr: SocketAddr, require_auth: bool, auth_token: &str) -> String {
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+    };
+    let url = format!("http://{host}:{}", addr.port());
+    if require_auth {
+        format!("{url}/?token={auth_token}")
+    } else {
+        url
+    }
+}
+
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let spawned = tokio::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = tokio::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = tokio::process::Command::new("xdg-open").arg(url).spawn();
+    match spawned {
+        Ok(_) => tracing::info!("opened browser at {url}"),
+        Err(error) => tracing::warn!("browser launch failed ({error}); open {url} manually"),
+    }
+}
+
 async fn list_sessions_wire_for(service: SessionService, cwd: PathBuf) -> Vec<SessionInfoWire> {
     let sessions = match tokio::task::spawn_blocking(move || service.list_sessions(&cwd)).await {
         Ok(sessions) => sessions.unwrap_or_default(),
@@ -672,6 +702,7 @@ pub async fn serve(
     config: Arc<ResolvedConfig>,
     public_url: Option<String>,
     tunnel: bool,
+    open_browser: bool,
 ) -> anyhow::Result<()> {
     // Bind the listener FIRST so the port is open before cloudflared tries
     // to connect (otherwise tunnel spawn races the bind and gets "connection
@@ -695,6 +726,12 @@ pub async fn serve(
     let auth_token = Uuid::new_v4().to_string().replace('-', "");
     let local_ws_ticket = Uuid::new_v4().to_string().replace('-', "");
     let require_auth = listener_requires_auth(addr, tunnel, public_url.as_deref());
+    if open_browser {
+        if let Ok(local) = listener.local_addr() {
+            let url = browser_url(local, require_auth, &auth_token);
+            open_url_in_browser(&url);
+        }
+    }
     let active_model = if config
         .conversation_models()
         .iter()
@@ -3838,6 +3875,20 @@ mod characterization_tests {
             Some("https://public.example/app?mode=mobile&token=current-token#share".into())
         );
         assert_eq!(authenticated_public_url("not a URL", "current-token"), None);
+    }
+
+    #[test]
+    fn browser_url_normalizes_unspecified_hosts_and_appends_token_when_auth_required() {
+        let v4 = "0.0.0.0:8765".parse::<SocketAddr>().unwrap();
+        assert_eq!(browser_url(v4, false, "t"), "http://127.0.0.1:8765");
+        assert_eq!(
+            browser_url(v4, true, "secret"),
+            "http://127.0.0.1:8765/?token=secret"
+        );
+        let v6 = "[::]:8765".parse::<SocketAddr>().unwrap();
+        assert_eq!(browser_url(v6, false, "t"), "http://[::1]:8765");
+        let loopback = "127.0.0.1:3000".parse::<SocketAddr>().unwrap();
+        assert_eq!(browser_url(loopback, false, "t"), "http://127.0.0.1:3000");
     }
 
     #[test]
