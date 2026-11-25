@@ -33,6 +33,15 @@ function websocketUrl(url: string): string {
   return `${url}?${query.toString()}`;
 }
 
+/** Module-level mirror of the hook's runtime so non-hook code (server-error
+ * retries) can reach the live socket. Single mounted hook owns this at a
+ * time, matching the single-connection design. */
+const socketRuntimeRef: { current: SocketRuntime | null } = { current: null };
+
+/** Path of the most recent switch_project send, used to retry with force
+ * after a run-gate rejection. */
+let lastSwitchProjectPath: string | null = null;
+
 export function useWebSocket(url: string) {
   const runtimeRef = useRef<SocketRuntime>({
     socket: null,
@@ -179,6 +188,7 @@ export function useWebSocket(url: string) {
   }, [connect]);
 
   const send = useCallback((message: ClientMsg) => {
+    if (message.type === "switch_project") lastSwitchProjectPath = message.path;
     const runtime = runtimeRef.current;
     const socket = runtime.socket;
     const healthy = !!socket
@@ -197,6 +207,7 @@ export function useWebSocket(url: string) {
   useEffect(() => {
     const runtime = runtimeRef.current;
     runtime.mounted = true;
+    socketRuntimeRef.current = runtime;
     connect();
 
     const onVisibility = () => {
@@ -213,6 +224,7 @@ export function useWebSocket(url: string) {
       const current = runtimeRef.current;
       current.mounted = false;
       current.opening = false;
+      if (socketRuntimeRef.current === current) socketRuntimeRef.current = null;
       document.removeEventListener("visibilitychange", onVisibility);
       if (current.reconnectTimer) clearTimeout(current.reconnectTimer);
       current.reconnectTimer = null;
@@ -543,6 +555,41 @@ export function dispatchServerMessage(message: ServerMsg): void {
         role: "system",
         content: `Error: ${safeMessage}`,
       });
+      // A background run (AutoDream, REST, another tab) can gate a project
+      // switch even when this session looks idle. The server offers a force
+      // path that cancels those runs; confirm once and retry with force.
+      if (
+        message.operation === "switch_project"
+        && message.message === "cannot switch project while a run is active"
+      ) {
+        if (window.confirm("A background run is active. Cancel it and switch projects?")) {
+          if (lastSwitchProjectPath) {
+            useStore.getState().enqueueOutbound({
+              type: "switch_project",
+              path: lastSwitchProjectPath,
+              force: true,
+            });
+            flushOutboundQueue();
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+/** Send every queued outbound message on the live socket. Called after
+ * enqueueing mid-connection (the queue otherwise only drains on open). */
+function flushOutboundQueue(): void {
+  const runtime = socketRuntimeRef.current;
+  const socket = runtime?.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  for (const entry of [...useStore.getState().outboundQueue]) {
+    try {
+      socket.send(JSON.stringify(entry.message));
+      useStore.getState().acknowledgeOutbound(entry.id);
+    } catch {
+      try { socket.close(); } catch {}
       break;
     }
   }
