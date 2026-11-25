@@ -227,7 +227,7 @@ export interface ErrorMsg extends RunWireMeta {
   safe_details?: Record<string, unknown>;
 }
 
-export interface ModelInfo { name: string; label: string; context_window?: number; }
+export interface ModelInfo { name: string; label: string; context_window?: number; /** Effort levels offered for this model; absent → no effort selector. */ reasoning_efforts?: string[]; }
 
 export interface InfoMsg {
   type: "info";
@@ -654,6 +654,8 @@ export interface RunRequest {
   type: "run";
   prompt: string;
   model?: string;
+  /** Reasoning effort picked in the model picker (validated server-side). */
+  reasoning_effort?: string;
   max_turns?: number;
   /** Skill body injected into system prompt (from /skill-name). */
   append_system_prompt?: string;

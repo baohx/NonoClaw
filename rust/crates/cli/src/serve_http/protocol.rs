@@ -30,6 +30,10 @@ pub(super) enum ClientMsg {
         prompt: String,
         #[serde(default)]
         model: Option<String>,
+        /// Reasoning effort chosen in the model picker; must be one of the
+        /// selected model's `reasoningEfforts` (validated in `resolve_run`).
+        #[serde(default)]
+        reasoning_effort: Option<String>,
         #[serde(default)]
         max_turns: Option<u32>,
         #[serde(default)]
@@ -141,6 +145,10 @@ pub(super) struct ModelInfo {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<usize>,
+    /// Effort levels the picker may offer for this model (from
+    /// `ModelProfile.reasoningEfforts`). Absent → no effort selector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Clone)]

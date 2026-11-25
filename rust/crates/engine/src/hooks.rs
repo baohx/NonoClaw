@@ -539,6 +539,7 @@ impl HookRuntime {
             tools: Vec::new(),
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: Some(0.0),
             betas: Vec::new(),
             extra_body: None,

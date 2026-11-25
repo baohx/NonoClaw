@@ -42,6 +42,10 @@ pub struct RunRequest {
     /// Maximum turns for this run.
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// Reasoning effort for the selected model; must be one of the model's
+    /// declared `reasoningEfforts` (falls back to the model default otherwise).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Additional system prompt text appended for this run.
     #[serde(default)]
     pub append_system_prompt: Option<String>,
@@ -334,6 +338,7 @@ async fn run_handler_inner(
             permission_mode: Some(perm_mode),
             append_system_prompt: req.append_system_prompt.clone(),
             arguments: req.arguments.clone(),
+            reasoning_effort: req.reasoning_effort.clone(),
             is_non_interactive: true,
             ..Default::default()
         })

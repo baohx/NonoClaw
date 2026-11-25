@@ -320,6 +320,7 @@ pub(super) fn build_options(
     max_turns: Option<u32>,
     append: Option<String>,
     arguments: Option<String>,
+    reasoning_effort: Option<String>,
     tx: Tx,
     pending_permissions: Arc<PermissionMap>,
     permission_mode: nonoclaw_core::PermissionMode,
@@ -338,6 +339,7 @@ pub(super) fn build_options(
             permission_mode: Some(permission_mode),
             append_system_prompt: append,
             arguments,
+            reasoning_effort,
             is_non_interactive: false,
             ..Default::default()
         })

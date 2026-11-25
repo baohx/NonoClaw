@@ -129,6 +129,11 @@ struct Cli {
     #[arg(long, value_name = "ID", help_heading = "Model & limits")]
     model: Option<String>,
 
+    /// Reasoning effort for the selected model (must be one of the model's
+    /// declared `reasoningEfforts`, e.g. `--effort high`).
+    #[arg(long, value_name = "LEVEL", help_heading = "Model & limits")]
+    effort: Option<String>,
+
     /// Permission mode.
     #[arg(
         long,
@@ -457,6 +462,7 @@ async fn main() -> Result<()> {
             append_system_prompt: cli.append_system_prompt.clone(),
             add_dirs: cli.add_dir.clone(),
             arguments: None,
+            reasoning_effort: cli.effort.clone(),
             is_non_interactive: true,
         })
         .options;

@@ -1261,6 +1261,7 @@ async fn run_dream(
         session_id: None,
         model: Some(model),
         max_turns: Some(DREAM_MAX_TURNS),
+        reasoning_effort: None,
         append_system_prompt: None,
         arguments: None,
         // Read-mostly autonomy: the dream writes facts via the Write tool,

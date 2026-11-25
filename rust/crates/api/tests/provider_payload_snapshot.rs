@@ -11,7 +11,9 @@
 //! whitelist. Adding a persistence-only field to `Message`/`ContentBlock`
 //! without stripping it in serialization fails here.
 
-use nonoclaw_api::{ApiFormat, Client, RequestParams, SystemBlock, ToolChoice, ToolSchema};
+use nonoclaw_api::{
+    ApiFormat, Client, RequestParams, SystemBlock, ThinkingConfig, ToolChoice, ToolSchema,
+};
 use nonoclaw_core::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -77,6 +79,9 @@ data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture\",\
 data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
+const GEMINI_SSE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1}}\n\n\n";
+
 /// Messages exercising every content-block type, with persistence-only
 /// `ts` populated exactly as a JSONL-loaded conversation would have.
 fn kitchen_sink_messages() -> Vec<Message> {
@@ -137,6 +142,7 @@ fn request_params() -> RequestParams {
         }],
         tool_choice: Some(ToolChoice::Auto),
         thinking: None,
+        reasoning_effort: None,
         temperature: None,
         betas: vec![],
         extra_body: None,
@@ -229,6 +235,9 @@ const ANTHROPIC_ALLOWED: &[&str] = &[
     // tools / tool_choice / system block internals
     "description",
     "input_schema",
+    // reasoning-effort dial (only present when the user picked a level)
+    "output_config",
+    "effort",
 ];
 
 /// OpenAI Chat Completions whitelist for `serialize_body_openai`.
@@ -243,6 +252,8 @@ const OPENAI_ALLOWED: &[&str] = &[
     "temperature",
     "stream_options",
     "include_usage",
+    // reasoning-effort dial (only present when the user picked a level)
+    "reasoning_effort",
     // message envelope
     "role",
     "content",
@@ -331,4 +342,59 @@ async fn openai_payload_contains_only_protocol_fields() {
         .find(|m| m["role"] == "tool")
         .expect("role:tool result message present");
     assert_eq!(tool_result["tool_call_id"], "toolu_fixture_1");
+}
+
+/// The user-selected reasoning-effort dial must land in the per-format field
+/// each provider documents, and must be absent entirely when unset.
+#[tokio::test]
+async fn reasoning_effort_lands_in_per_format_field() {
+    // Anthropic: output_config.effort
+    let (base_url, server) = capture_one_request(ANTHROPIC_SSE).await;
+    let client = Client::new(Some("fixture-key".into()), None, base_url).unwrap();
+    let mut params = request_params();
+    params.reasoning_effort = Some("max".into());
+    let _ = client.run_turn(&params, |_event| {}).await;
+    let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+    assert_eq!(body["output_config"]["effort"], "max");
+
+    // OpenAI Chat Completions: top-level reasoning_effort
+    let (base_url, server) = capture_one_request(OPENAI_SSE).await;
+    let client = Client::new(Some("fixture-key".into()), None, base_url)
+        .unwrap()
+        .with_format(ApiFormat::OpenAI);
+    let _ = client.run_turn(&params, |_event| {}).await;
+    let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+    assert_eq!(body["reasoning_effort"], "max");
+    assert!(body.get("output_config").is_none());
+
+    // Responses: reasoning.effort, overriding the budget-derived mapping.
+    let (base_url, server) = capture_one_request(OPENAI_SSE).await;
+    let client = Client::new(Some("fixture-key".into()), None, base_url)
+        .unwrap()
+        .with_format(ApiFormat::Responses);
+    let _ = client.run_turn(&params, |_event| {}).await;
+    let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "max");
+
+    // Gemini: generationConfig.thinkingConfig.thinkingLevel (upper-case enum),
+    // and thinkingBudget is dropped because the two are mutually exclusive.
+    let (base_url, server) = capture_one_request(GEMINI_SSE).await;
+    let client = Client::new(Some("fixture-key".into()), None, base_url)
+        .unwrap()
+        .with_format(ApiFormat::Gemini);
+    let mut params = request_params();
+    params.thinking = Some(ThinkingConfig::enabled(16_000));
+    params.reasoning_effort = Some("low".into());
+    let _ = client.run_turn(&params, |_event| {}).await;
+    let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+    let thinking_config = &body["generationConfig"]["thinkingConfig"];
+    assert_eq!(thinking_config["thinkingLevel"], "LOW");
+    assert!(thinking_config.get("thinkingBudget").is_none());
+
+    // Unset -> no effort keys anywhere (model default).
+    let (base_url, server) = capture_one_request(ANTHROPIC_SSE).await;
+    let client = Client::new(Some("fixture-key".into()), None, base_url).unwrap();
+    let _ = client.run_turn(&request_params(), |_event| {}).await;
+    let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+    assert!(body.get("output_config").is_none());
 }

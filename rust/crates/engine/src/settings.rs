@@ -646,6 +646,12 @@ pub struct ModelProfile {
     /// balance display. Overrides `base_url` inference.
     #[serde(rename = "billingProvider", default)]
     pub billing_provider: Option<String>,
+    /// Reasoning-effort levels this model accepts, in UI display order
+    /// (e.g. `["low", "medium", "high", "max"]`). Provider-specific —
+    /// the same `apiFormat` serves models with different dials, so the
+    /// user declares it per model. `None`/empty hides the effort picker.
+    #[serde(rename = "reasoningEfforts", default)]
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 impl fmt::Debug for ModelProfile {
@@ -664,6 +670,7 @@ impl fmt::Debug for ModelProfile {
             .field("profile", &self.profile)
             .field("api_format", &self.api_format)
             .field("billing_provider", &self.billing_provider)
+            .field("reasoning_efforts", &self.reasoning_efforts)
             .finish()
     }
 }
@@ -1091,6 +1098,10 @@ pub struct RunConfigOverrides {
     pub append_system_prompt: Option<String>,
     pub add_dirs: Vec<PathBuf>,
     pub arguments: Option<String>,
+    /// User-selected reasoning effort for the active model. Validated against
+    /// `ModelProfile.reasoning_efforts`; an undeclared level falls back to the
+    /// model default (`None`) with a warning instead of a provider 400.
+    pub reasoning_effort: Option<String>,
     pub is_non_interactive: bool,
 }
 
@@ -1105,6 +1116,7 @@ impl Default for RunConfigOverrides {
             compact_threshold: None,
             auto_compact: None,
             permission_mode: None,
+            reasoning_effort: None,
             allowed_tools: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -1579,6 +1591,23 @@ impl ResolvedConfig {
             set_scalar_source(&mut sources, "arguments", overrides.source.clone());
         }
         let thinking = self.settings.thinking.as_ref().and_then(parse_thinking);
+        let reasoning_effort = match overrides.reasoning_effort {
+            Some(effort) => {
+                let allowed = profile.and_then(|profile| profile.reasoning_efforts.as_ref());
+                let accepted = allowed.is_some_and(|levels| levels.contains(&effort));
+                if accepted {
+                    set_scalar_source(&mut sources, "reasoningEffort", overrides.source.clone());
+                    Some(effort)
+                } else {
+                    tracing::warn!(
+                        "reasoning effort {effort:?} is not declared for model {model}; \
+                         using the model default"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
         let token_mode = self
             .settings
             .token_mode
@@ -1638,6 +1667,7 @@ impl ResolvedConfig {
             arguments: overrides.arguments,
             background_registry: None,
             thinking,
+            reasoning_effort,
             is_non_interactive: overrides.is_non_interactive,
             permission_resolver: None,
             question_resolver: None,
@@ -2991,6 +3021,8 @@ fn record_layer_sources(layer: &ConfigLayer, sources: &mut BTreeMap<String, Vec<
                     "charsPerToken",
                     "profile",
                     "apiFormat",
+                    "billingProvider",
+                    "reasoningEfforts",
                 ] {
                     if layer.has(&format!("models[{index}].{field}")) {
                         set_scalar_source(
@@ -3258,6 +3290,7 @@ fn diagnose_unknown_fields(
             "profile",
             "apiFormat",
             "billingProvider",
+            "reasoningEfforts",
         ];
         for (index, model) in models.iter().filter_map(Value::as_object).enumerate() {
             for key in model
@@ -3929,6 +3962,85 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "invalid_api_format"));
+    }
+
+    #[test]
+    fn reasoning_effort_is_accepted_only_when_declared_for_the_model() {
+        // Regression: `reasoningEfforts` must be a *known* model field. The
+        // first e2e run showed the validator silently dropping it as unknown,
+        // which hid the effort picker entirely.
+        let resolved = resolve_layers(
+            &[layer(
+                "models.json",
+                serde_json::json!({
+                    "model": "glm-53",
+                    "models": [
+                        {
+                            "name": "glm-53",
+                            "label": "GLM 5.3",
+                            "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+                            "apiKey": "fixture-key",
+                            "apiFormat": "anthropic",
+                            "default": true,
+                            "reasoningEfforts": ["low", "high", "max"]
+                        },
+                        {
+                            "name": "plain",
+                            "label": "No dial",
+                            "baseUrl": "https://example.invalid",
+                            "apiKey": "fixture-key",
+                            "apiFormat": "anthropic"
+                        }
+                    ]
+                }),
+            )],
+            &ConfigEnvironment::default(),
+            Path::new("/project"),
+        );
+        assert!(
+            !resolved
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unknown_field"),
+            "reasoningEfforts must be a known model field: {:?}",
+            resolved.diagnostics
+        );
+        let dial = resolved
+            .settings
+            .models
+            .as_ref()
+            .and_then(|models| models.iter().find(|model| model.name == "glm-53"))
+            .and_then(|model| model.reasoning_efforts.clone());
+        assert_eq!(dial, Some(vec!["low".into(), "high".into(), "max".into()]));
+
+        // Declared level -> passed through to the engine options.
+        let cfg = resolved.resolve_run(RunConfigOverrides {
+            model: Some("glm-53".into()),
+            reasoning_effort: Some("max".into()),
+            ..Default::default()
+        });
+        assert_eq!(cfg.options.reasoning_effort.as_deref(), Some("max"));
+        assert!(cfg.field_sources.contains_key("reasoningEffort"));
+
+        // Level the model does not declare -> model default, no 400 upstream.
+        let cfg = resolved.resolve_run(RunConfigOverrides {
+            model: Some("glm-53".into()),
+            reasoning_effort: Some("xhigh".into()),
+            ..Default::default()
+        });
+        assert_eq!(cfg.options.reasoning_effort, None);
+
+        // Model without a dial -> never gets an effort.
+        let cfg = resolved.resolve_run(RunConfigOverrides {
+            model: Some("plain".into()),
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        });
+        assert_eq!(cfg.options.reasoning_effort, None);
+
+        // Nothing selected -> untouched.
+        let cfg = resolved.resolve_run(RunConfigOverrides::default());
+        assert_eq!(cfg.options.reasoning_effort, None);
     }
 
     #[test]
