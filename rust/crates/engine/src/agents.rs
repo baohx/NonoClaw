@@ -50,11 +50,23 @@ pub struct AgentProfile {
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_PROFILE_NAME_CHARS: usize = 128;
 
-/// Strictly load an agent profile by safe basename from
-/// `<cwd>/.nonoclaw/agents/<name>.md`.
+/// Strictly load an agent profile by safe basename, resolving the project
+/// directory first, then the user directory (`~/.nonoclaw/agents/<name>.md`)
+/// so globally installed profiles are usable at runtime, not just listed by
+/// discovery.
 pub fn load_profile_checked(cwd: &Path, name: &str) -> Result<AgentProfile> {
     validate_profile_name(name)?;
-    let path = cwd.join(".nonoclaw/agents").join(format!("{name}.md"));
+    let project_path = cwd.join(".nonoclaw/agents").join(format!("{name}.md"));
+    let user_path = crate::session::home_root().map(|root| {
+        root.join("agents").join(format!("{name}.md"))
+    });
+    let path = match std::fs::metadata(&project_path) {
+        Ok(meta) if meta.is_file() => project_path,
+        _ => match user_path {
+            Some(path) if path.is_file() => path,
+            _ => project_path,
+        },
+    };
     let metadata = std::fs::metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::Config(format!("agent profile `{name}` was not found"))
@@ -473,6 +485,50 @@ Body text here."#;
             Err(Error::Config(message)) if message.contains("invalid permission mode")
         ));
         std::fs::remove_dir_all(cwd).ok();
+    }
+
+    #[test]
+    fn checked_profile_falls_back_to_user_agents_dir() {
+        // home_root reads NONOCLAW_HOME/HOME at call time; hold the env lock
+        // so parallel tests flipping those vars cannot interleave.
+        let _env_guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("nonoclaw-agent-home-{}", uuid::Uuid::new_v4()));
+        let saved_home = std::env::var_os("NONOCLAW_HOME");
+        std::env::set_var("NONOCLAW_HOME", &home);
+
+        let cwd = profile_test_dir();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/global-agent.md"),
+            "---\nname: global-agent\ndescription: from user dir\n---\nuser body\n",
+        )
+        .unwrap();
+
+        // User-level profile resolves when no project-level one exists.
+        let global = load_profile_checked(&cwd, "global-agent").unwrap();
+        assert_eq!(global.name, "global-agent");
+        assert_eq!(global.description, "from user dir");
+        assert_eq!(global.body.trim(), "user body");
+
+        // Project-level profile takes precedence over the user-level one.
+        std::fs::write(
+            cwd.join(".nonoclaw/agents/global-agent.md"),
+            "---\nname: global-agent\ndescription: from project dir\n---\nproject body\n",
+        )
+        .unwrap();
+        let project = load_profile_checked(&cwd, "global-agent").unwrap();
+        assert_eq!(project.description, "from project dir");
+        assert_eq!(project.body.trim(), "project body");
+
+        // Restore env before dropping dirs.
+        match saved_home {
+            Some(v) => std::env::set_var("NONOCLAW_HOME", v),
+            None => std::env::remove_var("NONOCLAW_HOME"),
+        }
+        std::fs::remove_dir_all(cwd).ok();
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
