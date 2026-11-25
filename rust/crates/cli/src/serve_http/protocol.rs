@@ -98,6 +98,10 @@ pub(super) enum ClientMsg {
     /// fresh one).
     SwitchProject {
         path: String,
+        /// Cancel every active run before switching. Without this the server
+        /// refuses the switch while any session holds a run lease.
+        #[serde(default)]
+        force: bool,
     },
     /// List every project in the server-side project registry.
     ListProjects,
@@ -1052,6 +1056,27 @@ mod tests {
             ClientMsg::ListProjects => "list_projects",
             ClientMsg::AddProject { .. } => "add_project",
             ClientMsg::RemoveProject { .. } => "remove_project",
+        }
+    }
+
+    #[test]
+    fn switch_project_force_defaults_off() {
+        let legacy: ClientMsg = serde_json::from_str(
+            r#"{"type":"switch_project","path":"/tmp/proj"}"#,
+        )
+        .unwrap();
+        match legacy {
+            ClientMsg::SwitchProject { force, .. } => assert!(!force),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let forced: ClientMsg = serde_json::from_str(
+            r#"{"type":"switch_project","path":"/tmp/proj","force":true}"#,
+        )
+        .unwrap();
+        match forced {
+            ClientMsg::SwitchProject { force, .. } => assert!(force),
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 

@@ -409,6 +409,7 @@ export default function App() {
                 projects={projects}
                 activePath={fileTreeRoot}
                 send={send}
+                busy={agentRunning || compacting}
               />
             </div>
             <div className={`rail__files${railSections.files ? "" : " rail__files--collapsed"}`}>

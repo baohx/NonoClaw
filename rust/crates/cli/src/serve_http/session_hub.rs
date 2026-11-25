@@ -239,6 +239,42 @@ impl SessionHub {
         CancelRunResult::Cancelling
     }
 
+    /// Cancel every active run and wait, bounded by the shared cancel-wait
+    /// timeout, until their leases drain from the hub. Used by the project
+    /// switch path after the user confirmed a `force` switch. Returns the
+    /// number of runs that were still registered when the deadline hit.
+    pub(super) async fn cancel_all_runs_and_wait(&self, reason: &str) -> Result<(), usize> {
+        let deadline = tokio::time::Instant::now() + RUN_CANCEL_WAIT_TIMEOUT;
+        loop {
+            let (controller, mut done) = {
+                let active = self.active_runs.lock().await;
+                let Some(run) = active.values().next() else {
+                    return Ok(());
+                };
+                (run.controller.clone(), run.done.clone())
+            };
+            if let Some(controller) = controller.as_ref() {
+                controller.cancel(reason);
+            }
+            if !*done.borrow() {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(self.active_runs.lock().await.len());
+                }
+                match tokio::time::timeout(remaining, done.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        // done sender dropped without signaling: fall through
+                        // and re-check the registry once before giving up.
+                        if deadline <= tokio::time::Instant::now() {
+                            return Err(self.active_runs.lock().await.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) async fn register_existing(
         &self,
         service: &SessionService,

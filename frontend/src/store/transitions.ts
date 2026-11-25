@@ -120,7 +120,7 @@ function outboundKey(message: ClientMsg): string {
     case "set_model":
       return `${message.type}:${message.name}`;
     case "switch_project":
-      return `${message.type}:${message.path}`;
+      return `${message.type}:${message.path}:${message.force === true}`;
     case "list_projects":
       return message.type;
     case "add_project":

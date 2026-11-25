@@ -5,6 +5,8 @@ interface Props {
   projects: RegisteredProject[];
   activePath: string;
   send: (msg: ClientMsg) => void;
+  /** True while any run/compaction of the active session is in flight. */
+  busy?: boolean;
 }
 
 /** Clickable project list in the left rail. Clicking a project switches the
@@ -13,6 +15,7 @@ export default function ProjectTree({
   projects,
   activePath,
   send,
+  busy,
 }: Props) {
   const [adding, setAdding] = useState(false);
   const [addPath, setAddPath] = useState("");
@@ -64,7 +67,15 @@ export default function ProjectTree({
                 <button
                   className={`projecttree__name${isActive ? " projecttree__name--active" : ""}`}
                   onClick={() => {
-                    if (!isActive) send({ type: "switch_project", path: p.path });
+                    if (isActive) return;
+                    if (
+                      !busy ||
+                      window.confirm(
+                        "A run is active. Switch projects and cancel it?",
+                      )
+                    ) {
+                      send({ type: "switch_project", path: p.path, force: busy === true });
+                    }
                   }}
                   title={p.path}
                 >
