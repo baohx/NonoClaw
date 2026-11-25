@@ -3025,7 +3025,7 @@ async fn handle_ws(
             }
 
             // ── Switch project working directory ──────────────────────
-            ClientMsg::SwitchProject { path } => {
+            ClientMsg::SwitchProject { path, force } => {
                 // Run startup and project replacement share this gate. Once it
                 // is held, a global active-run check cannot race with a new
                 // WS, REST, or AutoDream run acquiring its session lease.
@@ -3036,23 +3036,52 @@ async fn handle_ws(
                     continue;
                 }
                 if state.session_hub.has_active_runs().await {
-                    drop(project_transition);
-                    if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                    if !force {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::InvalidRequest,
+                                "cannot switch project while a run is active",
+                                false,
+                                "switch_project",
+                            ),
+                        )
+                        .await;
                         continue;
                     }
-                    let _ = send_ws_project_msg(
-                        &state,
-                        &tx,
-                        project_generation,
-                        safe_error(
-                            ErrorCode::InvalidRequest,
-                            "cannot switch project while a run is active",
-                            false,
-                            "switch_project",
-                        ),
-                    )
-                    .await;
-                    continue;
+                    // The user confirmed the switch: cancel every active run
+                    // and wait for the leases to drain (bounded), then fall
+                    // through to the regular replacement below. The transition
+                    // lock stays held, so no new run can start meanwhile.
+                    if let Err(active) = state
+                        .session_hub
+                        .cancel_all_runs_and_wait("switching projects")
+                        .await
+                    {
+                        drop(project_transition);
+                        if !ensure_ws_project_generation(&state, &tx, project_generation).await {
+                            continue;
+                        }
+                        let _ = send_ws_project_msg(
+                            &state,
+                            &tx,
+                            project_generation,
+                            safe_error(
+                                ErrorCode::InvalidRequest,
+                                format!("cannot switch project: {active} run(s) still cancelling"),
+                                true,
+                                "switch_project",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
                 }
 
                 let current_project = state.project();

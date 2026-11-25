@@ -703,6 +703,8 @@ export interface FileTreeRequest {
 export interface SwitchProjectRequest {
   type: "switch_project";
   path: string;
+  /** Cancel every active run before switching. */
+  force?: boolean;
 }
 
 export interface ListProjectsRequest {
