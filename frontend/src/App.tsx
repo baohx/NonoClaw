@@ -313,9 +313,12 @@ export default function App() {
       });
       userScrolledUp.current = false;
       useStore.getState().setAgentRunning(true);
-      const activeModel = useStore.getState().availableModels.length > 0
-        ? useStore.getState().model : undefined;
-      send({ type: "run", prompt, model: activeModel, attachments: attachments.length ? attachments : undefined });
+      const store = useStore.getState();
+      const activeModel = store.availableModels.length > 0 ? store.model : undefined;
+      // Only send an effort the active model actually declares.
+      const declared = store.availableModels.find((item) => item.name === activeModel)?.reasoning_efforts ?? [];
+      const reasoningEffort = declared.includes(store.reasoningEffort ?? "") ? store.reasoningEffort : undefined;
+      send({ type: "run", prompt, model: activeModel, reasoning_effort: reasoningEffort, attachments: attachments.length ? attachments : undefined });
     },
     [send, clearMessages, addMessage]
   );
@@ -464,6 +467,7 @@ export default function App() {
                 const state = useStore.getState();
                 state.setInfo(name, state.sessionId, state.hasMobileAccessToken, state.availableModels);
               }}
+              onSetReasoningEffort={(effort) => useStore.getState().setReasoningEffort(effort)}
             />
           </main>
           <aside className="insight">

@@ -170,7 +170,8 @@ All models live in a single `models[]` array with `role` tags — main conversat
       "default": true,
       "contextWindow": 1048576,
       "maxTokens": 8192,
-      "charsPerToken": 3
+      "charsPerToken": 3,
+      "reasoningEfforts": ["low", "high", "max"]
     },
     {
       "name": "claude-sonnet-4-5-20250929",
@@ -180,7 +181,8 @@ All models live in a single `models[]` array with `role` tags — main conversat
       "role": ["main", "compact"],
       "contextWindow": 200000,
       "maxTokens": 8192,
-      "charsPerToken": 4
+      "charsPerToken": 4,
+      "reasoningEfforts": ["low", "medium", "high", "max"]
     },
     {
       "name": "mistral-ocr-latest",
@@ -910,7 +912,8 @@ Full example at `~/.nonoclaw/settings.json`:
 | `maxTurns` | Maximum agent turns per run (default 99999, i.e. effectively unlimited) |
 | `promptProfile` | System-prompt profile: `"full"` (default) or `"minimal"` (~60% smaller, keeps identity+safety+task-completion only) |
 | `env` | Configuration inputs and `$ENV` references resolved server-side; existing process values take precedence without mutating process state |
-| `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken`, `profile`, `apiFormat` |
+| `models[]` | All model profiles: `name`, `label`, `baseUrl`, `apiKey`, `role[]`, `default`, `contextWindow`, `maxTokens`, `charsPerToken`, `profile`, `apiFormat`, `billingProvider`, `reasoningEfforts` |
+| `models[].reasoningEfforts` | Reasoning-effort dial offered for that model in the composer (`model → effort → mode`), in display order; omit to hide the picker. Values are provider-native and serialized per `apiFormat` (`output_config.effort` for Anthropic, `reasoning_effort` for OpenAI Chat, `reasoning.effort` for Responses, `thinkingConfig.thinkingLevel` for Gemini). A chosen level that the active model does not declare is dropped with a warning instead of reaching the provider. |
 | `docModel` | Model name reference (or inline config) for document processing (OCR) |
 | `compactModel` | Model name reference for auto-compaction summarization |
 | `mcpServers` | MCP server configs: `command`, `args`, `env` |
@@ -928,6 +931,17 @@ Full example at `~/.nonoclaw/settings.json`:
 | `thinking` | Provider thinking configuration: `true` or `{"type":"enabled","budget_tokens":16000}` |
 | `executables` | Explicit rust/node/python executable paths and versions (see below) |
 | `elevenlabsApiKey` | ElevenLabs speech-to-text API key |
+
+Declared effort levels per provider (verify against the vendor docs when adding a model — the dial is model-specific, not provider-wide):
+
+| Provider / family | `reasoningEfforts` | Default | Wire field |
+|---|---|---|---|
+| Anthropic Claude (effort-capable) | `low` `medium` `high` `max` (`max` on newest only) | model default | `output_config.effort` |
+| OpenAI GPT-5.x / o-series | `none` `minimal` `low` `medium` `high` (`xhigh` on some) | model default | `reasoning_effort` (Chat) / `reasoning.effort` (Responses) |
+| DeepSeek V4 / flash (`low`/`high`/`max`; `medium` maps to `high`) | `low` `high` `max` | `high` | both Anthropic- and OpenAI-compatible endpoints |
+| GLM 5.x (`/api/anthropic` and `/coding/paas/v4`) | `none` `minimal` `low` `medium` `high` `xhigh` `max` | `max` | `output_config.effort` / `reasoning_effort` |
+| Moonshot Kimi K3.x | `low` `high` `max` | `max` | `output_config.effort` / `reasoning_effort` |
+| Gemini 3 Pro (`minimal` `low` `medium` `high`; Flash has no `high` in some tiers) | `minimal` `low` `medium` `high` | model default | `generationConfig.thinkingConfig.thinkingLevel` |
 
 ### Configuration loading (priority low → high)
 
@@ -1084,6 +1098,7 @@ NONOCLAW_MAX_TOOL_CONCURRENCY=4 nonoclaw "run independent checks"
 | `--permission-mode MODE` | `default` | Eight canonical values: `default`, `accept-edits`, `auto`, `sandbox-workspace-write`, `sandbox-read-only`, `sandbox-strict`, `bypass-permissions`, `plan`; legacy camelCase aliases remain accepted |
 | `--allowed-tools LIST` / `--disallowed-tools LIST` | unset | Comma-separated tool filters |
 | `--max-turns N` / `--max-tokens N` | resolved config | Bound loop turns and output tokens |
+| `--effort LEVEL` | model default | Reasoning effort for the selected model; must be one of its `reasoningEfforts` (otherwise a warning and the model default) |
 | `--append-system-prompt TXT` | unset | Append system instructions |
 | `--add-dir PATH` | unset | Add a repeatable `NONOCLAW.md` discovery directory |
 | `--dangerously-skip-permissions` | false | Bypass permission prompts; conflicts with explicit `--permission-mode` |
@@ -1307,7 +1322,8 @@ Insight 的工具、CLI 与顶层配置参考分别来自 `ToolRegistry`、Clap 
       "default": true,
       "contextWindow": 1048576,
       "maxTokens": 8192,
-      "charsPerToken": 3
+      "charsPerToken": 3,
+      "reasoningEfforts": ["low", "high", "max"]
     },
     {
       "name": "claude-sonnet-4-5-20250929",
@@ -1317,7 +1333,8 @@ Insight 的工具、CLI 与顶层配置参考分别来自 `ToolRegistry`、Clap 
       "role": ["main", "compact"],
       "contextWindow": 200000,
       "maxTokens": 8192,
-      "charsPerToken": 4
+      "charsPerToken": 4,
+      "reasoningEfforts": ["low", "medium", "high", "max"]
     },
     {
       "name": "mistral-ocr-latest",

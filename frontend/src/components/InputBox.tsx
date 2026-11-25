@@ -9,6 +9,7 @@ interface Props {
   onCancel: () => void;
   onSetPermissionMode: (mode: PermissionMode) => void;
   onSetModel: (name: string) => void;
+  onSetReasoningEffort: (effort: string | undefined) => void;
   disabled?: boolean;
   cancelling?: boolean;
 }
@@ -20,7 +21,7 @@ function authenticatedApiUrl(path: string): string {
   return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 }
 
-export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSetModel, disabled, cancelling }: Props) {
+export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSetModel, onSetReasoningEffort, disabled, cancelling }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const historyRef = useRef<string[]>([]);
@@ -36,9 +37,15 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
   const sessionId = useStore((state) => state.sessionId);
   const model = useStore((state) => state.model);
   const availableModels = useStore((state) => state.availableModels);
+  const reasoningEffort = useStore((state) => state.reasoningEffort);
   const permissionMode = useStore((state) => state.permissionMode);
   const [dragOver, setDragOver] = useState(false);
   const dragCounter = useRef(0);
+  // Effort dial for the *current* model only. A stored effort that the newly
+  // selected model does not declare is treated as unset so we never send an
+  // undeclared level (the server would drop it anyway).
+  const effortOptions = availableModels.find((item) => item.name === model)?.reasoning_efforts ?? [];
+  const effectiveEffort = effortOptions.includes(reasoningEffort ?? "") ? reasoningEffort : undefined;
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -324,6 +331,21 @@ export default function InputBox({ onSubmit, onCancel, onSetPermissionMode, onSe
                   {availableModels.map((item) => <option key={item.name} value={item.name}>{item.label || item.name}</option>)}
                 </select>
               </label>
+              {effortOptions.length > 0 && (
+                <label>
+                  <span>effort</span>
+                  <select
+                    aria-label="Reasoning effort for next run"
+                    value={effectiveEffort ?? ""}
+                    disabled={disabled}
+                    onChange={(event) => onSetReasoningEffort(event.target.value || undefined)}
+                    title={disabled ? "Effort can be changed after this run finishes" : "Reasoning effort for the next run"}
+                  >
+                    <option value="">default</option>
+                    {effortOptions.map((level) => <option key={level} value={level}>{level}</option>)}
+                  </select>
+                </label>
+              )}
               <label>
                 <span>mode</span>
                 <select

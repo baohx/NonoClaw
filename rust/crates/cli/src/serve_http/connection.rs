@@ -1244,6 +1244,7 @@ async fn handle_ws(
                         name: p.name.clone(),
                         label: p.label.clone().unwrap_or_else(|| p.name.clone()),
                         context_window: p.context_window,
+                        reasoning_efforts: p.reasoning_efforts.clone(),
                     })
                     .collect(),
                 session_id: sid,
@@ -1473,6 +1474,7 @@ async fn handle_ws(
                                 .clone()
                                 .unwrap_or_else(|| profile.name.clone()),
                             context_window: profile.context_window,
+                            reasoning_efforts: profile.reasoning_efforts.clone(),
                         })
                         .collect(),
                     session_id: sid,
@@ -1591,6 +1593,7 @@ async fn handle_ws(
                                 .clone()
                                 .unwrap_or_else(|| profile.name.clone()),
                             context_window: profile.context_window,
+                            reasoning_efforts: profile.reasoning_efforts.clone(),
                         })
                         .collect(),
                     session_id: sid,
@@ -2089,6 +2092,7 @@ async fn handle_ws(
             ClientMsg::Run {
                 prompt,
                 model,
+                reasoning_effort,
                 max_turns,
                 append_system_prompt,
                 arguments,
@@ -2096,6 +2100,7 @@ async fn handle_ws(
             } => {
                 tracing::info!(
                     model = ?model,
+                    reasoning_effort = ?reasoning_effort,
                     attachment_count = attachments.as_ref().map_or(0, Vec::len),
                     "ws run request accepted (prompt content omitted)"
                 );
@@ -2278,6 +2283,7 @@ async fn handle_ws(
                                 None,
                                 Some(body.clone()),
                                 arguments.clone(),
+                                None,
                                 tx2.clone(),
                                 Arc::clone(&s.pending_permissions),
                                 *s.permission_mode.lock().await,
@@ -2503,6 +2509,7 @@ async fn handle_ws(
                         max_turns,
                         append_system_prompt.clone(),
                         arguments.clone(),
+                        reasoning_effort.clone(),
                         tx2.clone(),
                         Arc::clone(&s.pending_permissions),
                         *s.permission_mode.lock().await,
@@ -2981,6 +2988,7 @@ async fn handle_ws(
                                 name: p.name.clone(),
                                 label: p.label.clone().unwrap_or_else(|| p.name.clone()),
                                 context_window: p.context_window,
+                                reasoning_efforts: p.reasoning_efforts.clone(),
                             })
                             .collect(),
                         session_id: session
@@ -3233,6 +3241,7 @@ async fn handle_ws(
                                 name: p.name.clone(),
                                 label: p.label.clone().unwrap_or_else(|| p.name.clone()),
                                 context_window: p.context_window,
+                                reasoning_efforts: p.reasoning_efforts.clone(),
                             })
                             .collect(),
                         session_id: sid,
@@ -3575,6 +3584,7 @@ async fn handle_ws(
                 let options = build_options(
                     project.config(),
                     compact_for_model.clone(),
+                    None,
                     None,
                     None,
                     None,

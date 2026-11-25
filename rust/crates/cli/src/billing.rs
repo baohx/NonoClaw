@@ -545,6 +545,7 @@ mod tests {
             profile: None,
             api_format: None,
             billing_provider: None,
+            reasoning_efforts: None,
         }
     }
 

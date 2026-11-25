@@ -1067,6 +1067,9 @@ pub struct EngineOptions {
     /// Background task registry for `run_in_background` bash commands.
     pub background_registry: Option<Arc<std::sync::Mutex<BackgroundTaskRegistry>>>,
     pub thinking: Option<ThinkingConfig>,
+    /// User-selected reasoning effort (validated against the model's declared
+    /// `reasoningEfforts` in `resolve_run`). `None` = model default.
+    pub reasoning_effort: Option<String>,
     /// `true` for `--print` / SDK mode. Unresolved permission `Ask`s are
     /// auto-denied (no TTY to prompt).
     pub is_non_interactive: bool,
@@ -1176,6 +1179,7 @@ impl Default for EngineOptions {
             arguments: None,
             background_registry: None,
             thinking: None,
+            reasoning_effort: None,
             is_non_interactive: true,
             permission_resolver: None,
             question_resolver: None,
@@ -2711,6 +2715,7 @@ impl QueryEngine {
                 } else {
                     self.options.thinking.clone()
                 },
+                reasoning_effort: self.options.reasoning_effort.clone(),
                 temperature: None,
                 betas: Vec::new(),
                 extra_body: None,

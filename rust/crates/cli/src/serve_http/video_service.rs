@@ -1026,6 +1026,7 @@ each ≤40 字, ready to paste into a video prompt. No preamble, no numbering."
         tools: vec![],
         tool_choice: None,
         thinking: None,
+        reasoning_effort: None,
         temperature: Some(0.4),
         betas: vec![],
         extra_body: None,

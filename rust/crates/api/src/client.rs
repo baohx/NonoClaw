@@ -98,6 +98,11 @@ pub struct RequestParams {
     pub tools: Vec<ToolSchema>,
     pub tool_choice: Option<ToolChoice>,
     pub thinking: Option<ThinkingConfig>,
+    /// Provider-neutral reasoning-effort dial chosen by the user for this run
+    /// (e.g. `"low"`, `"high"`, `"max"`). Serialized into the per-format field
+    /// (`output_config.effort` / `reasoning.effort` / `reasoning_effort` /
+    /// `thinkingConfig.thinkingLevel`). `None` leaves the model default.
+    pub reasoning_effort: Option<String>,
     pub temperature: Option<f64>,
     pub betas: Vec<String>,
     /// Provider-specific extra body fields, serialized into the OpenAI-format
@@ -1350,6 +1355,9 @@ fn serialize_body_anthropic(params: &RequestParams) -> Result<String> {
     if let Some(thinking) = &params.thinking {
         body["thinking"] = serde_json::to_value(thinking)?;
     }
+    if let Some(effort) = &params.reasoning_effort {
+        body["output_config"] = serde_json::json!({ "effort": effort });
+    }
     if let Some(t) = params.temperature {
         body["temperature"] = t.into();
     }
@@ -1503,6 +1511,11 @@ fn serialize_body_openai(params: &RequestParams) -> Result<String> {
     }
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(effort) = &params.reasoning_effort {
+        // OpenAI Chat Completions dialect (also DeepSeek / GLM / Kimi / Qwen
+        // OpenAI-compatible endpoints): top-level `reasoning_effort`.
+        body["reasoning_effort"] = serde_json::json!(effort);
     }
     if let Some(extra) = &params.extra_body {
         if let Some(extra_map) = extra.as_object() {
@@ -2024,6 +2037,10 @@ fn serialize_body_responses(params: &RequestParams) -> Result<String> {
         };
         body["reasoning"] = serde_json::json!({"effort": effort});
     }
+    if let Some(effort) = &params.reasoning_effort {
+        // Explicit user choice wins over the budget-derived mapping above.
+        body["reasoning"] = serde_json::json!({"effort": effort});
+    }
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
     }
@@ -2459,6 +2476,15 @@ fn serialize_body_gemini(params: &RequestParams) -> Result<String> {
         if let ThinkingConfig::Enabled { budget_tokens } = thinking {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"] =
                 serde_json::json!(budget_tokens);
+        }
+    }
+    if let Some(effort) = &params.reasoning_effort {
+        // Gemini takes an upper-case enum `thinkingLevel`; it is mutually
+        // exclusive with `thinkingBudget`, so drop the budget when set.
+        body["generationConfig"]["thinkingConfig"]["thinkingLevel"] =
+            serde_json::json!(effort.to_ascii_uppercase());
+        if let Some(cfg) = body["generationConfig"]["thinkingConfig"].as_object_mut() {
+            cfg.remove("thinkingBudget");
         }
     }
     if let Some(extra) = &params.extra_body {
@@ -3384,6 +3410,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,
@@ -3478,6 +3505,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,
@@ -3797,6 +3825,7 @@ mod tests {
             }],
             tool_choice: Some(ToolChoice::Auto),
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,
@@ -4608,6 +4637,7 @@ mod security_tests {
             }],
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,
@@ -4644,6 +4674,7 @@ mod security_tests {
             tools: vec![],
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,
@@ -4760,6 +4791,7 @@ mod security_tests {
             tools: vec![],
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
             temperature: None,
             betas: vec![],
             extra_body: None,

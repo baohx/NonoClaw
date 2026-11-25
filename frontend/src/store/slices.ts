@@ -79,6 +79,8 @@ export interface SessionSlice {
   sessions: SessionInfoWire[];
   hasMobileAccessToken: boolean;
   availableModels: ModelInfo[];
+  /** Reasoning effort selected in the picker; `undefined` = model default. */
+  reasoningEffort: string | undefined;
   addMessage: (message: ChatMessage) => void;
   ensureStreaming: () => void;
   appendStreaming: (text: string) => void;
@@ -86,6 +88,7 @@ export interface SessionSlice {
   finishStreaming: () => void;
   setInfo: (model: string, sessionId: string, hasMobileAccessToken?: boolean, availableModels?: ModelInfo[]) => void;
   setModel: (model: string) => void;
+  setReasoningEffort: (effort: string | undefined) => void;
   setSessions: (sessions: SessionInfoWire[]) => void;
   acceptSnapshot: (sessionId: string, revision: number) => boolean;
   acceptLegacySnapshot: () => boolean;
@@ -381,6 +384,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
   sessions: [],
   hasMobileAccessToken: false,
   availableModels: [],
+  reasoningEffort: undefined,
   historyOlderRemaining: 0,
   historyTotal: 0,
   historyLoading: false,
@@ -399,6 +403,7 @@ export const createSessionSlice: Slice<SessionSlice> = (set, get) => ({
     availableModels,
   })),
   setModel: (model) => set({ model }),
+  setReasoningEffort: (reasoningEffort) => set({ reasoningEffort }),
   setSessions: (sessions) => set({ sessions }),
   acceptSnapshot: (sessionId, revision) => {
     let accepted = false;
