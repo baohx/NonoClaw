@@ -71,6 +71,11 @@ pub enum NodeKind {
     Router,
     /// Pause for human approval via the interactive question resolver.
     Gate,
+    /// Jev-scored decision: score the candidate node outputs and pick the
+    /// best. `branches` lists the candidates (their outputs are read from
+    /// state). Falls back to a Router-style subagent judgment when jev is
+    /// unavailable, so the graph still converges.
+    Score,
 }
 
 /// A single node in a graph.
@@ -505,6 +510,54 @@ body text
         let missing = load_graph_checked(&dir, "nope").unwrap_err();
         assert!(missing.to_string().contains("was not found"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_arena_style_score_graph_with_profiles() {
+        // Minimal arena-shaped graph: fan-out 3 contenders with profiles →
+        // score node judging them. Exercises the V3 schema end to end.
+        let raw = r#"---
+name: arena-mini
+start: fan
+nodes:
+  fan:
+    prompt: "task: {task}"
+    next: [x, y, z]
+  x:
+    profile: arena-contender-a
+    prompt: "{fan}"
+    next: score
+  y:
+    profile: arena-contender-b
+    prompt: "{fan}"
+    next: score
+  z:
+    profile: arena-contender-c
+    prompt: "{fan}"
+    next: score
+  score:
+    kind: score
+    prompt: "pick the best"
+    branches: [x, y, z]
+    next: done
+  done:
+    prompt: "summarize {score}"
+    end: true
+---
+"#;
+        let def = parse_graph(raw, Path::new("/tmp/arena.md")).expect("arena graph parses");
+        assert_eq!(def.start_node(), Some("fan"));
+        let score = &def.nodes["score"];
+        assert!(matches!(score.kind, NodeKind::Score));
+        assert_eq!(score.branches, vec!["x", "y", "z"]);
+        let expected_profiles = [
+            ("x", "arena-contender-a"),
+            ("y", "arena-contender-b"),
+            ("z", "arena-contender-c"),
+        ];
+        for (id, expected) in expected_profiles {
+            assert_eq!(def.nodes[id].profile.as_deref(), Some(expected));
+        }
     }
 
     #[test]

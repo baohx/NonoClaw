@@ -52,6 +52,22 @@ pub struct AgentProfile {
     /// gateway is the authority on valid values for the routed model.
     #[serde(default, rename = "reasoning_effort")]
     pub reasoning_effort: Option<String>,
+    /// Docker container name for this profile's runs. When set, Bash and the
+    /// file tools of subagent runs spawned with this profile target the
+    /// container via `DockerEnvironment` instead of the host. The container
+    /// must already exist and is owned by the caller (profile never starts
+    /// or stops it). Empty/absent keeps the parent environment.
+    #[serde(default, rename = "docker_container")]
+    pub docker_container: Option<String>,
+    /// Optional workdir inside `docker_container` (e.g. "/workspace").
+    #[serde(default, rename = "docker_workdir")]
+    pub docker_workdir: Option<String>,
+    /// Per-profile run budget in USD. Subagent runs spawned with this profile
+    /// track cost against this cap instead of the parent run budget. Lower of
+    /// (this, parent budget) applies when both are set. Absent keeps the
+    /// parent budget.
+    #[serde(default, rename = "max_budget_usd")]
+    pub max_budget_usd: Option<f64>,
     /// Full markdown body (after frontmatter).
     #[serde(default)]
     pub body: String,
@@ -282,6 +298,36 @@ pub(crate) fn apply_subagent_effort(options: &mut crate::EngineOptions, profile:
     {
         options.reasoning_effort = Some(effort.to_string());
     }
+}
+
+/// Resolve a profile's `docker_container` override. Returns the container
+/// name to switch to, or `None` to keep the parent environment.
+pub(crate) fn resolve_subagent_environment(
+    profile: Option<&AgentProfile>,
+) -> Option<(String, Option<String>)> {
+    let container = profile
+        .and_then(|p| p.docker_container.as_deref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())?;
+    let workdir = profile
+        .and_then(|p| p.docker_workdir.as_deref())
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string());
+    Some((container.to_string(), workdir))
+}
+
+/// Apply a profile's `max_budget_usd` to child options. When both the profile
+/// and the parent options carry a budget, the lower (stricter) one wins.
+pub(crate) fn apply_subagent_budget(options: &mut crate::EngineOptions, profile: Option<&AgentProfile>) {
+    let Some(profile_budget) = profile.and_then(|p| p.max_budget_usd).filter(|b| b.is_finite() && *b > 0.0)
+    else {
+        return;
+    };
+    options.max_budget_usd = Some(match options.max_budget_usd {
+        Some(parent) if parent > 0.0 => parent.min(profile_budget),
+        _ => profile_budget,
+    });
 }
 
 impl std::fmt::Debug for SubagentModelRouting {
@@ -986,5 +1032,127 @@ Body text here."#;
         };
         apply_subagent_effort(&mut options, Some(&profile));
         assert_eq!(options.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn resolve_subagent_environment_requires_container() {
+        // No profile / no container / blank container → None (keep parent env).
+        assert!(resolve_subagent_environment(None).is_none());
+        let profile = AgentProfile {
+            name: "p".into(),
+            ..Default::default()
+        };
+        assert!(resolve_subagent_environment(Some(&profile)).is_none());
+        let profile = AgentProfile {
+            name: "p".into(),
+            docker_container: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(resolve_subagent_environment(Some(&profile)).is_none());
+
+        // Pinned container with optional workdir.
+        let profile = AgentProfile {
+            name: "p".into(),
+            docker_container: Some("arena-a".into()),
+            docker_workdir: Some("/workspace".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_subagent_environment(Some(&profile)),
+            Some(("arena-a".into(), Some("/workspace".into())))
+        );
+
+        // Blank workdir is dropped.
+        let profile = AgentProfile {
+            name: "p".into(),
+            docker_container: Some("arena-a".into()),
+            docker_workdir: Some("".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_subagent_environment(Some(&profile)),
+            Some(("arena-a".into(), None))
+        );
+    }
+
+    #[test]
+    fn apply_subagent_budget_takes_stricter_cap() {
+        // No profile budget → parent budget untouched (including None).
+        let mut options = crate::EngineOptions {
+            max_budget_usd: Some(2.0),
+            ..Default::default()
+        };
+        let profile = AgentProfile {
+            name: "p".into(),
+            ..Default::default()
+        };
+        apply_subagent_budget(&mut options, Some(&profile));
+        assert_eq!(options.max_budget_usd, Some(2.0));
+
+        // Profile cap lower than parent → profile wins.
+        let mut options = crate::EngineOptions {
+            max_budget_usd: Some(2.0),
+            ..Default::default()
+        };
+        let profile = AgentProfile {
+            name: "p".into(),
+            max_budget_usd: Some(0.5),
+            ..Default::default()
+        };
+        apply_subagent_budget(&mut options, Some(&profile));
+        assert_eq!(options.max_budget_usd, Some(0.5));
+
+        // Profile cap higher than parent → parent (stricter) wins.
+        let mut options = crate::EngineOptions {
+            max_budget_usd: Some(2.0),
+            ..Default::default()
+        };
+        let profile = AgentProfile {
+            name: "p".into(),
+            max_budget_usd: Some(10.0),
+            ..Default::default()
+        };
+        apply_subagent_budget(&mut options, Some(&profile));
+        assert_eq!(options.max_budget_usd, Some(2.0));
+
+        // Parent unset → profile cap applies.
+        let mut options = crate::EngineOptions::default();
+        apply_subagent_budget(&mut options, Some(&profile));
+        assert_eq!(options.max_budget_usd, Some(10.0));
+
+        // Non-positive / NaN budgets are ignored (keep parent).
+        let mut options = crate::EngineOptions {
+            max_budget_usd: Some(2.0),
+            ..Default::default()
+        };
+        let profile = AgentProfile {
+            name: "p".into(),
+            max_budget_usd: Some(f64::NAN),
+            ..Default::default()
+        };
+        apply_subagent_budget(&mut options, Some(&profile));
+        assert_eq!(options.max_budget_usd, Some(2.0));
+    }
+
+    #[test]
+    fn arena_contender_frontmatter_parses() {
+        // Full V2+V3 frontmatter as used by .nonoclaw/agents/arena-contender-*.md.
+        let raw = "---\n\
+name: arena-contender-c\n\
+description: competitor\n\
+tools_allow: [Read, Grep, Glob, Bash, Edit, Write]\n\
+model: glm-5.4\n\
+reasoning_effort: high\n\
+docker_container: arena-c\n\
+docker_workdir: /workspace\n\
+max_budget_usd: 1.5\n\
+---\n\n# Arena Contender C\nbody\n";
+        let fm = extract_frontmatter(raw).unwrap();
+        let profile: AgentProfile = serde_yaml::from_str(&fm).expect("frontmatter parses");
+        assert_eq!(profile.model.as_deref(), Some("glm-5.4"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(profile.docker_container.as_deref(), Some("arena-c"));
+        assert_eq!(profile.docker_workdir.as_deref(), Some("/workspace"));
+        assert_eq!(profile.max_budget_usd, Some(1.5));
     }
 }

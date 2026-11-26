@@ -3980,6 +3980,27 @@ impl SubagentRunner for EngineSubagent {
                             crate::agents::SubagentModelRouting::KeepParent => {}
                         }
                         crate::agents::apply_subagent_effort(&mut child_opts, profile.as_ref());
+                        // Profile-level environment routing: a pinned docker
+                        // container moves this child's Bash/file tools off the
+                        // host (or parent container). The container must exist;
+                        // lifecycle stays with the caller.
+                        if let Some((container, workdir)) =
+                            crate::agents::resolve_subagent_environment(profile.as_ref())
+                        {
+                            tracing::info!(
+                                profile = %request.profile.as_deref().unwrap_or(""),
+                                container = %container,
+                                "subagent environment override via agent profile"
+                            );
+                            let mut env = nonoclaw_tools::DockerEnvironment::new(container);
+                            if let Some(dir) = workdir {
+                                env = env.with_workdir(dir);
+                            }
+                            child_opts.environment = Some(Arc::new(env));
+                        }
+                        // Profile-level budget: the stricter of parent/profile
+                        // caps the child run.
+                        crate::agents::apply_subagent_budget(&mut child_opts, profile.as_ref());
 
                         let engine = QueryEngine::new(
                             client,

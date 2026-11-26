@@ -452,6 +452,19 @@ async fn execute_node(
                 Some(reply) => Ok((format!("approved: {reply}"), node.next.ids(), false)),
             }
         }
+        NodeKind::Score => {
+            let prompt = render_prompt(&node.prompt, state);
+            let branches = node.branches.clone();
+            if branches.is_empty() {
+                // No candidates declared: the score node only annotates —
+                // jev rates the state, output is the verdict text.
+                let (text, _) = score_with_jev(&prompt, &[], state, node_id, def, opts).await?;
+                return Ok((text, node.next.ids(), false));
+            }
+            let (output, chosen) = score_with_jev(&prompt, &branches, state, node_id, def, opts)
+                .await?;
+            Ok((output, vec![chosen], false))
+        }
     }
 }
 
@@ -485,6 +498,122 @@ fn normalize_branch(answer: &str, branches: &[String]) -> Option<String> {
         .iter()
         .find(|b| b.to_lowercase() == cleaned)
         .cloned()
+}
+
+/// Score the candidate node outputs and pick the best one.
+///
+/// Primary path: a Jev `Choice` question whose options are the candidate
+/// node outputs (`branches` = candidate ids; each output is read from state).
+/// Fallback path (fail-open): if jev is unavailable or its answer is not
+/// trusted, a Router-style subagent judges the candidates, so the graph
+/// still converges. Returns `(verdict_text, chosen_branch_id)`; when
+/// `branches` is empty only the verdict text is meaningful.
+async fn score_with_jev(
+    rendered_prompt: &str,
+    branches: &[String],
+    state: &BTreeMap<String, Value>,
+    node_id: &str,
+    def: &GraphDefinition,
+    opts: &GraphRunOptions<'_>,
+) -> Result<(String, String)> {
+    // Candidate outputs, joined for the state payload.
+    let mut candidates = Vec::with_capacity(branches.len());
+    for id in branches {
+        let text = state
+            .get(id)
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        candidates.push(serde_json::json!({ "id": id, "output": truncate(&text, 4000) }));
+    }
+
+    if let Some(jev) = crate::jev_reward::global_jev() {
+        let state_payload = serde_json::json!({
+            "task_prompt": rendered_prompt,
+            "candidates": candidates,
+            "context": "Scoring gate in an agent graph: pick the best candidate output for the task.",
+        })
+        .to_string();
+        let question = nonoclaw_api::jev::JevQuestion::choice(
+            "Pick the candidate output that best completes the task prompt: correct, complete, and faithful to the instructions.",
+            &branches
+                .iter()
+                .map(|b| (b.as_str(), ""))
+                .collect::<Vec<_>>(),
+        );
+        match jev
+            .ask_raw(&state_payload, &[("best_candidate".to_string(), question)])
+            .await
+        {
+            Ok(answers) => {
+                if let Some(answer) = answers.get("best_candidate") {
+                    let chosen = answer
+                        .choice
+                        .as_deref()
+                        .and_then(|c| normalize_branch(c, branches));
+                    if let Some(id) = chosen {
+                        let confidence = answer.confidence;
+                        let probs = answer
+                            .probabilities
+                            .iter()
+                            .map(|(k, v)| format!("{}={:.2}", k, v))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let output = format!(
+                            "jev-scored: winner={id} confidence={:?} probs=[{probs}]",
+                            confidence.unwrap_or(0.0)
+                        );
+                        tracing::info!(node = %node_id, winner = %id, "score node jev verdict");
+                        return Ok((output, id));
+                    }
+                }
+                tracing::warn!(node = %node_id, "score node jev answer unusable; falling back to subagent judgment");
+            }
+            Err(e) => {
+                tracing::warn!(node = %node_id, error = %e, "score node jev failed; falling back to subagent judgment");
+            }
+        }
+    }
+
+    // Fail-open fallback: Router-style subagent judgment over the candidates.
+    let node = &def.nodes[node_id];
+    if branches.is_empty() {
+        // Annotation mode: no candidates to pick between — the judge's free
+        // text IS the verdict.
+        let answer = run_node_subagent(node, rendered_prompt, node_id, opts).await?;
+        return Ok((format!("judge-scored: {answer} (jev unavailable)"), String::new()));
+    }
+    let mut decision_prompt = format!(
+        "{rendered_prompt}\n\nYou are the scoring judge. Below are candidate outputs; \
+         reply with EXACTLY one candidate id on the last line.\n"
+    );
+    for id in branches {
+        let text = state
+            .get(id)
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        decision_prompt.push_str(&format!("\n--- candidate {id} ---\n{}\n", truncate(&text, 2000)));
+    }
+    let answer = run_node_subagent(node, &decision_prompt, node_id, opts).await?;
+    let chosen = normalize_branch(
+        answer.lines().rev().find_map(|l| {
+            let t = l.trim();
+            (!t.is_empty()).then_some(t)
+        }).unwrap_or_default(),
+        branches,
+    )
+    .ok_or_else(|| Error::Tool {
+        tool: "graph".into(),
+        message: format!(
+            "score node '{node_id}': judge reply did not name any candidate id"
+        ),
+    })?;
+    Ok((format!("judge-scored: winner={chosen} (jev unavailable)"), chosen))
 }
 
 /// Render `{var}` references from shared state (inputs + completed outputs).
@@ -752,5 +881,107 @@ nodes:
         };
         let err = run_graph(&def, &json!({}), &opts).await.unwrap_err();
         assert!(matches!(err, Error::Cancelled));
+    }
+
+    /// Subagent runner whose reply names a fixed branch id — for score-node
+    /// tests exercising the fail-open (jev unavailable) path.
+    struct JudgeRunner {
+        pick: &'static str,
+    }
+    impl SubagentRunner for JudgeRunner {
+        fn run_subagent<'a>(
+            &'a self,
+            request: SubagentRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async move {
+                // Agent nodes echo; the score node's judge reply names the pick.
+                if request.description.starts_with("graph:") {
+                    Ok(self.pick.to_string())
+                } else {
+                    Ok(format!("ran:{}", request.description))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn score_node_falls_back_to_judge_and_activates_winner_branch() {
+        let raw = r#"---
+name: s
+version: 1
+start: a
+nodes:
+  a:
+    prompt: "implement X"
+    next: [b, c]
+  b:
+    prompt: "candidate b"
+    next: score
+  c:
+    prompt: "candidate c"
+    next: score
+  score:
+    kind: score
+    prompt: "pick the best implementation of X"
+    branches: [b, c]
+    end: true
+---
+"#;
+        let def = super::super::parse_graph(raw, Path::new("/tmp/s.md")).unwrap();
+        let cwd = test_dir("score_fallback");
+        // No global jev client in tests → fail-open subagent judgment.
+        let opts = GraphRunOptions {
+            cwd: &cwd,
+            session_id: "test",
+            cancel: CancellationToken::new(),
+            subagent: &JudgeRunner { pick: "c" },
+            question: None,
+            resume: false,
+        };
+        let result = run_graph(&def, &json!({}), &opts)
+            .await
+            .expect("graph runs");
+        // Score node completed after both candidates; verdict recorded in state.
+        let verdict = result.state["score"]
+            .as_str()
+            .expect("score output is a string");
+        assert!(verdict.contains("winner=c"), "verdict: {verdict}");
+        assert!(result.nodes_completed.contains(&"score".to_string()));
+        clear_checkpoint(&cwd, &def.name);
+    }
+
+    #[tokio::test]
+    async fn score_node_annotation_mode_without_branches() {
+        let raw = r#"---
+name: sa
+version: 1
+start: a
+nodes:
+  a:
+    prompt: "do work"
+    next: judge
+  judge:
+    kind: score
+    prompt: "rate the work in {a}"
+    end: true
+---
+"#;
+        let def = super::super::parse_graph(raw, Path::new("/tmp/sa.md")).unwrap();
+        let cwd = test_dir("score_annotate");
+        let opts = GraphRunOptions {
+            cwd: &cwd,
+            session_id: "test",
+            cancel: CancellationToken::new(),
+            subagent: &JudgeRunner { pick: "unused" },
+            question: None,
+            resume: false,
+        };
+        let result = run_graph(&def, &json!({}), &opts)
+            .await
+            .expect("graph runs");
+        // Annotation mode: verdict text is produced and the graph ends.
+        assert!(result.state.contains_key("judge"));
+        assert!(!result.aborted);
+        clear_checkpoint(&cwd, &def.name);
     }
 }
