@@ -1097,6 +1097,13 @@ pub struct EngineOptions {
     pub compact_client: Option<Arc<Client>>,
     /// Client selected by the canonical factory for child agents.
     pub subagent_client: Option<Arc<Client>>,
+    /// Model → client resolver (from `ResolvedConfig::client_for`) used when an
+    /// agent profile declares a `model` override. `None` in unit tests and when
+    /// no configuration was loaded; profile model overrides then fall back to
+    /// the shared subagent client with a warning.
+    pub subagent_client_factory: Option<
+        Arc<dyn Fn(&str) -> Result<Arc<Client>> + Send + Sync>,
+    >,
     /// Chars-per-token divisor for the token estimator. Default 4 (Claude).
     /// DeepSeek / GLM tokenize Chinese text more aggressively — set to 2–3
     /// for better compact-threshold accuracy on those models.
@@ -1196,6 +1203,7 @@ impl Default for EngineOptions {
             compact_max_tokens: crate::compact::DEFAULT_MAX_SUMMARY_TOKENS,
             compact_client: None,
             subagent_client: None,
+            subagent_client_factory: None,
             chars_per_token: 4,
             context_window: None,
             max_budget_usd: None,
@@ -3941,8 +3949,40 @@ impl SubagentRunner for EngineSubagent {
                         child_opts.max_turns = subagent_max_turns(child_opts.max_turns);
                         child_opts.finalize_on_max_turns = true;
 
+                        // Profile-level model/effort routing (V2): a profile may
+                        // pin a different model for its runs. The switch happens
+                        // once per subagent spawn (never mid-run), so the parent
+                        // prompt cache is untouched and the child builds its own.
+                        let mut client = Arc::clone(&self.client);
+                        match crate::agents::resolve_subagent_model(
+                            profile.as_ref(),
+                            &child_opts.model,
+                            self.options.subagent_client_factory.as_ref(),
+                        ) {
+                            crate::agents::SubagentModelRouting::Switched { model, client: swapped } => {
+                                tracing::info!(
+                                    profile = %request.profile.as_deref().unwrap_or(""),
+                                    from = %child_opts.model,
+                                    to = %model,
+                                    "subagent model override via agent profile"
+                                );
+                                child_opts.model = model;
+                                client = swapped;
+                            }
+                            crate::agents::SubagentModelRouting::Fallback { model, reason } => {
+                                tracing::warn!(
+                                    profile = %request.profile.as_deref().unwrap_or(""),
+                                    model,
+                                    reason,
+                                    "agent profile model override failed; keeping parent model"
+                                );
+                            }
+                            crate::agents::SubagentModelRouting::KeepParent => {}
+                        }
+                        crate::agents::apply_subagent_effort(&mut child_opts, profile.as_ref());
+
                         let engine = QueryEngine::new(
-                            Arc::clone(&self.client),
+                            client,
                             child_registry,
                             Arc::clone(&self.task_store),
                             child_opts,

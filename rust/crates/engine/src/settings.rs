@@ -1687,6 +1687,16 @@ impl ResolvedConfig {
                 .unwrap_or(crate::compact::DEFAULT_MAX_SUMMARY_TOKENS),
             compact_client: self.client_for(ClientPurpose::Compact, Some(&model)).ok(),
             subagent_client: self.client_for(ClientPurpose::Subagent, Some(&model)).ok(),
+            subagent_client_factory: {
+                let resolved = self.clone();
+                Some(Arc::new(
+                    move |model: &str| {
+                        resolved.client_for(ClientPurpose::Subagent, Some(model))
+                    },
+                ) as Arc<
+                    dyn Fn(&str) -> nonoclaw_core::Result<Arc<Client>> + Send + Sync,
+                >)
+            },
             chars_per_token,
             context_window,
             max_budget_usd: overrides.max_budget_usd,

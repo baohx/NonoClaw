@@ -42,6 +42,16 @@ pub struct AgentProfile {
     /// Permission mode override.
     #[serde(default, rename = "permission_mode")]
     pub permission_mode: Option<String>,
+    /// Model override for this profile's runs. When set, subagent runs spawned
+    /// with this profile switch the LLM client to the resolved model instead of
+    /// inheriting the parent's model. Empty/absent keeps the parent model.
+    #[serde(default, rename = "model")]
+    pub model: Option<String>,
+    /// Reasoning effort for the profile's model (e.g. "low" / "high" / "max").
+    /// Passed through to the provider's effort field as-is; the provider or
+    /// gateway is the authority on valid values for the routed model.
+    #[serde(default, rename = "reasoning_effort")]
+    pub reasoning_effort: Option<String>,
     /// Full markdown body (after frontmatter).
     #[serde(default)]
     pub body: String,
@@ -205,6 +215,85 @@ pub fn apply_profile(options: &mut crate::EngineOptions, profile: &AgentProfile)
     if let Some(ref mode) = profile.permission_mode {
         if let Some(mode) = nonoclaw_core::PermissionMode::from_kebab(mode) {
             options.permission_mode = mode;
+        }
+    }
+}
+
+/// Outcome of resolving a profile's model/effort routing for a subagent spawn.
+///
+/// The switch is evaluated once per spawn (never mid-run) so the parent's
+/// prompt cache stays byte-stable across the child's lifetime.
+pub(crate) enum SubagentModelRouting {
+    /// Profile pins no model (or pins the parent model): keep the parent
+    /// client and model unchanged.
+    KeepParent,
+    /// Profile pins a different model and the factory resolved it.
+    Switched {
+        model: String,
+        client: std::sync::Arc<nonoclaw_api::Client>,
+    },
+    /// Profile pins a different model but the switch failed (unknown model,
+    /// no factory, transport error). The parent model is kept.
+    Fallback {
+        model: String,
+        reason: &'static str,
+    },
+}
+
+/// Resolve a profile's `model`/`reasoning_effort` overrides against the
+/// parent's engine options and the subagent client factory.
+pub(crate) fn resolve_subagent_model(
+    profile: Option<&AgentProfile>,
+    parent_model: &str,
+    factory: Option<&std::sync::Arc<dyn Fn(&str) -> nonoclaw_core::Result<std::sync::Arc<nonoclaw_api::Client>> + Send + Sync>>,
+) -> SubagentModelRouting {
+    let Some(model) = profile
+        .and_then(|p| p.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != parent_model)
+    else {
+        return SubagentModelRouting::KeepParent;
+    };
+    let Some(factory) = factory else {
+        return SubagentModelRouting::Fallback {
+            model: model.to_string(),
+            reason: "no subagent client factory configured",
+        };
+    };
+    match factory(model) {
+        Ok(client) => SubagentModelRouting::Switched {
+            model: model.to_string(),
+            client,
+        },
+        Err(_) => SubagentModelRouting::Fallback {
+            model: model.to_string(),
+            reason: "factory failed to resolve the profile model",
+        },
+    }
+}
+
+/// Apply a profile's `reasoning_effort` to child options. A non-empty profile
+/// effort always wins; an empty/absent field leaves the parent effort intact.
+pub(crate) fn apply_subagent_effort(options: &mut crate::EngineOptions, profile: Option<&AgentProfile>) {
+    if let Some(effort) = profile
+        .and_then(|p| p.reasoning_effort.as_deref())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        options.reasoning_effort = Some(effort.to_string());
+    }
+}
+
+impl std::fmt::Debug for SubagentModelRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeepParent => f.write_str("SubagentModelRouting::KeepParent"),
+            Self::Switched { model, .. } => {
+                write!(f, "SubagentModelRouting::Switched({model})")
+            }
+            Self::Fallback { model, reason } => {
+                write!(f, "SubagentModelRouting::Fallback({model}, {reason})")
+            }
         }
     }
 }
@@ -768,5 +857,134 @@ Body text here."#;
             options.append_system_prompt.as_deref(),
             Some("Fixed prompt.\n\nAppend content.")
         );
+    }
+
+    #[test]
+    fn subagent_model_routing_keeps_parent_without_profile_model() {
+        let routing = resolve_subagent_model(None, "glm-5.3", None);
+        assert!(matches!(routing, SubagentModelRouting::KeepParent));
+
+        let profile = AgentProfile {
+            name: "p".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_subagent_model(Some(&profile), "glm-5.3", None),
+            SubagentModelRouting::KeepParent
+        ));
+    }
+
+    #[test]
+    fn subagent_model_routing_same_or_blank_model_keeps_parent() {
+        // Same model pinned: no switch, no factory call.
+        let profile = AgentProfile {
+            name: "p".into(),
+            model: Some("glm-5.3".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_subagent_model(Some(&profile), "glm-5.3", None),
+            SubagentModelRouting::KeepParent
+        ));
+
+        // Blank model pinned: treated as unset.
+        let profile = AgentProfile {
+            name: "p".into(),
+            model: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_subagent_model(Some(&profile), "glm-5.3", None),
+            SubagentModelRouting::KeepParent
+        ));
+    }
+
+    #[test]
+    fn subagent_model_routing_switches_when_factory_resolves() {
+        let profile = AgentProfile {
+            name: "p".into(),
+            model: Some("deepseek-v4-flash".into()),
+            ..Default::default()
+        };
+        let expected = nonoclaw_api::Client::new(
+            Some("fixture-key".into()),
+            None,
+            "http://127.0.0.1:9".into(),
+        )
+        .unwrap();
+        let expected = std::sync::Arc::new(expected);
+        let factory = expected.clone();
+        let resolve = std::sync::Arc::new(move |model: &str| {
+            assert_eq!(model, "deepseek-v4-flash");
+            Ok(factory.clone())
+        }) as std::sync::Arc<
+            dyn Fn(&str) -> nonoclaw_core::Result<std::sync::Arc<nonoclaw_api::Client>> + Send + Sync,
+        >;
+        match resolve_subagent_model(Some(&profile), "glm-5.3", Some(&resolve)) {
+            SubagentModelRouting::Switched { model, client } => {
+                assert_eq!(model, "deepseek-v4-flash");
+                assert!(std::sync::Arc::ptr_eq(&client, &expected));
+            }
+            other => panic!("expected Switched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_model_routing_falls_back_on_factory_error_or_missing() {
+        let profile = AgentProfile {
+            name: "p".into(),
+            model: Some("no-such-model".into()),
+            ..Default::default()
+        };
+
+        // No factory at all.
+        match resolve_subagent_model(Some(&profile), "glm-5.3", None) {
+            SubagentModelRouting::Fallback { model, reason } => {
+                assert_eq!(model, "no-such-model");
+                assert!(reason.contains("no subagent client factory"));
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+
+        // Factory rejects the model.
+        let resolve = std::sync::Arc::new(|_model: &str| {
+            Err(nonoclaw_core::Error::Config(
+                "unknown model".into(),
+            ))
+        }) as std::sync::Arc<
+            dyn Fn(&str) -> nonoclaw_core::Result<std::sync::Arc<nonoclaw_api::Client>> + Send + Sync,
+        >;
+        match resolve_subagent_model(Some(&profile), "glm-5.3", Some(&resolve)) {
+            SubagentModelRouting::Fallback { model, reason } => {
+                assert_eq!(model, "no-such-model");
+                assert!(reason.contains("factory failed"));
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_subagent_effort_sets_and_clears() {
+        let mut options = crate::EngineOptions::default();
+        let profile = AgentProfile {
+            name: "p".into(),
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        apply_subagent_effort(&mut options, Some(&profile));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+
+        // Blank effort leaves the parent effort untouched.
+        let mut options = crate::EngineOptions {
+            reasoning_effort: Some("low".into()),
+            ..Default::default()
+        };
+        let profile = AgentProfile {
+            name: "p".into(),
+            reasoning_effort: Some("  ".into()),
+            ..Default::default()
+        };
+        apply_subagent_effort(&mut options, Some(&profile));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("low"));
     }
 }
