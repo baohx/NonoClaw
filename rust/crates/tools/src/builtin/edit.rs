@@ -7,7 +7,8 @@ use nonoclaw_core::{Error, PermissionDecision, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::builtin::{read::require_str, resolve_path};
+use crate::builtin::read::require_str;
+use crate::environment::Environment;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const PROMPT: &str = "Performs exact string replacements in files.\n\nUsage:\n- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.\n- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- Only use emojis if the user explicitly requests it.\n- The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.\n- Use `replace_all` for replacing and renaming strings across the file.";
@@ -70,22 +71,21 @@ impl Tool for EditTool {
     ) -> Result<ToolResult> {
         let file_path = require_str(&input, "file_path")?;
         let new_string = require_str(&input, "new_string")?;
-        let path = resolve_path(ctx.cwd, file_path);
+        let path = ctx.environment.resolve_user_path(ctx.cwd, file_path);
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
 
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| Error::Tool {
-                tool: "Edit".into(),
-                message: format!("{}: {e}", path.display()),
-            })?;
+        let bytes = ctx.environment.read_bytes(&path).await?;
+        let content = String::from_utf8(bytes).map_err(|e| Error::Tool {
+            tool: "Edit".into(),
+            message: format!("{}: not valid UTF-8 ({e})", path.display()),
+        })?;
 
         // Hash-line mode: find a line by content fingerprint.
         if let Some(hash) = input["hash_line"].as_str() {
-            return edit_by_hash_line(&path, &content, hash, new_string);
+            return edit_by_hash_line(ctx.environment, &path, &content, hash, new_string).await;
         }
 
         let old_string = require_str(&input, "old_string")?;
@@ -125,12 +125,9 @@ impl Tool for EditTool {
             content.replacen(old_string, new_string, 1)
         };
 
-        tokio::fs::write(&path, &new_content)
-            .await
-            .map_err(|e| Error::Tool {
-                tool: "Edit".into(),
-                message: format!("{}: {e}", path.display()),
-            })?;
+        ctx.environment
+            .write_bytes(&path, new_content.as_bytes())
+            .await?;
 
         let short_path = path
             .strip_prefix(std::env::current_dir().unwrap_or_default())
@@ -157,7 +154,8 @@ pub fn hash_line(line: &str) -> String {
 }
 
 /// Find a line by its content hash and replace it.
-fn edit_by_hash_line(
+async fn edit_by_hash_line(
+    env: &dyn Environment,
     path: &std::path::Path,
     content: &str,
     target_hash: &str,
@@ -184,10 +182,7 @@ fn edit_by_hash_line(
         }
         updated.push('\n');
     }
-    std::fs::write(path, &updated).map_err(|e| Error::Tool {
-        tool: "Edit".into(),
-        message: format!("{}: {e}", path.display()),
-    })?;
+    env.write_bytes(path, updated.as_bytes()).await?;
     let short = path
         .strip_prefix(std::env::current_dir().unwrap_or_default())
         .unwrap_or(path);

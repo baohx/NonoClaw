@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::background::BackgroundTaskRegistry;
+pub use crate::environment::Environment;
 
 /// Owned description of one child run. Ownership keeps Coordinator fan-out
 /// independent from the model input value and preserves stable scope metadata.
@@ -172,6 +173,9 @@ pub struct ToolCtx<'a> {
     pub question: Option<&'a dyn QuestionResolver>,
     /// Background task registry for `run_in_background` bash commands.
     pub background_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
+    /// Shell execution backend (local host or container). Defaults to the local
+    /// environment; the engine injects a `DockerEnvironment` for sandboxed runs.
+    pub environment: &'a dyn Environment,
 }
 
 impl<'a> ToolCtx<'a> {

@@ -629,10 +629,17 @@ const SERVICE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Probe the Baidu OCR credential pair by exchanging it for an OAuth access
 /// token — the same call `attachments::process_baidu_unlimited` performs
 /// before every task, so token success ⇒ OCR pipeline is usable.
-async fn probe_baidu_ocr(http: &reqwest::Client, doc: &nonoclaw_engine::settings::DocModelConfig) -> (bool, Option<u64>, Option<String>) {
+async fn probe_baidu_ocr(
+    http: &reqwest::Client,
+    doc: &nonoclaw_engine::settings::DocModelConfig,
+) -> (bool, Option<u64>, Option<String>) {
     let api_key = doc.resolved_api_key();
     let Some(api_secret) = doc.resolved_api_secret() else {
-        return (false, None, Some("baidu_unlimited requires apiSecret".into()));
+        return (
+            false,
+            None,
+            Some("baidu_unlimited requires apiSecret".into()),
+        );
     };
     let started = std::time::Instant::now();
     let base = doc.base_url.trim_end_matches('/').to_string();
@@ -666,7 +673,11 @@ async fn probe_baidu_ocr(http: &reqwest::Client, doc: &nonoclaw_engine::settings
 /// `billing::query_ark_pay`: the listing endpoint is free, answers fast, and
 /// proves both reachability and key validity. 429 also proves the key is
 /// valid (rate limited, not rejected).
-async fn probe_video_model(http: &reqwest::Client, base_url: &str, api_key: &str) -> (bool, Option<u64>, Option<String>) {
+async fn probe_video_model(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> (bool, Option<u64>, Option<String>) {
     let started = std::time::Instant::now();
     let base = base_url.trim_end_matches('/');
     let result = tokio::time::timeout(
@@ -1827,7 +1838,10 @@ async fn handle_ws(
                 // Auxiliary services share the same probe: the docModel OCR
                 // provider and every configured video model.
                 let http = reqwest::Client::new();
-                if let Some(doc) = config.doc_model().filter(|d| d.provider == "baidu_unlimited") {
+                if let Some(doc) = config
+                    .doc_model()
+                    .filter(|d| d.provider == "baidu_unlimited")
+                {
                     let http = http.clone();
                     tasks.spawn(async move {
                         let (ok, latency_ms, error) = probe_baidu_ocr(&http, &doc).await;
@@ -2333,6 +2347,7 @@ async fn handle_ws(
                             max_turns: fork_opts.max_turns,
                             max_budget_usd: fork_opts.max_budget_usd,
                             context_window: None,
+                            wall_time_limit_seconds: fork_opts.wall_time_limit_seconds,
                         };
                         let fork_engine = QueryEngine::new(
                             fork_client,
@@ -2817,7 +2832,13 @@ async fn handle_ws(
                             // Broadcast updated messages + project info to all
                             // other peers sharing this session.
                             if let Some(ref cid) = sync_sid {
-                                s.session_hub.sync(cid, &tx2, history_redaction_enabled(s.project().config())).await;
+                                s.session_hub
+                                    .sync(
+                                        cid,
+                                        &tx2,
+                                        history_redaction_enabled(s.project().config()),
+                                    )
+                                    .await;
                                 // Also push ProjectInfo refresh.
                                 let pi = ServerMsg::ProjectInfo { info };
                                 let peers = s.session_hub.peers(cid).await;
@@ -3487,7 +3508,14 @@ async fn handle_ws(
                 // Broadcast the clear before releasing exclusivity, so a new
                 // run cannot race an older MessagesLoaded snapshot to peers.
                 if let Some(ref cid) = shared_sid {
-                    state.session_hub.sync(cid, &tx, history_redaction_enabled(state.project().config())).await;
+                    state
+                        .session_hub
+                        .sync(
+                            cid,
+                            &tx,
+                            history_redaction_enabled(state.project().config()),
+                        )
+                        .await;
                 }
                 clear_lease.finish().await;
             }
@@ -3700,7 +3728,10 @@ async fn handle_ws(
                         )
                         .await;
                         if let Some(ref id) = shared_sid {
-                            state.session_hub.sync(id, &tx, history_redaction_enabled(state.project().config())).await;
+                            state
+                                .session_hub
+                                .sync(id, &tx, history_redaction_enabled(state.project().config()))
+                                .await;
                         }
                     }
                     Ok(None) => {

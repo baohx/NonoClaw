@@ -6,7 +6,6 @@ use nonoclaw_core::{Error, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::builtin::resolve_path;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const PROMPT: &str = "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead";
@@ -58,61 +57,31 @@ impl Tool for GlobTool {
         })?;
         let base = input["path"]
             .as_str()
-            .map(|p| resolve_path(ctx.cwd, p))
-            .unwrap_or_else(|| ctx.cwd.to_path_buf());
+            .map(|p| ctx.environment.resolve_user_path(ctx.cwd, p))
+            .unwrap_or_else(|| ctx.environment.effective_cwd(ctx.cwd));
 
-        let full_pattern = join_pattern(&base, pattern);
-        let entries = glob::glob(&full_pattern).map_err(|e| Error::Tool {
-            tool: "Glob".into(),
-            message: format!("invalid pattern `{pattern}`: {e}"),
-        })?;
+        let mut found = ctx.environment.glob(&base, pattern).await?;
 
-        // Collect existing paths with mtimes, then sort most-recent first.
-        let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-        for entry in entries {
-            match entry {
-                Ok(p) => {
-                    if let Ok(meta) = std::fs::metadata(&p) {
-                        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                        found.push((mtime, p));
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-        found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        // Sort most-recent first; files with no mtime sort last.
+        found.sort_by_key(|entry| {
+            std::cmp::Reverse(entry.modified.unwrap_or(std::time::UNIX_EPOCH))
+        });
 
         if found.is_empty() {
             return Ok(ToolResult::ok("No files matched."));
         }
         let body = found
             .iter()
-            .map(|(_, p)| p.strip_prefix(ctx.cwd).unwrap_or(p).display().to_string())
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(ctx.cwd)
+                    .unwrap_or(&entry.path)
+                    .display()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolResult::ok(body))
-    }
-}
-
-/// Join a base directory and a glob pattern into a single pattern string.
-fn join_pattern(base: &std::path::Path, pattern: &str) -> String {
-    let base = base.display().to_string();
-    if pattern.starts_with('/') || pattern.starts_with('~') {
-        return pattern.to_string();
-    }
-    let base = base.trim_end_matches('/');
-    format!("{base}/{pattern}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn join_patterns() {
-        let p = std::path::Path::new("/tmp/x");
-        assert_eq!(join_pattern(p, "**/*.rs"), "/tmp/x/**/*.rs");
-        assert_eq!(join_pattern(p, "/abs/*.rs"), "/abs/*.rs");
-        assert_eq!(join_pattern(std::path::Path::new("/a/"), "b"), "/a/b");
     }
 }

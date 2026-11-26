@@ -31,6 +31,7 @@ fn ctx<'a>(
         graph_runner: None,
         question: None,
         background_registry: None,
+        environment: &nonoclaw_tools::environment::LocalEnvironment,
     }
 }
 

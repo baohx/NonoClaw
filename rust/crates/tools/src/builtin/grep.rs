@@ -4,11 +4,12 @@
 use async_trait::async_trait;
 use nonoclaw_core::{Error, PermissionResult, Result};
 use serde_json::{json, Value};
-use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::builtin::resolve_path;
 use crate::tool::{Tool, ToolCtx, ToolResult};
+
+/// Wall-clock budget for a single `rg` invocation.
+const GREP_TIMEOUT_MS: u64 = 120_000;
 
 const PROMPT: &str = "A powerful search tool built on ripgrep\n\nUsage:\n- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n- Supports full regex syntax (e.g. \"log.*Error\", \"function\\s+\\w+\")\n- Filter files with glob parameter (e.g. \"*.js\", \"**/*.tsx\") or type parameter (e.g. \"js\", \"py\", \"rust\")\n- Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts\n- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping\n- Multiline matching: by default patterns match within single lines only. For cross-line patterns use `multiline: true`";
 
@@ -83,7 +84,7 @@ impl Tool for GrepTool {
         &self,
         input: Value,
         ctx: &ToolCtx<'_>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolResult> {
         let pattern = input["pattern"].as_str().ok_or_else(|| Error::Tool {
             tool: "Grep".into(),
@@ -92,52 +93,70 @@ impl Tool for GrepTool {
         let mode = OutputMode::from_str(input["output_mode"].as_str().unwrap_or(""));
         let path = input["path"]
             .as_str()
-            .map(|p| resolve_path(ctx.cwd, p))
-            .unwrap_or_else(|| ctx.cwd.to_path_buf());
+            .map(|p| ctx.environment.resolve_user_path(ctx.cwd, p))
+            .unwrap_or_else(|| ctx.environment.effective_cwd(ctx.cwd));
 
-        let mut cmd = Command::new("rg");
-        cmd.arg("--color").arg("never").arg("--no-heading");
+        let mut argv: Vec<String> = vec![
+            "rg".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "--no-heading".to_string(),
+        ];
         if input["-i"].as_bool().unwrap_or(false) {
-            cmd.arg("-i");
+            argv.push("-i".to_string());
         }
         if input["multiline"].as_bool().unwrap_or(false) {
-            cmd.arg("-U").arg("--multiline-dotall");
+            argv.push("-U".to_string());
+            argv.push("--multiline-dotall".to_string());
         }
         if let Some(g) = input["glob"].as_str() {
-            cmd.arg("--glob").arg(g);
+            argv.push("--glob".to_string());
+            argv.push(g.to_string());
         }
         if let Some(t) = input["type"].as_str() {
-            cmd.arg("--type").arg(t);
+            argv.push("--type".to_string());
+            argv.push(t.to_string());
         }
         match mode {
             OutputMode::Content => {
                 let show_ln = input["-n"].as_bool().unwrap_or(true);
                 if show_ln {
-                    cmd.arg("-n");
+                    argv.push("-n".to_string());
                 }
             }
             OutputMode::FilesWithMatches => {
-                cmd.arg("--files-with-matches");
+                argv.push("--files-with-matches".to_string());
             }
             OutputMode::Count => {
-                cmd.arg("-c");
+                argv.push("-c".to_string());
             }
         }
-        cmd.arg(pattern).arg(&path);
+        argv.push(pattern.to_string());
+        argv.push(path.display().to_string());
 
-        let output = cmd.output().await.map_err(|e| Error::Tool {
-            tool: "Grep".into(),
-            message: format!("failed to run `rg` (is ripgrep installed?): {e}"),
-        })?;
+        let output = ctx
+            .environment
+            .run_argv(&argv, ctx.cwd, GREP_TIMEOUT_MS, cancel)
+            .await
+            .map_err(|e| Error::Tool {
+                tool: "Grep".into(),
+                message: format!(
+                    "failed to run `rg` (is ripgrep installed in this environment?): {e}"
+                ),
+            })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // rg exit code 1 = no matches (not an error); 2 = real error.
-        let code = output.status.code().unwrap_or(0);
-        if code == 2 {
+        let stdout = &output.stdout;
+        let stderr = output.stderr.trim().to_string();
+        // rg exit code 1 = no matches (not an error); anything else = error.
+        if output.exit_code != 0 && output.exit_code != 1 {
+            let hint = if stderr.contains("not found") || stderr.contains("No such file") {
+                " (ripgrep is not installed in this environment; install it or use the Bash tool with `grep -rn` instead)"
+            } else {
+                ""
+            };
             return Err(Error::Tool {
                 tool: "Grep".into(),
-                message: stderr.trim().to_string(),
+                message: format!("{stderr}{hint}"),
             });
         }
         if stdout.is_empty() {

@@ -20,9 +20,9 @@ use nonoclaw_core::{
 use nonoclaw_tools::permissions::PermissionGate;
 use nonoclaw_tools::tool::{GraphRunner, QuestionResolver, SubagentRunner};
 use nonoclaw_tools::{
-    PermissionResolverFuture, SubagentRequest, TodoStore, ToolCall, ToolExecutionContext,
-    ToolExecutor, ToolHookRunner, ToolOptions, ToolPermissionRequest, ToolPermissionResolver,
-    ToolRegistry,
+    Environment, LocalEnvironment, PermissionResolverFuture, SubagentRequest, TodoStore, ToolCall,
+    ToolExecutionContext, ToolExecutor, ToolHookRunner, ToolOptions, ToolPermissionRequest,
+    ToolPermissionResolver, ToolRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1108,6 +1108,13 @@ pub struct EngineOptions {
     /// Optional run budget propagated to tools and recorded in RunContext.
     /// Existing entry points leave this unset until a budget is configured.
     pub max_budget_usd: Option<f64>,
+    /// Optional wall-clock limit for the whole run. When set, the loop stops
+    /// with [`RunFinishReason::TimeExceeded`] once the run exceeds this many
+    /// seconds, mirroring mini-swe-agent's `wall_time_limit_seconds`.
+    pub wall_time_limit_seconds: Option<u64>,
+    /// Shell execution backend. `None` means the local host. Set to a
+    /// `DockerEnvironment` to run Bash inside a container (e.g. SWE-bench).
+    pub environment: Option<Arc<dyn Environment>>,
     /// High-level provider-independent payload preset.
     pub token_mode: crate::budget::TokenMode,
     /// Resolved per-partition request budgets in estimated tokens.
@@ -1192,6 +1199,8 @@ impl Default for EngineOptions {
             chars_per_token: 4,
             context_window: None,
             max_budget_usd: None,
+            wall_time_limit_seconds: None,
+            environment: None,
             token_mode: crate::budget::TokenMode::default(),
             context_budget: crate::budget::ContextBudget::default(),
             startup_events: Vec::new(),
@@ -1219,6 +1228,10 @@ pub enum RunFinishReason {
     },
     BudgetExceeded {
         max_budget_usd: f64,
+        suggestion: String,
+    },
+    TimeExceeded {
+        max_seconds: u64,
         suggestion: String,
     },
     ContextLimit {
@@ -1272,6 +1285,10 @@ struct EngineCache {
     /// Cumulative token usage across all turns in this run. Rebuilt from
     /// provider-reported per-turn data; does not participate in reducer state.
     total_usage: Usage,
+    /// Cumulative estimated USD cost across all turns, derived from
+    /// `total_usage` against the model price table. Only populated when the
+    /// model has a known price; used to enforce `max_budget_usd`.
+    cumulative_cost_usd: f64,
     /// Last turn's provider-reported `input_tokens` (full prompt size).
     /// Used as the primary compact-threshold signal; falls back to the
     /// chars/4 heuristic when zero (e.g. before the first turn).
@@ -1408,6 +1425,7 @@ impl Default for EngineCache {
     fn default() -> Self {
         EngineCache {
             total_usage: Usage::default(),
+            cumulative_cost_usd: 0.0,
             last_input_tokens: 0,
             frozen_idx: 0,
             pending_compact: None,
@@ -1434,6 +1452,8 @@ pub struct QueryEngine {
     session_revision: u64,
     session_repairs: Vec<SessionRepair>,
     hooks: Vec<(crate::hooks::HookType, crate::hooks::HookDef)>,
+    /// Resolved shell execution backend (local or container).
+    environment: Arc<dyn Environment>,
     /// Performance-only cache. Does not participate in the reducer state;
     /// reset to `Default` on session restore and rebuilt lazily.
     cache: EngineCache,
@@ -1450,6 +1470,10 @@ impl QueryEngine {
             client,
             registry,
             todos,
+            environment: options
+                .environment
+                .clone()
+                .unwrap_or_else(|| Arc::new(LocalEnvironment)),
             options,
             messages: Vec::new(),
             session_id: new_session_id(),
@@ -1484,6 +1508,10 @@ impl QueryEngine {
             client,
             registry,
             todos,
+            environment: options
+                .environment
+                .clone()
+                .unwrap_or_else(|| Arc::new(LocalEnvironment)),
             options,
             messages,
             session_id: session.id().to_string(),
@@ -1587,6 +1615,7 @@ impl QueryEngine {
                 max_turns: self.options.max_turns,
                 max_budget_usd: self.options.max_budget_usd,
                 context_window: self.options.context_window,
+                wall_time_limit_seconds: self.options.wall_time_limit_seconds,
             },
         )
     }
@@ -1600,6 +1629,7 @@ impl QueryEngine {
                 max_turns: self.options.max_turns,
                 max_budget_usd: self.options.max_budget_usd,
                 context_window: self.options.context_window,
+                wall_time_limit_seconds: self.options.wall_time_limit_seconds,
             },
         )
     }
@@ -2204,6 +2234,27 @@ impl QueryEngine {
                     .sum();
             }
 
+            // Wall-clock and cost limits are checked before every turn, mirroring
+            // mini-swe-agent's three-pronged runaway guard (steps + cost + wall
+            // time). Both are checked on the *next* iteration after the turn that
+            // crosses the limit, which keeps the check cheap and non-blocking.
+            if let Some(limit_secs) = self.options.wall_time_limit_seconds {
+                if run_started_at.elapsed().as_secs() >= limit_secs {
+                    break RunFinishReason::TimeExceeded {
+                        max_seconds: limit_secs,
+                        suggestion: "increase wall_time_limit_seconds or restart the run".into(),
+                    };
+                }
+            }
+            if let Some(budget) = self.options.max_budget_usd {
+                if self.cache.cumulative_cost_usd > budget {
+                    break RunFinishReason::BudgetExceeded {
+                        max_budget_usd: budget,
+                        suggestion: "increase max_budget_usd or use a cheaper model".into(),
+                    };
+                }
+            }
+
             let finalizing_after_max_turns = if turns_made >= self.options.max_turns {
                 if self.options.finalize_on_max_turns && last_stop == Some(StopReason::ToolUse) {
                     true
@@ -2384,10 +2435,8 @@ impl QueryEngine {
                     history_est,
                     history_budget,
                 );
-                let max_compact_input_chars = crate::budget::ContextBudget::chars(
-                    history_budget,
-                    chars_per_token,
-                );
+                let max_compact_input_chars =
+                    crate::budget::ContextBudget::chars(history_budget, chars_per_token);
                 // P0-2: prune oversized tool results before summarizing. When
                 // pruning alone brings both the total and history estimates back
                 // under their thresholds, skip the summarizer call entirely.
@@ -2544,10 +2593,8 @@ impl QueryEngine {
                             self.cache.last_request.as_ref().map(|p| p.as_ref()),
                         ) => result?,
                     };
-                    let chars_after =
-                        total_message_chars(&compacted, system_chars, tools_chars);
-                    let tokens_after =
-                        ratio_tokens(tokens_before, chars_before, chars_after);
+                    let chars_after = total_message_chars(&compacted, system_chars, tools_chars);
+                    let tokens_after = ratio_tokens(tokens_before, chars_before, chars_after);
                     let kept = compacted.len();
                     let removed = before.saturating_sub(kept);
                     if should_apply_compaction(removed, chars_before, chars_after)
@@ -2882,6 +2929,13 @@ impl QueryEngine {
             };
 
             self.cache.total_usage.accumulate(&turn.usage);
+            // Accumulate the estimated USD cost for this turn so the budget
+            // gate can fire on the next iteration. Unknown models contribute
+            // zero (and therefore never trip the cost limit).
+            if let Some(pricing) = crate::pricing::lookup_pricing(&self.options.model) {
+                self.cache.cumulative_cost_usd +=
+                    crate::pricing::estimate_cost(&turn.usage, &pricing);
+            }
             // Track the provider-reported prompt size for precise compact
             // threshold calibration. Normalized by dialect: Anthropic's
             // `input_tokens` excludes its cache siblings (832 reported while
@@ -3198,6 +3252,7 @@ impl QueryEngine {
                 question: self.options.question_resolver.as_deref(),
                 background_registry: self.options.background_registry.clone(),
                 is_non_interactive: self.options.is_non_interactive,
+                environment: self.environment.as_ref(),
             };
             let mut execution = Box::pin(tool_executor.execute(&calls, &execution_context));
             let executions = loop {
@@ -4829,11 +4884,7 @@ mod tests {
             "gate accepted a compaction that grew chars ({chars_before} -> {chars_after})"
         );
         // A genuinely shrinking compaction still applies.
-        assert!(should_apply_compaction(
-            7,
-            chars_before,
-            96_000 + 336_000
-        ));
+        assert!(should_apply_compaction(7, chars_before, 96_000 + 336_000));
         // No messages removed (compact failed / nothing to remove): never apply.
         assert!(!should_apply_compaction(0, chars_before, chars_after));
     }
@@ -5731,10 +5782,7 @@ mod tests {
     /// them already cached, 5 completion tokens. Drives the full engine run
     /// loop so the UsageUpdated / RunFinished payload shapes are exercised
     /// end-to-end (the frontend consumes exactly these events).
-    async fn spawn_openai_usage_fixture() -> (
-        Arc<Client>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn spawn_openai_usage_fixture() -> (Arc<Client>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5794,10 +5842,8 @@ mod tests {
     async fn openai_live_usage_events_are_anthropic_shaped() {
         let (client, fixture_task) = spawn_openai_usage_fixture().await;
         let mut engine = fixture_engine(client);
-        let cwd = std::env::temp_dir().join(format!(
-            "nonoclaw-openai-usage-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let cwd =
+            std::env::temp_dir().join(format!("nonoclaw-openai-usage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).unwrap();
         let mut events = Vec::new();
         let result = engine
@@ -5820,7 +5866,9 @@ mod tests {
         let mut checked_run_finished = 0;
         for event in &events {
             match event {
-                EngineEvent::UsageUpdated { turn_usage, total, .. } => {
+                EngineEvent::UsageUpdated {
+                    turn_usage, total, ..
+                } => {
                     for usage in [
                         Usage {
                             input_tokens: turn_usage.input_tokens.unwrap_or(0),
@@ -5860,7 +5908,10 @@ mod tests {
                     let base = usage.input_tokens
                         + usage.cache_read_input_tokens
                         + usage.cache_creation_input_tokens;
-                    assert_eq!(base, 1000, "RunFinished usage must count the true prompt exactly once");
+                    assert_eq!(
+                        base, 1000,
+                        "RunFinished usage must count the true prompt exactly once"
+                    );
                     checked_run_finished += 1;
                 }
                 _ => {}

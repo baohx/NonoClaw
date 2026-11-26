@@ -100,10 +100,14 @@ impl Tool for WebFetchTool {
         for _ in 0..=MAX_REDIRECTS {
             validate_url(&current)?;
             ensure_resolved_ips_public(&current).await?;
-            let r = client.get(current.clone()).send().await.map_err(|e| Error::Tool {
-                tool: "WebFetch".into(),
-                message: format!("request failed: {e}"),
-            })?;
+            let r = client
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|e| Error::Tool {
+                    tool: "WebFetch".into(),
+                    message: format!("request failed: {e}"),
+                })?;
             if r.status().is_redirection() {
                 let loc = r
                     .headers()
@@ -247,11 +251,7 @@ async fn ensure_resolved_ips_public(url: &reqwest::Url) -> Result<()> {
     let host = url
         .host_str()
         .ok_or_else(|| ssrf_error("url has no host".into()))?;
-    if host
-        .trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .is_ok()
-    {
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
         return Ok(()); // literal IP — already validated in validate_url
     }
     let addrs = tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(80)))
@@ -471,7 +471,9 @@ mod tests {
         // `localhost` resolves to 127.0.0.1/::1 on every normal host; this
         // exercises the resolve-then-check path without external DNS.
         let url = reqwest::Url::parse("http://localhost:1/").unwrap();
-        let err = ensure_resolved_ips_public(&url).await.expect_err("localhost");
+        let err = ensure_resolved_ips_public(&url)
+            .await
+            .expect_err("localhost");
         match err {
             Error::Tool { message, .. } => assert!(message.contains("SSRF"), "{message}"),
             other => panic!("expected Tool error, got {other:?}"),
@@ -501,6 +503,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let res = tool
             .call(

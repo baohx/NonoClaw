@@ -5,7 +5,6 @@ use nonoclaw_core::{Error, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::builtin::resolve_path;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const MAX_LINES: usize = 2000;
@@ -83,7 +82,7 @@ impl Tool for ReadTool {
         let file_path = require_str(&input, "file_path")?;
         let offset = input["offset"].as_u64().map(|n| n as usize);
         let limit = input["limit"].as_u64().map(|n| n as usize);
-        let path = resolve_path(ctx.cwd, file_path);
+        let path = ctx.environment.resolve_user_path(ctx.cwd, file_path);
 
         // Gate ③: refuse to read locations that routinely hold credentials
         // (SSH keys, cloud tokens, dotenv, private-key material). This runs in
@@ -102,10 +101,7 @@ impl Tool for ReadTool {
             return Err(Error::Cancelled);
         }
 
-        let bytes = tokio::fs::read(&path).await.map_err(|e| Error::Tool {
-            tool: "Read".into(),
-            message: format!("{}: {e}", path.display()),
-        })?;
+        let bytes = ctx.environment.read_bytes(&path).await?;
 
         // Binary detection: a NUL byte in the first chunk means not text.
         if bytes.iter().take(8000).any(|&b| b == 0) {
@@ -182,6 +178,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let res = tool
             .call(
@@ -220,6 +217,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let res = tool
             .call(json!({"file_path": ".env"}), &ctx, CancellationToken::new())
@@ -254,6 +252,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let res = tool
             .call(

@@ -1092,6 +1092,8 @@ pub struct RunConfigOverrides {
     pub context_window: Option<usize>,
     pub compact_threshold: Option<usize>,
     pub auto_compact: Option<bool>,
+    pub max_budget_usd: Option<f64>,
+    pub wall_time_limit_seconds: Option<u64>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Option<Vec<String>>,
@@ -1115,6 +1117,8 @@ impl Default for RunConfigOverrides {
             context_window: None,
             compact_threshold: None,
             auto_compact: None,
+            max_budget_usd: None,
+            wall_time_limit_seconds: None,
             permission_mode: None,
             reasoning_effort: None,
             allowed_tools: None,
@@ -1685,7 +1689,9 @@ impl ResolvedConfig {
             subagent_client: self.client_for(ClientPurpose::Subagent, Some(&model)).ok(),
             chars_per_token,
             context_window,
-            max_budget_usd: None,
+            max_budget_usd: overrides.max_budget_usd,
+            wall_time_limit_seconds: overrides.wall_time_limit_seconds,
+            environment: None,
             token_mode,
             context_budget,
             prompt_profile: self
@@ -1950,10 +1956,7 @@ fn merge_settings_value(
     if present("dreamEnabled", overlay.dream_enabled.is_some()) {
         base.dream_enabled = overlay.dream_enabled;
     }
-    if present(
-        "dreamIdleMinutes",
-        overlay.dream_idle_minutes.is_some(),
-    ) {
+    if present("dreamIdleMinutes", overlay.dream_idle_minutes.is_some()) {
         base.dream_idle_minutes = overlay.dream_idle_minutes;
     }
     if present(
@@ -3383,8 +3386,7 @@ fn diagnose_mcp_unknown_fields(
                         key.as_str(),
                         "type" | "command" | "args" | "env" | "url" | "headers"
                     )
-                })
-                {
+                }) {
                     unknown_field(&format!("mcpServers.{name}.{key}"), source, diagnostics);
                 }
             }

@@ -88,7 +88,8 @@ impl Tool for BashTool {
         // Route to the microVM when the user asked for VM-default execution and
         // a running instance exists. The guest sees the project at /workspace
         // (NFS), so relative paths and git work the same as on the host.
-        if let Some(result) = crate::vm::maybe_run_in_vm(ctx.cwd, &raw_command, &input, &cancel).await
+        if let Some(result) =
+            crate::vm::maybe_run_in_vm(ctx.cwd, &raw_command, &input, &cancel).await
         {
             return result;
         }
@@ -128,6 +129,26 @@ impl Tool for BashTool {
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+
+        // Non-local environment (e.g. `--docker`): delegate the whole command
+        // to the backend. Host-side discipline below — shell selection,
+        // sandbox, sudo hardening — only applies to local execution.
+        if !ctx.environment.is_local() {
+            let output = ctx
+                .environment
+                .execute(&command, ctx.cwd, timeout_ms, cancel)
+                .await?;
+            let data = if output.exit_code == 0 {
+                if output.combined().is_empty() {
+                    "[ok — no output]".into()
+                } else {
+                    output.combined()
+                }
+            } else {
+                format!("{}\n[exit code: {}]", output.combined(), output.exit_code)
+            };
+            return Ok(ToolResult::ok(data));
         }
 
         #[cfg(windows)]
@@ -476,6 +497,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let result = BashTool
             .call(

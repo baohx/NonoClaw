@@ -10,6 +10,7 @@ pub mod graph;
 pub mod hooks;
 pub mod jev_reward;
 pub mod loop_;
+pub mod pricing;
 pub mod prompt;
 pub mod run;
 pub mod session;

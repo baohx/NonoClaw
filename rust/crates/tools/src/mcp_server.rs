@@ -139,6 +139,7 @@ async fn call_tool(
         graph_runner: None,
         question: None,
         background_registry: None,
+        environment: &crate::environment::LocalEnvironment,
     };
 
     let outcome = tool.call(args, &ctx, cancel.clone()).await;

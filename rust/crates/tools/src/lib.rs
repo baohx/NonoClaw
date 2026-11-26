@@ -3,6 +3,7 @@
 
 pub mod background;
 pub mod builtin;
+pub mod environment;
 pub mod executor;
 pub mod mcp;
 pub mod mcp_server;
@@ -29,15 +30,16 @@ pub use mcp::{
 pub use permissions::{pattern_matches, wildcard_match, PermissionGate};
 pub use registry::ToolRegistry;
 pub use task_store::{TaskItem, TaskPatch, TaskStore, TodoItem};
-pub use vm::tools::{VmBrowserTool, VmExecTool, VmFsTool, VmTool};
 pub use tool::{
     allow_if_read_only, matches_name, QuestionFormat, QuestionRequest, QuestionResolver,
     QuestionUrgency, SubagentRequest, SubagentRunner, Tool, ToolDefinition, ToolOptions,
     ToolResult,
 };
+pub use vm::tools::{VmBrowserTool, VmExecTool, VmFsTool, VmTool};
 
 pub use background::{
     BackgroundTask, BackgroundTaskManager, BackgroundTaskRegistry,
     TaskStatus as BackgroundTaskStatus,
 };
 pub use builtin::{TodoStatus, TodoStore};
+pub use environment::{CommandOutput, DockerEnvironment, Environment, GlobEntry, LocalEnvironment};

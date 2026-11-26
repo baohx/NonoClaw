@@ -97,6 +97,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
 
         for _ in 0..2 {

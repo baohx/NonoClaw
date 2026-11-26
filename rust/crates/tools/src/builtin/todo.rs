@@ -173,6 +173,7 @@ mod tests {
             graph_runner: None,
             question: None,
             background_registry: None,
+            environment: &crate::environment::LocalEnvironment,
         };
         let result = tool
             .call(

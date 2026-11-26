@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::background::BackgroundTaskRegistry;
+use crate::environment::Environment;
 use crate::permissions::PermissionGate;
 use crate::registry::ToolRegistry;
 use crate::tool::{GraphRunner, QuestionResolver, SubagentRunner, ToolCtx, ToolOptions};
@@ -121,6 +122,9 @@ pub struct ToolExecutionContext<'a> {
     pub question: Option<&'a dyn QuestionResolver>,
     pub background_registry: Option<Arc<Mutex<BackgroundTaskRegistry>>>,
     pub is_non_interactive: bool,
+    /// Shell execution backend. Defaults to local when unset by callers (tests,
+    /// MCP server, etc.).
+    pub environment: &'a dyn Environment,
 }
 
 pub struct ToolExecutor {
@@ -263,6 +267,7 @@ impl ToolExecutor {
             graph_runner: context.graph_runner,
             question: context.question,
             background_registry: context.background_registry.clone(),
+            environment: context.environment,
         };
 
         if context.cancel.is_cancelled() {
@@ -677,16 +682,14 @@ fn bounded_result_preview(
         return notice;
     }
 
-    let marker = format!("\n…[{original_chars} total characters; middle omitted]…\n");
-    let marker = hard_limit_chars(&marker, max_chars - notice_chars);
-    let fixed_chars = notice_chars + marker.chars().count();
-    if fixed_chars >= max_chars {
-        return format!("{notice}{marker}");
-    }
-
-    let body_chars = max_chars - fixed_chars;
+    // Reserve a fixed budget for the omission marker + guidance so the model
+    // always sees *why* content was elided even for very small limits.
+    let remaining = max_chars - notice_chars;
+    let marker_reserve = remaining.min(112);
+    let body_chars = remaining.saturating_sub(marker_reserve);
     let head_chars = body_chars * 2 / 3;
     let tail_chars = body_chars.saturating_sub(head_chars);
+
     let head: String = raw.chars().take(head_chars).collect();
     let tail: String = raw
         .chars()
@@ -696,6 +699,14 @@ fn bounded_result_preview(
         .chars()
         .rev()
         .collect();
+    let elided = original_chars
+        .saturating_sub(head_chars)
+        .saturating_sub(tail_chars);
+
+    let marker = format!(
+        "\n…[{elided} characters omitted from the middle ({original_chars} total). \
+         Use head/tail/sed for files, a narrower grep pattern, or redirect to a file and search it.]…\n"
+    );
     hard_limit_chars(&format!("{notice}{head}{marker}{tail}"), max_chars)
 }
 
@@ -934,6 +945,7 @@ mod tests {
             question: None,
             background_registry: None,
             is_non_interactive: true,
+            environment: &crate::environment::LocalEnvironment,
         }
     }
 

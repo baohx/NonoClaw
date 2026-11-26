@@ -26,6 +26,7 @@ pub struct RunLimits {
     pub max_turns: u32,
     pub max_budget_usd: Option<f64>,
     pub context_window: Option<usize>,
+    pub wall_time_limit_seconds: Option<u64>,
 }
 
 /// Immutable identity and shared cancellation/ordering state for one run.
@@ -262,9 +263,8 @@ impl RunController {
             .last()
             .is_some_and(|event| matches!(&event.event, RunEvent::RunFinished { .. }))
         {
-            self.context
-                .trace
-                .record(self.context.recorded_envelope(RunEvent::RunFinished {
+            self.context.trace.record(
+                self.context.recorded_envelope(RunEvent::RunFinished {
                     status: match status {
                         RunTerminalStatus::Done => TechnicalStatus::Succeeded,
                         RunTerminalStatus::Cancelled => TechnicalStatus::Cancelled,
@@ -282,8 +282,8 @@ impl RunController {
                             )
                         })
                         .unwrap_or_default(),
-                },
-            ));
+                }),
+            );
         }
         let candidate = RunTerminal {
             run_id: self.context.run_id.clone(),

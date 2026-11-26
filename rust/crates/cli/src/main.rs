@@ -166,6 +166,27 @@ struct Cli {
     #[arg(long, value_name = "N", help_heading = "Model & limits")]
     max_turns: Option<u32>,
 
+    /// Hard cost cap for the run in USD (stops the run when estimated spend
+    /// exceeds this). Requires the model to have a known price.
+    #[arg(long, value_name = "USD")]
+    max_budget: Option<f64>,
+
+    /// Wall-clock limit for the whole run in seconds.
+    #[arg(long, value_name = "SECS")]
+    wall_time: Option<u64>,
+
+    /// Run Bash commands inside this Docker container via `docker exec`.
+    /// Note: only the Bash tool executes in the container — Read/Write/Edit/
+    /// Glob/Grep still touch the host filesystem. Combine with
+    /// `--allowed-tools Bash` for full sandbox semantics (SWE-bench style).
+    #[arg(long, value_name = "CONTAINER")]
+    docker: Option<String>,
+
+    /// Working directory inside the container (defaults to the host cwd).
+    /// For SWE-bench images this is typically `/testbed`.
+    #[arg(long, value_name = "PATH")]
+    docker_workdir: Option<PathBuf>,
+
     /// Max output tokens per turn.
     #[arg(long, value_name = "N", help_heading = "Model & limits")]
     max_tokens: Option<u32>,
@@ -455,6 +476,8 @@ async fn main() -> Result<()> {
             context_window: cli.context_window,
             compact_threshold: cli.compact_threshold,
             auto_compact: cli.no_auto_compact.then_some(false),
+            max_budget_usd: cli.max_budget,
+            wall_time_limit_seconds: cli.wall_time,
             permission_mode: Some(permission_mode),
             allowed_tools: (!cli.allowed_tools.is_empty()).then(|| cli.allowed_tools.clone()),
             disallowed_tools: (!cli.disallowed_tools.is_empty())
@@ -468,6 +491,16 @@ async fn main() -> Result<()> {
         .options;
     options.skills_manager = Some(Arc::clone(&skills_manager));
     options.background_registry = Some(Arc::clone(&background_registry));
+    // Route all shell execution and file I/O (Read/Write/Edit/Glob/Grep) into
+    // a container when `--docker` is given. The engine owns the backend for the
+    // whole run (including subagents that inherit the parent's options).
+    if let Some(container) = &cli.docker {
+        let mut docker_env = nonoclaw_tools::DockerEnvironment::new(container.clone());
+        if let Some(workdir) = &cli.docker_workdir {
+            docker_env = docker_env.with_workdir(workdir.clone());
+        }
+        options.environment = Some(Arc::new(docker_env));
+    }
 
     let (context_window, compact_threshold_tokens) = resolved.model_budget(&model);
     tracing::info!(
@@ -634,10 +667,8 @@ async fn main() -> Result<()> {
         // Text was streamed live; just print the usage summary on stderr.
         // Displayed numbers follow the Anthropic three-bucket shape so the
         // `in + cache read + cache write` sum equals the true prompt (#44).
-        let display_usage = nonoclaw_api::normalize_usage_to_anthropic_shape(
-            &result.usage,
-            result.api_format,
-        );
+        let display_usage =
+            nonoclaw_api::normalize_usage_to_anthropic_shape(&result.usage, result.api_format);
         eprintln!(
             "\n[turns: {}, in: {}, out: {}, cache read: {}, cache write: {}]",
             result.turns,

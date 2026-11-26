@@ -5,7 +5,7 @@ use nonoclaw_core::{Error, PermissionDecision, PermissionResult, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::builtin::{read::require_str, resolve_path};
+use crate::builtin::read::require_str;
 use crate::tool::{Tool, ToolCtx, ToolResult};
 
 const PROMPT: &str = "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provided path.\n- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.";
@@ -59,29 +59,15 @@ impl Tool for WriteTool {
             tool: "Write".into(),
             message: "missing required string field `content`".into(),
         })?;
-        let path = resolve_path(ctx.cwd, file_path);
+        let path = ctx.environment.resolve_user_path(ctx.cwd, file_path);
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
 
-        // Create parent directories as needed.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| Error::Tool {
-                        tool: "Write".into(),
-                        message: format!("create_dir_all {}: {e}", parent.display()),
-                    })?;
-            }
-        }
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| Error::Tool {
-                tool: "Write".into(),
-                message: format!("{}: {e}", path.display()),
-            })?;
+        ctx.environment
+            .write_bytes(&path, content.as_bytes())
+            .await?;
 
         Ok(ToolResult::ok(format!(
             "Successfully wrote {} bytes to {}",
