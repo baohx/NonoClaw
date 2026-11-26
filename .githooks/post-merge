@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# post-merge — PR 合并后自动同步需求说明书 + 刷新结构图 (devflow B13a/B13b)
+# 失败不影响 git 操作 (静默继续), 详情看脚本自身输出。
+"$(git rev-parse --show-toplevel)"/scripts/requirements-sync.sh \
+  --pr "$(git log -1 --format=%s | grep -oE '#[0-9]+' | head -1 | tr -d '#')" \
+  2>&1 | sed 's/^/[requirements-sync] /' || true
