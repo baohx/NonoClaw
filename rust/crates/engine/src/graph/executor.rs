@@ -212,7 +212,9 @@ pub async fn run_graph(
         let Some(node) = def.nodes.get(id) else {
             continue;
         };
-        if node.kind == NodeKind::Router {
+        if node.kind == NodeKind::Router
+            || (node.kind == NodeKind::Score && !node.branches.is_empty())
+        {
             if let Some(Value::String(branch)) = state.get(&format!("_router:{id}")) {
                 reachable.insert(branch.clone());
             }
@@ -318,11 +320,19 @@ pub async fn run_graph(
                     }
                 }
             }
-            // Router: activate the chosen branch only and record the choice so
-            // a resume can replay this dynamic edge.
-            if node.kind == NodeKind::Router {
+            // Router / Score: record the chosen branch so a resume can replay
+            // the dynamic edge, and activate a not-yet-run branch (Router
+            // semantics). A Score node's chosen candidate normally already
+            // ran (arena: score follows its branches) — its successor edges
+            // already fired, so only the winner is recorded. Annotation-mode
+            // score nodes (no branches) skip this entirely.
+            let is_dynamic_choice = node.kind == NodeKind::Router
+                || (node.kind == NodeKind::Score && !node.branches.is_empty());
+            if is_dynamic_choice {
                 if let Some(branch) = next_nodes.first() {
-                    reachable.insert(branch.clone());
+                    if !done.contains(branch) {
+                        reachable.insert(branch.clone());
+                    }
                     state.insert(format!("_router:{node_id}"), json!(branch));
                 }
             }
@@ -947,6 +957,54 @@ nodes:
             .expect("score output is a string");
         assert!(verdict.contains("winner=c"), "verdict: {verdict}");
         assert!(result.nodes_completed.contains(&"score".to_string()));
+        clear_checkpoint(&cwd, &def.name);
+    }
+
+    #[tokio::test]
+    async fn score_node_records_winner_and_runs_successor() {
+        // Arena shape: 3 contenders → score (jev/judge) → report successor.
+        // Verifies the dynamic-choice bookkeeping: the winner is recorded
+        // under `_router:score` and the score node's own `next` still runs.
+        let raw = r#"---
+name: sr
+start: fan
+nodes:
+  fan:
+    prompt: "task"
+    next: [x, y]
+  x:
+    prompt: "candidate x"
+    next: score
+  y:
+    prompt: "candidate y"
+    next: score
+  score:
+    kind: score
+    prompt: "pick the best candidate"
+    branches: [x, y]
+    next: report
+  report:
+    prompt: "report: {score}"
+    end: true
+---
+"#;
+        let def = super::super::parse_graph(raw, Path::new("/tmp/sr.md")).unwrap();
+        let cwd = test_dir("score_successor");
+        let opts = GraphRunOptions {
+            cwd: &cwd,
+            session_id: "test",
+            cancel: CancellationToken::new(),
+            subagent: &JudgeRunner { pick: "y" },
+            question: None,
+            resume: false,
+        };
+        let result = run_graph(&def, &json!({}), &opts)
+            .await
+            .expect("graph runs");
+        // Winner recorded as a replayable dynamic edge.
+        assert_eq!(result.state["_router:score"], json!("y"));
+        // The score node's own successor ran to completion.
+        assert!(result.nodes_completed.contains(&"report".to_string()));
         clear_checkpoint(&cwd, &def.name);
     }
 
